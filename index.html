@@ -1,18 +1,491 @@
 <!doctype html>
 <html lang="zh-CN">
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>H2 · Agent Team</title>
-<style>
-:root{color-scheme:dark;--bg:#1e1e1e;--panel:#242424;--line:#454545;--text:#f2f2f2;--muted:#9b9b9b;--green:#19c37d;--amber:#ff9d3d;--red:#ee6a6a}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}.shell{margin:22px auto;max-width:1180px;padding:0 18px}.panel{border:1px solid #3f3f3f;background:var(--panel);border-radius:18px;box-shadow:0 16px 40px #0005}.head{padding:22px 26px}.headrow{display:flex;align-items:center;gap:12px}.mark{width:26px;height:26px;border:2px solid #aaa;border-radius:7px;position:relative}.mark:before,.mark:after{content:"";position:absolute;background:#aaa}.mark:before{width:11px;height:2px;left:6px;top:10px}.mark:after{width:2px;height:11px;left:11px;top:5px}.title{font-size:20px;font-weight:700}.sub{color:var(--muted);font-size:15px}.stats{margin-left:auto;color:var(--muted)}button{border:1px solid #555;background:#363636;color:var(--text);border-radius:9px;padding:8px 13px;cursor:pointer}button:hover{background:#444}.rail{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:20px}.phase{min-height:100px;border:1px solid var(--line);border-radius:14px;padding:12px;background:#2c2c2c;position:relative}.phase:after{content:"";position:absolute;top:26px;right:-11px;width:12px;border-top:1px solid #666}.phase:last-child:after{display:none}.phase[data-state=running]{border-color:var(--amber);box-shadow:0 0 0 1px #ff9d3d44}.phase[data-state=done]{border-color:var(--green)}.phase[data-state=failed]{border-color:var(--red)}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#777;margin-right:7px}.phase[data-state=running] .dot{background:var(--amber);animation:pulse 1s infinite}.phase[data-state=done] .dot{background:var(--green)}.phase[data-state=failed] .dot{background:var(--red)}.phase-name{font-weight:650}.state{float:right;color:var(--muted);font-size:12px}.actors{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}.actor{padding:6px 9px;border-radius:9px;background:#363636;color:#ddd;font-size:12px}.actor.running{outline:1px solid var(--amber);color:#ffd0a1}.actor.done{outline:1px solid #268f68;color:#a8f0cf}.workspace{display:grid;grid-template-columns:1.35fr .65fr;gap:16px;margin-top:16px}.body{padding:20px}.body h2{font-size:15px;margin:0 0 12px}.log{height:270px;overflow:auto;border-top:1px solid var(--line)}.event{display:grid;grid-template-columns:90px 150px 1fr;gap:12px;padding:10px 0;border-bottom:1px solid #333;color:#d8d8d8}.event small{color:var(--muted)}.event b{font-weight:600}.event[data-state=done] b{color:#8ce7bd}.event[data-state=running] b{color:#ffc082}.event[data-state=failed] b{color:#ff9898}.result{white-space:pre-wrap;color:#d4d4d4;min-height:120px}.hint{color:var(--muted);font-size:12px;margin-top:10px}@keyframes pulse{50%{opacity:.3}}@media(max-width:800px){.rail,.workspace{grid-template-columns:1fr}.phase:after{display:none}.stats{margin-left:0}.headrow{flex-wrap:wrap}.event{grid-template-columns:70px 1fr}}
-</style>
-<body><main class="shell"><section class="panel head"><div class="headrow"><span class="mark"></span><span class="title">工作流运行中</span><span class="sub" id="run-title">阶段 0 · 控制面资格化</span><span class="stats">4 个阶段 · 3 个 worker</span><button id="run">Run demo</button></div><div class="rail" id="rail"></div></section><section class="workspace"><section class="panel body"><h2>运行日志</h2><div class="log" id="log"></div></section><section class="panel body"><h2>协调结果</h2><div class="result" id="result">等待运行。</div><div class="hint">H2 的核心是阶段边界、并行 worker、汇总和可复盘事件。</div></section></section></main>
-<script>
-const phases=[{name:"控制面资格化",actors:["脚本"]},{name:"三个 worker 并行检查",actors:["读图检验员","编辑提交员","规范朗读员"]},{name:"协调者收集验收",actors:["收集协调者"]},{name:"哨兵巡查日志",actors:["哨兵·日志巡查员"]}];
-const rail=document.querySelector('#rail'),log=document.querySelector('#log'),result=document.querySelector('#result'),title=document.querySelector('#run-title');
-function draw(states){rail.innerHTML=phases.map((p,i)=>`<article class="phase" data-state="${states[i]||'pending'}"><span class="dot"></span><span class="phase-name">${p.name}</span><span class="state">${states[i]||'pending'}</span><div class="actors">${p.actors.map(a=>`<span class="actor ${states[i]||''}">${a}</span>`).join('')}</div></article>`).join('')}
-function add(phase,actor,state,text){const row=document.createElement('div');row.className='event';row.dataset.state=state;row.innerHTML=`<small>${phase}</small><b>${actor}</b><span>${text}</span>`;log.append(row);log.scrollTop=log.scrollHeight}
-async function run(){log.innerHTML='';result.textContent='';const states=['pending','pending','pending','pending'];draw(states);const wait=ms=>new Promise(r=>setTimeout(r,ms));states[0]='running';title.textContent='阶段 0 · 控制面资格化';draw(states);add(phases[0].name,'脚本','running','检查输入和运行权限');await wait(450);add(phases[0].name,'脚本','done','控制面可运行');states[0]='done';states[1]='running';title.textContent='阶段 1 · 三个 worker 并行检查';draw(states);await Promise.all(phases[1].actors.map(async(a,i)=>{await wait(180+i*120);add(phases[1].name,a,'running',['读取项目结构','检查可交付修改','检查命名和文档'][i]);await wait(320);add(phases[1].name,a,'done','完成')}));states[1]='done';states[2]='running';title.textContent='阶段 2 · 协调者收集验收';draw(states);add(phases[2].name,'收集协调者','running','收齐三个 worker 的结果');await wait(500);add(phases[2].name,'收集协调者','done','验收通过');states[2]='done';states[3]='running';title.textContent='阶段 3 · 哨兵巡查日志';draw(states);add(phases[3].name,'哨兵·日志巡查员','running','检查事件顺序和遗漏');await wait(400);add(phases[3].name,'哨兵·日志巡查员','done','检查完成');states[3]='done';draw(states);title.textContent='运行完成';result.textContent='所有阶段完成。\n\n协调者确认：3 个 worker 均返回结果。\n哨兵确认：事件顺序完整，可继续接入真实 Agent。'}
-draw(['pending','pending','pending','pending']);document.querySelector('#run').onclick=run;
-</script></body></html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>H2 · Agent Team</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #191919;
+      --panel: #242424;
+      --panel-2: #2c2c2c;
+      --panel-3: #333333;
+      --line: #454545;
+      --line-soft: #393939;
+      --text: #f2f2f2;
+      --muted: #a3a3a3;
+      --faint: #747474;
+      --orange: #ff963d;
+      --orange-soft: #ff963d33;
+      --green: #36c996;
+      --red: #f07373;
+      --teal: #35c5b5;
+      --blue: #4c82ee;
+      --purple: #9568e9;
+      --pink: #e65a9f;
+      --radius-lg: 18px;
+      --radius-md: 12px;
+      --shadow: 0 18px 50px #00000042;
+      --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 var(--font);
+      letter-spacing: .005em;
+    }
+    button, textarea { font: inherit; }
+    button { color: inherit; }
+    button:focus-visible, textarea:focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
+
+    .shell { width: min(1440px, calc(100% - 36px)); margin: 22px auto 30px; }
+    .surface {
+      background: var(--panel);
+      border: 1px solid #414141;
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+    }
+
+    .run-card { overflow: hidden; }
+    .run-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 22px 26px 10px;
+      min-height: 72px;
+    }
+    .brand-mark {
+      width: 28px;
+      height: 28px;
+      flex: 0 0 auto;
+      position: relative;
+      border: 2px solid #a8a8a8;
+      border-radius: 7px;
+    }
+    .brand-mark::before, .brand-mark::after {
+      content: "";
+      position: absolute;
+      background: #a8a8a8;
+      border-radius: 4px;
+    }
+    .brand-mark::before { width: 12px; height: 2px; left: 6px; top: 11px; }
+    .brand-mark::after { width: 2px; height: 12px; left: 11px; top: 6px; }
+    .run-title { font-size: 20px; font-weight: 720; white-space: nowrap; }
+    .run-sub { color: var(--muted); font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .run-stats { margin-left: auto; color: var(--muted); font-size: 13px; white-space: nowrap; }
+    .head-actions { display: flex; align-items: center; gap: 8px; margin-left: 4px; }
+    .icon-btn, .text-btn {
+      border: 1px solid #555;
+      background: transparent;
+      border-radius: 9px;
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .icon-btn { width: 35px; height: 34px; display: grid; place-items: center; font-size: 16px; }
+    .icon-btn:hover, .text-btn:hover { background: var(--panel-3); color: var(--text); }
+    .text-btn { padding: 8px 12px; }
+    .text-btn.primary { background: var(--orange); border-color: var(--orange); color: #23160d; font-weight: 720; }
+    .text-btn.primary:hover { background: #ffad65; }
+    .text-btn.stop { color: #ddd; }
+    .text-btn.stop::before { content: ""; display: inline-block; width: 11px; height: 11px; margin-right: 7px; background: currentColor; border-radius: 2px; vertical-align: -1px; }
+
+    .phase-rail {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: 0;
+      padding: 10px 26px 22px;
+      overflow-x: auto;
+    }
+    .station {
+      position: relative;
+      min-width: 150px;
+      padding: 12px 17px 5px 34px;
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .station::before {
+      content: "";
+      position: absolute;
+      left: 7px;
+      top: 21px;
+      width: 11px;
+      height: 11px;
+      border: 2px solid #686868;
+      border-radius: 50%;
+      background: var(--panel);
+      z-index: 2;
+    }
+    .station:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      top: 27px;
+      left: 22px;
+      right: -1px;
+      border-top: 1px solid #5b5b5b;
+    }
+    .station[data-state="running"] { color: var(--text); }
+    .station[data-state="running"]::before { border-color: var(--orange); background: var(--orange); box-shadow: 0 0 0 7px var(--orange-soft); }
+    .station[data-state="done"] { color: var(--text); }
+    .station[data-state="done"]::before { border-color: var(--green); background: var(--green); }
+    .station[data-state="failed"] { color: var(--red); }
+    .station[data-state="failed"]::before { border-color: var(--red); background: var(--red); }
+    .station-label { display: block; font-size: 13px; font-weight: 680; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .station-meta { display: block; margin-top: 3px; color: var(--faint); font-size: 11px; white-space: nowrap; }
+    .station[data-state="running"] .station-meta { color: #d9a06d; }
+    .station-faces { display: flex; gap: 4px; margin-top: 9px; min-height: 23px; }
+
+    .face {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      flex: 0 0 auto;
+      border-radius: 8px;
+      background: var(--blue);
+      box-shadow: inset 0 0 0 1px #ffffff20;
+    }
+    .face::before {
+      content: "••";
+      color: #fff;
+      font-size: 14px;
+      line-height: 1;
+      letter-spacing: 2px;
+      transform: translateX(1px);
+    }
+    .face.orange { background: var(--orange); }
+    .face.teal { background: var(--teal); }
+    .face.purple { background: var(--purple); }
+    .face.pink { background: var(--pink); }
+    .face.blue { background: var(--blue); }
+    .face.muted { background: #5b5b5b; }
+    .face.running { animation: face-pulse 1.25s ease-in-out infinite; }
+    @keyframes face-pulse { 50% { transform: translateY(-2px); box-shadow: 0 0 0 4px #ff963d25; } }
+
+    .work-area { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; margin-top: 14px; }
+    .timeline-card, .summary-card { overflow: hidden; }
+    .card-head { display: flex; align-items: center; gap: 12px; padding: 18px 22px; border-bottom: 1px solid var(--line-soft); }
+    .card-head h2 { margin: 0; font-size: 15px; }
+    .card-head .quiet { color: var(--muted); font-size: 12px; }
+    .card-head .head-count { margin-left: auto; color: var(--muted); font-size: 12px; }
+    .timeline { padding: 8px 24px 22px 30px; }
+    .phase-block { position: relative; padding: 15px 0 4px 38px; }
+    .phase-block::before {
+      content: "";
+      position: absolute;
+      left: 7px;
+      top: 0;
+      bottom: -4px;
+      border-left: 1px solid #555;
+    }
+    .phase-block:last-child::before { bottom: 28px; }
+    .phase-node {
+      position: absolute;
+      left: -1px;
+      top: 18px;
+      width: 17px;
+      height: 17px;
+      border: 2px solid #686868;
+      border-radius: 50%;
+      background: var(--panel);
+      z-index: 1;
+    }
+    .phase-block[data-state="running"] .phase-node { border-color: var(--orange); background: var(--orange); box-shadow: 0 0 0 7px var(--orange-soft); }
+    .phase-block[data-state="done"] .phase-node { border-color: var(--green); background: var(--green); }
+    .phase-block[data-state="failed"] .phase-node { border-color: var(--red); background: var(--red); }
+    .phase-title-row { display: flex; align-items: baseline; gap: 9px; cursor: pointer; }
+    .phase-title { font-size: 16px; font-weight: 720; }
+    .phase-discipline { color: var(--faint); font: 11px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .phase-count { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .phase-chevron { color: var(--muted); font-size: 16px; transform: rotate(0deg); transition: transform .18s ease; }
+    .phase-block[data-open="true"] .phase-chevron { transform: rotate(90deg); }
+    .phase-note { margin: 4px 0 9px; color: var(--muted); font-size: 12px; }
+    .actor-list { display: grid; gap: 6px; max-height: 0; opacity: 0; overflow: hidden; transition: max-height .28s ease, opacity .2s ease; }
+    .phase-block[data-open="true"] .actor-list { max-height: 340px; opacity: 1; }
+    .actor-row {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 12px 9px 9px;
+      border: 1px solid transparent;
+      border-radius: 13px;
+      background: var(--panel-2);
+    }
+    .actor-row[data-state="running"] { border-color: #ff963d66; background: #322c27; }
+    .actor-row[data-state="failed"] { border-color: #f0737366; background: #342729; }
+    .actor-row[data-state="done"] .actor-state { color: var(--green); }
+    .actor-face { width: 30px; height: 30px; border-radius: 10px; }
+    .actor-name { font-weight: 680; }
+    .actor-role { margin-left: 7px; color: var(--faint); font-size: 11px; }
+    .actor-task { margin-top: 2px; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .actor-state { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .actor-state::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 6px; border: 1px solid currentColor; border-radius: 50%; vertical-align: 1px; }
+    .actor-state[data-state="running"] { color: var(--orange); }
+    .actor-state[data-state="running"]::before { background: var(--orange); box-shadow: 0 0 0 4px var(--orange-soft); }
+    .actor-state[data-state="done"]::before { background: var(--green); border-color: var(--green); }
+    .actor-state[data-state="failed"] { color: var(--red); }
+    .actor-state[data-state="failed"]::before { background: var(--red); border-color: var(--red); }
+    .collapsed-preview { display: flex; gap: 5px; padding: 1px 0 4px; }
+    .collapsed-preview .face { width: 20px; height: 20px; border-radius: 7px; }
+    .collapsed-preview .face::before { font-size: 11px; }
+
+    .summary-body { padding: 19px 20px 22px; }
+    .summary-status { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+    .status-orb { width: 13px; height: 13px; border-radius: 50%; background: var(--faint); }
+    .status-orb.running { background: var(--orange); box-shadow: 0 0 0 7px var(--orange-soft); animation: face-pulse 1.25s infinite; }
+    .status-orb.done { background: var(--green); }
+    .status-orb.failed { background: var(--red); }
+    .status-word { font-weight: 720; }
+    .summary-grid { display: grid; grid-template-columns: 1fr auto; gap: 9px 14px; padding: 15px 0; border-block: 1px solid var(--line-soft); }
+    .summary-grid dt { color: var(--muted); }
+    .summary-grid dd { margin: 0; font-weight: 680; text-align: right; }
+    .activity { margin-top: 18px; }
+    .activity h3 { margin: 0 0 9px; color: var(--muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+    .activity-list { display: grid; gap: 8px; max-height: 235px; overflow: auto; }
+    .activity-item { display: grid; grid-template-columns: 7px minmax(0, 1fr); gap: 9px; font-size: 12px; }
+    .activity-item::before { content: ""; width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: var(--faint); }
+    .activity-item[data-state="running"]::before { background: var(--orange); }
+    .activity-item[data-state="done"]::before { background: var(--green); }
+    .activity-item[data-state="failed"]::before { background: var(--red); }
+    .activity-main { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .activity-main b { font-weight: 680; }
+    .activity-sub { color: var(--faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .summary-result { margin-top: 18px; padding: 12px; border-radius: 10px; background: var(--panel-2); color: var(--muted); font-size: 12px; white-space: pre-wrap; }
+
+    .composer { margin-top: 14px; overflow: hidden; }
+    .composer textarea { display: block; width: 100%; min-height: 96px; resize: vertical; padding: 18px 22px; border: 0; background: transparent; color: var(--text); outline: none; }
+    .composer textarea::placeholder { color: #777; }
+    .composer-bottom { display: flex; align-items: center; gap: 9px; padding: 8px 14px 13px 20px; color: var(--muted); }
+    .composer-control { border: 0; background: transparent; color: var(--muted); cursor: pointer; padding: 5px 7px; border-radius: 7px; }
+    .composer-control:hover { background: var(--panel-3); color: var(--text); }
+    .composer-spacer { flex: 1; }
+    .composer-state { font-size: 12px; }
+    .send-btn { width: 31px; height: 31px; border: 0; border-radius: 9px; background: var(--panel-3); color: #d8d8d8; cursor: pointer; }
+    .send-btn:hover { background: var(--orange); color: #22150b; }
+    .toast { position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 18px); padding: 9px 14px; border: 1px solid #555; border-radius: 9px; background: #2d2d2d; color: var(--text); opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s; box-shadow: var(--shadow); }
+    .toast.show { opacity: 1; transform: translate(-50%, 0); }
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+
+    @media (max-width: 980px) {
+      .run-stats { display: none; }
+      .work-area { grid-template-columns: 1fr; }
+      .summary-card { order: -1; }
+      .summary-body { padding-bottom: 16px; }
+      .activity-list { max-height: 150px; }
+    }
+    @media (max-width: 700px) {
+      .shell { width: calc(100% - 18px); margin-top: 9px; }
+      .run-head { padding: 17px 16px 8px; flex-wrap: wrap; }
+      .run-title { font-size: 17px; }
+      .run-sub { order: 4; flex-basis: 100%; margin-left: 40px; font-size: 13px; }
+      .phase-rail { padding-inline: 11px; grid-template-columns: repeat(5, 150px); }
+      .timeline { padding-inline: 12px 14px; }
+      .phase-block { padding-left: 32px; }
+      .phase-discipline { display: none; }
+      .phase-count { font-size: 11px; }
+      .composer textarea { min-height: 82px; padding: 15px 16px; }
+      .composer-bottom { padding-left: 12px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="surface run-card" aria-labelledby="run-title">
+      <header class="run-head">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <strong class="run-title" id="run-title">工作流准备中</strong>
+        <span class="run-sub" id="run-sub">读取运行记录…</span>
+        <span class="run-stats" id="run-stats">5 个阶段 · 7 个 agent</span>
+        <div class="head-actions">
+          <button class="icon-btn" id="config" type="button" aria-label="显示运行配置">☷</button>
+          <button class="text-btn stop" id="stop" type="button">停止运行</button>
+          <button class="text-btn primary" id="run" type="button">开始运行</button>
+        </div>
+      </header>
+      <div class="phase-rail" id="phase-rail" aria-label="工作流阶段"></div>
+    </section>
+
+    <section class="work-area">
+      <section class="surface timeline-card" aria-labelledby="timeline-title">
+        <header class="card-head">
+          <h2 id="timeline-title">阶段时间线</h2>
+          <span class="quiet" id="timeline-note">每个阶段的 agent 结果按事件顺序展开</span>
+          <span class="head-count" id="event-count">0 条事件</span>
+        </header>
+        <div class="timeline" id="timeline"></div>
+      </section>
+
+      <aside class="surface summary-card" aria-labelledby="summary-title">
+        <header class="card-head">
+          <h2 id="summary-title">运行结算</h2>
+          <span class="head-count" id="source-label">内置演示</span>
+        </header>
+        <div class="summary-body">
+          <div class="summary-status"><span class="status-orb" id="status-orb"></span><span class="status-word" id="status-word">等待运行</span></div>
+          <dl class="summary-grid">
+            <dt>阶段</dt><dd id="summary-phases">0 / 5</dd>
+            <dt>Agent</dt><dd id="summary-actors">0 / 7</dd>
+            <dt>事件</dt><dd id="summary-events">0</dd>
+            <dt>协调者</dt><dd id="summary-coordinator">等待</dd>
+          </dl>
+          <div class="activity">
+            <h3>最近活动</h3>
+            <div class="activity-list" id="activity-list"></div>
+          </div>
+          <div class="summary-result" id="summary-result">运行后这里会显示结构化结算和失败停止点。</div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="surface composer" aria-label="继续输入">
+      <label class="sr-only" for="composer-input">继续输入以排队后续修改</label>
+      <textarea id="composer-input" placeholder="继续输入以排队后续修改"></textarea>
+      <div class="composer-bottom">
+        <button class="composer-control" id="attach" type="button" aria-label="添加上下文">＋</button>
+        <button class="composer-control" id="access" type="button">⌁ 完全访问</button>
+        <button class="composer-control" id="fanout" type="button">♧ 1</button>
+        <span class="composer-spacer"></span>
+        <span class="composer-state" id="composer-state">本地工作流 · 事件日志已连接</span>
+        <button class="send-btn" id="send" type="button" aria-label="排队后续修改">↑</button>
+      </div>
+    </section>
+  </main>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    "use strict";
+
+    const WORKFLOW = [
+      {id:"requirements", name:"需求与范围", discipline:"Software Requirements", actors:[{id:"requirements-coordinator",name:"需求协调者",role:"coordinator",task:"确认目标、输入和验收标准"}]},
+      {id:"design", name:"设计与依赖审查", discipline:"Software Design", actors:[
+        {id:"architecture-reviewer",name:"架构审查员",role:"reviewer",task:"检查模块边界和依赖关系"},
+        {id:"evidence-reviewer",name:"证据审查员",role:"reviewer",task:"检查证据链和可追溯性"},
+        {id:"test-planner",name:"测试规划员",role:"tester",task:"提出可执行的验收条件"}
+      ]},
+      {id:"construction", name:"实现与变更检查", discipline:"Software Construction", actors:[{id:"implementation-reviewer",name:"实现检验员",role:"builder",task:"检查实现是否满足设计约束"}]},
+      {id:"testing", name:"测试与质量验证", discipline:"Software Testing", actors:[{id:"test-runner",name:"测试验证员",role:"tester",task:"运行单元与回归检查"}]},
+      {id:"maintenance", name:"维护与交付反馈", discipline:"Software Maintenance", actors:[{id:"maintenance-recorder",name:"维护记录员",role:"maintainer",task:"形成修复建议、风险和后续动作"}]}
+    ];
+    const palette = ["teal", "orange", "blue", "purple", "pink"];
+    const actorPalette = ["teal", "orange", "blue", "purple", "pink", "blue", "teal"];
+    const $ = (id) => document.getElementById(id);
+    const state = {run:null, source:"内置演示", phaseState:{}, actorState:{}, events:[], cursor:0, timer:null, selected:"design", open:new Set(["design"]), running:false, feed:[]};
+
+    function fallbackRun() {
+      let seq=0, events=[];
+      for (const phase of WORKFLOW) {
+        events.push({seq:++seq,phase_id:phase.id,phase:phase.name,actor_id:"coordinator",actor:"协调者",state:"running",kind:"phase",text:`进入 ${phase.discipline} 阶段`});
+        if (phase.actors.length > 1) events.push({seq:++seq,phase_id:phase.id,phase:phase.name,actor_id:"coordinator",actor:"协调者",state:"running",kind:"coordination",text:`并行提交 ${phase.actors.length} 个 actor ask`});
+        for (const actor of phase.actors) {
+          events.push({seq:++seq,phase_id:phase.id,phase:phase.name,actor_id:actor.id,actor:actor.name,state:"running",kind:"actor",text:actor.task});
+          events.push({seq:++seq,phase_id:phase.id,phase:phase.name,actor_id:actor.id,actor:actor.name,state:"done",kind:"actor",text:`${actor.task}完成`});
+        }
+        events.push({seq:++seq,phase_id:phase.id,phase:phase.name,actor_id:"coordinator",actor:"协调者",state:"done",kind:"phase",text:"阶段结果齐全"});
+        if (phase.actors.length > 1) events.push({seq:++seq,phase_id:phase.id,phase:phase.name,actor_id:"coordinator",actor:"协调者",state:"done",kind:"coordination",text:"结构化结果已汇总"});
+      }
+      events.push({seq:++seq,phase_id:"runtime",phase:"运行结算",actor_id:"sentinel",actor:"哨兵",state:"running",kind:"audit",text:"检查事件序号、actor 终态和图拓扑"});
+      events.push({seq:++seq,phase_id:"runtime",phase:"运行结算",actor_id:"sentinel",actor:"哨兵",state:"done",kind:"audit",text:"事件连续、actor 终态齐全、图拓扑稳定"});
+      return {workflow_id:"software-engineering-review",status:"done",phases:WORKFLOW.map(p=>({id:p.id,name:p.name,discipline:p.discipline,state:"done",actors:p.actors.map(a=>({...a,state:"done"}))})),actors:WORKFLOW.flatMap(p=>p.actors.map(a=>({actor_id:a.id,actor:a.name,role:a.role,phase_id:p.id,ok:true,task:a.task,artifact:{summary:`${a.task}完成`}}))),coordinator:{accepted:true},sentinel:{ok:true},events};
+    }
+    function normalizedPhases() {
+      return state.run?.phases?.length ? state.run.phases : WORKFLOW.map(p=>({id:p.id,name:p.name,discipline:p.discipline,state:"pending",actors:p.actors.map(a=>({...a,state:"pending"}))}));
+    }
+    function actorFor(phase, id) { return (phase.actors || []).find(a=>a.id===id) || {id,name:id,role:"agent",task:""}; }
+    function actorFace(id, extra="") { const index=Math.max(0, WORKFLOW.flatMap(p=>p.actors).findIndex(a=>a.id===id)); return `<span class="face ${actorPalette[index%actorPalette.length]} ${extra}" aria-hidden="true"></span>`; }
+    function labelState(value) { return ({pending:"待处理",running:"运行中",done:"已完成",failed:"失败"})[value] || value || "待处理"; }
+    function countDone(phase) { const actors=phase.actors || []; return actors.filter(a=>(state.actorState[a.id] || a.state)==="done").length; }
+
+    function resetView() {
+      state.phaseState={}; state.actorState={}; state.events=[]; state.cursor=0; state.feed=[];
+      for (const phase of normalizedPhases()) { state.phaseState[phase.id]="pending"; for (const actor of phase.actors || []) state.actorState[actor.id]="pending"; }
+      render();
+    }
+    function applyEvent(event) {
+      if (!event) return;
+      state.events.push(event);
+      if (event.phase_id && state.phaseState[event.phase_id] !== undefined && event.kind !== "audit") state.phaseState[event.phase_id]=event.state;
+      if (event.actor_id && state.actorState[event.actor_id] !== undefined && ["running","done","failed"].includes(event.state)) state.actorState[event.actor_id]=event.state;
+      const phase=normalizedPhases().find(p=>p.id===event.phase_id);
+      if (phase) {
+        phase.state=state.phaseState[phase.id];
+        for (const actor of phase.actors || []) actor.state=state.actorState[actor.id];
+      }
+    }
+    function phaseClass(value) { return value || "pending"; }
+    function renderRail() {
+      const phases=normalizedPhases();
+      $("phase-rail").innerHTML=phases.map((phase,index)=>{
+        const stateValue=phaseClass(state.phaseState[phase.id]);
+        const done=countDone(phase), total=(phase.actors||[]).length;
+        const faces=(phase.actors||[]).slice(0,4).map(actor=>actorFace(actor.id,state.actorState[actor.id]==="running"?"running":"")).join("");
+        return `<article class="station" data-state="${stateValue}" data-phase="${phase.id}" tabindex="0" aria-label="${phase.name}，${labelState(stateValue)}"><span class="station-label">${index} · ${phase.name}</span><span class="station-meta">${done}/${total} · ${phase.discipline}</span><span class="station-faces">${faces}</span></article>`;
+      }).join("");
+      document.querySelectorAll(".station").forEach(node=>{ node.onclick=()=>{state.selected=node.dataset.phase; state.open.add(node.dataset.phase); render(); document.querySelector(`[data-phase-block="${node.dataset.phase}"]`)?.scrollIntoView({behavior:"smooth",block:"center"});}; node.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();node.click();}}; });
+    }
+    function renderTimeline() {
+      const phases=normalizedPhases();
+      $("timeline").innerHTML=phases.map((phase,index)=>{
+        const value=phaseClass(state.phaseState[phase.id]); const open=state.open.has(phase.id); const done=countDone(phase), total=(phase.actors||[]).length;
+        const actorRows=(phase.actors||[]).map(actor=>{
+          const actorState=state.actorState[actor.id] || actor.state || "pending";
+          return `<div class="actor-row" data-state="${actorState}">${actorFace(actor.id,actorState==="running"?"running":"actor-face")}<div><div><span class="actor-name">${actor.name}</span><span class="actor-role">${actor.role}</span></div><div class="actor-task">${actor.task || ""}</div></div><span class="actor-state" data-state="${actorState}">${labelState(actorState)}</span></div>`;
+        }).join("");
+        const preview=(phase.actors||[]).map(a=>actorFace(a.id,"")).join("");
+        return `<section class="phase-block" data-phase-block="${phase.id}" data-state="${value}" data-open="${open}"${state.selected===phase.id?" aria-current=\"step\"":""}><span class="phase-node"></span><div class="phase-title-row" data-toggle-phase="${phase.id}"><span class="phase-title">${index} · ${phase.name}</span><span class="phase-discipline">${phase.discipline}</span><span class="phase-count">${done}/${total}</span><span class="phase-chevron">›</span></div><p class="phase-note">${value==="pending"?"等待前一阶段完成":value==="failed"?"已停止，保留已完成结果":""}</p>${open?"":`<div class="collapsed-preview">${preview}</div>`}<div class="actor-list">${actorRows}</div></section>`;
+      }).join("");
+      document.querySelectorAll("[data-toggle-phase]").forEach(node=>node.onclick=()=>{const id=node.dataset.togglePhase; if(state.open.has(id))state.open.delete(id);else state.open.add(id);state.selected=id;renderTimeline();});
+    }
+    function renderActivity() {
+      const list=state.events.slice(-9).reverse();
+      $("activity-list").innerHTML=list.length?list.map(event=>`<div class="activity-item" data-state="${event.state}"><div><div class="activity-main"><b>${event.actor || event.actor_id || "系统"}</b> · ${event.text || ""}</div><div class="activity-sub">#${event.seq} · ${event.phase || "运行结算"}</div></div></div>`).join(""):"<div class=\"activity-sub\">还没有事件</div>";
+    }
+    function renderSummary() {
+      const phases=normalizedPhases(); const donePhases=phases.filter(p=>state.phaseState[p.id]==="done").length; const actors=Object.values(state.actorState); const doneActors=actors.filter(v=>v==="done").length;
+      const status=state.running?"running":(state.run?.status==="failed"||Object.values(state.phaseState).includes("failed")?"failed":(donePhases===phases.length&&state.events.length?"done":"pending"));
+      $("status-orb").className=`status-orb ${status}`; $("status-word").textContent=status==="running"?"运行中":status==="done"?"运行完成":status==="failed"?"运行失败":"等待运行";
+      $("summary-phases").textContent=`${donePhases} / ${phases.length}`; $("summary-actors").textContent=`${doneActors} / ${actors.length}`; $("summary-events").textContent=String(state.events.length); $("summary-coordinator").textContent=status==="done"?"验收通过":status==="failed"?"被阻断":"等待";
+      const stop=state.run?.stopped_at ? `\n停止点：${state.run.stopped_at}` : ""; $("summary-result").textContent=status==="done"?`哨兵确认：事件连续，图拓扑稳定。${stop}`:status==="failed"?`已保留部分结果。${stop}`:"运行后这里会显示结构化结算和失败停止点。";
+    }
+    function renderHeader() {
+      const phases=normalizedPhases(); const active=phases.find(p=>state.phaseState[p.id]==="running") || phases.find(p=>state.phaseState[p.id]==="failed") || phases[phases.length-1];
+      const status=state.running?"running":(state.run?.status==="failed"||Object.values(state.phaseState).includes("failed")?"failed":(state.events.length&&Object.values(state.phaseState).every(s=>s==="done")?"done":"pending"));
+      $("run-title").textContent=status==="running"?"工作流运行中":status==="done"?"工作流已完成":status==="failed"?"工作流已停止":"工作流准备中";
+      $("run-sub").textContent=active?`阶段 ${phases.indexOf(active)} · ${active.name}`:"读取运行记录…";
+      $("run-stats").textContent=`${phases.length} 个阶段 · ${Object.keys(state.actorState).length} 个 agent`;
+      $("event-count").textContent=`${state.events.length} 条事件`;
+      $("source-label").textContent=state.source;
+      $("run").textContent=state.running?"重播运行":(status==="done"?"再次运行":"开始运行");
+      $("stop").disabled=!state.running;
+    }
+    function render() { renderHeader(); renderRail(); renderTimeline(); renderActivity(); renderSummary(); }
+
+    function replay() {
+      if (state.timer) clearTimeout(state.timer); state.running=true; state.open=new Set(["design"]); state.events=[]; state.cursor=0;
+      for (const phase of normalizedPhases()) { state.phaseState[phase.id]="pending"; for (const actor of phase.actors||[]) state.actorState[actor.id]="pending"; }
+      render();
+      const tick=()=>{ if(!state.running)return; const event=state.run.events[state.cursor++]; if(!event){state.running=false;render();return;} applyEvent(event); render(); const next=state.run.events[state.cursor]; const gap=next?Math.max(110,Math.min(500,(next.at_ms||0)-(event.at_ms||0)+110)):500; state.timer=setTimeout(tick,gap); };
+      tick();
+    }
+    function showToast(text) { const toast=$("toast"); toast.textContent=text; toast.classList.add("show"); setTimeout(()=>toast.classList.remove("show"),2200); }
+    async function loadRun() { try { const response=await fetch("run.json?"+Date.now()); if(!response.ok)throw new Error(); state.run=await response.json();state.source="run.json"; } catch { state.run=fallbackRun();state.source="内置演示"; } resetView(); setTimeout(replay,260); }
+
+    $("run").onclick=replay;
+    $("stop").onclick=()=>{state.running=false;if(state.timer)clearTimeout(state.timer);render();showToast("已停止当前回放");};
+    $("config").onclick=()=>showToast("当前：本地确定性 actor · 事件日志模式");
+    $("send").onclick=()=>{const input=$("composer-input"); if(!input.value.trim()){showToast("先输入要排队的修改");return;} state.feed.push(input.value.trim()); input.value=""; $("composer-state").textContent=`已排队 ${state.feed.length} 条后续修改`; showToast("已加入后续修改队列");};
+    $("attach").onclick=()=>showToast("H2 当前使用 run.json 作为运行证据");
+    $("access").onclick=()=>showToast("本地工作流：工具访问由运行时控制");
+    $("fanout").onclick=()=>showToast("设计阶段包含 3 个并行 actor");
+    loadRun();
+  </script>
+</body>
+</html>

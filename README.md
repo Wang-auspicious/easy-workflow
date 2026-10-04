@@ -10,6 +10,7 @@ H2 把 ZCode 的多 agent 运行模型放进软件工程流程：需求、设计
 - `Run.events` 是追加式运行日志，包含序号、相对时间、阶段、actor、状态和产物。
 - `graph` 是静态拓扑叠加运行状态，节点和边在运行中保持稳定，适合后续 ZCode 风格 Web UI 实时消费。
 - 哨兵检查事件序号、actor 终态和图拓扑；失败时保留已经完成的产物，并把后续阶段留在 `pending`，记录 `blocked_by`。
+- `index.html` 是 ZCode 风格的运行面板：顶部阶段轨道、中间具名 agent 时间线、彩色小人状态、右侧结构化结算和底部后续输入区。
 
 ## 软件工程流程映射
 
@@ -38,6 +39,17 @@ python workflow_demo.py --output artifacts/run.json
 ```
 
 失败注入会返回退出码 `1`，但已完成的 actor 结果仍会保留；后续阶段不会假装执行。成功运行返回退出码 `0`。
+
+## 打开前端
+
+先生成一份后端运行记录，再用静态服务器打开页面：
+
+```powershell
+python workflow_demo.py --delay 0
+python -m http.server 8802
+```
+
+打开 `http://127.0.0.1:8802/index.html`。页面会优先读取同目录的 `run.json`，按后端事件顺序回放；直接双击 HTML 时无法读取本地 JSON，会使用同一协议的内置演示数据。点击阶段节点可以展开 agent，点击“开始运行”可以重播，底部输入区会记录后续修改意图。
 
 ## 与 H1 的关系
 
