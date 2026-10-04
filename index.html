@@ -137,35 +137,22 @@
     .station-label { display: block; font-size: 13px; font-weight: 680; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .station-meta { display: block; margin-top: 3px; color: var(--faint); font-size: 11px; white-space: nowrap; }
     .station[data-state="running"] .station-meta { color: #d9a06d; }
-    .station-faces { display: flex; gap: 4px; margin-top: 9px; min-height: 23px; }
+    .station-faces { display: flex; gap: 4px; margin-top: 9px; min-height: 28px; }
 
-    .face {
+    .bot-face {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 24px;
-      height: 24px;
+      width: 28px;
+      height: 28px;
       flex: 0 0 auto;
-      border-radius: 8px;
-      background: var(--blue);
-      box-shadow: inset 0 0 0 1px #ffffff20;
+      filter: drop-shadow(0 4px 5px #00000036);
+      transition: transform .18s ease, filter .18s ease;
     }
-    .face::before {
-      content: "••";
-      color: #fff;
-      font-size: 14px;
-      line-height: 1;
-      letter-spacing: 2px;
-      transform: translateX(1px);
-    }
-    .face.orange { background: var(--orange); }
-    .face.teal { background: var(--teal); }
-    .face.purple { background: var(--purple); }
-    .face.pink { background: var(--pink); }
-    .face.blue { background: var(--blue); }
-    .face.muted { background: #5b5b5b; }
-    .face.running { animation: face-pulse 1.25s ease-in-out infinite; }
-    @keyframes face-pulse { 50% { transform: translateY(-2px); box-shadow: 0 0 0 4px #ff963d25; } }
+    .bot-face svg { display: block; width: 100%; height: 100%; overflow: visible; }
+    .bot-face.running { animation: bot-bob 1.25s ease-in-out infinite; }
+    .bot-face.running svg { filter: drop-shadow(0 0 5px #ff963d77); }
+    @keyframes bot-bob { 50% { transform: translateY(-3px) rotate(-2deg); } }
 
     .work-area { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; margin-top: 14px; }
     .timeline-card, .summary-card { overflow: hidden; }
@@ -220,7 +207,7 @@
     .actor-row[data-state="running"] { border-color: #ff963d66; background: #322c27; }
     .actor-row[data-state="failed"] { border-color: #f0737366; background: #342729; }
     .actor-row[data-state="done"] .actor-state { color: var(--green); }
-    .actor-face { width: 30px; height: 30px; border-radius: 10px; }
+    .actor-face { width: 42px; height: 42px; }
     .actor-name { font-weight: 680; }
     .actor-role { margin-left: 7px; color: var(--faint); font-size: 11px; }
     .actor-task { margin-top: 2px; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -232,8 +219,18 @@
     .actor-state[data-state="failed"] { color: var(--red); }
     .actor-state[data-state="failed"]::before { background: var(--red); border-color: var(--red); }
     .collapsed-preview { display: flex; gap: 5px; padding: 1px 0 4px; }
-    .collapsed-preview .face { width: 20px; height: 20px; border-radius: 7px; }
-    .collapsed-preview .face::before { font-size: 11px; }
+    .collapsed-preview .bot-face { width: 22px; height: 22px; }
+
+    .roster { display: grid; gap: 6px; margin: 17px 0 2px; }
+    .roster-title { color: var(--muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+    .roster-row { display: grid; grid-template-columns: 30px minmax(0,1fr) auto; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 10px; background: var(--panel-2); }
+    .roster-row .bot-face { width: 28px; height: 28px; }
+    .roster-name { font-size: 12px; font-weight: 680; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .roster-role { display: block; color: var(--faint); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .roster-state { color: var(--muted); font-size: 10px; }
+    .roster-state[data-state="running"] { color: var(--orange); }
+    .roster-state[data-state="done"] { color: var(--green); }
+    .roster-state[data-state="failed"] { color: var(--red); }
 
     .summary-body { padding: 19px 20px 22px; }
     .summary-status { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
@@ -337,6 +334,7 @@
             <dt>事件</dt><dd id="summary-events">0</dd>
             <dt>协调者</dt><dd id="summary-coordinator">等待</dd>
           </dl>
+          <div class="roster" id="roster"><span class="roster-title">Agent roster</span></div>
           <div class="activity">
             <h3>最近活动</h3>
             <div class="activity-list" id="activity-list"></div>
@@ -375,8 +373,15 @@
       {id:"testing", name:"测试与质量验证", discipline:"Software Testing", actors:[{id:"test-runner",name:"测试验证员",role:"tester",task:"运行单元与回归检查"}]},
       {id:"maintenance", name:"维护与交付反馈", discipline:"Software Maintenance", actors:[{id:"maintenance-recorder",name:"维护记录员",role:"maintainer",task:"形成修复建议、风险和后续动作"}]}
     ];
-    const palette = ["teal", "orange", "blue", "purple", "pink"];
-    const actorPalette = ["teal", "orange", "blue", "purple", "pink", "blue", "teal"];
+    const BOT_PROFILES = {
+      "requirements-coordinator": {name:"Nori", role:"scope lead", fill:"#35c5b5", shape:"circle"},
+      "architecture-reviewer": {name:"Milo", role:"architect", fill:"#ff963d", shape:"pebble"},
+      "evidence-reviewer": {name:"Iris", role:"evidence", fill:"#9568e9", shape:"squircle"},
+      "test-planner": {name:"Pico", role:"test planner", fill:"#4c82ee", shape:"capsule"},
+      "implementation-reviewer": {name:"Bolt", role:"builder", fill:"#e65a9f", shape:"triangle"},
+      "test-runner": {name:"Quill", role:"test runner", fill:"#4c82ee", shape:"cloud"},
+      "maintenance-recorder": {name:"Mori", role:"maintainer", fill:"#35c5b5", shape:"droplet"}
+    };
     const $ = (id) => document.getElementById(id);
     const state = {run:null, source:"内置演示", phaseState:{}, actorState:{}, events:[], cursor:0, timer:null, selected:"design", open:new Set(["design"]), running:false, feed:[]};
 
@@ -400,7 +405,24 @@
       return state.run?.phases?.length ? state.run.phases : WORKFLOW.map(p=>({id:p.id,name:p.name,discipline:p.discipline,state:"pending",actors:p.actors.map(a=>({...a,state:"pending"}))}));
     }
     function actorFor(phase, id) { return (phase.actors || []).find(a=>a.id===id) || {id,name:id,role:"agent",task:""}; }
-    function actorFace(id, extra="") { const index=Math.max(0, WORKFLOW.flatMap(p=>p.actors).findIndex(a=>a.id===id)); return `<span class="face ${actorPalette[index%actorPalette.length]} ${extra}" aria-hidden="true"></span>`; }
+    function botSvg(id, actorState="pending") {
+      const p=BOT_PROFILES[id] || {name:"Bot",role:"agent",fill:"#6a6a6a",shape:"circle"};
+      const body={
+        circle:'<circle cx="24" cy="24" r="18" fill="' + p.fill + '"/>',
+        pebble:'<path d="M10 17c2-8 12-12 21-9 9 3 12 13 8 22-4 9-14 12-23 7C8 33 7 25 10 17Z" fill="' + p.fill + '"/>',
+        squircle:'<rect x="7" y="7" width="34" height="34" rx="13" fill="' + p.fill + '"/>',
+        capsule:'<rect x="8" y="14" width="32" height="20" rx="10" fill="' + p.fill + '"/>',
+        triangle:'<path d="M24 6 42 39a4 4 0 0 1-3.5 6h-29a4 4 0 0 1-3.5-6L24 6Z" fill="' + p.fill + '"/>',
+        cloud:'<path d="M13 35c-7-1-9-10-3-14 1-7 10-10 15-5 5-6 16-2 15 6 7 4 4 14-3 14Z" fill="' + p.fill + '"/>',
+        droplet:'<path d="M24 5c7 10 14 16 14 24a14 14 0 1 1-28 0c0-8 7-14 14-24Z" fill="' + p.fill + '"/>'
+      }[p.shape] || '<circle cx="24" cy="24" r="18" fill="' + p.fill + '"/>';
+      const angle=actorState==="failed"?-24:actorState==="running"?18:actorState==="done"?-10:8;
+      const eye=(x,y,rot)=>'<rect x="' + (x-3.4) + '" y="' + (y-1.8) + '" width="6.8" height="3.6" rx="1.8" fill="#fff" transform="rotate(' + rot + ' ' + x + ' ' + y + ')"/>';
+      const eyes=actorState==="failed" ? eye(18,23,-angle) + eye(30,23,angle) : eye(18,22,angle) + eye(30,22,angle);
+      const shine='<path d="M15 13c3-3 7-5 11-5" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" opacity=".18"/>';
+      return '<svg viewBox="0 0 48 48" role="img" aria-label="' + p.name + ' ' + p.role + '">' + body + shine + eyes + '</svg>';
+    }
+    function actorFace(id, extra="", actorState="pending") { const p=BOT_PROFILES[id] || {name:"Bot",role:"agent"}; return '<span class="bot-face ' + extra + '" title="' + p.name + ' · ' + p.role + '">' + botSvg(id,actorState) + '</span>'; }
     function labelState(value) { return ({pending:"待处理",running:"运行中",done:"已完成",failed:"失败"})[value] || value || "待处理"; }
     function countDone(phase) { const actors=phase.actors || []; return actors.filter(a=>(state.actorState[a.id] || a.state)==="done").length; }
 
@@ -426,7 +448,7 @@
       $("phase-rail").innerHTML=phases.map((phase,index)=>{
         const stateValue=phaseClass(state.phaseState[phase.id]);
         const done=countDone(phase), total=(phase.actors||[]).length;
-        const faces=(phase.actors||[]).slice(0,4).map(actor=>actorFace(actor.id,state.actorState[actor.id]==="running"?"running":"")).join("");
+        const faces=(phase.actors||[]).slice(0,4).map(actor=>actorFace(actor.id,state.actorState[actor.id]==="running"?"running":"",state.actorState[actor.id])).join("");
         return `<article class="station" data-state="${stateValue}" data-phase="${phase.id}" tabindex="0" aria-label="${phase.name}，${labelState(stateValue)}"><span class="station-label">${index} · ${phase.name}</span><span class="station-meta">${done}/${total} · ${phase.discipline}</span><span class="station-faces">${faces}</span></article>`;
       }).join("");
       document.querySelectorAll(".station").forEach(node=>{ node.onclick=()=>{state.selected=node.dataset.phase; state.open.add(node.dataset.phase); render(); document.querySelector(`[data-phase-block="${node.dataset.phase}"]`)?.scrollIntoView({behavior:"smooth",block:"center"});}; node.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();node.click();}}; });
@@ -437,9 +459,9 @@
         const value=phaseClass(state.phaseState[phase.id]); const open=state.open.has(phase.id); const done=countDone(phase), total=(phase.actors||[]).length;
         const actorRows=(phase.actors||[]).map(actor=>{
           const actorState=state.actorState[actor.id] || actor.state || "pending";
-          return `<div class="actor-row" data-state="${actorState}">${actorFace(actor.id,actorState==="running"?"running":"actor-face")}<div><div><span class="actor-name">${actor.name}</span><span class="actor-role">${actor.role}</span></div><div class="actor-task">${actor.task || ""}</div></div><span class="actor-state" data-state="${actorState}">${labelState(actorState)}</span></div>`;
+          return `<div class="actor-row" data-state="${actorState}">${actorFace(actor.id,actorState==="running"?"running":"actor-face",actorState)}<div><div><span class="actor-name">${actor.name}</span><span class="actor-role">${actor.role}</span></div><div class="actor-task">${actor.task || ""}</div></div><span class="actor-state" data-state="${actorState}">${labelState(actorState)}</span></div>`;
         }).join("");
-        const preview=(phase.actors||[]).map(a=>actorFace(a.id,"")).join("");
+        const preview=(phase.actors||[]).map(a=>actorFace(a.id,"",state.actorState[a.id])).join("");
         return `<section class="phase-block" data-phase-block="${phase.id}" data-state="${value}" data-open="${open}"${state.selected===phase.id?" aria-current=\"step\"":""}><span class="phase-node"></span><div class="phase-title-row" data-toggle-phase="${phase.id}"><span class="phase-title">${index} · ${phase.name}</span><span class="phase-discipline">${phase.discipline}</span><span class="phase-count">${done}/${total}</span><span class="phase-chevron">›</span></div><p class="phase-note">${value==="pending"?"等待前一阶段完成":value==="failed"?"已停止，保留已完成结果":""}</p>${open?"":`<div class="collapsed-preview">${preview}</div>`}<div class="actor-list">${actorRows}</div></section>`;
       }).join("");
       document.querySelectorAll("[data-toggle-phase]").forEach(node=>node.onclick=()=>{const id=node.dataset.togglePhase; if(state.open.has(id))state.open.delete(id);else state.open.add(id);state.selected=id;renderTimeline();});
@@ -448,11 +470,19 @@
       const list=state.events.slice(-9).reverse();
       $("activity-list").innerHTML=list.length?list.map(event=>`<div class="activity-item" data-state="${event.state}"><div><div class="activity-main"><b>${event.actor || event.actor_id || "系统"}</b> · ${event.text || ""}</div><div class="activity-sub">#${event.seq} · ${event.phase || "运行结算"}</div></div></div>`).join(""):"<div class=\"activity-sub\">还没有事件</div>";
     }
+    function renderRoster() {
+      const actors=WORKFLOW.flatMap(phase=>phase.actors.map(actor=>({...actor,phase:phase.name})));
+      $("roster").innerHTML=`<span class="roster-title">Agent roster</span>`+actors.map(actor=>{
+        const actorState=state.actorState[actor.id] || "pending"; const profile=BOT_PROFILES[actor.id];
+        return `<div class="roster-row">${actorFace(actor.id,actorState==="running"?"running":"",actorState)}<div><span class="roster-name">${profile?.name || actor.name}</span><span class="roster-role">${actor.name} · ${actor.role}</span></div><span class="roster-state" data-state="${actorState}">${labelState(actorState)}</span></div>`;
+      }).join("");
+    }
     function renderSummary() {
       const phases=normalizedPhases(); const donePhases=phases.filter(p=>state.phaseState[p.id]==="done").length; const actors=Object.values(state.actorState); const doneActors=actors.filter(v=>v==="done").length;
       const status=state.running?"running":(state.run?.status==="failed"||Object.values(state.phaseState).includes("failed")?"failed":(donePhases===phases.length&&state.events.length?"done":"pending"));
       $("status-orb").className=`status-orb ${status}`; $("status-word").textContent=status==="running"?"运行中":status==="done"?"运行完成":status==="failed"?"运行失败":"等待运行";
       $("summary-phases").textContent=`${donePhases} / ${phases.length}`; $("summary-actors").textContent=`${doneActors} / ${actors.length}`; $("summary-events").textContent=String(state.events.length); $("summary-coordinator").textContent=status==="done"?"验收通过":status==="failed"?"被阻断":"等待";
+      renderRoster();
       const stop=state.run?.stopped_at ? `\n停止点：${state.run.stopped_at}` : ""; $("summary-result").textContent=status==="done"?`哨兵确认：事件连续，图拓扑稳定。${stop}`:status==="failed"?`已保留部分结果。${stop}`:"运行后这里会显示结构化结算和失败停止点。";
     }
     function renderHeader() {
