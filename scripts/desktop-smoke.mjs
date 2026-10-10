@@ -43,11 +43,38 @@ async function closeAndVerify(instance) {
   assert.equal(response, null, 'backend listener must close');
 }
 
+async function checkNativeLayers(instance, browserVisible=false) {
+  const layers=await instance.evaluate(({BrowserWindow})=>{
+    const w=BrowserWindow.getAllWindows()[0],children=w.contentView.children;
+    return {visible:children.filter(v=>v.getVisible()).map(v=>v.getBounds()),size:w.getContentSize()};
+  });
+  assert.equal(layers.visible.length,browserVisible?1:0,'only the selected tab in the browser workspace may be visible');
+  for(const b of layers.visible){assert.ok(b.x>0&&b.y>0,'native page must respect the browser toolbar and application rail');assert.ok(b.x+b.width<=layers.size[0]&&b.y+b.height<=layers.size[1]);}
+}
+
+async function checkCompositedWindow(instance, name) {
+  // DOM screenshots omit native WebContentsView overlays. Capture this actual
+  // application window and reject the large black surface from the regression.
+  const shot=await instance.evaluate(async({BrowserWindow,desktopCapturer})=>{
+    const w=BrowserWindow.getAllWindows()[0];
+    const sources=await desktopCapturer.getSources({types:['window'],thumbnailSize:{width:1280,height:900}});
+    const source=sources.find(s=>s.id===w.getMediaSourceId());
+    if(!source)throw new Error('Native window capture unavailable');
+    const bitmap=source.thumbnail.toBitmap();let dark=0;
+    for(let i=0;i<bitmap.length;i+=4)if(bitmap[i]<40&&bitmap[i+1]<40&&bitmap[i+2]<40)dark++;
+    return {darkShare:dark/(bitmap.length/4),size:source.thumbnail.getSize(),png:source.thumbnail.toPNG().toString('base64')};
+  });
+  assert.ok(shot.size.width>500&&shot.size.height>300,'native window thumbnail must contain the actual client area');
+  fs.writeFileSync(path.join(artifacts,`${name}.png`),Buffer.from(shot.png,'base64'));
+  assert.ok(shot.darkShare<.15,`black native overlay covers ${(shot.darkShare*100).toFixed(1)}% of the app`);
+}
+
 try {
   app = await launch();
   const page = await app.firstWindow();
   const errors = []; page.on('pageerror', (error) => errors.push(error.message));
   await page.locator('.node').first().waitFor({ timeout: 30000 });
+  await checkNativeLayers(app);
   const desktop = await page.evaluate(() => window.desktop.info());
   assert.equal(desktop.readOnly, false);
   assert.equal(desktop.workspace, path.join(profile, 'workspace'));
@@ -86,6 +113,7 @@ try {
   await browserCall({action:'open',url:fixtureURL});
   await page.locator('.rail-item[data-tip="内置浏览器"]').click();
   await page.getByRole('tab',{name:/Local webview check/}).waitFor();
+  await checkNativeLayers(app,true);
   const browsing = await page.evaluate(async()=> (await fetch('/api/browser')).json());
   const manualTab = browsing.tabs.find(t=>t.url===fixtureURL+'/');
   const read = await browserCall({action:'read',id:manualTab.id});
@@ -95,6 +123,7 @@ try {
   await app.evaluate(async({session},url)=>session.fromPartition('persist:h2-browser').cookies.set({url,name:'shared-session-test',value:'shared-with-worker'}),fixtureURL);
   const lease=await app.evaluate(()=>globalThis.__factoryBrowser({action:'lease'}));
   await page.locator('.rail-item[data-tip="画布 · 流水线  Alt 1"]').click();
+  await checkNativeLayers(app);
   const cdp=await chromium.connectOverCDP(lease.endpoint);
   try {
     let workerPage;
@@ -102,6 +131,7 @@ try {
     assert.ok(workerPage,'leased native tab is available to background automation');
     await workerPage.setViewportSize({width:1280,height:800});
     await workerPage.goto(fixtureURL);
+    await checkNativeLayers(app);
     await app.evaluate((_electron,id)=>globalThis.__factoryBrowser({action:'capture.begin',id}),lease.id);
     await workerPage.screenshot({path:path.join(artifacts,'background-capture.png'),timeout:4000});
     const screencast=await workerPage.context().newCDPSession(workerPage);let frameCount=0;
@@ -110,6 +140,7 @@ try {
     for(let i=0;i<12&&frameCount<2;i++){await workerPage.evaluate(i=>document.body.style.background=i%2?'#ddeeff':'#fff',i);await new Promise(r=>setTimeout(r,100));}
     await screencast.send('Page.stopScreencast');await screencast.detach();assert.ok(frameCount>=2,'background recording must produce real frames');
     assert.equal((await app.evaluate((_electron,id)=>globalThis.__factoryBrowser({action:'capture.end',id}),lease.id)).capturing,false);
+    await checkCompositedWindow(app,'native-during-background-capture');
     assert.match(await workerPage.evaluate(()=>document.cookie),/shared-session-test=shared-with-worker/);
     await workerPage.goto(fixtureURL+'/login');
     await page.locator('.rail-browser-alert').waitFor();
@@ -164,6 +195,7 @@ try {
   await page.locator('.rail-item[data-tip="画布 · 流水线  Alt 1"]').click();
   for (const size of [[1440, 900], [1366, 768]]) {
     await app.evaluate(({ BrowserWindow }, size) => BrowserWindow.getAllWindows()[0].setContentSize(...size), size);
+    await checkNativeLayers(app);
     await page.screenshot({ path: path.join(artifacts, `desktop-${size.join('x')}.png`) });
   }
   await app.evaluate(async ({ session }) => {
@@ -173,9 +205,12 @@ try {
   await closeAndVerify(app); app = null;
   app = await launch();
   await (await app.firstWindow()).locator('.node').first().waitFor({ timeout: 30000 });
+  await checkNativeLayers(app);
   const cookies = await app.evaluate(async ({ session }) => session.fromPartition('persist:social-x').cookies.get({ name: 'factory-persistence-test' }));
   assert.equal(cookies[0]?.value, 'survives-restart');
   results.checks.push('persistent webview session survives restart');
+  results.checks.push('inactive native browser views stay hidden across restore, capture, navigation and resize');
+  await checkCompositedWindow(app,'native-after-restart');
   const restored = await (await app.firstWindow()).evaluate(async()=> (await fetch('/api/browser')).json());
   assert.equal(restored.bookmarks[0].id,'bilibili');assert.ok(restored.bookmarks.some(b=>b.title==='本地验证 · 已编辑'));assert.ok(restored.history.some(h=>h.title==='Local webview check'));
   results.checks.push('bookmarks and history survive restart');
