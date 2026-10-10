@@ -3,7 +3,7 @@
 // sub-agent view: input, thoughts, folded tool steps with their evidence, current activity.
 // A token card shows that item's evidence chain from URL to publication.
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, Check, AlertTriangle, Loader2, ExternalLink } from "lucide-react";
+import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, CircleMinus, Check, AlertTriangle, Loader2, ExternalLink } from "lucide-react";
 import type { CompiledNode, EvidenceRef } from "../../../shared/types.ts";
 import { median, quantile, type AttemptState } from "../../../shared/project.ts";
 import { roleColors } from "../../../shared/palette.ts";
@@ -164,7 +164,7 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
               <div className="sec-title">最近处理</div>
               {recent.map((a) => (
                 <button key={a.id} className={`recent-row ${current?.id === a.id ? "is-on" : ""}`} onClick={() => setAttemptSel(a.id)}>
-                  {a.endedAt === undefined ? <Loader2 size={12} className="spin-i" /> : a.ok ? <Check size={12} className="ok-c" /> : <AlertTriangle size={12} className="bad-c" />}
+                  {a.endedAt === undefined ? <Loader2 size={12} className="spin-i" /> : a.cancelled ? <CircleMinus size={12} className="muted" /> : a.ok ? <Check size={12} className="ok-c" /> : <AlertTriangle size={12} className="bad-c" />}
                   <span className="r-item">{s.fs.tokens[a.token]?.item}</span>
                   <span className="r-sum muted">{a.summary ?? a.input}</span>
                   <span className="num muted">{a.ms !== undefined ? secs(a.ms) : secs(now - a.startedAt)}</span>
@@ -182,7 +182,7 @@ const Stat = ({ k, v }: { k: string; v: string }) => <div className="stat"><span
 
 function NodeMetrics({attempts,onSelect}:{attempts:AttemptState[];onSelect:(id:string)=>void}) {
   const done=attempts.filter(a=>a.endedAt),work=done.reduce((n,a)=>n+(a.ms??0),0),wait=done.reduce((n,a)=>n+(a.queuedMs??0),0),input=done.reduce((n,a)=>n+a.usage.input,0),output=done.reduce((n,a)=>n+a.usage.output,0),recent=done.slice(-20),max=Math.max(1,...recent.map(a=>a.ms??0));
-  return <div className="insp-body node-metrics"><div className="node-metrics-row"><span>执行 <b>{secs(work)}</b></span><span>排队 <b>{secs(wait)}</b></span><span>失败 <b>{done.filter(a=>!a.ok).length}</b></span></div><div className="node-time-share"><i style={{width:`${work/Math.max(1,work+wait)*100}%`}}/></div><div className="node-metrics-row"><span>输入 <b>{fmt(input)} tok</b></span><span>输出 <b>{fmt(output)} tok</b></span></div><div className="node-duration-chart">{recent.map(a=><button key={a.id} title={`${a.summary || a.input} · ${secs(a.ms??0)}`} onClick={()=>onSelect(a.id)}><i className={a.ok?"":"is-failed"} style={{height:`${(a.ms??0)/max*100}%`}}/></button>)}</div><div className="node-metrics-caption">{done.length?"最近 20 次处理耗时 · 点击查看对应过程":"本轮尚无处理记录"}</div></div>;
+  return <div className="insp-body node-metrics"><div className="node-metrics-row"><span>执行 <b>{secs(work)}</b></span><span>排队 <b>{secs(wait)}</b></span><span>失败 <b>{done.filter(a=>!a.ok&&!a.cancelled).length}</b></span></div><div className="node-time-share"><i style={{width:`${work/Math.max(1,work+wait)*100}%`}}/></div><div className="node-metrics-row"><span>输入 <b>{fmt(input)} tok</b></span><span>输出 <b>{fmt(output)} tok</b></span></div><div className="node-duration-chart">{recent.map(a=><button key={a.id} title={`${a.summary || a.input} · ${secs(a.ms??0)}`} onClick={()=>onSelect(a.id)}><i className={a.ok?"":"is-failed"} style={{height:`${(a.ms??0)/max*100}%`}}/></button>)}</div><div className="node-metrics-caption">{done.length?"最近 20 次处理耗时 · 点击查看对应过程":"本轮尚无处理记录"}</div></div>;
 }
 
 function PartInspector({ insp, geo, onDrag, onClose, onPin }: { insp: Inspector; geo: Geometry; onDrag: (e: React.PointerEvent) => void; onClose: () => void; onPin: () => void }) {
@@ -275,9 +275,9 @@ function Trace({ a, node, c, now }: { a: AttemptState; node: CompiledNode; c: st
           </div>
         ))}
       </div>
-      <div className={`trace-foot ${running ? "is-running" : a.ok ? "is-ok" : "is-bad"}`}>
+      <div className={`trace-foot ${running ? "is-running" : a.cancelled ? "is-cancelled" : a.ok ? "is-ok" : "is-bad"}`}>
         {running ? <><Loader2 size={13} className="spin-i" /><span>{a.steps[a.steps.length - 1]?.text ?? "开始处理…"}</span><span className="num muted">{secs(now - a.startedAt)}</span></>
-          : <>{a.ok ? <Check size={13} /> : <AlertTriangle size={13} />}<span>{a.ok ? a.summary : `${a.summary}${a.error && a.error !== a.summary ? `：${a.error}` : ""}`}</span>
+          : <>{a.cancelled ? <CircleMinus size={13} /> : a.ok ? <Check size={13} /> : <AlertTriangle size={13} />}<span>{a.ok ? a.summary : `${a.summary}${a.error && a.error !== a.summary ? `：${a.error}` : ""}`}</span>
             <span className="num muted">{secs(a.ms ?? 0)}{a.usage.input ? ` · ${fmt(a.usage.input + a.usage.output)} tok` : ""}{a.queuedMs ? ` · 排队 ${secs(a.queuedMs)}` : ""}</span></>}
       </div>
     </div>
@@ -356,7 +356,7 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
           const n = name(node);
           if (!n) return null;
           return (
-            <div key={a.id} className={`chain-step ${a.endedAt === undefined ? "is-running" : a.ok ? "" : "is-bad"}`} style={{ ["--c" as string]: roleColors(n.role).border, ["--fill" as string]: roleColors(n.role).fill }}>
+            <div key={a.id} className={`chain-step ${a.endedAt === undefined ? "is-running" : a.cancelled ? "" : a.ok ? "" : "is-bad"}`} style={{ ["--c" as string]: roleColors(n.role).border, ["--fill" as string]: roleColors(n.role).fill }}>
               <div className="cs-head"><i>{i + 1}</i>{n.num} {n.name}</div>
               <div className="cs-sum">{a.summary ?? "…"}</div>
               {ev.length > 0 && <div className="cs-ev">{ev.map((e) => <EvThumb key={e.id} id={e.id} />)}</div>}

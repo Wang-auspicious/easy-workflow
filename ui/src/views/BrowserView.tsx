@@ -16,16 +16,20 @@ export function BrowserView() {
   const [adding,setAdding] = useState(false);
   const [label,setLabel] = useState("");
   const [bookmarkURL,setBookmarkURL] = useState("");
+  const [editing,setEditing]=useState<string|null>(null),[bookmarkMenu,setBookmarkMenu]=useState<{id:string;x:number;y:number}|null>(null);
+  const editBookmark=(id:string)=>{const b=browser.bookmarks.find(b=>b.id===id);if(!b)return;setEditing(id);setLabel(b.title);setBookmarkURL(b.url);setAdding(true);setBookmarkMenu(null);};
+  useEffect(()=>{if(!adding)setEditing(null);},[adding]);
+  useEffect(()=>{if(!bookmarkMenu)return;const dismiss=()=>setBookmarkMenu(null),key=(e:KeyboardEvent)=>{if(e.key==="Escape")dismiss();};window.addEventListener("click",dismiss);window.addEventListener("keydown",key);return()=>{window.removeEventListener("click",dismiss);window.removeEventListener("keydown",key);};},[bookmarkMenu]);
   const slot = useRef<HTMLDivElement>(null);
   const run = (action:string, extra:Record<string,unknown> = {}) => void actions.browser({action,id:active?.id,...extra}).catch(() => {});
   useEffect(() => { setURL(active?.url.startsWith("about:") ? "" : active?.url ?? ""); },[active?.id,active?.url]);
   const blank = !active || active.url.startsWith("about:");
   useLayoutEffect(() => {
     const el = slot.current; if (!desktop || !el) return;
-    const sync = () => { const r = el.getBoundingClientRect(); void desktop.browserBounds(history || blank ? null : {x:r.x,y:r.y,width:r.width,height:r.height}); };
+    const sync = () => { const r = el.getBoundingClientRect(); void desktop.browserBounds(history || blank || Boolean(bookmarkMenu) ? null : {x:r.x,y:r.y,width:r.width,height:r.height}); };
     const observer = new ResizeObserver(sync); observer.observe(el); window.addEventListener("resize",sync); sync();
     return () => { observer.disconnect(); window.removeEventListener("resize",sync); void desktop.browserBounds(null); };
-  },[history,blank,active?.id]);
+  },[history,blank,active?.id,bookmarkMenu]);
   const needs = browser.tabs.filter(t => t.attention);
   return <div className="view browser-workspace">
     <div className="browser-tabs" role="tablist" aria-label="浏览器标签页">
@@ -40,14 +44,15 @@ export function BrowserView() {
       <button className="icon-btn" aria-label="前进" disabled={!active?.canGoForward} onClick={() => run("forward")}><ArrowRight size={16}/></button>
       <button className="icon-btn" aria-label="刷新网页" disabled={!active} onClick={() => run("reload")}><RotateCw size={14}/></button>
       <form onSubmit={e => {e.preventDefault();setHistory(false);if(url.trim()) run(active ? "navigate" : "open",{url:normalize(url.trim())});}}><Globe size={13}/><input aria-label="网址" placeholder="输入网址" value={url} onChange={e=>setURL(e.target.value)}/></form>
-      <button className="icon-btn" aria-label="添加收藏" onClick={() => {setAdding(!adding);setLabel(active?.title || "");setBookmarkURL(url);}}><Star size={15}/></button>
+      <button className="icon-btn" aria-label="添加收藏" onClick={() => {setEditing(null);setAdding(!adding);setLabel(active?.title || "");setBookmarkURL(url);}}><Star size={15}/></button>
       <button className={`icon-btn ${history ? "is-on" : ""}`} aria-label="浏览历史" onClick={() => setHistory(!history)}><History size={15}/></button>
     </div>
     <div className="browser-bookmarks">
-      {browser.bookmarks.map(b => <button key={b.id} draggable onDragStart={e=>e.dataTransfer.setData("h2-bookmark",b.id)} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();const id=e.dataTransfer.getData("h2-bookmark");if(id)run("bookmark.move",{id,before:b.id});}} onClick={()=>{setHistory(false);run(active ? "navigate":"open",{url:b.url});}} title={`${b.url} · 拖动调整顺序`}><span>{b.title}</span><span role="button" tabIndex={0} aria-label={`删除收藏 ${b.title}`} onClick={e=>{e.stopPropagation();run("bookmark.remove",{id:b.id});}} onKeyDown={e=>{if(e.key==="Enter"){e.stopPropagation();run("bookmark.remove",{id:b.id});}}}>×</span></button>)}
-      <button className="bookmark-add" aria-label="自定义收藏" onClick={()=>{setAdding(!adding);setLabel("");setBookmarkURL("");}}><Plus size={12}/></button>
+      {browser.bookmarks.map(b => <button key={b.id} draggable onDragStart={e=>e.dataTransfer.setData("h2-bookmark",b.id)} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();const id=e.dataTransfer.getData("h2-bookmark");if(id)run("bookmark.move",{id,before:b.id});}} onClick={()=>{setHistory(false);run(active ? "navigate":"open",{url:b.url});}} onContextMenu={e=>{e.preventDefault();setBookmarkMenu({id:b.id,x:Math.min(e.clientX,innerWidth-170),y:e.clientY});}} onKeyDown={e=>{if(e.key==="ContextMenu"||(e.shiftKey&&e.key==="F10")){e.preventDefault();const r=e.currentTarget.getBoundingClientRect();setBookmarkMenu({id:b.id,x:r.left,y:r.bottom});}}} title={`${b.url} · 右键编辑或删除 · 拖动排序`}><span>{b.title}</span></button>)}
+      <button className="bookmark-add" aria-label="自定义收藏" onClick={()=>{setEditing(null);setAdding(!adding);setLabel("");setBookmarkURL("");}}><Plus size={12}/></button>
     </div>
-    {adding && <form className="bookmark-form" onSubmit={e=>{e.preventDefault();if(bookmarkURL.trim()){run("bookmark.add",{url:normalize(bookmarkURL.trim()),title:label.trim()});setAdding(false);}}}><input aria-label="收藏名称" placeholder="名称" value={label} onChange={e=>setLabel(e.target.value)}/><input aria-label="收藏网址" placeholder="https://" value={bookmarkURL} onChange={e=>setBookmarkURL(e.target.value)}/><button className="btn btn--sm" type="submit">保存</button><button className="icon-btn" type="button" aria-label="取消收藏" onClick={()=>setAdding(false)}><X size={13}/></button></form>}
+    {bookmarkMenu&&<div className="bookmark-context" role="menu" style={{left:bookmarkMenu.x,top:bookmarkMenu.y}}><button role="menuitem" onClick={()=>editBookmark(bookmarkMenu.id)}>编辑名称与网址</button><button role="menuitem" onClick={()=>{run("bookmark.remove",{id:bookmarkMenu.id});setBookmarkMenu(null);}}>删除收藏</button></div>}
+    {adding && <form className="bookmark-form" onSubmit={e=>{e.preventDefault();if(bookmarkURL.trim())void actions.browser({action:editing?"bookmark.update":"bookmark.add",...(editing?{id:editing}:{}),url:normalize(bookmarkURL.trim()),title:label.trim()}).then(()=>setAdding(false)).catch(()=>{});}}><input aria-label="收藏名称" placeholder="名称" value={label} onChange={e=>setLabel(e.target.value)}/><input aria-label="收藏网址" placeholder="https://" value={bookmarkURL} onChange={e=>setBookmarkURL(e.target.value)}/><button className="btn btn--sm" type="submit">保存</button><button className="icon-btn" type="button" aria-label="取消收藏" onClick={()=>setAdding(false)}><X size={13}/></button></form>}
     {needs.length>0 && <div className="browser-attention"><AlertCircle size={14}/><span>{active?.attention || `${needs.length} 个页面需要检查`}</span>{needs.filter(t=>t.id!==active?.id).map(t=><button key={t.id} onClick={()=>{setHistory(false);run("activate",{id:t.id});}}>{t.title}</button>)}<button onClick={()=>run("attention.check")}>重新检查</button></div>}
     <div className="browser-viewport" ref={slot}>
       {history ? <div className="browser-history"><div className="history-head"><h2>浏览历史</h2><label>保留 <select aria-label="历史保留天数" value={browser.retentionDays} onChange={e=>run("history.prune",{days:Number(e.target.value)})}>{[7,30,90].map(d=><option key={d} value={d}>{d} 天</option>)}</select></label></div><p>自动清理过期历史，不清除登录状态。</p>{browser.history.length ? browser.history.map((h,i)=><button key={`${h.at}-${i}`} onClick={()=>{setHistory(false);run("open",{url:h.url});}}><b>{h.title || new URL(h.url).hostname}</b><span>{h.url}</span><time>{new Date(h.at).toLocaleString("zh-CN",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}</time></button>):<div className="browser-empty">还没有浏览记录</div>}</div>

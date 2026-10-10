@@ -8,6 +8,7 @@ import { Canvas } from "./canvas/Canvas.tsx";
 import { EvidenceBoard } from "./board/EvidenceBoard.tsx";
 import { Library } from "./views/Library.tsx";
 import { Runs } from "./views/Runs.tsx";
+import { Candidates } from "./views/Candidates.tsx";
 import { BrowserView } from "./views/BrowserView.tsx";
 import { Settings } from "./views/Settings.tsx";
 import { Report } from "./report/Report.tsx";
@@ -42,6 +43,7 @@ export function App() {
             {view === "board" && <EvidenceBoard />}
             {view === "library" && <Library />}
             {view === "runs" && <Runs />}
+            {view === "candidates" && <Candidates />}
             {view === "browser" && <BrowserView />}
             {view === "settings" && <Settings />}
             {view === "report" && <Report />}

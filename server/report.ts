@@ -11,16 +11,16 @@ export interface Insight { id: string; title: string; value: string; detail: str
 export interface Suggestion { title: string; why: string; prompt: string; node?: string }
 
 export interface RunReport {
-  version: 2; status: FactoryState["run"]["status"];
+  version: 3; status: FactoryState["run"]["status"];
   runId: string; title: string; startedAt: number; endedAt: number; netMs: number;
-  totals: FactoryState["totals"] & { created: number; perPublishedMs: number; perPublishedCost: number; perPublishedTokens: number };
+  totals: FactoryState["totals"] & { created: number; parked:number; failedAttempts:number; perPublishedMs: number; perPublishedCost: number; perPublishedTokens: number };
   layers: { layer: number; nodes: NodeRow[] }[];
   flows: { from: string; to: string; n: number; returned: number }[];
   workers: WorkerRow[];
   insights: Insight[];
   suggestions: Suggestion[];
-  attempts: { id:string; node:string; token:string; item:string; startedAt:number; endedAt?:number; ms:number; queuedMs:number; input:number; output:number; cost:number; ok?:boolean; summary:string; steps:{at:number;text:string}[] }[];
-  items: { published: ItemRow[]; manual: ItemRow[]; corrected: ItemRow[]; merged: ItemRow[]; rejected: ItemRow[] };
+  attempts: { id:string; node:string; token:string; item:string; startedAt:number; endedAt?:number; ms:number; queuedMs:number; input:number; output:number; cost:number; ok?:boolean; cancelled?:boolean; summary:string; steps:{at:number;text:string}[] }[];
+  items: { published: ItemRow[]; manual: ItemRow[]; corrected: ItemRow[]; merged: ItemRow[]; rejected: ItemRow[]; parked:ItemRow[] };
 }
 interface NodeRow {
   key: string; name: string; role: string; layer: number; line: string; stockStart: number; stock: number; plus: number; sent: number; merged: number; rejected: number; failed: number;
@@ -41,7 +41,7 @@ export function buildReport(f: Factory, runId: string): RunReport {
   // Reconstruct the requested run, including its initial stock and worker pools.
   // Current in-memory counters may already belong to a completely different run.
   const s = initialState(f.compiled);
-  const last = end?.seq ?? events.at(-1)?.seq ?? 0;
+  const last = events.at(-1)?.seq ?? 0;
   for (const event of f.journal.read()) { if (event.seq > last) break; apply(s,event); }
   const startedAt = start?.at ?? s.run.startedAt, endedAt = end?.at ?? Date.now();
   let pausedMs = 0, pauseAt = 0;
@@ -107,19 +107,20 @@ export function buildReport(f: Factory, runId: string): RunReport {
     corrected: tokens.filter((t) => t.corrections > 0).map(row),
     merged: tokens.filter((t) => t.status === "merged").map(row),
     rejected: tokens.filter((t) => t.status === "rejected").map(row),
+    parked: tokens.filter(t=>t.status==="parked").map(row),
   };
   const usage = { input: sum(attempts.map((a) => a.usage.input)), output: sum(attempts.map((a) => a.usage.output)), cost: sum(attempts.map((a) => a.usage.cost)) };
   const pub = Math.max(1, items.published.length);
   const totals = {
-    ...s.totals, usage, created: tokens.length,
+    ...s.totals, usage, created: tokens.length, parked:items.parked.length, failedAttempts:attempts.filter(a=>a.ok===false&&!a.cancelled).length,
     perPublishedMs: items.published.length ? median(items.published.map((r) => r.ms ?? 0)) : 0,
     perPublishedCost: usage.cost / pub, perPublishedTokens: (usage.input + usage.output) / pub,
   };
 
   const insights = mine({ ...f, state:s } as Factory, events, rows, workers, tokens, attempts, startedAt, endedAt);
   const suggestions = suggest(rows, insights, f);
-  return { version:2, status:s.run.status, runId, title: start?.kind === "run.started" ? start.title : s.run.title, startedAt, endedAt, netMs, totals, layers, flows: [...flows.values()], workers, insights, suggestions, items,
-    attempts: attempts.map(a=>({id:a.id,node:a.node,token:a.token,item:s.tokens[a.token]?.title || s.tokens[a.token]?.item || a.token,startedAt:a.startedAt,endedAt:a.endedAt,ms:a.ms ?? Math.max(0,endedAt-a.startedAt),queuedMs:a.queuedMs ?? 0,input:a.usage.input,output:a.usage.output,cost:a.usage.cost,ok:a.ok,summary:a.summary || a.error || "进行中",steps:a.steps.map(st=>({at:st.at,text:st.text}))})) };
+  return { version:3, status:s.run.status, runId, title: start?.kind === "run.started" ? start.title : s.run.title, startedAt, endedAt, netMs, totals, layers, flows: [...flows.values()], workers, insights, suggestions, items,
+    attempts: attempts.map(a=>({id:a.id,node:a.node,token:a.token,item:s.tokens[a.token]?.title || s.tokens[a.token]?.item || a.token,startedAt:a.startedAt,endedAt:a.endedAt,ms:a.ms ?? Math.max(0,endedAt-a.startedAt),queuedMs:a.queuedMs ?? 0,input:a.usage.input,output:a.usage.output,cost:a.usage.cost,ok:a.ok,cancelled:a.cancelled,summary:a.summary || a.error || "进行中",steps:a.steps.map(st=>({at:st.at,text:st.text}))})) };
 }
 
 /* ------------------------------------------------------------------ insight mining */
@@ -264,9 +265,17 @@ function suggest(rows: NodeRow[], insights: Insight[], f: Factory): Suggestion[]
   return out.slice(0, 5);
 }
 
-export function endRun(f: Factory) {
-  const runId = f.runtime.end();
+const endingRuns=new WeakMap<Factory,Promise<RunReport|null>>();
+export async function endRun(f:Factory):Promise<RunReport|null> {
+  const pending=endingRuns.get(f);if(pending)return pending;
+  f.runtime.ending=true;
+  const task=finishRun(f).finally(()=>{f.runtime.ending=false;endingRuns.delete(f);});endingRuns.set(f,task);return task;
+}
+async function finishRun(f: Factory) {
+  const runId = f.runtime.end() ?? (f.state.run.status === "ended" ? f.state.run.id : null);
   if (!runId) return null;
+  await f.runtime.settle();
+  const existing=readReport(runId);if(existing)return existing;
   const report = buildReport(f, runId);
   const dir = path.join(VAR, "runs", runId);
   fs.mkdirSync(dir, { recursive: true });
@@ -276,5 +285,5 @@ export function endRun(f: Factory) {
 }
 
 export function readReport(runId: string): RunReport | null {
-  try { const report = JSON.parse(fs.readFileSync(path.join(VAR, "runs", runId, "report.json"), "utf8")); return report.version === 2 ? report : null; } catch { return null; }
+  try { const report = JSON.parse(fs.readFileSync(path.join(VAR, "runs", runId, "report.json"), "utf8")); return report.version === 3 ? report : null; } catch { return null; }
 }

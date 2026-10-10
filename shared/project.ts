@@ -29,6 +29,7 @@ export interface AttemptState {
   startedAt: number;
   endedAt?: number;
   ok?: boolean;
+  cancelled?: boolean;
   summary?: string;
   error?: string;
   steps: { at: number; text: string; step?: StepDetail }[];
@@ -119,6 +120,7 @@ export interface FactoryState {
   chat: ChatMessage[];
   conversation: ConversationEntry[];
   activity: ChatMessage[];
+  recoveries: Record<string, import("./failures.ts").CandidateRecovery>;
   totals: { usage: Usage; published: number; manual: number; failed: number; rejected: number; merged: number; returned: number; corrections: number };
   resources: { used: Record<string, number>; limits: Record<string, number>; freeMemMB: number; at: number; waiting: Record<string, string> };
   /** Ring of the latest edge transfers; the canvas turns new ones into particles. */
@@ -145,7 +147,7 @@ export function initialState(factory?: CompiledFactory): FactoryState {
   return {
     seq: 0, digest: factory?.digest ?? "",
     run: { id: "", title: "", startedAt: 0, pausedMs: 0, status: "idle" },
-    nodes, tokens: {}, tokenOrder: [], attempts: {}, workers: {}, evidence: {}, evidenceOrder: [], chat: [], conversation: [], activity: [],
+    nodes, tokens: {}, tokenOrder: [], attempts: {}, workers: {}, evidence: {}, evidenceOrder: [], chat: [], conversation: [], activity: [], recoveries: {},
     totals: { usage: zeroUsage(), published: 0, manual: 0, failed: 0, rejected: 0, merged: 0, returned: 0, corrections: 0 },
     resources: { used: {}, limits: {}, freeMemMB: 0, at: 0, waiting: {} },
     transfers: [], patches: [], reportReady: null, lockedStations: [],
@@ -250,16 +252,18 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
     case "attempt.finished": {
       const a = s.attempts[e.attempt];
       if (!a) break;
-      a.endedAt = e.at; a.ok = e.ok; a.summary = e.summary; a.error = e.error; a.ms = e.ms; a.queuedMs = e.queuedMs; a.output = e.output;
+      const ok = e.ok && !/^(打不开[：:]|HTTP [45]\d\d|网址无法解析)/.test(e.summary);
+      a.cancelled = e.cancelled || e.error === "stale";
+      a.endedAt = e.at; a.ok = ok; a.summary = e.summary; a.error = e.error; a.ms = e.ms; a.queuedMs = e.queuedMs; a.output = e.output;
       addUsage(a.usage, e.usage);
       const n = node(a.node);
       remove(n.active, a.id);
       addUsage(n.usage, e.usage);
       addUsage(s.totals.usage, e.usage);
-      pushCap(n.durations, e.ms);
+      if(ok) pushCap(n.durations, e.ms);
       pushCap(n.waits, e.queuedMs);
-      if (e.ok) { n.processed++; n.lastOkAt = e.at; } else { n.failed++; n.lastFailAt = e.at; }
-      n.summary = e.ok ? e.summary : `失败：${e.error ?? e.summary}`;
+      if (ok) { n.processed++; n.lastOkAt = e.at; } else if(!e.cancelled && e.error!=="stale") { n.failed++; n.lastFailAt = e.at; }
+      n.summary = ok || e.cancelled ? e.summary : `失败：${e.error ?? e.summary}`;
       n.lastAt = e.at;
       const w = s.workers[a.worker];
       if (w) {
@@ -304,6 +308,7 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       const t = s.tokens[e.token];
       if (!t) break;
       t.status = e.status; t.finishedAt = e.at; t.finishedAtNode = e.node; t.reason = e.reason;
+      if(s.recoveries[t.item]?.token===t.id && s.recoveries[t.item].disposition==="claimed" && e.status!=="parked")s.recoveries[t.item].disposition="resolved";
       for (const k of t.at) remove(node(k).queue, t.id);
       t.at = [];
       const n = node(e.node);
@@ -313,6 +318,23 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       else if (e.status === "manual") { s.totals.manual++; }
       else if (e.status === "published") { s.totals.published++; }
       if (e.status === "published" || e.status === "manual" || e.status === "parked") n.plus++;
+      break;
+    }
+    case "candidate.disposition": {
+      const prior=s.recoveries[e.candidate.item];
+      s.recoveries[e.candidate.item]={...e.candidate,at:e.at,attempts:(prior?.attempts??0)+(e.candidate.disposition==="retry"||e.candidate.disposition==="removed"?1:0)};
+      const t=s.tokens[e.candidate.token];
+      if(t && t.status!=="active" && (e.candidate.disposition==="retry"||e.candidate.disposition==="removed")) {
+        // Old versions rejected network failures as successes. Keep the immutable
+        // log, but project the explicit recovery disposition for history and UI.
+        const next=e.candidate.disposition==="retry"?"parked":"rejected";
+        if(t.createdAt>=s.run.startedAt && t.status!==next) {
+          if(t.status==="rejected")s.totals.rejected=Math.max(0,s.totals.rejected-1);
+          if(t.status==="manual")s.totals.manual=Math.max(0,s.totals.manual-1);
+          if(next==="rejected")s.totals.rejected++;
+        }
+        t.status=next;t.reason=`${next==="parked"?"已退回候选库":"已移除无效网址"}：${e.candidate.failure?.message??""}`;
+      }
       break;
     }
     case "worker.spawned":
@@ -392,6 +414,7 @@ export function nodeLight(n: NodeState | undefined, dormant: boolean, now: numbe
   const workers = Math.max(1, n.workers.length);
   if (n.queue.length >= 2 * workers || (n.returned && now - n.lastAt < 30_000)) return "yellow";
   if (n.active.length) return "green";
+  if (n.failed) return "yellow";
   if (n.processed || n.stock) return "green";
   return "idle";
 }

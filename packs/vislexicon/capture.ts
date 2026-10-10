@@ -3,16 +3,19 @@
 // `preview-rules.json`; read-only browsing: never accept cookies, log in or fill forms.
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { Page } from "playwright-core";
 import { aHash, hamming, imageStats } from "../../server/evidence.ts";
 import { PREVIEW_RULES } from "./env.ts";
 import { browserAttention } from "../../server/browser.ts";
+import { ClassifiedFailure, classifyFailure } from "../../shared/failures.ts";
 
 export const VIEW = { width: PREVIEW_RULES.viewport.width, height: PREVIEW_RULES.viewport.height };
 const DECLINE = /^(reject|decline|deny|refuse|necessary only|only necessary|essential only|required only|only required|use necessary cookies only|continue without accepting|拒绝|仅必要|仅限必要|不同意)/i;
 export const STAGE_SELECTORS: string[] = PREVIEW_RULES.kinds["component-source"]?.roles.proof?.stageSelectors ?? ["[class*=preview]", "[class*=demo]", "iframe"];
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const runFile = promisify(execFile);
 
 export interface Link { href: string; text: string; inNav: boolean; inMain: boolean; hasImage: boolean; visible: boolean; order: number }
 
@@ -127,10 +130,10 @@ export function scoreLinks(candidates: Pick<Link, "href" | "text" | "inNav">[], 
 export async function visit(page: Page, url: string, entryHost: string, say?: (t: string) => void) {
   say?.(`打开 ${url.replace(/^https?:\/\//, "")}`);
   const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 }).catch((error: Error) => ({ error }));
-  if (response && "error" in response) return { issues: [`navigation:${response.error.message.slice(0, 80)}`], hidden: [] as string[] };
+  if (response && "error" in response) throw new ClassifiedFailure(classifyFailure(response.error,{url}));
   if (response && response.status() >= 400) {
-    if ([401,403].includes(response.status())) { await browserAttention(page, `访问被拒绝（${response.status()}），请检查登录或验证状态`); throw new Error("浏览器访问需要检查，已保留标签页"); }
-    return { issues: [`httpError:${response.status()}`], hidden: [] as string[] };
+    if ([401,403].includes(response.status())) await browserAttention(page, `访问被拒绝（${response.status()}），请检查登录或验证状态`);
+    throw new ClassifiedFailure(classifyFailure(`HTTP ${response.status()}`,{url,status:response.status()}));
   }
   await settle(page);
   const declined = await declineCookies(page);
@@ -248,18 +251,15 @@ export async function iframeEmpty(page: Page) {
 
 const LIMITS = { introMs: 1500, stepMs: 140, stepPx: 120, maxMs: 16000, stillStopMs: 2500, minMs: 4000, cardMaxBytes: 1.5 * 1024 * 1024 };
 
-export async function recordScroll(page: Page, url: string, outDir: string, say: (t: string) => void) {
+export async function recordScroll(page: Page, url: string, outDir: string, say: (t: string) => void, signal?:AbortSignal) {
   const frames: { file: string; t: number }[] = [];
   const FR = path.join(outDir, "frames");
   fs.rmSync(FR, { recursive: true, force: true });
   fs.mkdirSync(FR, { recursive: true });
   const report: Record<string, unknown> & { issues: string[] } = { issues: [] };
   say(`打开 ${url.replace(/^https?:\/\//, "")}，先停 1.5 秒看入场动画`);
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-  await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
-  await sleep(1200);
-  const declined = await declineCookies(page);
-  if (declined) await sleep(600);
+  await visit(page,url,new URL(url).hostname.replace(/^www\./,""));
+  signal?.throwIfAborted();
   const shape = await page.evaluate(() => ({ scrollHeight: document.documentElement.scrollHeight, viewport: innerHeight }));
   const mode = shape.scrollHeight > shape.viewport * 1.2 ? "document-scroll" : "hijacked-or-single-screen";
   report.mode = mode;
@@ -272,11 +272,14 @@ export async function recordScroll(page: Page, url: string, outDir: string, say:
   });
   await page.mouse.move(VIEW.width / 2, VIEW.height / 2);
   const t0 = Date.now();
+  let reason = "time-cap";
+  try {
   await cdp.send("Page.startScreencast", { format: "jpeg", quality: 88, maxWidth: VIEW.width, maxHeight: VIEW.height, everyNthFrame: 1 });
   await sleep(LIMITS.introMs);
   say(mode === "document-scroll" ? "真实滚轮每 140ms 推 120px，到底就停" : "页面劫持了滚动：用滚轮推进，画面静止 2.5 秒就停");
-  let lastCount = frames.length, lastChange = Date.now(), reason = "time-cap";
+  let lastCount = frames.length, lastChange = Date.now();
   while (Date.now() - t0 < LIMITS.maxMs) {
+    signal?.throwIfAborted();
     await page.mouse.wheel(0, LIMITS.stepPx);
     await sleep(LIMITS.stepMs);
     if (frames.length !== lastCount) { lastCount = frames.length; lastChange = Date.now(); }
@@ -285,7 +288,10 @@ export async function recordScroll(page: Page, url: string, outDir: string, say:
       if (atEnd) { await sleep(900); reason = "reached-bottom"; break; }
     } else if (Date.now() - lastChange > LIMITS.stillStopMs) { reason = "still-for-2.5s"; break; }
   }
-  await cdp.send("Page.stopScreencast");
+  } finally {
+    await cdp.send("Page.stopScreencast").catch(()=>{});
+    await cdp.detach().catch(()=>{});
+  }
   await sleep(300);
   report.stop = reason; report.frames = frames.length;
   if (frames.length < 2) throw new Error("screencast 没有出帧");
@@ -294,15 +300,15 @@ export async function recordScroll(page: Page, url: string, outDir: string, say:
   fs.writeFileSync(path.join(FR, "list.txt"), list);
   report.durationSec = Number((end - frames[0].t).toFixed(2));
   say(`收到 ${frames.length} 帧，ffmpeg 按真实时间拼成 30fps`);
-  const encode = (name: string, width: number, crf: number) => execFileSync("ffmpeg", [
+  const encode = (name: string, width: number, crf: number) => runFile("ffmpeg", [
     "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", "list.txt", "-vf", `fps=30,scale=${width}:-2:flags=lanczos`, "-c:v", "libx264", "-preset", "slow", "-crf", String(crf),
     "-pix_fmt", "yuv420p", "-profile:v", "high", "-g", "30", "-movflags", "+faststart", "-an", path.join("..", name),
-  ], { cwd: FR });
-  encode("preview.mp4", 1280, 28);
-  encode("preview.card.mp4", 720, 31);
+  ], { cwd: FR, signal, timeout:120000, windowsHide:true });
+  await encode("preview.mp4", 1280, 28);
+  await encode("preview.card.mp4", 720, 31);
   const poster = frames.find((fr) => fs.statSync(fr.file).size > 12000) || frames[0];
   for (const [name, width] of [["poster.webp", 1280], ["poster.card.webp", 720]] as const) {
-    execFileSync("ffmpeg", ["-y", "-loglevel", "error", "-i", path.basename(poster.file), "-vf", `scale=${width}:-2:flags=lanczos`, "-quality", "80", path.join("..", name)], { cwd: FR });
+    await runFile("ffmpeg", ["-y", "-loglevel", "error", "-i", path.basename(poster.file), "-vf", `scale=${width}:-2:flags=lanczos`, "-quality", "80", path.join("..", name)], { cwd: FR, signal, timeout:30000, windowsHide:true });
   }
   const sizes = frames.map((fr) => fs.statSync(fr.file).size);
   const changed = sizes.filter((size, i) => i > 0 && Math.abs(size - sizes[i - 1]) / sizes[i - 1] > 0.01).length;

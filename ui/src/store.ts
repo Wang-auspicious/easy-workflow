@@ -7,7 +7,7 @@ import type { Attachment, CompiledFactory, Stamped } from "../../shared/types.ts
 import { apply, initialState, type FactoryState } from "../../shared/project.ts";
 import type { LayoutResult } from "../../shared/layout.ts";
 
-export type View = "canvas" | "board" | "library" | "runs" | "browser" | "settings" | "report";
+export type View = "canvas" | "board" | "candidates" | "library" | "runs" | "browser" | "settings" | "report";
 export type Layer = "pipeline" | "gantt" | "spec" | "channels";
 
 export interface LayoutFile {

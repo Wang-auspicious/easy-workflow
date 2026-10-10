@@ -11,6 +11,7 @@ import { piStatus, closeModelTransport } from "./pi.ts";
 import { publishConnection } from "./discovery.ts";
 import { buildReport, readReport } from "./report.ts";
 import { closeBrowser, browserCommand, browserEvents } from "./browser.ts";
+import { closeNetwork } from "./network.ts";
 import { layoutFactory } from "../shared/layout.ts";
 import type { Stamped } from "../shared/types.ts";
 import { FactoryControl } from "./control.ts";
@@ -200,7 +201,7 @@ const shutdown = async () => {
   for (const c of clients) c.end();
   server.close(); server.closeAllConnections();
   await Promise.all([factory.runtime.close(), chatTask]);
-  await Promise.all([closeBrowser(), closeModelTransport()]); factory.journal.close(); process.exit(0);
+  await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]); factory.journal.close(); process.exit(0);
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

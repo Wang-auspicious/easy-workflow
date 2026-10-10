@@ -154,7 +154,8 @@ export type JournalEvent =
   | { kind: "token.queued"; token: string; node: string; from?: string; returned?: boolean }
   | { kind: "attempt.started"; attempt: string; token: string; node: string; worker: string; input: string }
   | { kind: "attempt.progress"; attempt: string; text: string; step?: StepDetail }
-  | { kind: "attempt.finished"; attempt: string; ok: boolean; summary: string; ms: number; queuedMs: number; usage?: Usage; error?: string; output?: Record<string, unknown> }
+  | { kind: "attempt.finished"; attempt: string; ok: boolean; summary: string; ms: number; queuedMs: number; usage?: Usage; error?: string; output?: Record<string, unknown>; cancelled?:boolean }
+  | { kind: "candidate.disposition"; candidate: Omit<import("./failures.ts").CandidateRecovery,"at"|"attempts"> }
   | { kind: "evidence.added"; evidence: EvidenceRef }
   | { kind: "review.verdict"; token: string; node: string; verdict: "pass" | "return" | "escalate"; returnTo?: string; reason: string }
   | { kind: "token.returned"; token: string; from: string; to: string; reason: string; round: number; byHuman?: boolean; reset?: string[] }

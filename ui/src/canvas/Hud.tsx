@@ -27,11 +27,15 @@ export function Hud() {
   const now = useNow(1000);
   const [open, setOpen] = useState(false);
   const [pull, setPull] = useState(false);
+  const [ending,setEnding]=useState(false),[endConfirm,setEndConfirm]=useState(false),[endError,setEndError]=useState("");
+  const finishRun=async()=>{if(ending)return;setEnding(true);setEndError("");try{const result=await actions.run("end") as {runId:string};if(!result.runId)throw new Error("结束请求未返回运行编号");setEndConfirm(false);setState({reportRun:result.runId,view:"report"});}catch(error){setEndError((error as Error).message);}finally{setEnding(false);}};
   const s = getState();
   const run = s.fs.run;
   const t = replay ? replay.at : now;
   const tokens = s.fs.tokenOrder.map((id) => s.fs.tokens[id]).filter((x) => x && x.createdAt >= run.startedAt);
   const done = tokens.filter((x) => x.status !== "active").length;
+  const deferred = tokens.filter(x => x.status === "parked").length;
+  const invalid = tokens.filter(x => x.status === "rejected" && x.data.failure).length;
   const u = s.fs.totals.usage;
   const status = run.status;
   const isIdle = status === "idle";
@@ -51,9 +55,7 @@ export function Hud() {
               <button className="btn btn--primary" onClick={() => void actions.run(status === "running" ? "pause" : status === "paused" ? "resume" : "start").catch(() => {})}>
                 {status === "running" ? <Pause size={14} /> : <Play size={14} />}{status === "running" ? "暂停" : status === "paused" ? "继续" : "运行"}
               </button>
-              {(status === "running" || status === "paused") && <button className="icon-btn hud-end" aria-label="结束本轮" data-tip="结束本轮并生成报告" onClick={() => {
-                if (confirm("结束本轮？在途的货会退回候选层，然后生成工作报告。")) void actions.run("end").then((r: any) => { if (r?.runId) setState({ reportRun: r.runId, view: "report" }); }).catch(() => {});
-              }}><Square size={12} /></button>}
+              {(status === "running" || status === "paused") && <button className="icon-btn hud-end" aria-label="结束本轮" data-tip="结束本轮并生成报告" onClick={() => {setEndError("");setEndConfirm(true);}}><Square size={12} /></button>}
             </div>
           )}
         </div>
@@ -68,12 +70,13 @@ export function Hud() {
           </select>
           <button className="run-metrics num" onClick={() => setOpen((o) => !o)} data-tip="查看完整运行统计">
             <span className={`light light--${status === "running" ? "green" : status === "paused" ? "yellow" : "idle"}`} />
-            <span className="hud-done">完成 <b>{displayDone}/{displayTotal}</b></span><span className="metric-dot">·</span><span className="hud-clock">{displayTime}</span><span className="metric-dot">·</span><span>{displayTok} tok</span><ChevronDown size={12} />
+            <span className="hud-done">处理结束 <b>{displayDone}/{displayTotal}</b></span>{deferred>0&&<span className="has-failures">待重试 {deferred}</span>}{invalid>0&&<span className="has-failures">无效 {invalid}</span>}<span className="metric-dot">·</span><span className="hud-clock">{displayTime}</span><span className="metric-dot">·</span><span>{displayTok} tok</span><ChevronDown size={12} />
           </button>
           {selected.length > 0 && <button className="inspect-selection" onClick={() => toggleInspector(selected[0])}>查看所选</button>}
         </div>
       </div>
       {pull && <PullCard onClose={() => setPull(false)} />}
+      {endConfirm && <div className="end-run-card" role="dialog" aria-label="结束本轮确认"><b>结束本轮并生成报告</b><p>未完成的任务会退回候选库，保留原因与已有证据。</p>{endError&&<p role="alert" className="end-error">{endError}</p>}<div><button className="btn btn--sm" disabled={ending} onClick={()=>setEndConfirm(false)}>取消</button><button className="btn btn--sm btn--primary" disabled={ending} onClick={()=>void finishRun()}>{ending?"正在回收任务并生成报告…":"结束并生成报告"}</button></div></div>}
       {open && <HudCard onClose={() => setOpen(false)} />}
     </>
   );

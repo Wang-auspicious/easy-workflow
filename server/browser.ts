@@ -59,7 +59,7 @@ async function checkHeadless(id:string) {
 
 export async function browserCommand(args: Record<string, any>): Promise<any> {
   const action = args.action ?? "state";
-  const allowed = ["state","read","open","activate","navigate","back","forward","reload","close","tab.move","bookmark.add","bookmark.remove","bookmark.move","history.prune","attention.check"];
+  const allowed = ["state","read","open","activate","navigate","back","forward","reload","close","tab.move","bookmark.add","bookmark.update","bookmark.remove","bookmark.move","history.prune","attention.check"];
   if (!allowed.includes(action)) throw new Error("未知浏览器操作");
   if (args.url !== undefined) args.url = webURL(args.url);
   if (action === "read") {

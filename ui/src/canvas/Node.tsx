@@ -86,8 +86,8 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         <div className="node-metric"><span>{shape === "store" ? "本轮新增" : "进行中"}</span><b>{fmt(shape === "store" ? n?.plus ?? 0 : n?.active.length ?? 0)}<small> 件</small></b></div>
       </div>}
       <div className="node-footer">
-        <span className="node-status" data-tip={n?.summary || waiting || lightTip(light, waiting)}><i className={`light light--${light} ${n?.active.length ? "is-pulse" : ""}`} />{dormant ? "待接入" : n?.active.length ? "处理中" : n?.queue.length ? "排队中" : light === "red" ? "需要检查" : n?.processed ? "已完成" : "待命"}</span>
-        <span className="node-staff num" data-tip={`${workers} 位工人`}>本轮 {fmt(n?.processed ?? 0)}</span>
+        <span className="node-status" data-tip={n?.summary || waiting || lightTip(light, waiting)}><i className={`light light--${light} ${n?.active.length ? "is-pulse" : ""}`} />{dormant ? "待接入" : n?.active.length ? "处理中" : n?.queue.length ? "排队中" : light === "red" ? "需要检查" : n?.failed ? "有异常" : n?.processed ? "已完成" : "待命"}</span>
+        <span className={`node-staff num ${n?.failed?"has-failures":""}`} data-tip={`${workers} 位工人 · 通过 ${n?.processed??0} · 失败 ${n?.failed??0}`}>{n?.failed?`通过 ${fmt(n.processed)} · 异常 ${fmt(n.failed)}`:`本轮 ${fmt(n?.processed ?? 0)}`}</span>
       </div>
     </div>
   );

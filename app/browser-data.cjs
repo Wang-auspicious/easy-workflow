@@ -24,6 +24,7 @@ class BrowserData {
   }
   change(action, args) {
     if (action === 'bookmark.add') { const url = webURL(args.url); if (!this.bookmarks.some(b => b.url === url)) this.bookmarks.push({ id: crypto.randomUUID(), url, title: String(args.title || new URL(url).hostname).slice(0, 60) }); }
+    else if(action==='bookmark.update'){const item=this.bookmarks.find(b=>b.id===args.id);if(!item)throw new Error('收藏已不存在');const url=webURL(args.url);item.url=url;item.title=String(args.title||new URL(url).hostname).slice(0,60);}
     else if (action === 'bookmark.remove') this.bookmarks = this.bookmarks.filter(b => b.id !== args.id);
     else if (action === 'bookmark.move') { const i = this.bookmarks.findIndex(b => b.id === args.id), j = this.bookmarks.findIndex(b => b.id === args.before); if (i >= 0 && j >= 0 && i !== j) { const [item] = this.bookmarks.splice(i, 1); this.bookmarks.splice(this.bookmarks.findIndex(b => b.id === args.before), 0, item); } }
     else if (action === 'history.prune') { if (args.days !== undefined) { if (!Number.isInteger(args.days) || args.days < 1 || args.days > 365) throw new Error('历史保留天数须为 1–365'); this.retentionDays = args.days; } this.prune(); }

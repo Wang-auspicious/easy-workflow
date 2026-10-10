@@ -2,7 +2,7 @@
 // per row, its preview images in order) or image-only tiles; filter, single / Ctrl / Shift /
 // box select — the selection *is* the chat's attachment strip — and one-click correction.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Rows3, LayoutGrid, Search, AlertTriangle, X, Undo2, ArrowRight } from "lucide-react";
+import { Rows3, LayoutGrid, Search, AlertTriangle, X, Undo2, ArrowRight, FileText, ClipboardCheck } from "lucide-react";
 import type { Attachment, EvidenceRef } from "../../../shared/types.ts";
 import type { TokenState } from "../../../shared/project.ts";
 import { getState, setState, useStore } from "../store.ts";
@@ -40,10 +40,10 @@ export function EvidenceBoard() {
       const t = s.fs.tokens[id];
       if (!t) continue;
       if (f.run === "current" && t.createdAt < runStart) continue;
-      const all = t.evidence.map((e) => s.fs.evidence[e]).filter((e): e is EvidenceRef => Boolean(e) && (e!.kind === "image" || e!.kind === "video"));
+      const all = t.evidence.map((e) => s.fs.evidence[e]).filter((e): e is EvidenceRef => Boolean(e));
       // Latest image per role (a reshoot replaces the earlier one in the row).
       const byRole = new Map<string, EvidenceRef>();
-      for (const e of all) byRole.set(String(e.meta?.role ?? e.kind), e);
+      for (const e of all) byRole.set(e.kind==="image"||e.kind==="video"?String(e.meta?.role??e.kind):e.id, e);
       const order = ["identity", "breadth", "proof", "video"];
       const images = [...byRole.entries()].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0])).map(([, e]) => e);
       if (!images.length && !f.status) continue;
@@ -147,7 +147,7 @@ export function EvidenceBoard() {
   };
 
   const kinds = [...new Set(Object.values(s.fs.tokens).map((t) => String((t.data as any).kind ?? "")).filter(Boolean))];
-  const stations = [...new Set(Object.values(s.fs.evidence).filter((e) => e.kind === "image" || e.kind === "video").map((e) => e.station))];
+  const stations = [...new Set(Object.values(s.fs.evidence).map((e) => e.station))];
   const nodeName = (k: string) => s.factory?.nodes.find((n) => n.key === k)?.name ?? k;
   const corrSel = () => [...selected].map((id) => s.fs.evidence[id]).filter(Boolean).map((e) => ({ token: e.token, node: e.station, evidence: e.id, label: `${s.fs.tokens[e.token]?.item} · ${e.label}` }));
 
@@ -164,7 +164,7 @@ export function EvidenceBoard() {
         <button className={`bd-toggle ${f.corrected ? "is-on" : ""}`} onClick={() => setF({ ...f, corrected: !f.corrected })}><Undo2 size={13} />纠错过</button>
         <button className={`bd-toggle ${f.suspicious ? "is-on" : ""}`} onClick={() => setF({ ...f, suspicious: !f.suspicious })}><AlertTriangle size={13} />只看可疑</button>
         <span className="grow" />
-        <span className="muted num">{rows.length} 件 · {flat.length} 张</span>
+        <span className="muted num">{rows.length} 件 · {flat.length} 条证据（{flat.filter(x=>x.e.kind==="image"||x.e.kind==="video").length} 张图像 / 视频）</span>
         <Seg value={mode} onChange={(v) => setMode(v as Mode)} options={[["rows", <Rows3 key="r" size={14} />], ["tiles", <LayoutGrid key="t" size={14} />]]} />
       </div>
       {selected.size > 0 && (
@@ -177,7 +177,7 @@ export function EvidenceBoard() {
         </div>
       )}
       <div className={`bd-scroll ${mode}`} ref={scroller}>
-        {!rows.length && <div className="bd-empty"><b>还没有证据</b><span>证据会随着货流过采集工位出现在这里。</span></div>}
+        {!rows.length && <div className="bd-empty"><b>{s.fs.evidenceOrder.length?"当前筛选下没有证据":"还没有证据"}</b><span>{s.fs.evidenceOrder.length?"可切换“全部”或清除筛选条件查看已有证据。":"文字、判定、图片和视频都会随处理过程出现在这里。"}</span></div>}
         {mode === "rows" ? rows.map((row, ri) => (
           <div key={row.t.id} data-row={ri} className={`bd-row ${cursor.r === ri ? "is-cursor" : ""}`}>
             <div className="bd-imgs">
@@ -221,7 +221,7 @@ function Ev({ e, t, sel, cur, tile, onClick, onZoom }: { e: EvidenceRef; t: Toke
   const returning = t.status === "active" && t.at.includes(e.station);
   return (
     <div className={`ev ${sel ? "is-sel" : ""} ${cur ? "is-cur" : ""} ${tile ? "is-tile" : ""}`} data-ev={e.id} onClick={onClick} onDoubleClick={onZoom}>
-      <img src={e.poster ?? e.card ?? e.src} alt="" draggable={false} loading="lazy" />
+      {e.kind==="image"||e.kind==="video"?<img src={e.poster ?? e.card ?? e.src} alt="" draggable={false} loading="lazy" />:<div className={`ev-document tone-${e.tone??"none"}`}>{e.kind==="verdict"?<ClipboardCheck size={23}/>:<FileText size={23}/>}<b>{e.label}</b><span>{e.verdict||"查看文字证据"}</span></div>}
       <span className="ev-role">{ROLE_ZH[String(e.meta?.role)] ?? (e.kind === "video" ? "录屏" : e.label)}</span>
       {e.kind === "video" && <span className="play">▶</span>}
       {returning && <span className="ev-state">已退回 → 重做中</span>}
@@ -243,7 +243,7 @@ function Lightbox({ e, onClose }: { e: EvidenceRef; onClose: () => void }) {
   return (
     <div className="lightbox" onClick={onClose}>
       <div className="lb-inner" onClick={(ev) => ev.stopPropagation()}>
-        {e.kind === "video" ? <video src={e.src} poster={e.poster} autoPlay loop muted controls /> : <img src={e.src?.replace(/\.webp$/, ".webp") ?? e.card} alt="" />}
+        {e.kind === "video" ? <video src={e.src} poster={e.poster} autoPlay loop muted controls /> : e.kind==="image"?<img src={e.src?.replace(/\.webp$/, ".webp") ?? e.card} alt="" />:<article className="evidence-document"><h2>{e.label}</h2><p>{e.verdict}</p><pre>{JSON.stringify(e.meta??{},null,2)}</pre></article>}
         <div className="lb-meta">
           <b>{t?.item}</b><span className="muted">{e.label}{e.meta?.href ? ` · ${String(e.meta.href).replace(/^https?:\/\//, "")}` : ""}{e.meta?.framing ? ` · ${e.meta.framing}` : ""}</span>
           <span className="grow" />

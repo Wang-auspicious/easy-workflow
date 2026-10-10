@@ -17,6 +17,7 @@ import { TOOLS, canonical, type Services } from "../packs/vislexicon/tools.ts";
 import { agentDefs, warmStyleLib } from "../packs/vislexicon/agents.ts";
 import { loadCatalog, loadPublished, type CatalogEntry } from "../packs/vislexicon/env.ts";
 import { ControlError } from "./errors.ts";
+import { classifyFailure, type Failure } from "../shared/failures.ts";
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -65,9 +66,11 @@ export class Factory {
       return def ? (ctx) => runAgentStation(def, ctx) : null;
     };
     this.runtime = new Runtime(this.compiled, this.journal, this.broker, pack.conditions, executors);
+    this.wireRecovery();
     if (process.env.FACTORY_READONLY === "1") { this.catalog = loadCatalog(); return; }
     void warmStyleLib();
     this.loadStock();
+    this.recoverLegacyFailures();
     this.restore();
     this.runtime.tick();
   }
@@ -81,7 +84,8 @@ export class Factory {
     const left = this.catalog.filter((c) => !this.taken.has(c.id) && !publishedHosts.has(this.hostOf(c.canonicalUrl)));
     const pool = "candidates/pool";
     const localPublished = fs.existsSync(path.join(VAR, "published")) ? fs.readdirSync(path.join(VAR, "published")).length : 0;
-    const want: Record<string, number> = { [pool]: left.length, "curation/published": publishedHosts.size + localPublished };
+    const deferred=Object.values(this.state.recoveries).filter(c=>c.disposition==="retry").length;
+    const want: Record<string, number> = { [pool]: left.length+deferred, "curation/published": publishedHosts.size + localPublished };
     for (const [node, stock] of Object.entries(want)) {
       this.runtime.stock.set(node, stock);
       if (this.state.nodes[node]?.stock !== stock) this.journal.append({ kind: "stock.set", node, stock, note: node === pool ? "VisLexicon 候选目录（去掉已发布、已取走）" : "VisLexicon 已发布 + 本工厂发布" });
@@ -91,12 +95,60 @@ export class Factory {
 
   private hostOf(u: string) { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return u; } }
 
+  private wireRecovery() {
+    this.runtime.onRecovery = (token, failure) => this.recordRecovery(token, failure);
+    this.runtime.onPark = token => this.recordRecovery(token, {tag:"run_ended",category:"system",message:"本轮结束，工作尚未完成",url:token.url,retryable:true});
+  }
+
+  private recordRecovery(token:Pick<TokenRun,"id"|"item"|"url"|"title"|"source">,failure:Failure) {
+    const previous=this.state.recoveries[token.item],disposition=failure.retryable?"retry":"removed";
+    if(previous?.token===token.id&&previous.disposition===disposition)return;
+    if(!this.state.tokens[token.id]?.data.failure)this.journal.append({kind:"token.data",token:token.id,patch:{failure}});
+    this.journal.append({kind:"candidate.disposition",candidate:{item:token.item,token:token.id,url:token.url,title:token.title||token.item,source:token.source,category:this.state.tokens[token.id]?.category,disposition,failure}});
+    const delta=Number(disposition==="retry")-Number(previous?.disposition==="retry");
+    if(delta)this.runtime.stockDelta("candidates/pool",delta,`${token.item}：${disposition==="retry"?"退回待重试":"移除无效网址"}`);
+  }
+
+  private recoverLegacyFailures() {
+    // Repair the old "fetch failed → successful rejection" and exhausted capture
+    // paths once, without rewriting evidence or rerunning paid model work.
+    const latest = new Map(Object.values(this.state.tokens).sort((a,b)=>a.createdAt-b.createdAt).map(t=>[t.item,t]));
+    for(const token of latest.values()) {
+      if(this.state.recoveries[token.item]||!["rejected","manual","parked"].includes(token.status))continue;
+      const attempts=token.attempts.map(id=>this.state.attempts[id]).filter(Boolean);
+      const failed=[...attempts].reverse().find(a=>a.ok===false||/^打不开[：:]|^HTTP [45]\d\d/.test(a.summary??""));
+      if(!failed&&token.status!=="parked")continue;
+      if(failed&&!/fetch|screenshot|navigation|ERR_|Timeout|打不开|HTTP|网址/i.test(failed.error??failed.summary??""))continue;
+      const invalid=/^https?:\/\/git\+https?\//i.test(token.url)||!canonical(token.url);
+      const failure:Failure=!failed&&token.status==="parked"
+        ? {tag:"run_ended",category:"system",message:token.reason??"本轮结束，工作未完成",url:token.url,retryable:true}
+        : classifyFailure(failed?.error??failed?.summary,{url:token.url,stage:invalid?"url":undefined});
+      this.recordRecovery(token,failure);
+    }
+  }
+
+  candidateFailures(filter:{tag?:string;disposition?:string}={}) {
+    return Object.values(this.state.recoveries).filter(c=>(!filter.tag||c.failure?.tag===filter.tag)&&(!filter.disposition||c.disposition===filter.disposition)).sort((a,b)=>b.at-a.at);
+  }
+
+  retryCandidates(filter:{tag?:string;items?:string[];count:number}) {
+    if(this.runtime.paused&&this.runtime.running)throw new ControlError(409,"run_paused","请先继续或结束当前暂停的轮次");
+    const selected=this.candidateFailures({tag:filter.tag,disposition:"retry"}).filter(c=>!filter.items||filter.items.includes(c.item)).slice(0,filter.count);
+    if(!selected.length)return [];
+    if(!this.runtime.running)this.runtime.start(`失败重试 × ${selected.length}`);
+    return selected.map(c=>{
+      const t=this.runtime.create("candidates/tidy",{item:c.item,url:c.url,title:c.title,source:"candidates/pool",category:c.category,data:{express:true,retryOf:c.token,retryTag:c.failure?.tag}});
+      this.journal.append({kind:"candidate.disposition",candidate:{...c,token:t.id,disposition:"claimed"}});
+      this.runtime.stockDelta("candidates/pool",-1,`${c.item} 已取出重试`);return t;
+    });
+  }
+
   pull(count: number, filter: { category?: string; query?: string; includeRepos?: boolean } = {}) {
     const publishedHosts = new Set(loadPublished().map((p) => p.domain.replace(/^www\./, "")));
     const q = filter.query?.toLowerCase();
     const pick = this.catalog.filter((c) => !this.taken.has(c.id) && !publishedHosts.has(this.hostOf(c.canonicalUrl))
       && (!filter.category || c.category === filter.category || (c.subcategories ?? []).includes(filter.category))
-      && (filter.includeRepos || !/^https?:\/\/(www\.)?(github\.com|gitlab\.com|npmjs\.com|www\.npmjs\.com)\//i.test(c.canonicalUrl))
+      && (filter.includeRepos || !/^https?:\/\/(www\.)?(github\.com|gitlab\.com|npmjs\.com|www\.npmjs\.com)\//i.test(canonical(c.canonicalUrl)??c.canonicalUrl))
       && (!q || `${c.name} ${c.canonicalUrl} ${c.descriptionZh ?? ""} ${(c.tags ?? []).join(" ")}`.toLowerCase().includes(q)));
     // Spread the pick over the list so one run is not 20 sites from the same letter.
     const step = Math.max(1, Math.floor(pick.length / Math.max(1, count)));
@@ -226,6 +278,7 @@ export class Factory {
       for (const pool of previous.workers.values()) for (const w of pool) this.journal.append({ kind: "worker.retired", node: w.node, worker: w.id, reason: "规格新版本生效，重新配员" });
       this.compiled = trial;
       this.runtime = new Runtime(trial, this.journal, this.broker, pack.conditions, previous.executors);
+      this.wireRecovery();
       this.runtime.stock = previous.stock;
       this.runtime.tokens = previous.tokens;
       for (const t of this.runtime.tokens.values()) t.closure = this.runtime.closureOf(t.entry);

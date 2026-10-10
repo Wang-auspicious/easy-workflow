@@ -1,9 +1,10 @@
-import { Workflow, Images, Library, History, Globe, Settings2 } from "lucide-react";
+import { Workflow, Images, Library, History, Globe, Settings2, ListRestart } from "lucide-react";
 import { setState, useStore, type View } from "../store.ts";
 
 const ITEMS: { view: View; icon: typeof Workflow; label: string; key?: string }[] = [
   { view: "canvas", icon: Workflow, label: "画布 · 流水线", key: "Alt 1" },
   { view: "board", icon: Images, label: "证据板", key: "Alt 2" },
+  { view:"candidates",icon:ListRestart,label:"候选恢复 · 按原因重试" },
   { view: "library", icon: Library, label: "流水线库" },
   { view: "runs", icon: History, label: "运行记录与回放" },
   { view: "browser", icon: Globe, label: "内置浏览器" },

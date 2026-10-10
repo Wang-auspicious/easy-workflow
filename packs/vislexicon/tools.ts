@@ -7,6 +7,8 @@ import path from "node:path";
 import type { EvidenceRef, Usage } from "../../shared/types.ts";
 import { EvidenceStore, aHash, hamming } from "../../server/evidence.ts";
 import { openPage } from "../../server/browser.ts";
+import { networkFetch } from "../../server/network.ts";
+import { classifyFailure } from "../../shared/failures.ts";
 import { pickOne } from "../../server/agent-station.ts";
 import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { KIND_ZH, PREVIEW_RULES, loadPublished } from "./env.ts";
@@ -28,7 +30,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export function canonical(raw: string): string | null {
   try {
+    raw=raw.trim().replace(/^git\+(https?:\/\/)/i,"$1").replace(/^https?:\/\/git\+https?\/+/i,"https://");
+    if(/^[a-z][a-z\d+.-]*:/i.test(raw)&&!/^https?:\/\//i.test(raw))return null;
     const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if(!["http:","https:"].includes(u.protocol)||u.username||u.password||!u.hostname||/[+\s]/.test(u.hostname))return null;
+    if(["github.com","gitlab.com"].includes(u.hostname))u.pathname=u.pathname.replace(/\.git$/i,"");
     u.hash = "";
     for (const k of [...u.searchParams.keys()]) if (/^(utm_|ref$|ref_|source$|fbclid|gclid|mc_)/i.test(k)) u.searchParams.delete(k);
     u.hostname = u.hostname.toLowerCase().replace(/^www\./, "");
@@ -49,7 +55,7 @@ function published(dir: string) {
 
 const tidy: Tool = async (ctx) => {
   const url = canonical(ctx.token.url);
-  if (!url) return { ok: true, summary: "网址无法解析", finish: { status: "rejected", reason: `无法解析的网址：${ctx.token.url}` } };
+  if (!url) return { ok: false, summary: "网址无法解析", failure: classifyFailure(`无法解析的网址：${ctx.token.url}`,{url:ctx.token.url,stage:"url"}) };
   ctx.progress("规范化网址", { tool: "normalize", text: url, ok: true });
   const title = ctx.token.title?.trim() || hostOf(url);
   ctx.progress("提取标题与来源", { tool: "extract", text: `${title} · ${ctx.token.source}`, ok: true });
@@ -77,7 +83,7 @@ export function itemKey(url: string) {
 
 const dedupe: Tool = async (ctx, svc) => {
   const url = canonical(String(ctx.token.data.canonical ?? ctx.token.url));
-  if (!url) return { ok: true, summary: "网址无法解析", finish: { status: "rejected", reason: "网址无法解析" } };
+  if (!url) return { ok: false, summary: "网址无法解析", failure:classifyFailure("网址无法解析",{url:ctx.token.url,stage:"url"}) };
   const host = hostOf(url), key = itemKey(url);
   if (published(svc.publishDir).has(key)) return { ok: true, summary: `${key} 已发布，合并`, data: { canonical: url, host, key }, finish: { status: "merged", reason: `${key} 已是发布条目（处置：合并到已发布条目，不重复入库）` } };
   const others = svc.inFlight(ctx.token.id);
@@ -112,7 +118,7 @@ export function parseHtml(html: string, base: string) {
 }
 
 export async function httpGet(url: string, signal: AbortSignal, timeout = 20000) {
-  const res = await fetch(url, {
+  const res = await networkFetch(url, {
     redirect: "follow", signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
     headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36", "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.6" },
   });
@@ -125,10 +131,11 @@ const fetchHome: Tool = async (ctx) => {
   ctx.progress(`GET ${url.replace(/^https:\/\//, "")}`, { tool: "http", text: "只发 HTTP，不开浏览器" });
   let r;
   try { r = await httpGet(url, ctx.signal); } catch (err) {
-    const msg = (err as Error).message;
-    return { ok: true, summary: `打不开：${msg.slice(0, 60)}`, finish: { status: "rejected", reason: `首页打不开（${msg.slice(0, 80)}）` } };
+    ctx.signal.throwIfAborted();
+    const failure=classifyFailure(err,{url});
+    return {ok:false,summary:failure.message,error:failure.message,failure};
   }
-  if (r.status >= 400) return { ok: true, summary: `HTTP ${r.status}`, finish: { status: "rejected", reason: `首页返回 HTTP ${r.status}` } };
+  if (r.status >= 400) return {ok:false,summary:`HTTP ${r.status}`,failure:classifyFailure(`首页返回 HTTP ${r.status}`,{url,status:r.status})};
   const p = parseHtml(r.body, r.finalUrl);
   const host = hostOf(r.finalUrl);
   const navLinks = p.links.filter((l) => sameSite(l.href, String(ctx.token.data.host ?? host)) || sameSite(l.href, host));
@@ -373,7 +380,7 @@ const record: Tool = async (ctx, svc) => {
   fs.mkdirSync(dir, { recursive: true });
   const { page, close } = await openPage(VIEW, "zh-CN", ctx.signal);
   let report;
-  try { report = await recordScroll(page, url, dir, (t) => ctx.progress(t, { tool: "record", text: t })); } finally { await close(); }
+  try { report = await recordScroll(page, url, dir, (t) => ctx.progress(t, { tool: "record", text: t }),ctx.signal); } finally { await close(); }
   const put = (name: string, ext: string) => svc.store.put(fs.readFileSync(path.join(dir, name)), ext);
   const full = put("preview.mp4", "mp4"), card = put("preview.card.mp4", "mp4"), poster = put("poster.webp", "webp"), posterCard = put("poster.card.webp", "webp");
   const ev = ctx.addEvidence({ id: `vid-${card.sha.slice(0, 16)}`, kind: "video", src: full.src, card: card.src, poster: posterCard.src, label: "滚动录屏", tone: report.issues.length ? "bad" : "ok", meta: { ...report, posterFull: poster.src } });

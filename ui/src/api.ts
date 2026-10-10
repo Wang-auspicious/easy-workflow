@@ -24,6 +24,7 @@ export async function boot() {
   const fs = await api.get<FactoryState>("/api/state");
   // A window can reload while an older desktop backend is still shutting down.
   fs.activity ??= fs.chat.filter(m=>m.role==="note");
+  fs.recoveries ??= {};
   fs.conversation ??= fs.chat.filter(m=>m.role!=="note").map(m=>({id:m.id,turn:m.id.replace(/-r$/,""),message:m.role==="user"?{role:"user" as const,content:m.text,timestamp:m.at}:legacyReply(m.text,m.at),attachments:m.attachments}));
   const layout = { pos: {}, open: {}, colors: {}, bots: {}, capsules: {}, ...f.layout };
   if (layout.designVersion !== 4) {

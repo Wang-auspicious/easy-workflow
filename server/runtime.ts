@@ -5,6 +5,8 @@
 import crypto from "node:crypto";
 import type { CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
 import { median } from "../shared/project.ts";
+import { classifyFailure, failureLabels, type Failure } from "../shared/failures.ts";
+import { ControlError } from "./errors.ts";
 import type { Broker, Lease } from "./broker.ts";
 import type { Journal } from "./journal.ts";
 
@@ -50,6 +52,7 @@ export interface StationResult {
   data?: Record<string, unknown>;
   usage?: Usage;
   error?: string;
+  failure?:Failure;
   verdict?: { verdict: "pass" | "return" | "escalate"; returnTo?: string; reason: string };
   /** Leave the line here (duplicate, unreachable site…). */
   finish?: { status: TokenStatus; reason: string };
@@ -82,10 +85,14 @@ export class Runtime {
   waiting: Record<string, string> = {};
   paused = false;
   running = false;
+  ending = false;
   runStartedAt = 0;
   private scheduling = false;
   private again = false;
   private aborts = new Map<string, AbortController>();
+  private attemptTokens = new Map<string,string>();
+  onRecovery?: (token:TokenRun,failure:Failure)=>void;
+  onPark?: (token:TokenRun)=>void;
   private jobs = new Set<Promise<void>>();
   private timer: NodeJS.Timeout | null = null;
   private lastSample = 0;
@@ -141,6 +148,7 @@ export class Runtime {
   }
 
   start(title: string) {
+    if(this.ending)throw new ControlError(409,"run_ending","正在结束上一轮，请等待报告生成");
     // Starting an existing paused run must never reset its identity or counters.
     if (this.running) return this.journal.run;
     const runId = `run-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}-${short().slice(0, 4)}`;
@@ -180,7 +188,7 @@ export class Runtime {
     t.finished = true;
     const back = this.nodes.get(t.source)?.kind === "store" ? t.source : t.entry;
     this.journal.append({ kind: "token.finished", token: t.id, status: "parked", node: back, reason: "本轮结束时仍在途：退回候选层，下一轮接着做" });
-    if (back === t.source) this.stockDelta(back, +1, `${t.item} 退回候选库`);
+    if(this.onPark)this.onPark(t);else if (back === t.source) this.stockDelta(back, +1, `${t.item} 退回候选库`);
   }
 
   tick() {
@@ -200,6 +208,8 @@ export class Runtime {
     this.dispose();
     await Promise.allSettled([...this.jobs]);
   }
+
+  async settle() { await Promise.allSettled([...this.jobs]); }
 
   setWorkerLock(key: string, locked: boolean, reason: string) {
     const n = this.nodes.get(key);
@@ -316,6 +326,7 @@ export class Runtime {
     const queuedMs = Date.now() - (t.queuedAt.get(n.key) ?? Date.now());
     const ctrl = new AbortController();
     this.aborts.set(attempt, ctrl);
+    this.attemptTokens.set(attempt,t.id);
     w.busy = attempt;
     t.inflight.add(n.key);
     this.journal.append({ kind: "attempt.started", attempt, token: t.id, node: n.key, worker: w.id, input: this.describeInput(t, n) });
@@ -338,15 +349,17 @@ export class Runtime {
         },
       });
     } catch (err) {
-      res = { ok: false, summary: "工具出错", error: (err as Error).message?.slice(0, 300) ?? String(err) };
+      const failure=(err as {failure?:Failure})?.failure ?? classifyFailure(err,{url:t.url});
+      res = { ok: false, summary: "工具出错", error: failure.message, failure };
     } finally {
       lease.release();
       this.aborts.delete(attempt);
+      this.attemptTokens.delete(attempt);
       w.busy = null; w.idleSince = Date.now();
     }
     const ms = Date.now() - t0;
     if (ctrl.signal.aborted || t.epoch !== epoch || t.finished) {
-      this.journal.append({ kind: "attempt.finished", attempt, ok: false, summary: "作废：这件货已被退回或已结束", ms, queuedMs, usage: res.usage, error: "stale" });
+      this.journal.append({ kind: "attempt.finished", attempt, ok: false, cancelled:true, summary: "已取消：任务已退回或本轮已结束", ms, queuedMs, usage: res.usage, error: "stale" });
       t.inflight.delete(n.key);
       this.schedule();
       return;
@@ -358,12 +371,15 @@ export class Runtime {
     if (res.ok) (this.durations.get(n.key) ?? this.durations.set(n.key, []).get(n.key)!).push(ms);
 
     if (!res.ok) {
-      const fails = (t.failures.get(n.key) ?? 0) + 1;
-      t.failures.set(n.key, fails);
-      if (fails < 2) {
-        this.journal.append({ kind: "dispatch.note", node: n.key, tone: "warn", text: `[${n.name}] ${t.item} 失败（${res.error ?? res.summary}），自动重试 1 次` });
-        this.enqueue(t, n.key, undefined, true);
-      } else this.toManual(t, n, `${n.name} 连续失败：${res.error ?? res.summary}`);
+      const failure=res.failure ?? classifyFailure(res.error??res.summary,{url:t.url});
+      t.finished=true;t.data.failure=failure;
+      for(const [id,controller] of this.aborts)if(this.attemptTokens.get(id)===t.id)controller.abort();
+      for(const q of this.queues.values()){const i=q.indexOf(t.id);if(i>=0)q.splice(i,1);}
+      this.journal.append({kind:"token.data",token:t.id,patch:{failure}});
+      const reason=failure.retryable?`已退回候选库，等待按标签重试：${failure.message}`:`已移出候选库：${failure.message}`;
+      this.journal.append({kind:"token.finished",token:t.id,node:n.key,status:failure.retryable?"parked":"rejected",reason});
+      this.onRecovery?.(t,failure);
+      this.journal.append({kind:"dispatch.note",node:n.key,tone:"warn",text:`[${n.name}] ${t.title||t.item}：${failureLabels[failure.tag]}，${failure.retryable?"已退回候选库，可按原因重试":"已移除无效网址"}`});
     } else if (res.finish) {
       t.finished = true;
       for (const q of this.queues.values()) { const i = q.indexOf(t.id); if (i >= 0) q.splice(i, 1); }
