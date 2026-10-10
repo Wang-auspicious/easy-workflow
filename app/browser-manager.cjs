@@ -104,7 +104,17 @@ class BrowserManager {
     if (action.startsWith('bookmark.') || action === 'history.prune') { this.data.change(action,args); this.publish(); return this.snapshot(); }
     const t = this.tabs.get(args.id); if (!t) throw new Error('标签页已经关闭');
     const wc = t.view.webContents;
-    if (action === 'activate') { this.active = t.id; this.mount(); }
+    if (action === 'capture.begin') {
+      // A mounted but occluded view can stop producing compositor frames. Hold a
+      // native capturer only for the screenshot/recording operation, never idle.
+      if(!t.captureDepth)wc.beginFrameSubscription(true,()=>{});
+      t.captureDepth=(t.captureDepth||0)+1;return {capturing:true};
+    }
+    else if(action==='capture.end') {
+      t.captureDepth=Math.max(0,(t.captureDepth||0)-1);
+      if(!t.captureDepth)wc.endFrameSubscription();return {capturing:Boolean(t.captureDepth)};
+    }
+    else if (action === 'activate') { this.active = t.id; this.mount(); }
     else if (action === 'navigate') { await wc.loadURL(webURL(args.url)); }
     else if (action === 'back') { if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack(); }
     else if (action === 'forward') { if (wc.navigationHistory.canGoForward()) wc.navigationHistory.goForward(); }
@@ -112,7 +122,7 @@ class BrowserManager {
     else if (action === 'attention') t.attention = String(args.message || '页面需要检查').slice(0,200);
     else if (action === 'attention.check') await this.check(t);
     else if (action === 'tab.move') { const entries=[...this.tabs]; const i=entries.findIndex(([id])=>id===t.id); const [entry]=entries.splice(i,1); const j=entries.findIndex(([id])=>id===args.before); if(j<0)throw new Error('目标标签不存在'); entries.splice(j,0,entry); this.tabs=new Map(entries); this.persistTabs(); }
-    else if (action === 'release') { if (!t.attention) wc.close(); }
+    else if (action === 'release') { if(t.captureDepth){wc.endFrameSubscription();t.captureDepth=0;} if (!t.attention) wc.close(); }
     else if (action === 'close') wc.close();
     else throw new Error('未知浏览器操作');
     this.publish(); return this.snapshot();

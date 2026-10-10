@@ -100,13 +100,16 @@ try {
     let workerPage;
     for(let i=0;i<30&&!workerPage;i++){workerPage=cdp.contexts().flatMap(c=>c.pages()).find(p=>p.url()===lease.marker);if(!workerPage)await new Promise(r=>setTimeout(r,50));}
     assert.ok(workerPage,'leased native tab is available to background automation');
+    await workerPage.setViewportSize({width:1280,height:800});
     await workerPage.goto(fixtureURL);
+    await app.evaluate((_electron,id)=>globalThis.__factoryBrowser({action:'capture.begin',id}),lease.id);
     await workerPage.screenshot({path:path.join(artifacts,'background-capture.png'),timeout:4000});
     const screencast=await workerPage.context().newCDPSession(workerPage);let frameCount=0;
     screencast.on('Page.screencastFrame',e=>{frameCount++;void screencast.send('Page.screencastFrameAck',{sessionId:e.sessionId}).catch(()=>{});});
     await screencast.send('Page.startScreencast',{format:'jpeg',quality:80,everyNthFrame:1});
     for(let i=0;i<12&&frameCount<2;i++){await workerPage.evaluate(i=>document.body.style.background=i%2?'#ddeeff':'#fff',i);await new Promise(r=>setTimeout(r,100));}
     await screencast.send('Page.stopScreencast');await screencast.detach();assert.ok(frameCount>=2,'background recording must produce real frames');
+    assert.equal((await app.evaluate((_electron,id)=>globalThis.__factoryBrowser({action:'capture.end',id}),lease.id)).capturing,false);
     assert.match(await workerPage.evaluate(()=>document.cookie),/shared-session-test=shared-with-worker/);
     await workerPage.goto(fixtureURL+'/login');
     await page.locator('.rail-browser-alert').waitFor();

@@ -26,10 +26,21 @@ try {
       const response=await page.goto(urls[i],{waitUntil:'domcontentloaded',timeout:25000});
       assert.ok(response&&response.status()<400,`HTTP ${response?.status()}`);
       await page.waitForLoadState('networkidle',{timeout:7000}).catch(()=>{});
-      const started=Date.now(),png=await page.screenshot({path:path.join(out,`live-background-${i}.png`),timeout:8000});
+      const started=Date.now();
+      await app.evaluate((_electron,id)=>globalThis.__factoryBrowser({action:"capture.begin",id}),lease.id);
+      const png=await page.screenshot({path:path.join(out,`live-background-${i}.png`),timeout:8000});
       assert.ok(png.length>6000,'capture must contain a rendered page');
       const clip=await page.screenshot({clip:{x:40,y:40,width:600,height:400},fullPage:true,timeout:8000});assert.ok(clip.length>1000);
-      return {url:urls[i],title:await page.title(),status:response.status(),bytes:png.length,captureMs:Date.now()-started};
+      const session=await page.context().newCDPSession(page);let frames=0;
+      session.on('Page.screencastFrame',event=>{frames++;void session.send('Page.screencastFrameAck',{sessionId:event.sessionId}).catch(()=>{});});
+      try {
+        await session.send('Page.startScreencast',{format:'jpeg',quality:80,everyNthFrame:1});
+        for(let n=0;n<15&&frames<2;n++){await page.mouse.wheel(0,120);await new Promise(r=>setTimeout(r,120));}
+        assert.ok(frames>=2,'recording must produce real frames');
+      }finally{await session.send('Page.stopScreencast').catch(()=>{});await session.detach();}
+      const released=await app.evaluate((_electron,id)=>globalThis.__factoryBrowser({action:'capture.end',id}),lease.id);
+      assert.equal(released.capturing,false);
+      return {url:urls[i],title:await page.title(),status:response.status(),bytes:png.length,captureMs:Date.now()-started,frames,capturerReleased:true};
     }catch(error){return {url:urls[i],error:error.message};}
     finally{await app.evaluate((_electron,id)=>globalThis.__factoryBrowser({action:'release',id}),lease.id);}
   }));

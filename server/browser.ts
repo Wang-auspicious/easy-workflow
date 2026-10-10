@@ -116,6 +116,14 @@ export async function browserAttention(page: Page, message: string) {
   if (desktop) await rpc({action:"attention",id,message});
   else { const t = tabs.get(id); if (t) { t.attention = message; update(); } }
 }
+/** Hold real compositor frames while capturing an occluded native task page. */
+export async function withBrowserFrames<T>(page:Page, capture:()=>Promise<T>):Promise<T> {
+  const id=pageIds.get(page);
+  if(!desktop||!id)return capture();
+  await rpc({action:"capture.begin",id});
+  try{return await capture();}
+  finally{await rpc({action:"capture.end",id}).catch(()=>{});}
+}
 export async function closeBrowser() {
   if (!desktop) await (await context?.catch(() => null))?.close();
   if (connection) await (await connection.catch(() => null))?.close().catch(() => {});

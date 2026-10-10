@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import type { Page } from "playwright-core";
 import { aHash, hamming, imageStats } from "../../server/evidence.ts";
 import { PREVIEW_RULES } from "./env.ts";
-import { browserAttention } from "../../server/browser.ts";
+import { browserAttention, withBrowserFrames } from "../../server/browser.ts";
 import { ClassifiedFailure, classifyFailure } from "../../shared/failures.ts";
 
 export const VIEW = { width: PREVIEW_RULES.viewport.width, height: PREVIEW_RULES.viewport.height };
@@ -146,7 +146,7 @@ export async function visit(page: Page, url: string, entryHost: string, say?: (t
 }
 
 export async function shoot(page: Page, clip?: { x: number; y: number; width: number; height: number }) {
-  return clip ? page.screenshot({ clip, fullPage: true }) : page.screenshot({ fullPage: false });
+  return withBrowserFrames(page,()=>clip ? page.screenshot({ clip, fullPage: true }) : page.screenshot({ fullPage: false }));
 }
 
 export function checkImage(png: Buffer, others: string[], { stage = false } = {}) {
@@ -263,6 +263,8 @@ export async function recordScroll(page: Page, url: string, outDir: string, say:
   const shape = await page.evaluate(() => ({ scrollHeight: document.documentElement.scrollHeight, viewport: innerHeight }));
   const mode = shape.scrollHeight > shape.viewport * 1.2 ? "document-scroll" : "hijacked-or-single-screen";
   report.mode = mode;
+  let reason = "time-cap";
+  await withBrowserFrames(page,async()=>{
   const cdp = await page.context().newCDPSession(page);
   cdp.on("Page.screencastFrame", async ({ data, metadata, sessionId }) => {
     const file = path.join(FR, `${String(frames.length).padStart(5, "0")}.jpg`);
@@ -272,7 +274,6 @@ export async function recordScroll(page: Page, url: string, outDir: string, say:
   });
   await page.mouse.move(VIEW.width / 2, VIEW.height / 2);
   const t0 = Date.now();
-  let reason = "time-cap";
   try {
   await cdp.send("Page.startScreencast", { format: "jpeg", quality: 88, maxWidth: VIEW.width, maxHeight: VIEW.height, everyNthFrame: 1 });
   await sleep(LIMITS.introMs);
@@ -292,6 +293,7 @@ export async function recordScroll(page: Page, url: string, outDir: string, say:
     await cdp.send("Page.stopScreencast").catch(()=>{});
     await cdp.detach().catch(()=>{});
   }
+  });
   await sleep(300);
   report.stop = reason; report.frames = frames.length;
   if (frames.length < 2) throw new Error("screencast 没有出帧");
