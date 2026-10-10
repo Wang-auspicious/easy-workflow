@@ -11,6 +11,8 @@ import { CorrectionPopover } from "../board/Correction.tsx";
 import { toggleInspector } from "../canvas/Canvas.tsx";
 import { PiConversation } from "./PiConversation.tsx";
 import "./activity.css";
+import {latestRunTokens} from "../../../shared/project.ts";
+
 
 
 const SUGGEST = [
@@ -120,8 +122,12 @@ function Activity() {
   const [dismissed, setDismissed] = useState("");
   const notes = fs.activity.filter(n => n.at >= fs.run.startedAt);
   const warning = [...notes].reverse().find(n => n.tone === "warn" && (!n.node || (fs.nodes[n.node]?.lastOkAt ?? 0) <= n.at));
-  if (!notes.length) return null;
+  const batch=latestRunTokens(fs);
+  const blocked=batch.filter(t=>t.status==="parked"||t.status==="manual");
+  const settled=batch.length>0&&batch.every(t=>t.status!=="active");
+  if (!notes.length&&!settled) return null;
   return <div className="chat-activity">
+    {settled&&<div className="batch-outcome"><b>本批已处理完{blocked.length?`，${blocked.length} 件需要处理`:""}</b><p>发布 {batch.filter(t=>t.status==="published").length} · 合并 {batch.filter(t=>t.status==="merged").length} · 排除 {batch.filter(t=>t.status==="rejected").length}</p>{blocked.length>0&&<button onClick={()=>setState({view:"candidates"})}>查看阻塞原因与下一步</button>}<small>本轮仍可继续投料，结束后生成报告。</small></div>}
     {warning && warning.id !== dismissed && <div className="chat-attention"><AlertTriangle size={13} /><button onClick={() => { if (warning.node) { setState({ view: "canvas" }); toggleInspector(warning.node); } else setOpen(true); }}>{warning.text}</button><button aria-label="收起提示" onClick={() => setDismissed(warning.id)}><X size={12} /></button></div>}
     <button className="activity-toggle" onClick={() => setOpen(!open)} aria-expanded={open}><ScrollText size={12} />运行记录 <span>{notes.length}</span></button>
     {open && <div className="activity-log">{notes.slice(-15).map(m => <Note key={m.id} m={m} />)}</div>}

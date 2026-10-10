@@ -2,7 +2,7 @@
 // It floats on the canvas, top-left; clicking it opens the per-station breakdown.
 import { useState } from "react";
 import { Play, Pause, Square, PackagePlus, ChevronDown } from "lucide-react";
-import { elapsed, median, type TokenState } from "../../../shared/project.ts";
+import { elapsed, median, latestRunTokens, type TokenState } from "../../../shared/project.ts";
 import { getState, setState, useStore } from "../store.ts";
 import { actions } from "../api.ts";
 import { useNow } from "../util/useNow.ts";
@@ -32,7 +32,7 @@ export function Hud() {
   const s = getState();
   const run = s.fs.run;
   const t = replay ? replay.at : now;
-  const tokens = s.fs.tokenOrder.map((id) => s.fs.tokens[id]).filter((x) => x && x.createdAt >= run.startedAt);
+  const tokens = latestRunTokens(s.fs);
   const done = tokens.filter((x) => x.status !== "active").length;
   const deferred = tokens.filter(x => x.status === "parked").length;
   const invalid = tokens.filter(x => x.status === "rejected" && x.data.failure).length;
@@ -48,7 +48,7 @@ export function Hud() {
     <>
       <div className="hud-wrap">
         <div className="hud">
-          <div className="canvas-title"><span>工作区</span><i>/</i><b>{isIdle ? "网站入库" : run.title || "网站入库"}</b><span className="hud-badge">{status === "running" && !displayTotal ? "等待投料" : ({ idle: "尚未运行", running: "运行中", paused: "已暂停", ended: "已结束" })[status]}</span></div>
+          <div className="canvas-title"><span>工作区</span><i>/</i><b>{isIdle ? "网站入库" : run.title || "网站入库"}</b><span className="hud-badge">{status === "running" && !displayTotal ? "等待投料" : status==="running"&&displayDone===displayTotal?(deferred?"有待处理项":"本批已完成"):({ idle: "尚未运行", running: "运行中", paused: "已暂停", ended: "已结束" })[status]}</span></div>
           {!replay && (
             <div className="hud-actions">
               <button className="btn" onClick={() => setPull((p) => !p)}><PackagePlus size={15} />投料</button>

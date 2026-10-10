@@ -8,13 +8,13 @@ import type { EvidenceRef, Usage } from "../../shared/types.ts";
 import { EvidenceStore, aHash, hamming } from "../../server/evidence.ts";
 import { openPage } from "../../server/browser.ts";
 import { networkFetch } from "../../server/network.ts";
-import { classifyFailure } from "../../shared/failures.ts";
+import { classifyFailure, type Failure } from "../../shared/failures.ts";
 import { pickOne } from "../../server/agent-station.ts";
 import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { KIND_ZH, PREVIEW_RULES, loadPublished } from "./env.ts";
 import {
   VIEW, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, recordScroll, sameSite,
-  scoreLinks, shoot, stageClip, visit, type Link,
+  scoreLinks, shoot, stageClip, visit, pageKey, type Link,
 } from "./capture.ts";
 
 export interface Services {
@@ -23,6 +23,7 @@ export interface Services {
   publishDir: string;
   /** Identity keys of tokens past dedupe and still on the line (excluding `self`). */
   inFlight: (self: string) => Set<string>;
+  tryBrowser?:()=>{release:()=>void}|null;
 }
 
 type Tool = (ctx: StationContext, svc: Services) => Promise<StationResult>;
@@ -126,16 +127,28 @@ export async function httpGet(url: string, signal: AbortSignal, timeout = 20000)
   return { status: res.status, finalUrl: res.url, body };
 }
 
-const fetchHome: Tool = async (ctx) => {
+const fetchHome: Tool = async (ctx,svc) => {
   const url = String(ctx.token.data.canonical ?? ctx.token.url);
   ctx.progress(`GET ${url.replace(/^https:\/\//, "")}`, { tool: "http", text: "只发 HTTP，不开浏览器" });
-  let r;
+  let r:Awaited<ReturnType<typeof httpGet>>|undefined,failed:ReturnType<typeof classifyFailure>|undefined;
   try { r = await httpGet(url, ctx.signal); } catch (err) {
     ctx.signal.throwIfAborted();
     const failure=classifyFailure(err,{url});
-    return {ok:false,summary:failure.message,error:failure.message,failure};
+    failed=failure;
   }
-  if (r.status >= 400) return {ok:false,summary:`HTTP ${r.status}`,failure:classifyFailure(`首页返回 HTTP ${r.status}`,{url,status:r.status})};
+  if(r&&r.status>=400)failed=classifyFailure(`首页返回 HTTP ${r.status}`,{url,status:r.status});
+  if(failed&&['network_timeout','network_connection','auth_required'].includes(failed.tag)) {
+    const lease=svc.tryBrowser?.();
+    if(lease)try{
+      ctx.progress('HTTP 未取得首页，改用共享浏览器现场补取一次',{tool:'recover',text:failed.message});
+      const browser=await openPage(VIEW,'en-US',ctx.signal);
+      try{await visit(browser.page,url,hostOf(url));r={status:200,finalUrl:browser.page.url(),body:await browser.page.content()};failed=undefined;}
+      catch(error){ctx.signal.throwIfAborted();failed=(error as {failure?:ReturnType<typeof classifyFailure>}).failure??classifyFailure(error,{url});}
+      finally{await browser.close();}
+    }finally{lease.release();}
+    else ctx.progress('浏览器名额正在使用，保留请求等待恢复，不突破全局配额',{tool:'recover',text:failed.message});
+  }
+  if(failed||!r){const failure=failed??classifyFailure('首页没有响应',{url});return {ok:false,summary:failure.message,error:failure.message,failure};}
   const p = parseHtml(r.body, r.finalUrl);
   const host = hostOf(r.finalUrl);
   const navLinks = p.links.filter((l) => sameSite(l.href, String(ctx.token.data.host ?? host)) || sameSite(l.href, host));
@@ -178,11 +191,16 @@ const ROLE_ZH: Record<string, string> = { identity: "首屏", breadth: "目录",
 type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number };
 const shotsOf = (ctx: StationContext) => ({ ...((ctx.token.data.shots as Record<string, ShotData>) ?? {}) });
 
+async function visitCandidate(page:Parameters<typeof visit>[0],href:string,host:string,ctx:StationContext,errors:Failure[]) {
+  try{return await visit(page,href,host,t=>ctx.progress(t,{tool:"browser",text:t}));}
+  catch(error){ctx.signal.throwIfAborted();const failure=(error as {failure?:Failure}).failure??classifyFailure(error,{url:href});if(["auth_required","network_tls"].includes(failure.tag))throw error;errors.push(failure);return {issues:[`${failure.tag}: ${failure.message}`],hidden:[]};}
+}
+
 /** Same-site links with text, one per page, for the numbered needsPick list. */
 function dedupeLinks(links: Link[]) {
   const seen = new Set<string>();
   return links.filter((l) => {
-    const k = l.href.split("?")[0].replace(/\/+$/, "");
+    const k = pageKey(l.href);
     if (!l.text || seen.has(k) || /\.(pdf|zip|png|jpe?g|svg|mp4)$/i.test(k) || /login|signin|sign-in|signup|register|account|cart|checkout/i.test(k)) return false;
     seen.add(k);
     return true;
@@ -242,9 +260,13 @@ const breadth: Tool = async (ctx, svc) => {
   const exclude = new Set<string>((ctx.token.data.rejectedPages as string[]) ?? []);
   if (ctx.redo && shots.breadth?.href) exclude.add(shots.breadth.href.replace(/\/+$/, ""));
   // The home page itself never counts as the catalogue.
-  for (const h of [shots.identity?.href, String(ctx.token.data.canonical), (ctx.token.data.home as { finalUrl?: string })?.finalUrl]) if (h) exclude.add(h.split("#")[0].split("?")[0].replace(/\/+$/, ""));
+  for (const h of [shots.identity?.href, String(ctx.token.data.canonical), (ctx.token.data.home as { finalUrl?: string })?.finalUrl]) if (h) exclude.add(pageKey(h));
   const pool = [...((ctx.token.data.homeLinks as Link[]) ?? []), ...(((ctx.token.data.home as { navLinks?: Link[] })?.navLinks) ?? [])];
+  if(!pool.some(l=>new URL(l.href).searchParams.has('path'))&&String(ctx.token.data.title).toLowerCase().includes('storybook')) {
+    const probe=await openPage(VIEW,'en-US',ctx.signal);try{await visit(probe.page,shots.identity?.href??ctx.token.url,host);pool.push(...await links(probe.page));}finally{await probe.close();}
+  }
   const ranked: { href: string; score: number; reasons: string[]; text: string }[] = scoreLinks(pool, role).filter((c) => !exclude.has(c.href)).slice(0, 4);
+  for(const link of pool.filter(l=>new URL(l.href).searchParams.get('path')?.startsWith('/docs/')).slice(0,4))if(!exclude.has(pageKey(link.href))&&!ranked.some(r=>pageKey(r.href)===pageKey(link.href)))ranked.push({href:link.href,text:link.text,score:8,reasons:['storybook-docs']});
   ctx.progress(`目录候选 ${ranked.length} 个：${ranked.map((r) => new URL(r.href).pathname).join("  ") || "无"}`, { tool: "rules", text: "path +3 · text +2 · nav +1" });
   let usage: Usage | undefined;
   const options = dedupeLinks(pool).filter((l) => !exclude.has(l.href.replace(/\/+$/, "")) && l.href.replace(/\/+$/, "") !== String(ctx.token.data.canonical)).slice(0, 30);
@@ -256,10 +278,12 @@ const breadth: Tool = async (ctx, svc) => {
   try {
     const hashes = [shots.identity?.hash ?? ""];
     const tried = new Set<string>();
+    const accessFailures:Failure[]=[];
     for (let i = 0; i < ranked.length; i++) {
       const c = ranked[i];
       tried.add(c.href.replace(/\/+$/, ""));
-      const v = await visit(page, c.href, host, (t) => ctx.progress(t, { tool: "browser", text: t }));
+      const v = await visitCandidate(page,c.href,host,ctx,accessFailures);
+      if(v.issues.some(i=>/^(network_|http_|page_)/.test(i))){ctx.progress(`候选访问失败，继续下一页：${c.href}`,{tool:"reject",text:v.issues.join(", "),ok:false});continue;}
       const png = await shoot(page);
       const check = checkImage(png, hashes);
       const issues = [...v.issues, ...check.issues];
@@ -275,16 +299,16 @@ const breadth: Tool = async (ctx, svc) => {
       }
       let chosen = { png, hash: check.hash, href: page.url(), reason: c.reasons.includes("needsPick") ? "模型从编号列表选的（needsPick）" : `score ${c.score}（${c.reasons.join("+")}）` };
       const deeper = (await links(page)).filter((l) => sameSite(l.href, host));
+      let breadthLinks=deeper,previews=await previewsInViewport(page);
       const better = scoreLinks(deeper, role).find((x) => x.score > c.score + 0.3 && x.href.replace(/\/+$/, "") !== c.href.replace(/\/+$/, "") && !exclude.has(x.href));
       if (better) {
         ctx.progress(`第二跳：${new URL(better.href).pathname} 分数 ${better.score} 高于 ${c.score}`, { tool: "rules", text: "second hop" });
-        const hop = await visit(page, better.href, host);
-        const hopPng = await shoot(page);
-        const hopCheck = checkImage(hopPng, hashes);
-        if (!hop.issues.length && !hopCheck.issues.length) chosen = { png: hopPng, hash: hopCheck.hash, href: page.url(), reason: `第二跳 ${better.score} > ${c.score}` };
+        const hop = await visitCandidate(page,better.href,host,ctx,accessFailures);
+        if(!hop.issues.length){const hopPng = await shoot(page);
+          const hopCheck = checkImage(hopPng, hashes);
+          if (!hopCheck.issues.length) {chosen = { png: hopPng, hash: hopCheck.hash, href: page.url(), reason: `第二跳 ${better.score} > ${c.score}` };breadthLinks=(await links(page)).filter(l=>sameSite(l.href,host));previews=await previewsInViewport(page);}
+        }
       }
-      const previews = await previewsInViewport(page);
-      const breadthLinks = (await links(page)).filter((l) => sameSite(l.href, host));
       const file = path.join(workDir(svc, ctx), "breadth.png");
       fs.writeFileSync(file, chosen.png);
       const ev = shotEvidence(ctx, svc, chosen.png, "breadth", { href: chosen.href, reason: chosen.reason, previews });
@@ -292,7 +316,7 @@ const breadth: Tool = async (ctx, svc) => {
       shots.breadth = { file, href: chosen.href, hash: chosen.hash, evidence: ev.id };
       return { ok: true, summary: `目录 ✓ ${new URL(chosen.href).pathname}`, data: { shots, breadthLinks: breadthLinks.slice(0, 200) }, usage };
     }
-    return { ok: false, summary: "没有合格的目录页", error: ranked.length ? "所有候选都被拒收" : "规则和模型都没找到目录页（needsPick 交人）", usage, data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) } } };
+    return { ok: false, summary: "没有合格的目录页", error: ranked.length ? "所有候选都被拒收" : "规则和模型都没找到目录页（needsPick 交人）", failure:accessFailures.length===tried.size?accessFailures.at(-1):undefined,usage, data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) },candidateAccessFailures:accessFailures } };
   } finally { await close(); }
 };
 
@@ -315,7 +339,8 @@ const proof: Tool = async (ctx, svc) => {
     const inGrid = pool.filter((l) => l.inMain && (l.hasImage || usesStage));
     candidates = [...new Set((under.length ? under : inGrid).map((l) => l.href))].slice(0, 8);
   }
-  const norm = (h: string) => { try { const u = new URL(h); return u.origin + u.pathname.replace(/\/+$/, ""); } catch { return h; } };
+  const norm = pageKey;
+  if(usesStage){const extra=scoreLinks([...breadthLinks,...homeLinks],{pathPatterns:['iframe[.]html','demo|example|playground','/components/'],linkText:['playground','examples','preview','demo']}).map(l=>l.href);candidates=[...new Set([...extra,...candidates])];}
   const taken = new Set([norm(String(ctx.token.data.canonical)), norm(shots.breadth?.href ?? ""), norm(shots.identity?.href ?? ""), ...(((ctx.token.data.rejectedPages as string[]) ?? []).map(norm))]);
   if (ctx.redo && shots.proof?.href) taken.add(norm(shots.proof.href));
   candidates = [...new Set(candidates.map(norm))].filter((h) => !taken.has(h)).slice(0, 6);
@@ -331,10 +356,11 @@ const proof: Tool = async (ctx, svc) => {
     const hashes = [shots.identity?.hash ?? "", shots.breadth?.hash ?? ""];
     let best: { href: string; png: Buffer; content: number; hash: string; framing: string } | null = null;
     let tried = 0;
+    const accessFailures:Failure[]=[];
     for (const href of candidates) {
       if (ctx.signal.aborted) break;
       tried++;
-      const v = await visit(page, href, host, (t) => ctx.progress(t, { tool: "browser", text: t }));
+      const v = await visitCandidate(page,href,host,ctx,accessFailures);
       if (v.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
       let png: Buffer | null = null;
       let framing = "viewport";
@@ -362,7 +388,7 @@ const proof: Tool = async (ctx, svc) => {
       if (!usesStage) break;
       if (best && tried >= 3 && best.content > 0.12) break;
     }
-    if (!best) return { ok: false, summary: "没有合格的特写", error: tried ? `试了 ${tried} 页都不合格` : "规则和模型都没找到特写页（needsPick 交人）", usage };
+    if (!best) return { ok: false, summary: "没有合格的特写", error: tried ? `试了 ${tried} 页都不合格` : "规则和模型都没找到特写页（needsPick 交人）",failure:accessFailures.length===tried?accessFailures.at(-1):undefined, data:{needsPick:{proof:candidates},candidateAccessFailures:accessFailures},usage };
     const file = path.join(workDir(svc, ctx), "proof.png");
     fs.writeFileSync(file, best.png);
     const ev = shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, content: Number(best.content.toFixed(3)), tried });
@@ -403,20 +429,26 @@ const processShots: Tool = async (ctx, svc) => {
   const roles = ["identity", "breadth", "proof"].filter((r) => shots[r]);
   const images: { role: string; src: string; card: string; sha256: string; ahash: string; href: string; evidence: string }[] = [];
   const t0 = Date.now();
+  const previous = (ctx.token.data.images ?? []) as typeof images;
+  const temporary:string[]=[];
   for (const role of roles) {
     const s = shots[role];
+    const reusable=previous.find(image=>image.role===role&&image.evidence===s.evidence&&fs.existsSync(svc.store.resolve(image.src)??""));
+    if(reusable){images.push(reusable);shots[role]={...s,file:svc.store.resolve(reusable.src)!};ctx.progress(`${ROLE_ZH[role]}沿用已验收的持久图像，无需重新拍摄`,{tool:"reuse",text:reusable.sha256,ok:true});continue;}
     if (!fs.existsSync(s.file)) return { ok: false, summary: `${ROLE_ZH[role]}原图丢失`, error: `${s.file} missing` };
     const png = fs.readFileSync(s.file);
     const full = svc.store.put(EvidenceStore.webp(png, 1280, 82), "webp");
     const card = svc.store.put(EvidenceStore.webp(png, 720, 80), "webp");
     images.push({ role, src: full.src, card: card.src, sha256: full.sha, ahash: aHash(png), href: s.href, evidence: s.evidence });
+    shots[role]={...s,file:full.file};
+    if(path.resolve(s.file).startsWith(path.resolve(svc.workDir)+path.sep)&&path.extname(s.file)===".png")temporary.push(s.file);
   }
   const dupes: string[] = [];
   for (let i = 0; i < images.length; i++) for (let j = i + 1; j < images.length; j++) if (hamming(images[i].ahash, images[j].ahash) <= 6) dupes.push(`${ROLE_ZH[images[i].role]}≈${ROLE_ZH[images[j].role]}`);
   ctx.progress(`${images.length} 张 → WebP 1280 + 720，用时 ${Date.now() - t0}ms；PNG 不保留`, { tool: "webp", text: images.map((i) => i.sha256.slice(0, 8)).join(" "), ok: true });
-  for (const role of roles) fs.rmSync(shots[role].file, { force: true });
-  if (dupes.length) return { ok: false, summary: `图片重复：${dupes.join("、")}`, error: `duplicate images ${dupes.join(", ")}`, data: { images } };
-  return { ok: true, summary: `${images.length} 张互不重复 ✓`, data: { images } };
+  for (const file of temporary) fs.rmSync(file, { force: true });
+  if (dupes.length) return { ok: false, summary: `图片重复：${dupes.join("、")}`, error: `duplicate images ${dupes.join(", ")}`, data: { images,shots } };
+  return { ok: true, summary: `${images.length} 张互不重复 ✓`, data: { images,shots } };
 };
 
 /* ------------------------------------------------------------------ ⑰ gate */

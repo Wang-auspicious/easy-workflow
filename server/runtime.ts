@@ -7,6 +7,7 @@ import type { CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDeta
 import { median } from "../shared/project.ts";
 import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
 import { ControlError } from "./errors.ts";
+import { readRole } from "./roles.ts";
 import type { Broker, Lease } from "./broker.ts";
 import type { Journal } from "./journal.ts";
 
@@ -335,6 +336,8 @@ export class Runtime {
     let res: StationResult;
     try {
       if (!exec) throw new Error(`工位 ${n.key} 没有执行器`);
+      const role=readRole(n.key);
+      this.journal.append({kind:"attempt.progress",attempt,text:`按 ${n.name} 的 ROLE.md 执行`,step:{tool:"role",text:`${role.path} @ ${role.revision}`}});
       res = await exec({
         token: t, node: n, attempt, worker: w, signal: ctrl.signal, redo: t.notes.get(n.key),
         progress: (text, step) => {

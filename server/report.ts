@@ -51,7 +51,7 @@ export function buildReport(f: Factory, runId: string): RunReport {
   const nodeOf = new Map(f.compiled.nodes.map((n) => [n.key, n]));
   const tokenIds = new Set(events.flatMap(e=>e.kind==="token.created"?[e.token]:[]));
   const attemptIds = new Set(events.flatMap(e=>e.kind==="attempt.started"?[e.attempt]:[]));
-  const tokens = Object.values(s.tokens).filter((t) => tokenIds.has(t.id));
+  const tokens = [...new Map(Object.values(s.tokens).filter((t) => tokenIds.has(t.id)).map(t=>[t.item,t])).values()];
   const attempts = Object.values(s.attempts).filter((a) => attemptIds.has(a.id));
 
   /* per-node reasons and slowest items */
@@ -112,7 +112,7 @@ export function buildReport(f: Factory, runId: string): RunReport {
   const usage = { input: sum(attempts.map((a) => a.usage.input)), output: sum(attempts.map((a) => a.usage.output)), cost: sum(attempts.map((a) => a.usage.cost)) };
   const pub = Math.max(1, items.published.length);
   const totals = {
-    ...s.totals, usage, created: tokens.length, parked:items.parked.length, failedAttempts:attempts.filter(a=>a.ok===false&&!a.cancelled).length,
+    ...s.totals, usage, created: tokens.length, published:items.published.length,manual:items.manual.length,merged:items.merged.length,rejected:items.rejected.length,parked:items.parked.length, failedAttempts:attempts.filter(a=>a.ok===false&&!a.cancelled).length,
     perPublishedMs: items.published.length ? median(items.published.map((r) => r.ms ?? 0)) : 0,
     perPublishedCost: usage.cost / pub, perPublishedTokens: (usage.input + usage.output) / pub,
   };

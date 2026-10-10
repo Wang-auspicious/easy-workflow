@@ -58,6 +58,7 @@ export class Factory {
     const defs = agentDefs(this.store);
     const services: Services = {
       store: this.store, workDir: path.join(VAR, "work"), publishDir: path.join(VAR, "published"),
+      tryBrowser:()=>this.broker.tryAcquire("browser"),
       inFlight: (self) => new Set([...this.runtime.tokens.values()].filter((t) => !t.finished && t.id !== self && t.data.key).map((t) => String(t.data.key))),
     };
     const executors = (n: CompiledNode): Executor | null => {
@@ -71,6 +72,10 @@ export class Factory {
     void warmStyleLib();
     this.loadStock();
     this.recoverLegacyFailures();
+    for(const c of Object.values(this.state.recoveries))if(c.failure?.tag==="tool_error") {
+      const failure=classifyFailure(c.failure.message,{url:c.url});
+      if(failure.tag!=="tool_error")this.journal.append({kind:"candidate.disposition",candidate:{...c,failure}});
+    }
     this.restore();
     this.runtime.tick();
   }
@@ -137,7 +142,26 @@ export class Factory {
     if(!selected.length)return [];
     if(!this.runtime.running)this.runtime.start(`失败重试 × ${selected.length}`);
     return selected.map(c=>{
-      const t=this.runtime.create("candidates/tidy",{item:c.item,url:c.url,title:c.title,source:"candidates/pool",category:c.category,data:{express:true,retryOf:c.token,retryTag:c.failure?.tag}});
+      const previous=this.state.tokens[c.token];
+      const failedAt=previous?.finishedAtNode;
+      const checkpoint=previous?.data.canonical&&failedAt&&this.compiled.nodes.some(n=>n.key===failedAt&&this.runtime.runnable(n))?failedAt:"candidates/tidy";
+      const data:Record<string,unknown>=checkpoint==="candidates/tidy"?{}:structuredClone(previous.data);
+      delete data.failure;delete data.gate;delete data.digest;
+      const recoveryRoot=String(previous?.data.recoveryRoot??(previous&&this.state.attempts[previous.attempts[0]]?.node)??checkpoint);
+      const completed=new Map((previous?.attempts??[]).map(id=>this.state.attempts[id]).filter(Boolean).map(a=>[a.node,a.ok]));
+      const t=this.runtime.create(checkpoint,{item:c.item,url:c.url,title:c.title,source:"candidates/pool",category:c.category,data:{...data,express:true,retryOf:c.token,retryTag:c.failure?.tag,recoveryStation:checkpoint,recoveryRoot}});
+      if(checkpoint!=="candidates/tidy") {
+        t.entry=recoveryRoot;t.closure=this.runtime.closureOf(recoveryRoot);
+        const invalidated=this.runtime.descendants(t,checkpoint);
+        t.done=new Set([...(previous.data.checkpointDone as string[]??[]),...[...completed].filter(([,ok])=>ok).map(([key])=>key)].filter(key=>!invalidated.has(key)));
+        for(const key of t.done)for(const edge of this.runtime.outFlow.get(key)??[])t.edgeLive.set(edge.key,!edge.when||Boolean(pack.conditions[edge.when]?.(t.data)));
+        t.data.checkpointDone=[...t.done];this.journal.append({kind:"token.data",token:t.id,patch:{checkpointDone:[...t.done]}});
+      }
+      if(previous&&checkpoint!=="candidates/tidy"){
+        for(const id of previous.evidence){const ev=this.state.evidence[id];if(!ev)continue;this.journal.append({kind:"evidence.added",evidence:{...ev,id:`${ev.id}-${t.id}`,token:t.id,at:Date.now(),meta:{...ev.meta,reusedFrom:ev.id}}});}
+        this.journal.append({kind:"token.data",token:previous.id,patch:{retriedBy:t.id}});
+      }
+      this.journal.append({kind:"dispatch.note",node:checkpoint,tone:"info",text:`${c.title} 从${this.compiled.nodes.find(n=>n.key===checkpoint)?.name??checkpoint}继续，保留此前成果`});
       this.journal.append({kind:"candidate.disposition",candidate:{...c,token:t.id,disposition:"claimed"}});
       this.runtime.stockDelta("candidates/pool",-1,`${c.item} 已取出重试`);return t;
     });
@@ -189,7 +213,7 @@ export class Factory {
     rt.running = true; rt.paused = run.status === "paused" || process.env.FACTORY_START_PAUSED === "1"; rt.runStartedAt = run.startedAt;
     if (rt.paused && this.state.run.status === "running") this.journal.append({ kind: "run.paused", runId: run.id });
     // Which nodes each token has finished, per the journal (returns reset descendants).
-    const done = new Map<string, Set<string>>();
+    const done = new Map<string, Set<string>>(Object.values(this.state.tokens).map(t=>[t.id,new Set((t.data.checkpointDone as string[])??[])]));
     for (const e of this.journal.read(0, run.id)) {
       if (e.kind === "attempt.finished" && e.ok && e.error !== "stale") {
         const a = this.state.attempts[e.attempt];
@@ -200,7 +224,7 @@ export class Factory {
     let requeued = 0, voided = 0;
     for (const ts of Object.values(this.state.tokens)) {
       if (ts.status !== "active") continue;
-      const entry = this.state.attempts[ts.attempts[0]]?.node ?? (ts.source === "manual" ? "candidates/tidy" : "candidates/route");
+      const entry = String(ts.data.recoveryRoot??this.state.attempts[ts.attempts[0]]?.node ?? (ts.source === "manual" ? "candidates/tidy" : "candidates/route"));
       const t: TokenRun = {
         id: ts.id, item: ts.item, url: ts.url, title: ts.title, source: ts.source, entry, data: { ...ts.data },
         closure: rt.closureOf(entry), done: done.get(ts.id) ?? new Set(), dead: new Set(), edgeLive: new Map(), inflight: new Set(),

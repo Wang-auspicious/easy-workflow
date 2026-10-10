@@ -14,6 +14,8 @@ import { ClassifiedFailure, classifyFailure } from "../../shared/failures.ts";
 export const VIEW = { width: PREVIEW_RULES.viewport.width, height: PREVIEW_RULES.viewport.height };
 const DECLINE = /^(reject|decline|deny|refuse|necessary only|only necessary|essential only|required only|only required|use necessary cookies only|continue without accepting|拒绝|仅必要|仅限必要|不同意)/i;
 export const STAGE_SELECTORS: string[] = PREVIEW_RULES.kinds["component-source"]?.roles.proof?.stageSelectors ?? ["[class*=preview]", "[class*=demo]", "iframe"];
+/** Query/hash routers identify distinct rendered pages, not tracking noise. */
+export function pageKey(href:string) {try{const u=new URL(href);for(const k of [...u.searchParams.keys()])if(/^utm_|^(ref|fbclid|gclid)$/i.test(k))u.searchParams.delete(k);u.searchParams.sort();if(!/^#(?:\/|!)/.test(u.hash))u.hash="";return u.origin+u.pathname.replace(/\/+$/,"")+u.search+u.hash;}catch{return href;}}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const runFile = promisify(execFile);
 
@@ -85,10 +87,10 @@ async function hideFloating(page: Page): Promise<string[]> {
 }
 
 export async function links(page: Page): Promise<Link[]> {
-  return page.evaluate(() => [...document.querySelectorAll("a[href]")].map((a, order) => {
+  const found=await page.evaluate(() => [...document.querySelectorAll("a[href]")].map((a, order) => {
     const r = a.getBoundingClientRect();
     return {
-      href: (a as HTMLAnchorElement).href.split("#")[0],
+      href: (a as HTMLAnchorElement).href,
       text: (((a as HTMLElement).innerText || a.getAttribute("aria-label") || "").trim()).slice(0, 60),
       inNav: Boolean(a.closest("header, nav, [role=navigation]")),
       inMain: Boolean(a.closest("main, [role=main], article")) && !a.closest("header, nav, footer, aside"),
@@ -97,6 +99,21 @@ export async function links(page: Page): Promise<Link[]> {
       order,
     };
   })).catch(() => []);
+  const stories=await page.evaluate(async()=>{
+    if(!document.querySelector('#storybook-preview-iframe')&&!document.title.toLowerCase().includes('storybook'))return [];
+    const base=new URL(location.href);base.search="";base.hash="";if(!base.pathname.endsWith('/')&&!base.pathname.endsWith('.html'))base.pathname+='/';
+    for(const file of ['index.json','stories.json'])try{
+      const r=await fetch(new URL(file,base),{signal:AbortSignal.timeout(3000)});if(!r.ok)continue;
+      const body=await r.json();const entries=Object.values(body.entries??body.stories??{}) as {id:string;title:string;name:string;type?:string}[];
+      return entries.filter(e=>typeof e.id==='string'&&/^[a-z0-9_-]+$/i.test(e.id)).slice(0,160).map(e=>{
+        const u=new URL(e.type==='docs'?'./':'iframe.html',base);
+        if(e.type==='docs')u.searchParams.set('path',`/docs/${e.id}`);else{u.searchParams.set('id',e.id);u.searchParams.set('viewMode','story');}
+        return {href:u.href,text:`${e.title} ${e.name}`,inNav:true,inMain:e.type!=='docs',hasImage:false,visible:false,order:0};
+      });
+    }catch{}
+    return [];
+  }).catch(()=>[]);
+  return [...found,...stories].filter((l,i,all)=>all.findIndex(a=>pageKey(a.href)===pageKey(l.href))===i);
 }
 
 export function sameSite(href: string, entryHost: string) {
@@ -114,14 +131,14 @@ export function scoreLinks(candidates: Pick<Link, "href" | "text" | "inNav">[], 
     if (/\.(pdf|zip|png|jpe?g|svg|mp4)$/i.test(url.pathname)) continue;
     const reasons: string[] = [];
     let score = 0;
-    const hit = pathRes.findIndex((re) => re.test(url.pathname));
+    const hit = pathRes.findIndex((re) => re.test(url.pathname+(url.searchParams.get('path')??'')));
     if (hit >= 0) { score += 3 + (pathRes.length - hit) * 0.2; reasons.push(`path#${hit + 1}`); }
     const text = link.text.toLowerCase();
     if (texts.some((t) => text === t || text.startsWith(t + " ") || text.endsWith(" " + t))) { score += 2; reasons.push("text"); }
     if (!score) continue;
     if (link.inNav) { score += 1; reasons.push("nav"); }
     score -= url.pathname.split("/").filter(Boolean).length * 0.25;
-    const key = url.origin + url.pathname.replace(/\/+$/, "");
+    const key = pageKey(url.href);
     if (!seen.has(key) || seen.get(key)!.score < score) seen.set(key, { href: key, score: Number(score.toFixed(2)), reasons, text: link.text });
   }
   return [...seen.values()].sort((a, b) => b.score - a.score);
@@ -182,24 +199,25 @@ export async function findStage(page: Page): Promise<Stage | null> {
   return page.evaluate((selectors) => {
     const seen = new Set<Element>();
     const boxes: Stage[] = [];
-    for (const sel of selectors) {
+    const roots:(Document|ShadowRoot)[]=[document];
+    for(let i=0;i<roots.length;i++)for(const el of roots[i].querySelectorAll('*'))if(el.shadowRoot)roots.push(el.shadowRoot);
+    for (const sel of [".bd-example", "[data-preview]", "#storybook-root", "#root > .sb-story", "canvas", "svg", "[class*=playground]", ...selectors]) {
       let found: Element[] = [];
-      try { found = [...document.querySelectorAll(sel)]; } catch { continue; }
+      try { found = roots.flatMap(root=>[...root.querySelectorAll(sel)]); } catch { continue; }
       for (const el of found) {
         if (seen.has(el) || el.closest("nav, header, footer, aside, pre, code")) continue;
         seen.add(el);
         const r = el.getBoundingClientRect();
-        if (r.width < 240 || r.height < 120 || r.top > innerHeight * 1.5) continue;
+        if (r.width < 80 || r.height < 24 || r.height > innerHeight * 1.5 || getComputedStyle(el).visibility==="hidden") continue;
         const painted = el.querySelectorAll("*").length;
-        const media = el.querySelectorAll("canvas, img, svg, video").length + (el.tagName === "IFRAME" ? 1 : 0);
-        if (painted < 3 && !media) continue;
-        const codeOnly = el.querySelectorAll("pre, code").length > 0 && painted - el.querySelectorAll("pre *, code *").length < 4;
-        if (codeOnly) continue;
+        const media = el.querySelectorAll("canvas, img, svg, video").length + (el.matches("iframe,canvas,img,svg,video") ? 1 : 0);
+        if (painted < 1 && !media && !el.matches("button,input,[role=button]")) continue;
+        if (el.querySelector("pre,code") && !el.matches(".bd-example,[data-preview],#storybook-root")) continue;
         const locked = /\b(pro|upgrade|unlock)\b|会员/i.test(((el as HTMLElement).innerText || "").slice(0, 200)) && el.querySelectorAll("svg").length > 0 && painted < 12;
         boxes.push({ sel, x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height, painted, media, locked });
       }
     }
-    boxes.sort((a, b) => b.w * b.h - a.w * a.h);
+    boxes.sort((a, b) => (a.y<innerHeight?0:1)-(b.y<innerHeight?0:1) || b.w*b.h-a.w*a.h);
     return boxes.find((b) => !b.locked) || null;
   }, STAGE_SELECTORS).catch(() => null);
 }

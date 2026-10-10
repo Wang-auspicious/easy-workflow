@@ -38,7 +38,7 @@ test("Pi profile, structured station submission, repair and cancellation", { tim
   fs.writeFileSync(path.join(dir, "auth.json"), JSON.stringify({ fixture: { type: "api_key", key: "local-fixture-secret" } }));
   fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: `http://127.0.0.1:${address.port}/v1`, models: [{ id: "fixture-model", input: ["text"] }] } } }));
   const authBefore = fs.readFileSync(path.join(dir, "auth.json"), "utf8");
-  const ctx = (signal: AbortSignal) => ({ node: { key: "test/classify" }, token: { id: "t-test" }, worker: { id: "w-test" }, attempt: "a-test", signal, progress: () => {} }) as unknown as StationContext;
+  const ctx = (signal: AbortSignal) => ({ node: { key: "curation/classify" }, token: { id: "t-test" }, worker: { id: "w-test" }, attempt: "a-test", signal, progress: () => {} }) as unknown as StationContext;
   const definition = {
     system: "Return a structured value.", schema: Type.Object({ value: Type.Number() }), input: () => ({ text: "Return 7." }),
     check: (value: { value: number }) => value.value < 0 ? ["value must be positive"] : [],
@@ -56,6 +56,7 @@ test("Pi profile, structured station submission, repair and cancellation", { tim
       assert.equal(result.ok, true); assert.deepEqual(result.data, { value: 7 });
       assert.equal(requestCount, 2);
       assert.ok(JSON.stringify(bodies[0]).includes("H2 station contract v1"));
+      assert.ok(JSON.stringify(bodies[0]).includes("职责与场景"),"each model receives its own ROLE.md");
       assert.equal(bodies[0].tools.length, 1, "station agents get only their own submit tool");
       assert.ok(JSON.stringify(bodies[1]).includes("value must be positive"));
       assert.equal(fs.readFileSync(path.join(dir, "auth.json"), "utf8"), authBefore);

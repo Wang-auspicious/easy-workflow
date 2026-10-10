@@ -2,13 +2,13 @@
 // workers and, for the chosen worker, its work as a narrated trace — like a Claude Code
 // sub-agent view: input, thoughts, folded tool steps with their evidence, current activity.
 // A token card shows that item's evidence chain from URL to publication.
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, CircleMinus, Check, AlertTriangle, Loader2, ExternalLink } from "lucide-react";
 import type { CompiledNode, EvidenceRef } from "../../../shared/types.ts";
 import { median, quantile, type AttemptState } from "../../../shared/project.ts";
 import { roleColors } from "../../../shared/palette.ts";
 import { attach, getState, setState, useStore, type Inspector } from "../store.ts";
-import { actions } from "../api.ts";
+import { actions, api } from "../api.ts";
 import { StationIcon } from "./StationIcon.tsx";
 import { fmt, secs } from "./Node.tsx";
 import { openCorrection } from "../board/Correction.tsx";
@@ -212,8 +212,11 @@ function PartInspector({ insp, geo, onDrag, onClose, onPin }: { insp: Inspector;
 }
 
 function SpecView({ node }: { node: CompiledNode }) {
+  const [role,setRole]=useState("");
+  useEffect(()=>{let alive=true;setRole("");void api.post<{result:{content:string}}>("/api/tools/read_role",{station:node.key}).then(r=>{if(alive)setRole(r.result.content);}).catch(e=>{if(alive)setRole(e.message);});return()=>{alive=false;};},[node.key]);
   return (
     <div className="insp-body spec-view">
+      <details className="node-role" open><summary>ROLE.md · 职责与异常处理</summary><pre>{role||"正在读取职责…"}</pre></details>
       <div className="spec-row"><span>I/O</span><code>{node.input} → {node.output}</code></div>
       <div className="spec-row"><span>工人</span><code>min {node.workers.min} · max {node.workers.max} · 初始 {node.workers.initial} · {node.workers.policy === "auto" ? "自动伸缩" : "固定"}</code></div>
       <div className="spec-row"><span>预计耗时</span><code>{node.estimateSeconds}s</code></div>
@@ -286,7 +289,7 @@ function Trace({ a, node, c, now }: { a: AttemptState; node: CompiledNode; c: st
 
 function SayRow({ st }: { st: AttemptState["steps"][number] }) {
   const tool = st.step?.tool;
-  const cls = tool === "think" ? "say--think" : tool === "check" ? (st.step?.ok === false ? "say--bad" : "say--ok") : tool === "submit" ? "say--submit" : tool === "model" ? "say--model" : "";
+  const cls = st.step?.ok===false?"say--bad":st.step?.ok===true?"say--ok":tool === "think" ? "say--think" : tool === "submit" ? "say--submit" : tool === "model" ? "say--model" : "";
   return (
     <div className={`say ${cls}`}>
       <span className="say-dot" />

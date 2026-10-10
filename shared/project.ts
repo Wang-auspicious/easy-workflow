@@ -322,7 +322,7 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
     }
     case "candidate.disposition": {
       const prior=s.recoveries[e.candidate.item];
-      s.recoveries[e.candidate.item]={...e.candidate,at:e.at,attempts:(prior?.attempts??0)+(e.candidate.disposition==="retry"||e.candidate.disposition==="removed"?1:0)};
+      s.recoveries[e.candidate.item]={...e.candidate,at:e.at,attempts:(prior?.attempts??0)+((e.candidate.disposition==="retry"||e.candidate.disposition==="removed")&&!(prior?.token===e.candidate.token&&prior.disposition===e.candidate.disposition)?1:0)};
       const t=s.tokens[e.candidate.token];
       if(t && t.status!=="active" && (e.candidate.disposition==="retry"||e.candidate.disposition==="removed")) {
         // Old versions rejected network failures as successes. Keep the immutable
@@ -417,6 +417,13 @@ export function nodeLight(n: NodeState | undefined, dormant: boolean, now: numbe
   if (n.failed) return "yellow";
   if (n.processed || n.stock) return "green";
   return "idle";
+}
+
+/** A retry is another attempt at the same item, not another unresolved item. */
+export function latestRunTokens(s:FactoryState) {
+  const latest=new Map<string,TokenState>();
+  for(const id of s.tokenOrder){const t=s.tokens[id];if(t&&t.createdAt>=s.run.startedAt)latest.set(t.item,t);}
+  return [...latest.values()];
 }
 
 /** Station takt: median service time divided by worker count (Spec §7.2). */

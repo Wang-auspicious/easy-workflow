@@ -2,6 +2,7 @@
 // does station work. Every action it takes is a journaled event with a reason.
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import fs from "node:fs";
+import {readRole} from "./roles.ts";
 import type { Attachment } from "../shared/types.ts";
 import { transcriptMessage, legacyReply, type PiMessage } from "../shared/conversation.ts";
 import { models, MODEL_ID, promptAgent } from "./agent-station.ts";
@@ -35,7 +36,7 @@ export class Dispatcher {
     if (this.agent) return this.agent;
     const { stream, model } = models();
     this.agent = new Agent({
-      initialState: { systemPrompt: SYSTEM + "\n\n" + this.control.bootstrap().instructions, model, thinkingLevel: "off", tools: this.control.agentTools() as never },
+      initialState: { systemPrompt: readRole("dispatcher").content + "\n\n" + SYSTEM + "\n\n" + this.control.bootstrap().instructions, model, thinkingLevel: "off", tools: this.control.agentTools() as never },
       streamFn: stream,
       sessionId: "factory-dispatcher",
       // Bounded memory view: keep the newest turns (Spec §5.1 — OptChat evaluation pending, R8).
@@ -103,7 +104,8 @@ export class Dispatcher {
       const images = attachments.filter((a) => a.type === "evidence").map((a) => this.f.state.evidence[a.id]).filter((e) => e?.card && e.kind !== "video").slice(0, 6)
         .map((e) => this.f.store.resolve(e!.card!)).filter((p): p is string => Boolean(p && fs.existsSync(p)));
       const { EvidenceStore } = await import("./evidence.ts");
-      const content = attachments.length ? `${text}\n\n附件：\n${attachments.map((a) => this.describe(a)).join("\n")}` : text;
+      const current=(await this.control.execute("status",{},"dispatcher")).result;
+      const content = `${text}${attachments.length?`\n\n附件：\n${attachments.map((a) => this.describe(a)).join("\n")}`:""}\n\n<H2_CURRENT_STATE at="${new Date().toISOString()}">${JSON.stringify(current)}</H2_CURRENT_STATE>\n以上为本次对话开始时的实时快照，历史回答中的数字可能已过期。若后续操作改变状态，回答前再次核对。`;
       await promptAgent(agent, content, images.length ? images.map((p) => ({ type: "image" as const, data: EvidenceStore.jpeg(p).toString("base64"), mimeType: "image/jpeg" })) : undefined);
       const last = [...agent.state.messages].reverse().find((m) => m.role === "assistant") as { content?: { type: string; text?: string }[]; usage?: { input: number; output: number; cost?: { total: number } } } | undefined;
       const reply = (last?.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("").trim() || (agent.state.errorMessage ? `（模型出错：${agent.state.errorMessage.slice(0, 160)}）` : "（已处理）");

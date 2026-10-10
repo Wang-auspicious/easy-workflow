@@ -40,6 +40,7 @@ export function EvidenceBoard() {
       const t = s.fs.tokens[id];
       if (!t) continue;
       if (f.run === "current" && t.createdAt < runStart) continue;
+      if(f.run==="current"&&typeof t.data.retriedBy==="string"&&s.fs.tokens[t.data.retriedBy])continue;
       const all = t.evidence.map((e) => s.fs.evidence[e]).filter((e): e is EvidenceRef => Boolean(e));
       // Latest image per role (a reshoot replaces the earlier one in the row).
       const byRole = new Map<string, EvidenceRef>();

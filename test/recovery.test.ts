@@ -87,11 +87,16 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
     await t.test("explicit tagged retry claims once and keeps invalid candidates excluded",async()=>{
       const f=factory!,control=new FactoryControl(f);
       assert.match(control.bootstrap().instructions,/candidate_failures/);
-      f.runtime.executors=()=>async()=>({ok:true,summary:"fixture complete",finish:{status:"published",reason:"test outcome"}});
+      f.journal.append({kind:"token.data",token:"network",patch:{canonical:base,kind:"tool",home:{title:"Existing evidence"}}});
+      f.journal.append({kind:"evidence.added",evidence:{id:"before-retry",token:"network",station:"curation/fetch",attempt:"a-network",at:Date.now(),kind:"text",label:"Existing evidence"}});
+      let resumedAt="";
+      f.runtime.executors=n=>async ctx=>{resumedAt=n.key;assert.equal(ctx.token.data.kind,"tool");return {ok:true,summary:"fixture complete",finish:{status:"published",reason:"test outcome"}};};
       const result=await control.execute("retry_candidates",{tag:"network_connection",count:10});
       assert.equal(result.result.count,1);
       const again=await control.execute("retry_candidates",{tag:"network_connection",count:10});assert.equal(again.result.count,0);
       await f.runtime.settle();
+      assert.equal(resumedAt,"curation/fetch","resume the failing station, not intake/classification");
+      assert.ok(f.state.tokens[result.result.tokens[0].id].evidence.some(id=>f.state.evidence[id].meta?.reusedFrom==="before-retry"));
       assert.equal(f.state.recoveries.network.disposition,"resolved");
       assert.equal(f.state.recoveries.invalid.disposition,"removed");
       assert.equal(f.state.nodes["candidates/pool"].stock,1);
