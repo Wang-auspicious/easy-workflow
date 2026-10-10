@@ -94,12 +94,19 @@ try {
   assert.ok(bounds.some(b=>b.width>600&&b.height>400), 'native browser view mounted in the browser body');
   await app.evaluate(async({session},url)=>session.fromPartition('persist:h2-browser').cookies.set({url,name:'shared-session-test',value:'shared-with-worker'}),fixtureURL);
   const lease=await app.evaluate(()=>globalThis.__factoryBrowser({action:'lease'}));
+  await page.locator('.rail-item[data-tip="画布 · 流水线  Alt 1"]').click();
   const cdp=await chromium.connectOverCDP(lease.endpoint);
   try {
     let workerPage;
     for(let i=0;i<30&&!workerPage;i++){workerPage=cdp.contexts().flatMap(c=>c.pages()).find(p=>p.url()===lease.marker);if(!workerPage)await new Promise(r=>setTimeout(r,50));}
     assert.ok(workerPage,'leased native tab is available to background automation');
     await workerPage.goto(fixtureURL);
+    await workerPage.screenshot({path:path.join(artifacts,'background-capture.png'),timeout:4000});
+    const screencast=await workerPage.context().newCDPSession(workerPage);let frameCount=0;
+    screencast.on('Page.screencastFrame',e=>{frameCount++;void screencast.send('Page.screencastFrameAck',{sessionId:e.sessionId}).catch(()=>{});});
+    await screencast.send('Page.startScreencast',{format:'jpeg',quality:80,everyNthFrame:1});
+    for(let i=0;i<12&&frameCount<2;i++){await workerPage.evaluate(i=>document.body.style.background=i%2?'#ddeeff':'#fff',i);await new Promise(r=>setTimeout(r,100));}
+    await screencast.send('Page.stopScreencast');await screencast.detach();assert.ok(frameCount>=2,'background recording must produce real frames');
     assert.match(await workerPage.evaluate(()=>document.cookie),/shared-session-test=shared-with-worker/);
     await workerPage.goto(fixtureURL+'/login');
     await page.locator('.rail-browser-alert').waitFor();
@@ -110,6 +117,7 @@ try {
     await browserCall({action:'close',id:lease.id});
   } finally { await cdp.close(); }
   await browserCall({action:'bookmark.add',url:fixtureURL,title:'本地验证'});
+  await page.locator('.rail-item[data-tip="内置浏览器"]').click();
   await browserCall({action:'bookmark.move',id:'bilibili',before:'x'});
   await page.waitForFunction(()=>document.querySelector('.browser-bookmarks button')?.textContent.includes('B 站'));
   await page.screenshot({path:path.join(artifacts,'shared-browser.png')});
@@ -150,6 +158,7 @@ try {
   assert.deepEqual(errors, []);
   results.checks.push('no renderer exceptions');
   results.ok = true;
+  results.checks.push('background screenshot and recording frames while canvas is active');
   fs.writeFileSync(path.join(artifacts, 'smoke.json'), JSON.stringify(results, null, 2));
   console.log(JSON.stringify(results, null, 2));
 } finally {

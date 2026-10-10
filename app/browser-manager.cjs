@@ -39,7 +39,10 @@ class BrowserManager {
   mount() {
     if (!this.window || this.window.isDestroyed()) return;
     const view = this.bounds && this.tabs.get(this.active)?.view;
-    if (this.mounted && this.mounted !== view) this.window.contentView.removeChildView(this.mounted);
+    if (this.mounted && this.mounted !== view) {
+      this.window.contentView.removeChildView(this.mounted);
+      if (!this.mounted.webContents.isDestroyed()) this.window.contentView.addChildView(this.mounted,0);
+    }
     this.mounted = view || null;
     if (view) { this.window.contentView.addChildView(view); view.setBounds(this.bounds); }
   }
@@ -55,6 +58,9 @@ class BrowserManager {
     const view = new WebContentsView({ webPreferences: { partition: this.partition, nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true, backgroundThrottling: owner !== 'agent' } });
     const t = { id, view, url, title: url === 'about:blank' ? '新标签页' : new URL(url).hostname, owner, loading: false, attention: undefined };
     this.tabs.set(id,t); view.setBounds({x:0,y:0,width:1280,height:800});
+    // Detached WebContentsViews can navigate but have no composited frame to capture.
+    // Keep task pages mounted beneath the app surface; bring only the selected tab forward.
+    this.window?.contentView.addChildView(view,0);
     const wc = view.webContents;
     wc.setAudioMuted(true);
     wc.setWindowOpenHandler(({url}) => { try { this.create(url, 'user'); } catch {} return {action:'deny'}; });
