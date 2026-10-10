@@ -1,0 +1,346 @@
+{
+  "source": "https://github.com/jeremy-prt/bloub (MIT, © 2026 Jérémy Perret) — avatars rendered from its engine",
+  "size": 96,
+  "fps": 20,
+  "seconds": 3,
+  "shapes": {
+    "circle": "cercle",
+    "squircle": "squircle",
+    "drop": "goutte",
+    "capsule": "capsule",
+    "star": "nuage",
+    "hex": "hexagone",
+    "bean": "galet"
+  },
+  "states": {
+    "idle": {
+      "expression": "neutre"
+    },
+    "work": {
+      "expression": "attentif",
+      "scan": true
+    },
+    "wait": {
+      "expression": "blase"
+    },
+    "returned": {
+      "expression": "confus"
+    },
+    "fail": {
+      "expression": "effraye"
+    },
+    "sleep": {
+      "expression": "somnolent"
+    }
+  },
+  "roleInk": {
+    "source": "#0086d9",
+    "social": "#0094af",
+    "candidate": "#5a79d9",
+    "sort": "#00978b",
+    "judge": "#1a9951",
+    "capture": "#738c17",
+    "process": "#5d879c",
+    "write": "#7970d5",
+    "verify": "#956ab9",
+    "review": "#b47000",
+    "arbiter": "#cb5a00",
+    "publish": "#d24c4c",
+    "channel": "#b456ae",
+    "store": "#5b5a55"
+  },
+  "combos": {
+    "goutte-source": [
+      "idle",
+      "sleep"
+    ],
+    "cercle-source": [
+      "idle",
+      "sleep"
+    ],
+    "hexagone-social": [
+      "idle",
+      "sleep"
+    ],
+    "goutte-social": [
+      "idle",
+      "sleep"
+    ],
+    "squircle-social": [
+      "idle",
+      "sleep"
+    ],
+    "capsule-candidate": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "cercle-candidate": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "goutte-candidate": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "cercle-sort": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "capsule-sort": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "nuage-judge": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "goutte-review": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "nuage-arbiter": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "goutte-sort": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "squircle-capture": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "goutte-capture": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "cercle-capture": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "goutte-process": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "nuage-review": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "capsule-judge": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "squircle-verify": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "capsule-write": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "squircle-review": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "cercle-publish": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "capsule-store": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "cercle-arbiter": [
+      "idle",
+      "work",
+      "wait",
+      "returned",
+      "fail",
+      "sleep"
+    ],
+    "nuage-channel": [
+      "idle",
+      "sleep"
+    ],
+    "nuage-sort": [
+      "idle",
+      "sleep"
+    ],
+    "cercle-write": [
+      "idle",
+      "sleep"
+    ],
+    "squircle-process": [
+      "idle",
+      "sleep"
+    ],
+    "galet-review": [
+      "idle",
+      "sleep"
+    ],
+    "cercle-store": [
+      "idle",
+      "sleep"
+    ],
+    "hexagone-channel": [
+      "idle",
+      "sleep"
+    ],
+    "hexagone-process": [
+      "idle",
+      "sleep"
+    ],
+    "galet-store": [
+      "idle",
+      "sleep"
+    ],
+    "goutte-channel": [
+      "idle",
+      "sleep"
+    ],
+    "squircle-sort": [
+      "idle",
+      "sleep"
+    ],
+    "galet-verify": [
+      "idle",
+      "sleep"
+    ],
+    "hexagone-write": [
+      "idle",
+      "sleep"
+    ],
+    "cercle-review": [
+      "idle",
+      "sleep"
+    ],
+    "goutte-store": [
+      "idle",
+      "sleep"
+    ],
+    "hexagone-capture": [
+      "idle",
+      "sleep"
+    ],
+    "squircle-write": [
+      "idle",
+      "sleep"
+    ],
+    "hexagone-review": [
+      "idle",
+      "sleep"
+    ],
+    "capsule-channel": [
+      "idle",
+      "sleep"
+    ],
+    "squircle-store": [
+      "idle",
+      "sleep"
+    ],
+    "squircle-channel": [
+      "idle",
+      "sleep"
+    ],
+    "galet-process": [
+      "idle",
+      "sleep"
+    ],
+    "nuage-capture": [
+      "idle",
+      "sleep"
+    ],
+    "cercle-verify": [
+      "idle",
+      "sleep"
+    ],
+    "hexagone-store": [
+      "idle",
+      "sleep"
+    ],
+    "cercle-dispatcher": [
+      "idle",
+      "work"
+    ]
+  }
+}
