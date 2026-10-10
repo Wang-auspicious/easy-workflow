@@ -47,7 +47,9 @@ function definitions(f: Factory): Tool[] {
           }).filter((x) => x.queue || x.active || x.processed || x.failed || x.returned);
           const bottleneck = f.runtime.lineTakt("curation");
           return ok({
-            run: { ...s.run, elapsedMin: +(elapsed(s.run, now) / 60000).toFixed(1) }, totals: s.totals,
+            run: { ...s.run, elapsedMin: +(elapsed(s.run, now) / 60000).toFixed(1) }, totals: {...s.totals,
+              parked:Object.values(s.tokens).filter(t=>t.createdAt>=s.run.startedAt&&t.status==="parked").length,
+              failedAttempts:stations.reduce((n,station)=>n+station.failed,0)},
             tokensActive: Object.values(s.tokens).filter((t) => t.status === "active").length, stations,
             bottleneck: bottleneck.at ? `${nodeName(bottleneck.at)} 节拍 ${bottleneck.takt.toFixed(1)}s` : "尚无实测", resources: s.resources,
             candidatePool: s.nodes["candidates/pool"]?.stock, published: s.nodes["curation/published"]?.stock,

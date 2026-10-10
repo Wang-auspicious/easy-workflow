@@ -12,7 +12,7 @@ import { toggleInspector } from "../canvas/Canvas.tsx";
 type Mode = "rows" | "tiles";
 const KIND_ZH: Record<string, string> = { gallery: "灵感合集", "component-source": "组件源", "design-system": "设计规范", assets: "素材与模板", tool: "工具与库", knowledge: "知识", work: "作品" };
 const ROLE_ZH: Record<string, string> = { identity: "首屏", breadth: "目录", proof: "特写" };
-const STATUS_ZH: Record<string, string> = { active: "在线上", published: "已发布", merged: "已合并", rejected: "拒收", manual: "待人工", failed: "失败", parked: "停放" };
+const STATUS_ZH: Record<string, string> = { active: "在线上", published: "已发布", merged: "已合并", rejected: "已排除", manual: "待人工", failed: "失败", parked: "待重试" };
 
 interface Row { t: TokenState; images: EvidenceRef[]; suspicious: string[] }
 
@@ -221,8 +221,8 @@ function Ev({ e, t, sel, cur, tile, onClick, onZoom }: { e: EvidenceRef; t: Toke
   const returning = t.status === "active" && t.at.includes(e.station);
   return (
     <div className={`ev ${sel ? "is-sel" : ""} ${cur ? "is-cur" : ""} ${tile ? "is-tile" : ""}`} data-ev={e.id} onClick={onClick} onDoubleClick={onZoom}>
-      {e.kind==="image"||e.kind==="video"?<img src={e.poster ?? e.card ?? e.src} alt="" draggable={false} loading="lazy" />:<div className={`ev-document tone-${e.tone??"none"}`}>{e.kind==="verdict"?<ClipboardCheck size={23}/>:<FileText size={23}/>}<b>{e.label}</b><span>{e.verdict||"查看文字证据"}</span></div>}
-      <span className="ev-role">{ROLE_ZH[String(e.meta?.role)] ?? (e.kind === "video" ? "录屏" : e.label)}</span>
+      {e.kind==="image"||e.kind==="video"?<img src={e.poster ?? e.card ?? e.src} alt="" draggable={false} loading="lazy" />:<div className={`ev-document tone-${e.tone??"none"}`}><header>{e.kind==="verdict"?<ClipboardCheck size={17}/>:<FileText size={17}/>}<b>{e.label}</b></header><span>{e.verdict||"查看文字证据"}</span></div>}
+      {(e.kind==="image"||e.kind==="video")&&<span className="ev-role">{ROLE_ZH[String(e.meta?.role)] ?? (e.kind === "video" ? "录屏" : e.label)}</span>}
       {e.kind === "video" && <span className="play">▶</span>}
       {returning && <span className="ev-state">已退回 → 重做中</span>}
       {!returning && corrected && <span className="ev-state is-done">已纠错</span>}

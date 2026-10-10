@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
-import { classifyFailure } from "../shared/failures.ts";
+import { classifyFailure, candidateFailure } from "../shared/failures.ts";
 import type { StationContext } from "../server/runtime.ts";
 
 // Every database, catalogue and report belongs to this test process.
@@ -41,6 +41,9 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       }
       assert.equal(classifyFailure("page.screenshot: Timeout 30000ms exceeded").tag,"browser_capture");
       assert.equal(classifyFailure("page.goto: Timeout 40000ms exceeded").tag,"network_timeout");
+      const deadDemo=classifyFailure("HTTP 404",{url:"https://example.test/demos/old",status:404});
+      assert.equal(candidateFailure(deadDemo,"https://example.test").retryable,true,"a broken demo must not remove its valid homepage");
+      assert.equal(candidateFailure(deadDemo,"https://example.test/demos/old").retryable,false,"a dead candidate entry itself is removed");
     });
     await t.test("real HTTP errors are failed station results; successful text remains evidence",async()=>{
       const evidence:unknown[]=[];

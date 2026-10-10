@@ -5,7 +5,7 @@
 import crypto from "node:crypto";
 import type { CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
 import { median } from "../shared/project.ts";
-import { classifyFailure, failureLabels, type Failure } from "../shared/failures.ts";
+import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
 import { ControlError } from "./errors.ts";
 import type { Broker, Lease } from "./broker.ts";
 import type { Journal } from "./journal.ts";
@@ -371,7 +371,7 @@ export class Runtime {
     if (res.ok) (this.durations.get(n.key) ?? this.durations.set(n.key, []).get(n.key)!).push(ms);
 
     if (!res.ok) {
-      const failure=res.failure ?? classifyFailure(res.error??res.summary,{url:t.url});
+      const failure=candidateFailure(res.failure ?? classifyFailure(res.error??res.summary,{url:t.url}),String(t.data.canonical??t.url));
       t.finished=true;t.data.failure=failure;
       for(const [id,controller] of this.aborts)if(this.attemptTokens.get(id)===t.id)controller.abort();
       for(const q of this.queues.values()){const i=q.indexOf(t.id);if(i>=0)q.splice(i,1);}

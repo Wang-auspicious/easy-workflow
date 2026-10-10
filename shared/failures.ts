@@ -1,7 +1,15 @@
-export type FailureTag = "invalid_url" | "http_not_found" | "network_timeout" | "network_dns" | "network_connection" | "network_tls" | "http_rate_limit" | "http_server" | "auth_required" | "browser_capture" | "tool_error" | "run_ended";
+export type FailureTag = "invalid_url" | "http_not_found" | "page_unavailable" | "network_timeout" | "network_dns" | "network_connection" | "network_tls" | "http_rate_limit" | "http_server" | "auth_required" | "browser_capture" | "tool_error" | "run_ended";
 export interface Failure { tag:FailureTag; category:"invalid"|"network"|"auth"|"system"; message:string; url?:string; code?:string; status?:number; retryable:boolean }
 export interface CandidateRecovery { item:string; token:string; url:string; title:string; source:string; category?:string; disposition:"retry"|"removed"|"claimed"|"resolved"; failure?:Failure; at:number; attempts:number }
-export const failureLabels:Record<FailureTag,string>={invalid_url:"网址格式错误",http_not_found:"页面不存在",network_timeout:"网络超时",network_dns:"DNS 解析失败",network_connection:"连接中断",network_tls:"TLS / 证书问题",http_rate_limit:"访问限流",http_server:"站点暂时异常",auth_required:"登录或验证",browser_capture:"浏览器截图异常",tool_error:"工具执行异常",run_ended:"本轮中止，尚未完成"};
+export const failureLabels:Record<FailureTag,string>={invalid_url:"网址格式错误",http_not_found:"页面不存在",page_unavailable:"采集子页面失效",network_timeout:"网络超时",network_dns:"DNS 解析失败",network_connection:"连接中断",network_tls:"TLS / 证书问题",http_rate_limit:"访问限流",http_server:"站点暂时异常",auth_required:"访问受限 / 登录验证",browser_capture:"浏览器截图异常",tool_error:"工具执行异常",run_ended:"本轮中止，尚未完成"};
+
+/** A dead detail/demo link is not evidence that the candidate's homepage is dead. */
+export function candidateFailure(failure:Failure, entryURL:string):Failure {
+  const key=(url:string)=>url.split("#")[0].replace(/\/$/,"");
+  if(failure.tag==="http_not_found" && failure.url && key(failure.url)!==key(entryURL))
+    return {...failure,tag:"page_unavailable",category:"system",retryable:true,message:`采集子页面失效，需要重新选择页面：${failure.url}（${failure.message}）`};
+  return failure;
+}
 
 export function classifyFailure(error:unknown, context:{url?:string;status?:number;stage?:string}={}):Failure {
   const e=error as {message?:string;code?:string;cause?:{code?:string;message?:string}};
