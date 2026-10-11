@@ -1,7 +1,13 @@
-export type FailureTag = "invalid_url" | "http_not_found" | "page_unavailable" | "network_timeout" | "network_dns" | "network_connection" | "network_tls" | "http_rate_limit" | "http_server" | "auth_required" | "browser_capture" | "tool_error" | "run_ended" | "needs_selection" | "missing_artifact" | "quality_rejected";
-export interface Failure { tag:FailureTag; category:"invalid"|"network"|"auth"|"system"; message:string; url?:string; code?:string; status?:number; retryable:boolean }
+export type FailureTag = "invalid_url" | "http_not_found" | "page_unavailable" | "network_timeout" | "network_dns" | "network_connection" | "network_tls" | "http_rate_limit" | "http_server" | "auth_required" | "browser_capture" | "tool_error" | "run_ended" | "needs_selection" | "missing_artifact" | "quality_rejected" | "model_unavailable";
+export interface Failure { tag:FailureTag; category:"invalid"|"network"|"auth"|"system"; message:string; url?:string; code?:string; status?:number; retryable:boolean;
+  /** What to do next, written for the agent or person who owns the fix (Spec §30.4). */
+  nextAction?:string;
+  /** Who can fix it: the agent itself, the owner (login, certificate, credentials) or the system (bug / environment). */
+  owner?:"agent"|"user"|"system";
+  /** Methods already tried, so nobody repeats them. */
+  tried?:string[] }
 export interface CandidateRecovery { item:string; token:string; url:string; title:string; source:string; category?:string; disposition:"retry"|"removed"|"claimed"|"resolved"; failure?:Failure; at:number; attempts:number }
-export const failureLabels:Record<FailureTag,string>={invalid_url:"网址格式错误",http_not_found:"页面不存在",page_unavailable:"采集子页面失效",network_timeout:"网络超时",network_dns:"DNS 解析失败",network_connection:"连接中断",network_tls:"TLS / 证书问题",http_rate_limit:"访问限流",http_server:"站点暂时异常",auth_required:"访问受限 / 登录验证",browser_capture:"浏览器截图异常",tool_error:"工具执行异常",run_ended:"本轮中止，尚未完成",needs_selection:"需要重新选页",missing_artifact:"产物引用失效",quality_rejected:"图像质量不合格"};
+export const failureLabels:Record<FailureTag,string>={invalid_url:"网址格式错误",http_not_found:"页面不存在",page_unavailable:"采集子页面失效",network_timeout:"网络超时",network_dns:"DNS 解析失败",network_connection:"连接中断",network_tls:"TLS / 证书问题",http_rate_limit:"访问限流",http_server:"站点暂时异常",auth_required:"访问受限 / 登录验证",browser_capture:"浏览器截图异常",tool_error:"工具执行异常",run_ended:"本轮中止，尚未完成",needs_selection:"需要重新选页",missing_artifact:"产物引用失效",quality_rejected:"图像质量不合格",model_unavailable:"模型不可用（额度 / 凭据 / 限流）"};
 
 export function recoveryAdvice(f:Failure|undefined) {
   const tag=f?.tag;
@@ -18,7 +24,7 @@ export function recoveryAdvice(f:Failure|undefined) {
 export function candidateFailure(failure:Failure, entryURL:string):Failure {
   const key=(url:string)=>url.split("#")[0].replace(/\/$/,"");
   if(failure.tag==="http_not_found" && failure.url && key(failure.url)!==key(entryURL))
-    return {...failure,tag:"page_unavailable",category:"system",retryable:true,message:`采集子页面失效，需要重新选择页面：${failure.url}（${failure.message}）`};
+    return withAdvice({...failure,tag:"page_unavailable",category:"system",retryable:true,nextAction:undefined,owner:undefined,message:`采集子页面失效，需要重新选择页面：${failure.url}（${failure.message}）`});
   return failure;
 }
 
@@ -30,7 +36,8 @@ export function classifyFailure(error:unknown, context:{url?:string;status?:numb
   const text=`${code??""} ${message} ${e?.cause?.message??""}`;
   const status=context.status??(Number(text.match(/(?:HTTP|httpError:)[ :]*(\d{3})/i)?.[1]??0)||undefined);
   let tag:FailureTag="tool_error",category:Failure["category"]="system";
-  if(context.stage==="url"||/invalid url|无法解析.*网址/i.test(text)){tag="invalid_url";category="invalid";}
+  if(context.stage==="model"&&/401|403|429|quota|insufficient|credit|balance|rate.?limit|unauthori[sz]ed|api key|余额|额度/i.test(text)){tag="model_unavailable";category="auth";}
+  else if(context.stage==="url"||/invalid url|无法解析.*网址/i.test(text)){tag="invalid_url";category="invalid";}
   else if(status===404||status===410){tag="http_not_found";category="invalid";}
   else if([401,403].includes(status??0)||/登录|验证|captcha|loginWall|challenge/i.test(text)){tag="auth_required";category="auth";}
   else if(/原图丢失|[.](png|webp).*missing/i.test(text)){tag="missing_artifact";}
@@ -43,8 +50,30 @@ export function classifyFailure(error:unknown, context:{url?:string;status?:numb
   else if(/certificate|CERT_|TLS|SSL/i.test(text)){tag="network_tls";category="network";}
   else if(/timeout|timed? ?out|ETIMEDOUT|超时/i.test(text)){tag="network_timeout";category="network";}
   else if(/fetch failed|ECONN|ERR_CONNECTION|socket|network|导航|navigation/i.test(text)){tag="network_connection";category="network";}
-  return {tag,category,message,url:context.url,code,status,retryable:category!=="invalid"};
+  return withAdvice({tag,category,message,url:context.url,code,status,retryable:category!=="invalid"});
 }
+
+const OWNER:Record<FailureTag,"agent"|"user"|"system">={invalid_url:"agent",http_not_found:"agent",page_unavailable:"agent",network_timeout:"system",network_dns:"system",network_connection:"system",network_tls:"user",http_rate_limit:"system",http_server:"system",auth_required:"user",browser_capture:"system",tool_error:"system",run_ended:"system",needs_selection:"agent",missing_artifact:"system",quality_rejected:"agent",model_unavailable:"user"};
+const NEXT:Record<FailureTag,string>={
+  invalid_url:"网址无法使用：检查是否为仓库写法或拼写错误；确实无效就排除并保留出处。",
+  http_not_found:"入口 404/410：换一个同站入口（首页、文档首页），确实不存在才排除。",
+  page_unavailable:"子页面失效：从拍摄单的备选页或站点目录里换一页，不要删除整站。",
+  network_timeout:"网络超时：环境已自动重试一次；稍后按原因批量重试，不在原地连续重试。",
+  network_dns:"DNS 解析失败：检查代理或域名；不能据此判定网址永久无效。",
+  network_connection:"连接中断：环境会尝试用共享浏览器补取；仍失败就按原因稍后重试。",
+  network_tls:"证书错误：已亮红灯通知站长；不要跳过校验，等站长处理或给出正确入口。",
+  http_rate_limit:"被限流：降低该主机的请求频率，稍后重试。",
+  http_server:"站点暂时异常（5xx）：稍后重试，不改动已完成的成果。",
+  auth_required:"需要登录或验证：已亮红灯并保留页面；等站长在内置浏览器完成登录后按原因重试。",
+  browser_capture:"截图异常：环境问题，页面池会自动重建；本次作废重排，不计站点失败。",
+  tool_error:"工具异常：记录完整错误交给系统修复，不要反复尝试同一方法。",
+  run_ended:"本轮已结束：下轮从失败工位继续，复用已有成果。",
+  needs_selection:"没有合格页面：列出试过的页和拒收原因，交阅读员或站长指定页面。",
+  missing_artifact:"产物引用失效：先从持久证据恢复，只补做确实丢失的部分。",
+  quality_rejected:"图像不合格：按拒收原因在原页重新取景或换备选页。",
+  model_unavailable:"模型不可用：已暂停领取模型任务并亮红灯；站长检查额度、凭据或代理后按原因重试。",
+};
+export function withAdvice(f:Failure):Failure { return {...f,owner:f.owner??OWNER[f.tag],nextAction:f.nextAction??NEXT[f.tag]}; }
 
 export class ClassifiedFailure extends Error {
   failure:Failure;

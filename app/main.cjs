@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, ipcMain, dialog, session } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, dialog, session, shell } = require('electron');
 const { fork } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -18,6 +18,31 @@ let viewDir = process.env.FACTORY_VIEW_VAR || null;
 const configFile = () => path.join(app.getPath('userData'), 'desktop.json');
 const config = () => { try { return JSON.parse(fs.readFileSync(configFile(), 'utf8')); } catch { return {}; } };
 const isWeb = (url) => { try { return ['http:', 'https:'].includes(new URL(url).protocol); } catch { return false; } };
+const saveConfig = (patch) => fs.writeFileSync(configFile(), JSON.stringify({ ...config(), ...patch }, null, 2));
+
+/* Projects (Spec §30.1): one folder per project holds all of its data. Test profiles keep
+ * their projects inside the profile; real profiles default to Documents/Pi Factory/Projects. */
+function defaultProject() {
+  const base = process.env.FACTORY_PROFILE ? path.join(app.getPath('userData'), 'projects') : path.join(app.getPath('documents'), 'Pi Factory', 'Projects');
+  return path.join(base, 'vislexicon-curation');
+}
+function activeProject() {
+  if (process.env.FACTORY_PROJECT) return path.resolve(process.env.FACTORY_PROJECT);
+  const saved = config().activeProject;
+  if (saved) return saved;
+  const dir = defaultProject();
+  // Copy (never move) data from the old single workspace the first time.
+  const legacy = path.join(app.getPath('userData'), 'workspace');
+  if (!fs.existsSync(path.join(dir, 'journal.db')) && fs.existsSync(path.join(legacy, 'journal.db'))) {
+    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    fs.cpSync(legacy, dir, { recursive: true, errorOnExist: false, force: false });
+  }
+  return dir;
+}
+function rememberProject(dir) {
+  const recent = [dir, ...(config().recentProjects ?? []).filter((d) => d !== dir)].slice(0, 8);
+  saveConfig({ activeProject: dir, recentProjects: recent });
+}
 if (!app.requestSingleInstanceLock()) app.quit();
 app.on('second-instance', () => { if (window) { if (window.isMinimized()) window.restore(); window.show(); window.focus(); } });
 
@@ -39,7 +64,8 @@ async function startBackend() {
   const env = {
     ...process.env, ELECTRON_RUN_AS_NODE: '1', FACTORY_ROOT: root,
     FACTORY_PORT: '0', FACTORY_TOKEN: token,
-    FACTORY_VAR: viewDir || path.join(profile, 'workspace'),
+    FACTORY_VAR: viewDir || activeProject(),
+    FACTORY_PROJECT_NAME: path.basename(viewDir || activeProject()),
     FACTORY_LAYOUT: path.join(profile, 'layout', 'factory.layout.json'),
     FACTORY_READONLY: viewDir ? '1' : '0', FACTORY_START_PAUSED: '1',
     FACTORY_BROWSER_BRIDGE: '1',
@@ -82,18 +108,38 @@ function secureSession(s) {
   s.setPermissionCheckHandler(() => false);
 }
 
+const windowTitle = () => viewDir ? 'Pi Factory · 只读查看已有运行' : `Pi Factory · ${path.basename(activeProject())}`;
 async function changeWorkspace(dir) {
   viewDir = dir;
   await stopBackend();
   await startBackend();
-  window.setTitle(viewDir ? 'Pi Factory · 只读查看已有运行' : 'Pi Factory');
+  window.setTitle(windowTitle());
+  Menu.setApplicationMenu(menu());
   await window.loadURL(baseURL);
+}
+async function openProject(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  rememberProject(dir);
+  await changeWorkspace(null);
 }
 
 function menu() {
   return Menu.buildFromTemplate([
-    { label: '工作区', submenu: [
-      { label: '使用独立工作区', click: () => changeWorkspace(null).catch(showError) },
+    { label: '项目', submenu: [
+      { label: '新建项目…', click: async () => {
+        const chosen = await dialog.showSaveDialog(window, { title: '新建项目文件夹（项目的全部数据都会存在这里）', defaultPath: path.join(path.dirname(activeProject()), 'new-project'), buttonLabel: '创建项目' });
+        if (chosen.canceled || !chosen.filePath) return;
+        await openProject(chosen.filePath).catch(showError);
+      } },
+      { label: '打开项目…', click: async () => {
+        const chosen = await dialog.showOpenDialog(window, { title: '选择项目文件夹', defaultPath: path.dirname(activeProject()), properties: ['openDirectory', 'createDirectory'] });
+        if (chosen.canceled) return;
+        await openProject(chosen.filePaths[0]).catch(showError);
+      } },
+      { label: '最近项目', submenu: (config().recentProjects ?? [activeProject()]).map((dir) => ({ label: `${path.basename(dir)}  —  ${dir}`, type: 'radio', checked: !viewDir && dir === activeProject(), click: () => openProject(dir).catch(showError) })) },
+      { label: '在资源管理器中显示', click: () => shell.openPath(viewDir || activeProject()) },
+      { type: 'separator' },
+      { label: '回到当前项目', click: () => changeWorkspace(null).catch(showError) },
       { label: '查看已有运行（只读）…', click: async () => {
         const chosen = await dialog.showOpenDialog(window, { title: '选择包含 journal.db 的 var 目录（不会复制或修改）', properties: ['openDirectory'] });
         if (chosen.canceled) return;
@@ -139,7 +185,7 @@ app.whenReady().then(async () => {
   await startBackend();
   window = new BrowserWindow({
     width: 1440, height: 900, minWidth: 900, minHeight: 600,
-    title: viewDir ? 'Pi Factory · 只读查看已有运行' : 'Pi Factory',
+    title: windowTitle(),
     backgroundColor: '#f7f8fa', show: false, autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webviewTag: true, webSecurity: true },
   });
@@ -154,7 +200,7 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('desktop:info', (event) => {
     if (event.sender !== window?.webContents) throw new Error('Forbidden');
-    return { version: app.getVersion(), platform: process.platform, workspace: viewDir || path.join(app.getPath('userData'), 'workspace'), readOnly: Boolean(viewDir) };
+    return { version: app.getVersion(), platform: process.platform, workspace: viewDir || activeProject(), project: path.basename(viewDir || activeProject()), readOnly: Boolean(viewDir) };
   });
   Menu.setApplicationMenu(menu());
   ipcMain.handle('desktop:browser-bounds', (event, bounds) => {

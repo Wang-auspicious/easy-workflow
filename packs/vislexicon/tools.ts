@@ -7,7 +7,7 @@ import path from "node:path";
 import type { EvidenceRef, Usage } from "../../shared/types.ts";
 import { EvidenceStore, aHash, hamming } from "../../server/evidence.ts";
 import { openPage } from "../../server/browser.ts";
-import { networkFetch } from "../../server/network.ts";
+import { webGet } from "../../server/network.ts";
 import { classifyFailure, type Failure } from "../../shared/failures.ts";
 import { pickOne } from "../../server/agent-station.ts";
 import type { StationContext, StationResult } from "../../server/runtime.ts";
@@ -119,12 +119,9 @@ export function parseHtml(html: string, base: string) {
 }
 
 export async function httpGet(url: string, signal: AbortSignal, timeout = 20000) {
-  const res = await networkFetch(url, {
-    redirect: "follow", signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
-    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36", "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.6" },
-  });
-  const body = await res.text();
-  return { status: res.status, finalUrl: res.url, body };
+  const r = await webGet(url, { signal, timeout });
+  const out: { status: number; finalUrl: string; body: string; via?: string } = { status: r.status, finalUrl: r.finalUrl, body: r.body, via: r.via };
+  return out;
 }
 
 const fetchHome: Tool = async (ctx,svc) => {

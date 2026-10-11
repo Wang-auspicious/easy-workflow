@@ -3,7 +3,7 @@
 // spec; the balancer measures service times and forks or retires same-duty workers.
 // Everything that changes state is journaled first.
 import crypto from "node:crypto";
-import type { CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
+import type { AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
 import { median } from "../shared/project.ts";
 import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
 import { ControlError } from "./errors.ts";
@@ -33,6 +33,8 @@ export interface TokenRun {
   finished: boolean;
   finishedStore?:string;
   notes: Map<string, { reason: string; note?: string; byHuman: boolean }>;
+  /** Open direct consultation between a reviewer and field owners (Spec §34). */
+  consult?: { reviewer: string; queue: (Fix & { id: string })[]; current?: Fix & { id: string }; chain: string[]; replies: string[]; open: string[] };
 }
 
 export interface Worker { id: string; label: string; node: string; busy: string | null; idleSince: number }
@@ -54,14 +56,20 @@ export interface StationResult {
   summary: string;
   data?: Record<string, unknown>;
   usage?: Usage;
+  metrics?: AttemptMetrics;
   error?: string;
   failure?:Failure;
-  verdict?: { verdict: "pass" | "return" | "escalate"; returnTo?: string; reason: string };
+  verdict?: { verdict: "pass" | "return" | "escalate" | "fix"; returnTo?: string; reason: string; fixes?: Fix[] };
   /** Leave the line here (duplicate, unreachable site…). */
   finish?: { status: TokenStatus; reason: string };
 }
 
 export type Executor = (ctx: StationContext) => Promise<StationResult>;
+
+/** A reviewer's request to the station that owns some fields (Spec §34). `via` lists the
+ *  stations that must re-run after the owner before the reviewer looks again. */
+export interface Fix { station: string; fields: string[]; problem: string; via?: string[] }
+const MAX_CONSULT_ROUNDS = 3;
 
 const RHO = 0.8;
 const FORK_BACKLOG_MS = 30_000;
@@ -95,6 +103,8 @@ export class Runtime {
   private aborts = new Map<string, AbortController>();
   private attemptTokens = new Map<string,string>();
   onRecovery?: (token:TokenRun,failure:Failure)=>void;
+  /** Owner-facing problems (certificate, login, model quota) light the red alert. */
+  onAlert?: (token:TokenRun,node:CompiledNode,failure:Failure)=>void;
   onPark?: (token:TokenRun)=>void;
   private jobs = new Set<Promise<void>>();
   private timer: NodeJS.Timeout | null = null;
@@ -390,13 +400,16 @@ export class Runtime {
       return;
     }
     if (res.data && Object.keys(res.data).length) { Object.assign(t.data, res.data); this.journal.append({ kind: "token.data", token: t.id, patch: res.data }); }
-    this.journal.append({ kind: "attempt.finished", attempt, ok: res.ok, summary: res.summary, ms, queuedMs, usage: res.usage, error: res.error });
+    const metrics = res.metrics ?? (n.kind === "agent" || n.kind === "review" ? undefined : { time: { firstTokenMs: 0, outputMs: 0, toolMs: 0, programMs: ms, modelCalls: 0, toolCalls: 0 } });
+    this.journal.append({ kind: "attempt.finished", attempt, ok: res.ok, summary: res.summary, ms, queuedMs, usage: res.usage, error: res.error, metrics });
+    if (res.ok && n.kind !== "store") this.journal.append({ kind: "case.noted", caseId: t.item, token: t.id, note: { station: n.key, section: res.verdict ? `审核：${({ pass: "通过", return: "退回", escalate: "交人", fix: "要求修改" } as Record<string, string>)[res.verdict.verdict]}` : "结果", text: res.verdict?.reason && res.verdict.verdict !== "pass" ? `${res.summary}\n${res.verdict.reason}` : res.summary, by: "runtime" } });
     t.inflight.delete(n.key);
     t.notes.delete(n.key);
     if (res.ok) (this.durations.get(n.key) ?? this.durations.set(n.key, []).get(n.key)!).push(ms);
 
     if (!res.ok) {
-      const failure=candidateFailure(res.failure ?? classifyFailure(res.error??res.summary,{url:t.url}),String(t.data.canonical??t.url));
+      const failure=candidateFailure(res.failure ?? classifyFailure(res.error??res.summary,{url:t.url,stage:n.kind==="agent"||n.kind==="review"?"model":undefined}),String(t.data.canonical??t.url));
+      if(failure.owner==="user")this.onAlert?.(t,n,failure);
       t.finished=true;t.data.failure=failure;
       for(const [id,controller] of this.aborts)if(this.attemptTokens.get(id)===t.id)controller.abort();
       for(const q of this.queues.values()){const i=q.indexOf(t.id);if(i>=0)q.splice(i,1);}
@@ -409,11 +422,18 @@ export class Runtime {
       t.finished = true;
       for (const q of this.queues.values()) { const i = q.indexOf(t.id); if (i >= 0) q.splice(i, 1); }
       this.journal.append({ kind: "token.finished", token: t.id, status: res.finish.status, node: n.key, reason: res.finish.reason });
+    } else if (t.consult && t.consult.chain[0] === n.key && t.consult.reviewer !== n.key) {
+      this.consultStep(t, n, res);
     } else if (res.verdict) {
-      this.journal.append({ kind: "review.verdict", token: t.id, node: n.key, verdict: res.verdict.verdict, returnTo: res.verdict.returnTo, reason: res.verdict.reason });
-      if (res.verdict.verdict === "return" && res.verdict.returnTo) this.returnToken(t, n.key, res.verdict.returnTo, res.verdict.reason, false);
-      else if (res.verdict.verdict === "escalate") this.toManual(t, n, res.verdict.reason);
-      else this.complete(t, n.key);
+      const v = res.verdict.verdict === "fix" ? "return" : res.verdict.verdict;
+      this.journal.append({ kind: "review.verdict", token: t.id, node: n.key, verdict: v, returnTo: res.verdict.returnTo ?? res.verdict.fixes?.[0]?.station, reason: res.verdict.reason });
+      if (res.verdict.verdict === "fix") this.openConsult(t, n, res.verdict.fixes ?? [], res.verdict.reason);
+      else {
+        if (t.consult?.reviewer === n.key) this.closeConsult(t, res.verdict.verdict === "pass" ? "resolved" : "manual", res.verdict.reason);
+        if (res.verdict.verdict === "return" && res.verdict.returnTo) this.returnToken(t, n.key, res.verdict.returnTo, res.verdict.reason, false);
+        else if (res.verdict.verdict === "escalate") this.toManual(t, n, res.verdict.reason);
+        else this.complete(t, n.key);
+      }
     } else this.complete(t, n.key);
     this.schedule();
   }
@@ -507,6 +527,73 @@ export class Runtime {
     this.journal.append({ kind: "token.returned", token: t.id, from, to, reason, round, byHuman, reset: [...reset] });
     this.enqueue(t, to, from, true);
     return true;
+  }
+
+  /* -------------------------------------------------------------- direct consultation (Spec §34) */
+
+  /** A reviewer names fields and their owners; owners re-run in repair mode and reply straight back. */
+  openConsult(t: TokenRun, reviewer: CompiledNode, fixes: Fix[], reason: string) {
+    const usable = fixes.filter((f) => { const o = this.nodes.get(f.station); return o && this.runnable(o) && t.closure.has(f.station) && f.station !== reviewer.key; });
+    if (!usable.length) { this.toManual(t, reviewer, `审核要求修改，但没有指向可执行的负责工位：${reason}`); return; }
+    const queue: (Fix & { id: string })[] = [];
+    for (const f of usable) {
+      const key = `consult:${reviewer.key}>${f.station}`;
+      const round = (t.rounds[key] ?? 0) + 1;
+      if (round > MAX_CONSULT_ROUNDS) {
+        const history = (t.consult?.replies ?? []).join("；");
+        this.closeConsult(t, "manual", `${this.nodes.get(f.station)?.name} 与 ${reviewer.name} 来回 ${MAX_CONSULT_ROUNDS} 轮仍未解决`);
+        this.toManual(t, reviewer, `审核往来已满 ${MAX_CONSULT_ROUNDS} 轮：${f.problem}${history ? `（往来：${history}）` : ""}`);
+        return;
+      }
+      t.rounds[key] = round;
+      const id = `k-${short()}`;
+      this.journal.append({ kind: "consult.opened", consult: id, token: t.id, reviewer: reviewer.key, owner: f.station, fields: f.fields, problem: f.problem, round });
+      queue.push({ ...f, id });
+    }
+    t.consult = { reviewer: reviewer.key, queue, chain: [], replies: [], open: [...(t.consult?.open ?? []), ...queue.map((q) => q.id)] };
+    this.nextConsult(t);
+  }
+
+  private nextConsult(t: TokenRun) {
+    const c = t.consult!;
+    const fix = c.queue.shift();
+    if (!fix) {
+      // Every owner has replied: the same reviewer looks again, with the replies in hand.
+      const reviewer = c.reviewer;
+      c.chain = [];
+      this.redoAt(t, reviewer, `负责工位已按要求修改，请复查同一批字段。回复：${c.replies.join("；")}`);
+      this.enqueue(t, reviewer, c.current?.station, true);
+      return;
+    }
+    c.current = fix;
+    c.chain = [fix.station, ...(fix.via ?? []).filter((v) => this.nodes.has(v) && this.runnable(this.nodes.get(v)!))];
+    this.redoAt(t, fix.station, `${this.nodes.get(c.reviewer)?.name} 要求修改字段 ${fix.fields.join("、")}：${fix.problem}`);
+    this.enqueue(t, fix.station, c.reviewer, true);
+  }
+
+  /** Voids older attempts at a node and leaves a redo note for the next one. */
+  private redoAt(t: TokenRun, key: string, reason: string) {
+    t.nodeEpochs ??= new Map();
+    t.nodeEpochs.set(key, (t.nodeEpochs.get(key) ?? 0) + 1);
+    t.inflight.delete(key);
+    const q = this.queues.get(key); const i = q?.indexOf(t.id) ?? -1; if (q && i >= 0) q.splice(i, 1);
+    t.notes.set(key, { reason, byHuman: false });
+  }
+
+  private consultStep(t: TokenRun, n: CompiledNode, res: StationResult) {
+    const c = t.consult!;
+    c.chain.shift();
+    if (c.chain.length) { this.redoAt(t, c.chain[0], `上游 ${n.name} 已按审核意见修改，请据此更新`); this.enqueue(t, c.chain[0], n.key, true); return; }
+    const fix = c.current!;
+    const reply = String((res.data as { reply?: string } | undefined)?.reply ?? res.summary);
+    c.replies.push(`${this.nodes.get(fix.station)?.name}：${reply}`);
+    this.journal.append({ kind: "consult.replied", consult: fix.id, token: t.id, owner: fix.station, reply, ok: res.ok });
+    this.nextConsult(t);
+  }
+
+  private closeConsult(t: TokenRun, outcome: "resolved" | "manual", reason: string) {
+    for (const id of t.consult?.open ?? []) this.journal.append({ kind: "consult.closed", consult: id, token: t.id, outcome, reason });
+    t.consult = undefined;
   }
 
   correct(target: { token: string; node: string; evidence?: string }, reason: string, note?: string) {

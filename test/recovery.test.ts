@@ -10,7 +10,7 @@ import type { StationContext } from "../server/runtime.ts";
 
 // Every database, catalogue and report belongs to this test process.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-recovery-"));
-process.env.FACTORY_VAR = dir;
+process.env.FACTORY_VAR = dir; process.env.FACTORY_PREFLIGHT = "0";
 process.env.VISLEXICON_ROOT = path.join(dir, "no-catalogue");
 const { Factory } = await import("../server/factory.ts");
 const { FactoryControl } = await import("../server/control.ts");
