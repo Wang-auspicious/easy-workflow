@@ -340,7 +340,7 @@ const proof: Tool = async (ctx, svc) => {
   const role = PREVIEW_RULES.kinds[kind]?.roles.proof ?? {};
   const host = String(ctx.token.data.host);
   const shots = shotsOf(ctx);
-  const usesStage = ["component-source", "design-system", "tool"].includes(kind) || Boolean(role.stageSelectors);
+  const usesStage = ["component-source", "design-system"].includes(kind) || Boolean(role.stageSelectors);
   const breadthLinks = (ctx.token.data.breadthLinks as Link[]) ?? [];
   const homeLinks = (ctx.token.data.homeLinks as Link[]) ?? [];
   let candidates: string[];
@@ -379,7 +379,7 @@ const proof: Tool = async (ctx, svc) => {
       if (v.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
       let png: Buffer | null = null;
       let framing = "viewport";
-      let stage = usesStage ? await findStage(page) : null;
+      let stage = usesStage || kind==="tool" ? await findStage(page) : null;
       if (stage) {
         await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
         await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
