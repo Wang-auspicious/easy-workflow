@@ -143,6 +143,28 @@ export interface EvidenceRef {
 
 export type StepDetail = { tool: string; text: string; ok?: boolean; evidence?: string[] };
 
+/** Observed client-side boundaries, never reconstructed from duration proportions. */
+export interface ActivitySpan {
+  id: string;
+  kind: "model_request" | "first_token" | "model_output" | "tool";
+  source: "model-stream" | "tool-executor";
+  startedAt: number;
+  endedAt?: number;
+  status: "running" | "completed" | "failed" | "cancelled";
+  /** The enclosing model request; its wait/output children must not be double-counted. */
+  requestId?: string;
+  model?: string;
+  toolName?: string;
+  operation?: string;
+}
+
+export interface AttemptActivity {
+  version: 1;
+  /** Aggregate durations from a closed launcher do not establish real intervals. */
+  modelTiming: "observed" | "unavailable";
+  spans: ActivitySpan[];
+}
+
 /** Token and time breakdown of one attempt (Spec §37). Estimated parts are char-based. */
 export interface AttemptMetrics {
   usageReported?: boolean;
@@ -150,6 +172,7 @@ export interface AttemptMetrics {
   usageComplete?: boolean;
   cacheUsageComplete?: boolean;
   execution?: { adapter: string; model: string };
+  activity?: AttemptActivity;
   tokens?: { system: number; context: number; caseFile: number; input: number; images: number; toolDefs: number; toolResults: number; output: number; actualInput: number; actualOutput: number; cacheRead: number; cacheWrite: number };
   time?: { firstTokenMs: number; outputMs: number; toolMs: number; programMs: number; modelCalls: number; toolCalls: number };
 }
@@ -170,6 +193,7 @@ export type JournalEvent =
   | { kind: "token.queued"; token: string; node: string; from?: string; returned?: boolean }
   | { kind: "attempt.started"; attempt: string; token: string; node: string; worker: string; input: string }
   | { kind: "attempt.progress"; attempt: string; text: string; step?: StepDetail }
+  | { kind: "attempt.activity"; attempt: string; activity: ActivitySpan }
   | { kind: "attempt.finished"; attempt: string; ok: boolean; summary: string; ms: number; queuedMs: number; usage?: Usage; error?: string; output?: Record<string, unknown>; cancelled?:boolean; metrics?: AttemptMetrics }
   | { kind: "candidate.disposition"; candidate: Omit<import("./failures.ts").CandidateRecovery,"at"|"attempts"> }
   | { kind: "evidence.added"; evidence: EvidenceRef }

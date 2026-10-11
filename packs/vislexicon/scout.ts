@@ -63,7 +63,10 @@ const FRAMEWORK_PROBE = () => {
   return out;
 };
 
-export async function scout(ctx: StationContext, svc: { tryBrowser?: () => { release: () => void } | null }): Promise<StationResult> {
+export async function scout(ctx: StationContext, svc: {
+  tryBrowser?: () => { release: () => void } | null;
+  acquireBrowser?: (signal: AbortSignal, timeoutMs: number) => Promise<{ release: () => void } | null>;
+}): Promise<StationResult> {
   const url = String(ctx.token.data.canonical ?? ctx.token.url);
   const host = String(ctx.token.data.host ?? hostOf(url));
   const via: string[] = [];
@@ -82,7 +85,16 @@ export async function scout(ctx: StationContext, svc: { tryBrowser?: () => { rel
   // 2. Render the home page in the shared browser: what a person actually sees.
   let rendered: { title: string; text: string; headings: { level: number; text: string }[]; links: { text: string; href: string; region: string }[]; framework: string[] } | null = null;
   let homeLinks: Link[] = [];
-  const lease = svc.tryBrowser?.();
+  let lease = svc.tryBrowser?.();
+  if (!lease && !http && svc.acquireBrowser) {
+    ctx.progress("HTTP 未取得正文，等待共享浏览器名额（最多 60 秒）", { tool: "resource", text: "等待 browser；可取消" });
+    lease = await svc.acquireBrowser(ctx.signal, 60000);
+    if (!lease) {
+      ctx.signal.throwIfAborted();
+      const f: Failure = { tag: "tool_error", category: "system", code: "BROWSER_CAPACITY_TIMEOUT", message: "共享浏览器名额等待超过 60 秒，浏览器补取尚未开始", url, retryable: true, owner: "system", nextAction: "等待在途页面释放，或检查内存与浏览器并发上限后，从侦察工位继续。此前 HTTP 失败不代表站点不可用。", tried: [failure?.message ?? "HTTP 未取得正文", "等待共享浏览器名额 60 秒"] };
+      return { ok: false, summary: f.message, error: f.message, failure: f };
+    }
+  }
   if (lease) {
     try {
       const { page, close } = await openPage(VIEW, "en-US", ctx.signal);
@@ -108,7 +120,7 @@ export async function scout(ctx: StationContext, svc: { tryBrowser?: () => { rel
       if (!http) return { ok: false, summary: f.message, error: f.message, failure: f };
       ctx.progress(`浏览器渲染失败，改用 HTTP 正文继续：${f.message.slice(0, 80)}`, { tool: "recover", text: f.tag, ok: false });
     } finally { lease.release(); }
-  } else ctx.progress("浏览器名额已满：先用 HTTP 正文建卷宗", { tool: "recover", text: "no browser lease" });
+  } else if (http) ctx.progress("浏览器名额已满：先用已取得的 HTTP 正文建卷宗", { tool: "recover", text: "no browser lease" });
   if (!rendered && !http) { const f = failure ?? classifyFailure("首页没有响应", { url }); return { ok: false, summary: f.message, error: f.message, failure: f }; }
 
   const text = rendered?.text || http!.text;

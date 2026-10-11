@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
-import { configureAgentStations, runAgentStation, combineAgentAttempts } from "../server/agent-station.ts";
+import { configureAgentStations, runAgentStation } from "../server/agent-station.ts";
 import { Toolbox } from "../server/toolbox.ts";
 import { Broker } from "../server/broker.ts";
 import type { Docs } from "../server/docs.ts";
@@ -40,7 +40,11 @@ test("closed launcher receives envelope first, calls scoped MCP, repairs and rep
     assert.equal(result.metrics?.time?.modelCalls, 2);
     assert.equal(result.metrics?.time?.firstTokenMs, 16);
     assert.equal(result.metrics?.time?.outputMs, 24);
-    assert.equal(result.metrics?.time?.toolCalls, 2);
+    assert.equal(result.metrics?.time?.toolCalls, 8, "count actual env_call, env_help, submit and duplicate-submit executions in both answers");
+    assert.equal(result.metrics?.activity?.modelTiming, "unavailable", "aggregate launcher durations cannot establish model interval boundaries");
+    assert.equal(result.metrics?.activity?.spans.length, 8);
+    assert.ok(result.metrics?.activity?.spans.every(span => span.kind === "tool" && span.endedAt !== undefined));
+    assert.equal(result.metrics?.activity?.spans.filter(span => span.status === "failed").length, 4);
     assert.ok(progress.some(p => p.includes("程序检查全部通过")));
     assert.ok(!progress.join("\n").includes("not-for-station"));
     assert.ok(fs.existsSync(path.join(dir, "work", "fixture-task")));
@@ -59,12 +63,4 @@ test("closed launcher receives envelope first, calls scoped MCP, repairs and rep
     assert.ok(path.resolve(dir).startsWith(path.join(path.resolve(os.tmpdir()), "h2-closed-agent-test-")));
     fs.rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test("automatic retry retains the failed call's observed usage and phase metrics", () => {
-  const first = { ok: false, summary: "connection error", usage: { input: 10, output: 2, cost: .01, cacheRead: 3, cacheWrite: 0 }, metrics: { usageReported: true, modelTimeReported: true, time: { firstTokenMs: 5, outputMs: 7, toolMs: 0, programMs: 0, modelCalls: 1, toolCalls: 0 } } };
-  const second = { ok: true, summary: "done", usage: { input: 20, output: 4, cost: .02, cacheRead: 0, cacheWrite: 1 }, metrics: { usageReported: true, modelTimeReported: true, time: { firstTokenMs: 6, outputMs: 9, toolMs: 2, programMs: 0, modelCalls: 1, toolCalls: 1 } } };
-  const result = combineAgentAttempts(first, second);
-  assert.deepEqual(result.usage, { input: 30, output: 6, cost: .03, cacheRead: 3, cacheWrite: 1 });
-  assert.deepEqual(result.metrics?.time, { firstTokenMs: 11, outputMs: 16, toolMs: 2, programMs: 0, modelCalls: 2, toolCalls: 1 });
 });

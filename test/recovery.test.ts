@@ -79,7 +79,7 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       assert.equal(factory.state.recoveries["later-success"],undefined);
       assert.equal(factory.state.attempts["a-network"].ok,false);
       assert.equal(factory.state.nodes["candidates/pool"].stock,2);
-      await factory.runtime.close();factory.journal.close();
+      await factory.runtime.close();factory.docs.flush();factory.lessons.close();factory.journal.close();
       factory=new Factory();await factory.boot();
       assert.equal(factory.state.nodes["candidates/pool"].stock,2);
       assert.equal(factory.state.recoveries.network.attempts,1);
@@ -105,7 +105,9 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
     await t.test("station failure parks immediately and preserves reason without blind repeated attempts",async()=>{
       const f=factory!;
       f.runtime.executors=()=>async()=>{throw new Error("fetch failed",{cause:Object.assign(new Error("connection reset"),{code:"ECONNRESET"})});};
+      f.raiseAlert({id:"browser:capture",kind:"browser",level:"red",item:"capture",message:"Browser pool recovery exhausted",nextAction:"Retry after repair"});
       const tasks=f.retryCandidates({tag:"browser_capture",count:5});assert.equal(tasks.length,1);
+      assert.equal(f.state.alerts["browser:capture"],undefined,"retry clears the repaired browser pool alert");
       await f.runtime.settle();
       const token=f.state.tokens[tasks[0].id];
       assert.equal(token.status,"parked");assert.equal(token.attempts.length,1);
@@ -145,7 +147,7 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       f.feed([`${base}/pending`]);await endRun(f);
       assert.equal(f.candidateFailures({tag:"run_ended",disposition:"retry"}).length,2);
       const expected=f.candidateFailures({disposition:"retry"}).length;
-      await f.runtime.close();f.journal.close();factory=undefined;
+      await f.runtime.close();f.docs.flush();f.lessons.close();f.journal.close();factory=undefined;
       factory=new Factory();await factory.boot();
       assert.equal(factory.candidateFailures({disposition:"retry"}).length,expected);
       assert.equal(factory.state.nodes["candidates/pool"].stock,expected);
@@ -171,7 +173,7 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       const [retry]=f.retryCandidates({items:["checkpoint-item"],count:1});
       await until(()=>f.runtime.queues.get("curation/identity")!.includes(retry.id));
       assert.equal(f.state.attempts[f.state.tokens[retry.id].attempts[0]].node,"curation/proof");
-      await f.runtime.close();f.journal.close();factory=undefined;
+      await f.runtime.close();f.docs.flush();f.lessons.close();f.journal.close();factory=undefined;
       factory=new Factory();await factory.boot();f=factory;
       f.broker.memoryFloorMB=0;
       const resumed=f.runtime.tokens.get(retry.id)!;
@@ -213,7 +215,7 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
     await t.test("completed items remain correctable after restarting an ended run",async()=>{
       let f=factory!;
       const previous=Object.values(f.state.tokens).find(t=>t.item==="branched-review")!;
-      await f.runtime.close();f.journal.close();factory=undefined;
+      await f.runtime.close();f.docs.flush();f.lessons.close();f.journal.close();factory=undefined;
       factory=new Factory();await factory.boot();f=factory;
       f.runtime.executors=()=>async()=>({ok:true,summary:"fixture corrected",finish:{status:"published",reason:"fixture"}});
       assert.equal(f.runtime.correct({token:previous.id,node:"curation/facts"},"Verify the source again").ok,true);
@@ -234,7 +236,7 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       await endRun(f);
     });
   } finally {
-    if(factory){await factory.runtime.close();factory.journal.close();}
+    if(factory){await factory.runtime.close();factory.docs.flush();factory.lessons.close();factory.journal.close();}
     fixture.closeAllConnections();await new Promise<void>(resolve=>fixture.close(()=>resolve()));
     await closeNetwork();fs.rmSync(dir,{recursive:true,force:true});
   }

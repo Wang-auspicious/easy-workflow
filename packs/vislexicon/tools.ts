@@ -27,6 +27,7 @@ export interface Services {
   /** Identity keys of tokens past dedupe and still on the line (excluding `self`). */
   inFlight: (self: string) => Set<string>;
   tryBrowser?:()=>{release:()=>void}|null;
+  acquireBrowser?:(signal:AbortSignal,timeoutMs:number)=>Promise<{release:()=>void}|null>;
 }
 
 type Tool = (ctx: StationContext, svc: Services) => Promise<StationResult>;
@@ -445,10 +446,9 @@ const proof: Tool = async (ctx, svc) => {
       if (stage) {
         await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
         await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
-        for (const frame of page.frames()) if (frame !== page.mainFrame()) await frame.waitForLoadState("load", { timeout: 8000 }).catch(() => {});
-        await sleep(1500);
         stage = (await findStage(page)) || stage;
-        if ((stage.sel.startsWith("iframe") || stage.media > 0) && (await iframeEmpty(page))) { ctx.progress(`拒收 ${new URL(href).pathname}：舞台 iframe 是空的`, { tool: "reject", text: "iframe-empty", ok: false }); continue; }
+        ctx.progress("检查选中舞台，必要时等待 iframe 渲染（最多 45 秒）", { tool: "browser", text: "stage iframe readiness" });
+        if (await iframeEmpty(page, stage, { timeoutMs: 45000, signal: ctx.signal })) { ctx.progress(`拒收 ${new URL(href).pathname}：舞台 iframe 是空的`, { tool: "reject", text: "iframe-empty", ok: false }); continue; }
         const pageWidth = await page.evaluate(() => document.documentElement.scrollWidth);
         const clip = stageClip(stage, pageWidth);
         png = letterbox(await shoot(page, clip), clip);

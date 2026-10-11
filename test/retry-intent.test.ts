@@ -26,5 +26,5 @@ test('retry after intake failure preserves explicit published-site rerun intent'
     assert.equal(retry.data.rerunPublished, true);
     assert.equal(retry.data.retryOf, first.id);
     await endRun(factory);
-  } finally { await factory.runtime.close(); factory.lessons.close(); factory.journal.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+  } finally { await factory.runtime.close(); factory.docs.flush(); factory.lessons.close(); factory.journal.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

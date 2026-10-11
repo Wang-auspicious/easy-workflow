@@ -117,16 +117,23 @@ class BrowserManager {
     const navigated = () => { t.url = wc.getURL(); t.title = t.url.startsWith('about:') ? '新标签页' : wc.getTitle() || t.title; this.data.visit(t.url,t.title); this.persistTabs(); this.publish(); void this.check(t); };
     wc.on('did-navigate', navigated); wc.on('did-navigate-in-page', navigated); wc.on('did-finish-load', () => void this.check(t));
     wc.on('did-fail-load', (_e,code,description,_url,main) => { if (main && code !== -3) { t.attention = `页面加载失败：${description}`; this.publish(); } });
-    wc.on('render-process-gone', () => { t.attention = '页面进程已退出，点击重新加载'; t.loading = false; this.publish(); });
+    wc.on('render-process-gone', (_event, details) => {
+      t.crashed = true; t.attention = `页面进程已退出（${details?.reason || 'crashed'}），点击重新加载`; t.loading = false;
+      this.publish();
+      // Only disposable agent leases are replaced automatically. User/verification
+      // tabs remain visible and retain their persistent session for manual reload.
+      if (t.owner === 'agent') this.discardAgent(t);
+    });
+    wc.on('did-finish-load', () => { t.crashed = false; });
     wc.once('destroyed', () => { this.tabs.delete(id); if (this.active === id) this.active = this.tabs.keys().next().value ?? null; this.mount(); this.publish(); this.persistTabs(); });
     if (owner === 'user' || !this.active) this.active = id;
     // The marker lets Playwright find precisely this page, never a user's other tab.
-    t.ready = wc.loadURL(url === 'about:blank' ? `about:blank#easy-workflow-${id}` : url).catch(error => { t.attention = error.message; this.publish(); });
+    t.ready = wc.loadURL(url === 'about:blank' ? `about:blank#easy-workflow-${id}` : url).catch(error => { t.readyError = error.message; t.attention = error.message; this.publish(); });
     this.mount(); this.publish(); return t;
   }
   async check(t, manualCheck = false) {
     const check = (t.attentionCheck || Promise.resolve()).catch(() => {}).then(async () => {
-      const wc = t.view.webContents; if (!this.tabs.has(t.id) || wc.isDestroyed() || !/^https?:/.test(wc.getURL())) return;
+      const wc = t.view.webContents; if (!this.tabs.has(t.id) || t.crashed || wc.isDestroyed() || !/^https?:/.test(wc.getURL())) return;
       const serial=t.checkSerial=(t.checkSerial||0)+1, url=wc.getURL();
       const probe = await wc.executeJavaScript(`(${browserAttentionProbe.toString()})()`).catch(() => null);
       if (!this.tabs.has(t.id)||serial!==t.checkSerial||wc.isDestroyed()||wc.getURL()!==url) return;
@@ -136,6 +143,14 @@ class BrowserManager {
     t.attentionCheck = check;
     await check;
   }
+  discardAgent(t) {
+    if (t.owner !== 'agent') return false;
+    const wc = t.view.webContents;
+    if (t.captureDepth && !wc.isDestroyed()) { try { wc.endFrameSubscription(); } catch {} }
+    t.captureDepth = 0;
+    if (!wc.isDestroyed()) wc.close();
+    return true;
+  }
   async endpoint() {
     for (let i=0;i<50;i++) { try { const lines = fs.readFileSync(path.join(this.profile, 'DevToolsActivePort'),'utf8').trim().split(/\r?\n/); const port = Number(lines[0]); if (port > 0 && lines[1]?.startsWith('/devtools/browser/')) return `http://127.0.0.1:${port}`; } catch {} await new Promise(r=>setTimeout(r,100)); }
     throw new Error('内置浏览器调试连接尚未就绪');
@@ -144,18 +159,26 @@ class BrowserManager {
     const action = args.action;
     if (action === 'state') return this.snapshot();
     if (action === 'target') {
-      const t=this.tabs.get(args.id); if(!t)throw new Error('标签页已经关闭');
+      const t=this.tabs.get(args.id); if(!t || t.crashed || t.view.webContents.isDestroyed())throw new Error('BROWSER_PAGE_CLOSED: 内置浏览器标签已失效，请重新领取页面');
       const debug=t.view.webContents.debugger, own=!debug.isAttached();
       try {if(own)debug.attach('1.3');const result=await debug.sendCommand('Target.getTargetInfo');return {endpoint:await this.endpoint(), targetId:result.targetInfo.targetId};} finally {if(own&&debug.isAttached())debug.detach();}
     }
-    if (action === 'lease') { const t = this.create('about:blank','agent'); await t.ready; return { id:t.id, marker:`about:blank#easy-workflow-${t.id}`, endpoint:await this.endpoint() }; }
+    if (action === 'lease') {
+      const t = this.create('about:blank','agent');
+      try {
+        await t.ready;
+        if (t.readyError || t.crashed || t.view.webContents.isDestroyed()) throw new Error('BROWSER_LEASE_FAILED: 内置浏览器未能创建可用页面');
+        return { id:t.id, marker:`about:blank#easy-workflow-${t.id}`, endpoint:await this.endpoint() };
+      } catch (error) { this.discardAgent(t); throw error; }
+    }
     if (action === 'open') { this.create(args.url || 'about:blank'); return this.snapshot(); }
     if (action.startsWith('bookmark.') || action === 'history.prune') { this.data.change(action,args); this.publish(); return this.snapshot(); }
-    const t = this.tabs.get(args.id); if (!t) throw new Error('标签页已经关闭');
+    const t = this.tabs.get(args.id); if (!t) throw new Error('BROWSER_PAGE_CLOSED: 标签页已经关闭');
     const wc = t.view.webContents;
     if (action === 'capture.begin') {
       // A mounted but occluded view can stop producing compositor frames. Hold a
       // native capturer only for the screenshot/recording operation, never idle.
+      if(t.crashed||wc.isDestroyed())throw new Error('BROWSER_PAGE_CRASHED: 截图页面已失效，请重新领取页面');
       if(!t.captureDepth)wc.beginFrameSubscription(true,()=>{});
       t.captureDepth=(t.captureDepth||0)+1;return {capturing:true};
     }
@@ -171,7 +194,11 @@ class BrowserManager {
     else if (action === 'attention') { t.attention = String(args.message || '页面需要检查').slice(0,200); t.manualAttention = true; }
     else if (action === 'attention.check') await this.check(t, true);
     else if (action === 'tab.move') { const entries=[...this.tabs]; const i=entries.findIndex(([id])=>id===t.id); const [entry]=entries.splice(i,1); const j=entries.findIndex(([id])=>id===args.before); if(j<0)throw new Error('目标标签不存在'); entries.splice(j,0,entry); this.tabs=new Map(entries); this.persistTabs(); }
-    else if (action === 'release') { if(t.captureDepth){wc.endFrameSubscription();t.captureDepth=0;} await this.check(t); if (!t.attention) wc.close(); }
+    else if (action === 'release') {
+      if (args.discard || t.crashed) { this.discardAgent(t); return this.snapshot(); }
+      if(t.captureDepth){wc.endFrameSubscription();t.captureDepth=0;}
+      await this.check(t); if (!t.attention) wc.close();
+    }
     else if (action === 'close') wc.close();
     else throw new Error('未知浏览器操作');
     this.publish(); return this.snapshot();

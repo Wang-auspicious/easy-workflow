@@ -3,7 +3,7 @@
 // but everybody wants once they see them — each with a number, a sparkline and a link.
 import fs from "node:fs";
 import path from "node:path";
-import type { AttemptMetrics, Stamped, Usage } from "../shared/types.ts";
+import type { ActivitySpan, AttemptMetrics, Stamped, Usage } from "../shared/types.ts";
 import { apply, initialState, median, quantile, type FactoryState } from "../shared/project.ts";
 import { VAR, type Factory } from "./factory.ts";
 
@@ -20,6 +20,7 @@ export interface RunReport {
   insights: Insight[];
   suggestions: Suggestion[];
   metrics?: ReportMetrics;
+  activity?: ReportActivity;
   attempts: { id:string; node:string; token:string; item:string; startedAt:number; endedAt?:number; ms:number; queuedMs:number; input:number; output:number; cost:number; cacheRead?:number; cacheWrite?:number; metrics?:AttemptMetrics; ok?:boolean; cancelled?:boolean; summary:string; steps:{at:number;text:string}[] }[];
   items: { published: ItemRow[]; manual: ItemRow[]; corrected: ItemRow[]; merged: ItemRow[]; rejected: ItemRow[]; parked:ItemRow[] };
 }
@@ -31,6 +32,50 @@ interface NodeRow {
 }
 interface WorkerRow { id: string; label: string; node: string; nodeName: string; done: number; busyMs: number; idleShare: number; spawnedAt: number; retiredAt?: number; forked: boolean; spans: [number, number, string][]; items: string[] }
 interface ItemRow { token: string; item: string; title?: string; reason?: string; thumbs: string[]; node?: string; ms?: number; cost?: number }
+
+export interface ReportActivity {
+  version: 1;
+  source: "run-journal";
+  runId: string;
+  station?: string;
+  clock: "unix-ms";
+  /** Model requests contain their wait/output children; concurrent tools overlap. */
+  aggregation: "overlapping-intervals";
+  coverage: { attempts: number; recordedAttempts: number; modelTimingObserved: number; modelTimingUnknown: number; unclosedSpans: number };
+  intervals: (ActivitySpan & { attempt: string; node: string; token: string; worker: string; durationMs: number | null })[];
+  unrecordedAttempts: string[];
+}
+
+/** No duration-ratio reconstruction, and no guessed end time after a crash. */
+export function buildActivity(attempts: FactoryState["attempts"][string][], runId: string, station?: string): ReportActivity {
+  const selected = attempts.filter(a => !station || a.node === station);
+  const intervals = selected.flatMap(a => (a.metrics?.activity?.spans ?? []).map(span => ({ ...span,
+    attempt: a.id, node: a.node, token: a.token, worker: a.worker,
+    durationMs: span.endedAt === undefined ? null : Math.max(0, span.endedAt - span.startedAt) })));
+  // Stable ties preserve recorded request → wait → output order within an attempt.
+  intervals.sort((a, b) => a.startedAt - b.startedAt || a.attempt.localeCompare(b.attempt));
+  const observed = selected.filter(a => a.metrics?.activity?.modelTiming === "observed").length;
+  return { version: 1, source: "run-journal", runId, ...(station ? { station } : {}), clock: "unix-ms", aggregation: "overlapping-intervals",
+    coverage: { attempts: selected.length, recordedAttempts: selected.filter(a => a.metrics?.activity?.spans.length).length,
+      modelTimingObserved: observed, modelTimingUnknown: selected.length - observed, unclosedSpans: intervals.filter(span => span.endedAt === undefined).length },
+    intervals, unrecordedAttempts: selected.filter(a => !a.metrics?.activity?.spans.length).map(a => a.id) };
+}
+
+/** A station query has station totals only; global run totals are intentionally absent. */
+export function stationReport(report: RunReport, station: string) {
+  const activity = report.activity;
+  const attempts = report.attempts.filter(a => a.node === station);
+  const node = report.layers.flatMap(layer => layer.nodes).find(node => node.key === station);
+  const selected = new Set(attempts.map(a => a.id));
+  const intervals = activity?.intervals.filter(span => selected.has(span.attempt));
+  const observed = attempts.filter(a => a.metrics?.activity?.modelTiming === "observed").length;
+  return { version: report.version, runId: report.runId, station, title: report.title, status: report.status,
+    startedAt: report.startedAt, endedAt: report.endedAt, metrics: node?.metrics ?? aggregateMetrics([], []), attempts,
+    activity: activity && intervals ? { ...activity, station, intervals,
+      coverage: { attempts: attempts.length, recordedAttempts: attempts.filter(a => a.metrics?.activity?.spans.length).length,
+        modelTimingObserved: observed, modelTimingUnknown: attempts.length - observed, unclosedSpans: intervals.filter(span => span.endedAt === undefined).length },
+      unrecordedAttempts: activity.unrecordedAttempts.filter(id => selected.has(id)) } : undefined };
+}
 
 const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
 const pct = (x: number) => `${Math.round(x * 100)}%`;
@@ -133,11 +178,18 @@ export function buildReport(f: Factory, runId: string): RunReport {
   }
   const totalWork = sum(attempts.map((a) => a.ms ?? 0)) || 1;
   const rows: NodeRow[] = [];
-  for (const n of f.compiled.nodes) {
+  const reportedNodes = new Map<string, Pick<NodeRow, "key" | "name" | "role" | "layer" | "line">>(f.compiled.nodes.map(n => [n.key, { key: n.key, name: n.name, role: n.role, layer: n.layer, line: n.line }]));
+  for (const attempt of attempts) if (!reportedNodes.has(attempt.node)) {
+    // Removed stations still own real journal receipts. Their old display metadata
+    // is unavailable; do not infer a role/layer from the current graph or omit work.
+    reportedNodes.set(attempt.node, { key: attempt.node, name: `${attempt.node}（历史工位）`, role: "historical", layer: 0, line: attempt.node.split("/")[0] });
+  }
+  for (const n of reportedNodes.values()) {
     const st = s.nodes[n.key];
     if (!st) continue;
-    const mine = attempts.filter((a) => a.node === n.key && a.ms !== undefined);
-    const touched = st.inRun || st.processed || st.plus || st.sent || (st.stockStart !== null && st.stockStart !== st.stock) || mine.length;
+    const nodeAttempts = attempts.filter(a => a.node === n.key);
+    const mine = nodeAttempts.filter(a => a.ms !== undefined);
+    const touched = st.inRun || st.processed || st.plus || st.sent || (st.stockStart !== null && st.stockStart !== st.stock) || nodeAttempts.length;
     if (!touched) continue;
     const okMs = mine.filter((a) => a.ok).map((a) => a.ms!);
     const work = sum(mine.map((a) => a.ms!)), wait = sum(mine.map((a) => a.queuedMs ?? 0));
@@ -148,10 +200,10 @@ export function buildReport(f: Factory, runId: string): RunReport {
       returned: st.returned, inRun: st.inRun, processed: st.processed, medianMs: median(okMs), p90Ms: quantile(okMs, 0.9), waitShare: wait / Math.max(1, wait + work),
       tokens: sum(mine.map((a) => a.usage.input + a.usage.output)), cost: sum(mine.map((a) => a.usage.cost)), timeShare: work / totalWork,
       workers: st.workers.length, forks: st.forks, retires: st.retires, topReasons: top, slowest: slow,
-      metrics: aggregateMetrics(mine, events),
+      metrics: aggregateMetrics(nodeAttempts, events),
     });
   }
-  const layers = [1, 2, 3].map((layer) => ({ layer, nodes: rows.filter((r) => r.layer === layer) })).filter((l) => l.nodes.length);
+  const layers = [...new Set(rows.map(row => row.layer))].sort((a, b) => a - b).map((layer) => ({ layer, nodes: rows.filter((r) => r.layer === layer) }));
 
   /* workers */
   const workers: WorkerRow[] = Object.values(s.workers).filter((w) => (w.retiredAt ?? Infinity) >= startedAt && w.spawnedAt <= endedAt).map((w) => {
@@ -184,7 +236,7 @@ export function buildReport(f: Factory, runId: string): RunReport {
 
   const insights = mine({ ...f, state:s } as Factory, events, rows, workers, tokens, attempts, startedAt, endedAt);
   const suggestions = suggest(rows, insights, f);
-  return { version:3, status:s.run.status, runId, title: start?.kind === "run.started" ? start.title : s.run.title, startedAt, endedAt, netMs, totals, layers, flows: [...flows.values()], workers, insights, suggestions, items, metrics: runMetrics,
+  return { version:3, status:s.run.status, runId, title: start?.kind === "run.started" ? start.title : s.run.title, startedAt, endedAt, netMs, totals, layers, flows: [...flows.values()], workers, insights, suggestions, items, metrics: runMetrics, activity: buildActivity(attempts, runId),
     attempts: attempts.map(a=>({id:a.id,node:a.node,token:a.token,item:s.tokens[a.token]?.title || s.tokens[a.token]?.item || a.token,startedAt:a.startedAt,endedAt:a.endedAt,ms:a.ms ?? Math.max(0,endedAt-a.startedAt),queuedMs:a.queuedMs ?? 0,input:a.usage.input,output:a.usage.output,cost:a.usage.cost,cacheRead:recordedUsage.get(a.id)?.cacheRead,cacheWrite:recordedUsage.get(a.id)?.cacheWrite,metrics:a.metrics,ok:a.ok,cancelled:a.cancelled,summary:a.summary || a.error || "进行中",steps:a.steps.map(st=>({at:st.at,text:st.text}))})) };
 }
 
@@ -314,8 +366,9 @@ function suggest(rows: NodeRow[], insights: Insight[], f: Factory): Suggestion[]
   const name = (k: string) => f.compiled.nodes.find((n) => n.key === k)?.name ?? k;
   const wait = insights.find((i) => i.id === "wait");
   if (wait?.node) {
-    const n = f.compiled.nodes.find((x) => x.key === wait.node)!;
-    out.push({ title: `给「${name(wait.node)}」把人数上限从 ${n.workers.max} 提到 ${n.workers.max + 1}`, why: wait.detail, prompt: `「${name(wait.node)}」排队时间占比太高（${wait.value}）。请起草补丁把 workers.max 提到 ${n.workers.max + 1}，并说明对浏览器 / 模型配额的影响。`, node: wait.node });
+    const n = f.compiled.nodes.find((x) => x.key === wait.node);
+    // Historical receipts establish queue time, not an absent worker configuration.
+    if (n) out.push({ title: `给「${name(wait.node)}」把人数上限从 ${n.workers.max} 提到 ${n.workers.max + 1}`, why: wait.detail, prompt: `「${name(wait.node)}」排队时间占比太高（${wait.value}）。请起草补丁把 workers.max 提到 ${n.workers.max + 1}，并说明对浏览器 / 模型配额的影响。`, node: wait.node });
   }
   const rej = insights.find((i) => i.id === "rejects");
   if (rej) out.push({ title: "把最常被拒收的页型挡在开页之前", why: rej.detail, prompt: `本轮“拍了又扔”的页面有 ${rej.value}。请看特写 / 目录摄影里被拒收最多的路径，给出 preview-rules 的拒收前缀建议（先列证据，不要直接改）。`, node: rej.node });

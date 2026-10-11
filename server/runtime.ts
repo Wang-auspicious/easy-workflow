@@ -3,13 +3,14 @@
 // spec; the balancer measures service times and forks or retires same-duty workers.
 // Everything that changes state is journaled first.
 import crypto from "node:crypto";
-import type { AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
+import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
 import { median } from "../shared/project.ts";
 import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
 import { ControlError } from "./errors.ts";
 import { readRole } from "./roles.ts";
 import type { Broker, Lease } from "./broker.ts";
 import type { Journal } from "./journal.ts";
+import { browserAttemptScope, withBrowserAttempt, type BrowserPoolFault } from "./browser.ts";
 
 export interface TokenRun {
   id: string;
@@ -60,6 +61,8 @@ export interface StationContext {
   /** Set when this attempt re-runs a returned or corrected token. */
   redo?: { reason: string; note?: string; byHuman: boolean };
   progress(text: string, step?: StepDetail): void;
+  /** Observations remain journaled even when cancellation invalidates the output. */
+  activity?(activity: ActivitySpan): void;
   addEvidence(ev: Omit<EvidenceRef, "station" | "token" | "attempt" | "at">): EvidenceRef;
 }
 
@@ -84,6 +87,7 @@ export type Executor = (ctx: StationContext) => Promise<StationResult>;
  *  stations that must re-run after the owner before the reviewer looks again. */
 export interface Fix { station: string; fields: string[]; problem: string; via?: string[] }
 const MAX_CONSULT_ROUNDS = 3;
+const MAX_BROWSER_RECOVERIES = 2;
 
 const RHO = 0.8;
 const FORK_BACKLOG_MS = 30_000;
@@ -236,7 +240,16 @@ export class Runtime {
     await Promise.allSettled([...this.jobs]);
   }
 
-  async settle() { await Promise.allSettled([...this.jobs]); }
+  async settle() {
+    // create/enqueue dispatch on a microtask; completed jobs can also enqueue the
+    // next station or a browser recovery. Observe those before declaring quiescence.
+    while (true) {
+      await Promise.resolve();
+      const jobs = [...this.jobs];
+      if (!jobs.length) return;
+      await Promise.allSettled(jobs);
+    }
+  }
 
   setWorkerLock(key: string, locked: boolean, reason: string) {
     const n = this.nodes.get(key);
@@ -372,6 +385,7 @@ export class Runtime {
     const epoch = t.nodeEpochs?.get(n.key)??0;
     const queuedMs = Date.now() - (t.queuedAt.get(n.key) ?? Date.now());
     const ctrl = new AbortController();
+    const browserScope = browserAttemptScope(ctrl.signal, fault => ctrl.abort(fault));
     this.aborts.set(attempt, ctrl);
     this.attemptTokens.set(attempt,t.id);
     w.busy = attempt;
@@ -384,11 +398,12 @@ export class Runtime {
       if (!exec) throw new Error(`工位 ${n.key} 没有执行器`);
       const role=readRole(n.key);
       this.journal.append({kind:"attempt.progress",attempt,text:`按 ${n.name} 的 ROLE.md 执行`,step:{tool:"role",text:`${role.path} @ ${role.revision}`}});
-      res = await exec({
+      res = await withBrowserAttempt(browserScope, () => exec({
         token: t, node: n, attempt, worker: w, signal: ctrl.signal, redo: t.notes.get(n.key),
         progress: (text, step) => {
           if (!ctrl.signal.aborted && (t.nodeEpochs?.get(n.key)??0) === epoch && !t.finished) this.journal.append({ kind: "attempt.progress", attempt, text, step });
         },
+        activity: activity => { this.journal.append({ kind: "attempt.activity", attempt, activity }); },
         addEvidence: (ev) => {
           ctrl.signal.throwIfAborted();
           if ((t.nodeEpochs?.get(n.key)??0) !== epoch || t.finished) throw new Error("stale attempt");
@@ -396,7 +411,7 @@ export class Runtime {
           this.journal.append({ kind: "evidence.added", evidence: full });
           return full;
         },
-      });
+      }));
     } catch (err) {
       const failure=(err as {failure?:Failure})?.failure ?? classifyFailure(err,{url:t.url});
       const observed = err as { usage?: Usage; metrics?: AttemptMetrics };
@@ -408,6 +423,11 @@ export class Runtime {
       w.busy = null; w.idleSince = Date.now();
     }
     const ms = Date.now() - t0;
+    if (browserScope.fault && this.running && !this.ending && !t.finished && (t.nodeEpochs?.get(n.key) ?? 0) === epoch) {
+      this.recoverBrowserAttempt(t, n, attempt, browserScope.fault, res, ms, queuedMs);
+      this.schedule();
+      return;
+    }
     if (ctrl.signal.aborted || (t.nodeEpochs?.get(n.key)??0) !== epoch || t.finished) {
       this.journal.append({ kind: "attempt.finished", attempt, ok: false, cancelled:true, summary: "已取消：任务已退回或本轮已结束", ms, queuedMs, usage: res.usage, metrics: res.metrics, error: "stale" });
       if((t.nodeEpochs?.get(n.key)??0)===epoch)t.inflight.delete(n.key);
@@ -457,6 +477,36 @@ export class Runtime {
       this.complete(t, n.key);
     }
     this.schedule();
+  }
+
+  /** Pool faults invalidate the whole attempt, even if a tool caught its page exception.
+   * Requeue only this station; completed predecessors, parallel branches and consultations
+   * retain their checkpoints. Persistent faults stay recoverable without a station failure. */
+  private recoverBrowserAttempt(t: TokenRun, n: CompiledNode, attempt: string, fault: BrowserPoolFault, res: StationResult, ms: number, queuedMs: number) {
+    const previous = t.data.browserRecoveries as Record<string, { token: string; count: number }> | undefined;
+    const count = (previous?.[n.key]?.token === t.id ? previous[n.key].count : 0) + 1;
+    const retry = count <= MAX_BROWSER_RECOVERIES;
+    const summary = retry ? `浏览器处理作废（${fault.code}）：从本工位自动恢复 ${count}/${MAX_BROWSER_RECOVERIES}` : `浏览器恢复次数已满（${fault.code}）：已用完 ${MAX_BROWSER_RECOVERIES} 次自动恢复，保留检查点等待处理`;
+    this.journal.append({ kind: "attempt.finished", attempt, ok: false, cancelled: true, summary, ms, queuedMs, usage: res.usage, metrics: res.metrics, error: "stale" });
+    t.inflight.delete(n.key);
+    const patch = { browserRecoveries: { ...previous, [n.key]: { token: t.id, count, code: fault.code, mode: fault.mode, at: Date.now(), nextAction: fault.nextAction } }, checkpointDone: [...t.done] };
+    Object.assign(t.data, patch); this.journal.append({ kind: "token.data", token: t.id, patch });
+    this.journal.append({ kind: "dispatch.note", node: n.key, tone: "warn", text: `${n.name} · ${t.title || t.item}：${summary}。${fault.nextAction}` });
+    if (retry) {
+      const note = t.notes.get(n.key);
+      t.notes.set(n.key, { reason: `${note?.reason ? `${note.reason}\n` : ""}${summary}；复用此前工位的持久成果。`, byHuman: note?.byHuman ?? false, note: note?.note });
+      this.enqueue(t, n.key, n.key, true);
+      return;
+    }
+    const failure: Failure = { tag: "browser_capture", category: "system", code: "BROWSER_POOL_RECOVERY_EXHAUSTED", message: summary, url: t.url, retryable: true, owner: "system", nextAction: fault.nextAction, tried: [`${MAX_BROWSER_RECOVERIES} 次页面池自动恢复`, fault.code] };
+    this.closeConsult(t, "manual", summary);
+    t.finished = true; t.data.failure = failure;
+    for (const [id, controller] of this.aborts) if (this.attemptTokens.get(id) === t.id) controller.abort();
+    for (const q of this.queues.values()) { const at = q.indexOf(t.id); if (at >= 0) q.splice(at, 1); }
+    this.journal.append({ kind: "token.data", token: t.id, patch: { failure } });
+    this.journal.append({ kind: "token.finished", token: t.id, node: n.key, status: "parked", reason: summary });
+    this.onRecovery?.(t, failure);
+    this.journal.append({ kind: "alert.raised", alert: { id: `browser:${t.item}`, kind: "browser", level: "red", token: t.id, item: t.item, message: summary, nextAction: fault.nextAction } });
   }
 
   /* -------------------------------------------------------------- flow */

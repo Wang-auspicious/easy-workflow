@@ -82,6 +82,7 @@ export class Factory {
     const services: Services = {
       store: this.store, workDir: path.join(VAR, "work"), publishDir: path.join(VAR, "published"),
       tryBrowser:()=>this.broker.tryAcquire("browser"),
+      acquireBrowser:(signal,timeoutMs)=>this.broker.acquire("browser",{signal,timeoutMs}),
       inFlight: (self) => new Set([...this.runtime.tokens.values()].filter((t) => !t.finished && t.id !== self && t.data.key).map((t) => String(t.data.key))),
     };
     const executors = (n: CompiledNode): Executor | null => {
@@ -132,14 +133,22 @@ export class Factory {
 
   private wireDocs() {
     this.journal.subscribe((e) => {
-      const a = e.kind === "attempt.finished" || e.kind === "attempt.started" ? this.state.attempts[e.attempt] : undefined;
-      if (a) { this.docs.schedule("context", a.node); const t = this.state.tokens[a.token]; if (t) this.docs.schedule("case", t.item); }
+      const a = e.kind === "attempt.finished" || e.kind === "attempt.started" || e.kind === "attempt.progress" ? this.state.attempts[e.attempt] : undefined;
+      if (a) { if (e.kind !== "attempt.progress") this.docs.schedule("context", a.node); const t = this.state.tokens[a.token]; if (t) this.docs.schedule("case", t.item); }
       else if (e.kind === "case.noted") this.docs.schedule("case", e.caseId);
       else if (e.kind === "context.noted") this.docs.schedule("context", e.node);
       else if (e.kind === "report.ready") queueMicrotask(() => { try { this.lessons.draftRun(e.runId); } catch (error) { this.lessonIssue(error); } });
-      else if (e.kind === "token.finished" || e.kind === "consult.opened" || e.kind === "consult.replied" || e.kind === "consult.closed") { const t = this.state.tokens[e.token]; if (t) this.docs.schedule("case", t.item); }
+      else if (e.kind === "run.started" || e.kind === "run.paused" || e.kind === "run.resumed" || e.kind === "run.ended") {
+        // Delay journal reads and disk work until the batch timer/flush, including
+        // records that have notes but no token.created event (legacy tool calls).
+        for (const item of new Set([...Object.values(this.state.tokens).map((t) => t.item), ...Object.keys(this.state.cases)])) this.docs.schedule("case", item);
+      }
+      else if (e.kind === "candidate.disposition") this.docs.schedule("case", e.candidate.item);
+      else if (e.kind === "evidence.added") { const t = this.state.tokens[e.evidence.token]; if (t) this.docs.schedule("case", t.item); }
+      else if (e.kind === "token.created" || e.kind === "token.queued" || e.kind === "token.data" || e.kind === "token.returned" || e.kind === "token.finished" || e.kind === "review.verdict" || e.kind === "correction.created" || e.kind === "consult.opened" || e.kind === "consult.replied" || e.kind === "consult.closed") { const t = this.state.tokens[e.token]; if (t) this.docs.schedule("case", t.item); }
     });
     try { this.docs.writeAllContexts(); } catch (err) { console.warn("contexts", (err as Error).message); }
+    this.docs.writeAllCases();
   }
 
   /** Bind the whole rerun before Runtime's queued microtask may start a worker. */
@@ -269,7 +278,7 @@ export class Factory {
     if(this.runtime.paused&&this.runtime.running)throw new ControlError(409,"run_paused","请先继续或结束当前暂停的轮次");
     const selected=this.candidateFailures({tag:filter.tag,disposition:"retry"}).filter(c=>!filter.items||filter.items.includes(c.item)).slice(0,filter.count);
     if(!selected.length)return [];
-    for(const c of selected)for(const k of ["tls","auth"])this.clearAlert(`${k}:${c.item}`,"站长已处理，按原因重试");
+    for(const c of selected)for(const k of ["tls","auth","browser"])this.clearAlert(`${k}:${c.item}`,"站长已处理，按原因重试");
     if(!this.runtime.running)this.runtime.start(`失败重试 × ${selected.length}`);
     return selected.map(c=>{
       const previous=this.state.tokens[c.token];

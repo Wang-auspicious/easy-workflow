@@ -6,6 +6,7 @@ import { apply, initialState } from "../shared/project.ts";
 import type { AttemptMetrics, JournalEvent, Stamped } from "../shared/types.ts";
 import { aggregateMetrics, buildReport } from "../server/report.ts";
 import type { Factory } from "../server/factory.ts";
+import { Journal } from "../server/journal.ts";
 
 test("report aggregates recorded token/time parts, preserves estimates and isolates historical runs", () => {
   const compiled = compile([pack]), events: Stamped[] = []; let run = "";
@@ -61,4 +62,32 @@ test("partial usage remains an observed subtotal without a fabricated cache rate
   assert.equal(result.tokens.actual?.input, 100); assert.equal(result.tokens.actual?.cacheRead, 5);
   assert.equal(result.coverage.usageReported, 1); assert.equal(result.coverage.usageComplete, 0); assert.equal(result.coverage.cacheUsageComplete, 0);
   assert.equal(result.tokens.cacheHitRate, null); assert.equal(result.time.outputTokensPerSecond, null);
+});
+
+test("historical waiting statistics survive a removed station without inventing a worker configuration suggestion", () => {
+  const original = compile([pack]), state = initialState(original), journal = new Journal(":memory:");
+  journal.subscribe(event => apply(state, event));
+  try {
+    const runId = "run-historical-wait";
+    journal.append({ kind: "run.started", runId, title: "historical reader queue" });
+    for (let i = 0; i < 3; i++) {
+      const token = `historical-${i}`, attempt = `historical-attempt-${i}`;
+      journal.append({ kind: "token.created", token, line: "curation", item: `recorded-${i}`, url: "https://example.test", source: "manual" });
+      journal.append({ kind: "attempt.started", attempt, token, node: "curation/reader", worker: "old-reader", input: "recorded input" });
+      journal.append({ kind: "attempt.finished", attempt, ok: true, summary: "read", ms: 100, queuedMs: 1000, usage: { input: 20, output: 10, cost: .01 } });
+    }
+    journal.append({ kind: "run.ended", runId, manual: true });
+    const compiled = { ...original, nodes: original.nodes.filter(node => node.key !== "curation/reader") };
+    const report = buildReport({ compiled, state, journal } as unknown as Factory, runId);
+    const historical = report.layers.flatMap(layer => layer.nodes).find(node => node.key === "curation/reader")!;
+    assert.equal(historical.processed, 3);
+    assert.equal(historical.metrics.coverage.attempts, 3);
+    assert.equal(historical.metrics.time.attemptMs, 300);
+    assert.equal(historical.metrics.time.queuedMs, 3000);
+    assert.equal(historical.metrics.tokens.actual?.input, 60);
+    assert.equal(historical.metrics.tokens.actual?.output, 30);
+    assert.equal(historical.waitShare, 3000 / 3300);
+    assert.equal(report.insights.find(insight => insight.id === "wait")?.node, "curation/reader", "historical queue evidence must remain visible");
+    assert.ok(report.suggestions.every(suggestion => !suggestion.prompt.includes("workers.max")), "no known current worker configuration exists for this deleted node");
+  } finally { journal.close(); }
 });

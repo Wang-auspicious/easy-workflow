@@ -5,7 +5,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { Page } from "playwright-core";
+import { setTimeout as wait } from "node:timers/promises";
+import type { ElementHandle, Frame, Page } from "playwright-core";
 import { aHash, hamming, imageStats } from "../../server/evidence.ts";
 import { PREVIEW_RULES } from "./env.ts";
 import { browserAttention, withBrowserFrames } from "../../server/browser.ts";
@@ -162,9 +163,22 @@ export async function visit(page: Page, url: string, entryHost: string, say?: (t
   return { issues, hidden };
 }
 
+/** Consent UI can arrive while a demo is rendering or reappear on scroll. Reuse
+ * the visit policy immediately before each captured frame; never hide an access wall. */
+async function prepareScreenshot(page: Page) {
+  const issues = await pageVerdict(page, new URL(page.url()).hostname.replace(/^www\./, ""));
+  if (issues.includes("loginWall") || issues.includes("challenge")) {
+    const message = "页面需要登录或验证，已保留在内置浏览器";
+    await browserAttention(page, message);
+    throw new ClassifiedFailure(classifyFailure(message, { url: page.url() }));
+  }
+  await declineCookies(page);
+  await hideFloating(page);
+}
+
 export async function shoot(page: Page, clip?: { x: number; y: number; width: number; height: number }) {
   return withBrowserFrames(page,async()=>{
-    if(!clip)return page.screenshot({fullPage:false});
+    if(!clip){await prepareScreenshot(page);return page.screenshot({fullPage:false});}
     // Full-page capture can reposition responsive/sticky content after the DOM
     // coordinates were measured. Crop the real viewport pixels instead, and tile
     // taller stages without changing viewport dimensions or reflowing the page.
@@ -177,7 +191,9 @@ export async function shoot(page: Page, clip?: { x: number; y: number; width: nu
         let rowHeight=height-dy;
         for(let dx=0;dx<width;){
           const x=Math.round(clip.x)+dx,y=Math.round(clip.y)+dy;
-          const view=await page.evaluate(async({x,y})=>{window.scrollTo(Math.max(0,x-32),Math.max(0,y-Math.min(160,innerHeight/4)));await new Promise<void>(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r())));return {x:scrollX,y:scrollY,w:innerWidth,h:innerHeight};},{x,y});
+          await page.evaluate(async({x,y})=>{window.scrollTo(Math.max(0,x-32),Math.max(0,y-Math.min(160,innerHeight/4)));await new Promise<void>(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r())));},{x,y});
+          await prepareScreenshot(page);
+          const view=await page.evaluate(()=>({x:scrollX,y:scrollY,w:innerWidth,h:innerHeight}));
           const sx=Math.round(x-view.x),sy=Math.round(y-view.y);
           const w=Math.min(width-dx,view.w-sx),h=Math.min(height-dy,view.h-sy);
           if(sx<0||sy<0||w<1||h<1)throw new Error('舞台裁剪超出页面范围');
@@ -244,11 +260,14 @@ export function breadthPreviewIssues(kind: string, previews: unknown): string[] 
 /* ------------------------------------------------------------------ stage (component close-up) */
 
 export interface Stage { sel: string; x: number; y: number; w: number; h: number; painted: number; media: number; locked: boolean }
+// Selectors are descriptive (and can match several examples). Retain the exact
+// chosen DOM node for frame checks without adding attributes to the source page.
+const stageElements = new WeakMap<Stage, ElementHandle<Element>>();
 
 export async function findStage(page: Page): Promise<Stage | null> {
-  return page.evaluate((selectors) => {
+  const selection = await page.evaluateHandle((selectors) => {
     const seen = new Set<Element>();
-    const boxes: Stage[] = [];
+    const boxes: { stage: Stage; element: Element }[] = [];
     const roots:(Document|ShadowRoot)[]=[document];
     for(let i=0;i<roots.length;i++)for(const el of roots[i].querySelectorAll('*'))if(el.shadowRoot)roots.push(el.shadowRoot);
     // Documentation frameworks often put an unnamed live example directly before
@@ -280,12 +299,21 @@ export async function findStage(page: Page): Promise<Stage | null> {
         if (painted < 1 && !media && !el.matches("button,input,[role=button]")) continue;
         if (el.querySelector("pre,code") && !el.matches(".bd-example,[data-preview],#storybook-root")) continue;
         const locked = /\b(pro|upgrade|unlock)\b|会员/i.test(((el as HTMLElement).innerText || "").slice(0, 200)) && el.querySelectorAll("svg").length > 0 && painted < 12;
-        boxes.push({ sel, x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height, painted, media, locked });
+        boxes.push({ stage: { sel, x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height, painted, media, locked }, element: el });
       }
     }
-    boxes.sort((a, b) => (a.y<innerHeight?0:1)-(b.y<innerHeight?0:1) || b.w*b.h-a.w*a.h);
-    return boxes.find((b) => !b.locked) || null;
+    boxes.sort((a, b) => (a.stage.y<innerHeight?0:1)-(b.stage.y<innerHeight?0:1) || b.stage.w*b.stage.h-a.stage.w*a.stage.h);
+    return boxes.find((b) => !b.stage.locked) || { stage: null, element: null };
   }, STAGE_SELECTORS).catch(() => null);
+  if (!selection) return null;
+  try {
+    const info = await selection.getProperty("stage");
+    const stage = await info.jsonValue(); await info.dispose();
+    const node = await selection.getProperty("element"), element = node.asElement();
+    if (!stage || !element) { await node.dispose(); return null; }
+    stageElements.set(stage, element as ElementHandle<Element>);
+    return stage;
+  } finally { await selection.dispose(); }
 }
 
 export function stageClip(stage: Stage, pageWidth: number) {
@@ -322,13 +350,77 @@ export function letterbox(png: Buffer, clip: { width: number; height: number }) 
   return execFileSync("ffmpeg", ["-loglevel", "error", "-f", "image2pipe", "-i", "pipe:0", "-vf", `pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2:color=0x${hex}`, "-f", "image2", "-c:v", "png", "pipe:1"], { input: png, maxBuffer: 1 << 26 });
 }
 
-export async function iframeEmpty(page: Page) {
-  const counts: number[] = [];
-  for (const frame of page.frames()) {
-    if (frame === page.mainFrame()) continue;
-    counts.push(await frame.evaluate(() => [...document.querySelectorAll("body *")].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 10 && r.height > 10; }).length).catch(() => 0));
+/** Visible iframe content belonging to this exact stage, including nested demos.
+ * Hidden analytics and unrelated sibling frames cannot veto or validate a stage. */
+export async function stageFrames(page: Page, stage: Stage): Promise<(Frame | null)[]> {
+  const element = stageElements.get(stage);
+  if (!element || (await element.ownerFrame())?.page() !== page || !(await element.evaluate(el => el.isConnected))) throw new Error("选中的舞台元素已失效，需要重新定位");
+  const visible = (el: Element) => {
+    const r = el.getBoundingClientRect(), css = getComputedStyle(el);
+    return r.width > 10 && r.height > 10 && css.display !== "none" && css.visibility !== "hidden" && Number(css.opacity) > 0
+      && ((el as HTMLElement).checkVisibility?.({ opacityProperty: true, visibilityProperty: true }) ?? true);
+  };
+  const handles = await element.$$("iframe");
+  if (await element.evaluate(el => el.matches("iframe"))) handles.unshift(element as ElementHandle<HTMLIFrameElement>);
+  const frames: (Frame | null)[] = [];
+  for (const handle of handles) {
+    try { if (await handle.evaluate(visible)) frames.push(await handle.contentFrame()); }
+    finally { if (handle !== element) await handle.dispose(); }
   }
-  return counts.length > 0 && Math.max(...counts) < 3;
+  for (let i = 0; i < frames.length; i++) {
+    for (const child of frames[i]?.childFrames() ?? []) {
+      const handle = await child.frameElement();
+      try { if (await handle.evaluate(visible)) frames.push(child); }
+      finally { await handle.dispose(); }
+    }
+  }
+  return frames;
+}
+
+async function boundedFrameRead<T>(read: () => Promise<T>, signal?: AbortSignal, timeoutMs?: number): Promise<T | null> {
+  signal?.throwIfAborted();
+  if (timeoutMs !== undefined && timeoutMs <= 0) return null;
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined, done = false;
+    const finish = (value: T | null, error?: unknown) => {
+      if (done) return;
+      done = true; clearTimeout(timer); signal?.removeEventListener("abort", aborted);
+      error === undefined ? resolve(value) : reject(error);
+    };
+    const aborted = () => finish(null, signal!.reason);
+    signal?.addEventListener("abort", aborted, { once: true });
+    if (timeoutMs !== undefined) timer = setTimeout(() => finish(null), timeoutMs);
+    void read().then(value => finish(value), error => finish(null, error));
+  });
+}
+
+/** Load/networkidle can precede async Storybook rendering. Re-check this stage's
+ * current frames until the original threshold is met or the one deadline expires.
+ * Frame attachment and navigation are sampled again, never satisfied by siblings. */
+export async function iframeEmpty(page: Page, stage: Stage, opts: { timeoutMs?: number; signal?: AbortSignal } = {}) {
+  const budget = Math.max(0, opts.timeoutMs ?? 0), deadline = Date.now() + budget;
+  let hadFrames = false;
+  while (true) {
+    opts.signal?.throwIfAborted();
+    const sample = await boundedFrameRead(async () => {
+      try {
+        const frames = await stageFrames(page, stage), counts: number[] = [];
+        for (const frame of frames) counts.push(frame ? await frame.evaluate(() => [...document.querySelectorAll("body *")].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 10 && r.height > 10; }).length).catch(() => 0) : 0);
+        return { hasFrames: frames.length > 0, ready: counts.some(count => count >= 3) };
+      } catch {
+        // A navigating/detached frame is not evidence of readiness. The exact
+        // selected element must become readable again within the same budget.
+        return { hasFrames: true, ready: false };
+      }
+    }, opts.signal, budget ? deadline - Date.now() : undefined);
+    opts.signal?.throwIfAborted();
+    if (!sample) return true;
+    hadFrames ||= sample.hasFrames;
+    if (sample.ready || !hadFrames) return false;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return true;
+    await wait(Math.min(200, remaining), undefined, { signal: opts.signal });
+  }
 }
 
 /* ------------------------------------------------------------------ scroll recording */

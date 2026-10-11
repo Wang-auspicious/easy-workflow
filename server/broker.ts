@@ -17,6 +17,7 @@ export class Broker {
   /** Model leases are refused while a quota/credential alert is open. */
   modelHold: string | null = null;
   private next = 1;
+  private waiters = new Set<() => void>();
   onRelease: () => void = () => {};
   freeMem: () => number = () => Math.round(os.freemem() / 1048576);
 
@@ -58,9 +59,46 @@ export class Broker {
         if (done) return;
         done = true;
         if (cls !== "none") this.used[cls] = Math.max(0, (this.used[cls] ?? 1) - 1);
+        // Existing callers waiting for capacity get the released slot before the
+        // scheduler admits more work. Each waiter still checks the live limit.
+        for (const wake of this.waiters) wake();
         queueMicrotask(this.onRelease);
       },
     };
+  }
+
+  /** Wait for capacity without conflating resource saturation with a site error.
+   * Null means this bounded wait expired; cancellation rejects immediately. The
+   * timer also observes memory recovery, which need not release an existing lease. */
+  async acquire(cls: ResourceClass, opts: { review?: boolean; signal?: AbortSignal; timeoutMs?: number } = {}): Promise<Lease | null> {
+    opts.signal?.throwIfAborted();
+    const immediate = this.tryAcquire(cls, opts);
+    if (immediate) return immediate;
+    const timeout = opts.timeoutMs ?? 20000;
+    if (timeout <= 0) return null;
+    return new Promise((resolve, reject) => {
+      const deadline = Date.now() + timeout;
+      let timer: ReturnType<typeof setTimeout> | undefined, done = false;
+      const finish = (lease: Lease | null, error?: unknown) => {
+        if (done) return;
+        done = true; clearTimeout(timer); this.waiters.delete(check);
+        opts.signal?.removeEventListener("abort", aborted);
+        error === undefined ? resolve(lease) : reject(error);
+      };
+      const aborted = () => finish(null, opts.signal!.reason);
+      const check = () => {
+        if (done) return;
+        clearTimeout(timer);
+        if (opts.signal?.aborted) { aborted(); return; }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) { finish(null); return; }
+        const lease = this.tryAcquire(cls, opts);
+        if (lease) { finish(lease); return; }
+        timer = setTimeout(check, Math.min(250, remaining));
+      };
+      this.waiters.add(check); opts.signal?.addEventListener("abort", aborted, { once: true });
+      check();
+    });
   }
 
   static order(p: keyof typeof PRIORITY) { return PRIORITY[p]; }
