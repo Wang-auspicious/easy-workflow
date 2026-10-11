@@ -6,11 +6,13 @@ import path from "node:path";
 import type { ActivitySpan, AttemptMetrics, Stamped, Usage } from "../shared/types.ts";
 import { apply, initialState, median, quantile, type FactoryState } from "../shared/project.ts";
 import { VAR, type Factory } from "./factory.ts";
+import { batchSummary } from '../shared/batch.ts';
 
 export interface Insight { id: string; title: string; value: string; detail: string; spark?: number[]; tone: "good" | "warn" | "info"; node?: string; token?: string; score: number }
 export interface Suggestion { title: string; why: string; prompt: string; node?: string }
 
 export interface RunReport {
+  batch?: ReturnType<typeof batchSummary>;
   version: 3; status: FactoryState["run"]["status"];
   runId: string; title: string; startedAt: number; endedAt: number; netMs: number;
   totals: FactoryState["totals"] & { created: number; parked:number; failedAttempts:number; perPublishedMs: number; perPublishedCost: number; perPublishedTokens: number };
@@ -236,7 +238,7 @@ export function buildReport(f: Factory, runId: string): RunReport {
 
   const insights = mine({ ...f, state:s } as Factory, events, rows, workers, tokens, attempts, startedAt, endedAt);
   const suggestions = suggest(rows, insights, f);
-  return { version:3, status:s.run.status, runId, title: start?.kind === "run.started" ? start.title : s.run.title, startedAt, endedAt, netMs, totals, layers, flows: [...flows.values()], workers, insights, suggestions, items, metrics: runMetrics, activity: buildActivity(attempts, runId),
+  return { version:3, status:s.run.status, batch: batchSummary(s), runId, title: start?.kind === "run.started" ? start.title : s.run.title, startedAt, endedAt, netMs, totals, layers, flows: [...flows.values()], workers, insights, suggestions, items, metrics: runMetrics, activity: buildActivity(attempts, runId),
     attempts: attempts.map(a=>({id:a.id,node:a.node,token:a.token,item:s.tokens[a.token]?.title || s.tokens[a.token]?.item || a.token,startedAt:a.startedAt,endedAt:a.endedAt,ms:a.ms ?? Math.max(0,endedAt-a.startedAt),queuedMs:a.queuedMs ?? 0,input:a.usage.input,output:a.usage.output,cost:a.usage.cost,cacheRead:recordedUsage.get(a.id)?.cacheRead,cacheWrite:recordedUsage.get(a.id)?.cacheWrite,metrics:a.metrics,ok:a.ok,cancelled:a.cancelled,summary:a.summary || a.error || "进行中",steps:a.steps.map(st=>({at:st.at,text:st.text}))})) };
 }
 

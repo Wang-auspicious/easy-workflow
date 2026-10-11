@@ -64,7 +64,7 @@ async function startBackend() {
     FACTORY_VAR: viewDir || activeProject(),
     FACTORY_PROJECT_NAME: path.basename(viewDir || activeProject()),
     FACTORY_LAYOUT: path.join(profile, 'layout', 'factory.layout.json'),
-    FACTORY_READONLY: viewDir ? '1' : '0', FACTORY_START_PAUSED: '1',
+    FACTORY_READONLY: viewDir ? '1' : '0', FACTORY_START_PAUSED: '1', FACTORY_RESUME_MANAGED: '1',
     FACTORY_BROWSER_BRIDGE: '1',
     FACTORY_DIST: path.join(root, 'ui', 'dist'),
     VISLEXICON_BUNDLED: path.join(root, 'resources', 'vislexicon'),

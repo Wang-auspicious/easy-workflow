@@ -6,16 +6,16 @@ import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
-import { emptyBrowser, type BrowserState } from "../shared/browser.ts";
+import { emptyBrowser, type BrowserState, type BrowserAttentionKind } from "../shared/browser.ts";
 
 const desktop = process.env.FACTORY_BROWSER_BRIDGE === "1" && Boolean(process.send);
 const { BrowserData, webURL } = createRequire(import.meta.url)("../app/browser-data.cjs");
-const { browserAttentionProbe, noteBrowserResponse, applyBrowserAttention } = createRequire(import.meta.url)("../app/browser-manager.cjs");
+const { browserAttentionProbe, browserAttentionKind, retainBrowserAttention, noteBrowserResponse, applyBrowserAttention } = createRequire(import.meta.url)("../app/browser-manager.cjs");
 const profile = path.resolve(process.env.FACTORY_VAR || "var", "browser");
 const data = desktop ? null : new BrowserData(path.join(profile, "browser.json"));
 const pending = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
 const pageIds = new WeakMap<Page, string>();
-const tabs = new Map<string, { page: Page; owner: "user" | "agent"; attention?: string; checkSerial?: number; attentionCheck?: Promise<void>; documentUrl?: string; documentStatus?: number; denied?: Set<string>; manualAttention?: boolean }>();
+const tabs = new Map<string, { page: Page; owner: "user" | "agent"; leased: boolean; attention?: string; attentionKind?: BrowserAttentionKind; checkSerial?: number; attentionCheck?: Promise<void>; documentUrl?: string; documentStatus?: number; denied?: Set<string>; manualAttention?: boolean }>();
 let state: BrowserState = { ...emptyBrowser(), ...(data ? { bookmarks: data.bookmarks, history: data.history, retentionDays: data.retentionDays } : {}) };
 let context: Promise<BrowserContext> | null = null;
 let connection: Promise<Browser> | null = null;
@@ -105,12 +105,12 @@ async function persistent(): Promise<BrowserContext> {
 }
 function update() {
   if (desktop) return;
-  publish({ mode: "headless", tabs: [...tabs].map(([id,t]) => ({ id, url:t.page.url(), title:titles.get(id) || "新标签页", loading:false, owner:t.owner, attention:t.attention })), active: state.active && tabs.has(state.active) ? state.active : tabs.keys().next().value ?? null, bookmarks:data.bookmarks, history:[...data.history].slice(-200).reverse(), retentionDays:data.retentionDays });
+  publish({ mode: "headless", tabs: [...tabs].map(([id,t]) => ({ id, url:t.page.url(), title:titles.get(id) || "新标签页", loading:false, owner:t.owner, attention:t.attention, attentionKind:t.attentionKind })), active: state.active && tabs.has(state.active) ? state.active : tabs.keys().next().value ?? null, bookmarks:data.bookmarks, history:[...data.history].slice(-200).reverse(), retentionDays:data.retentionDays });
 }
 async function createHeadless(owner: "user" | "agent") {
   if (tabs.size >= 30) throw new Error("已有 30 个标签页，请先关闭不需要的页面");
   const c = await persistent(), page = await c.newPage(), id = crypto.randomUUID();
-  tabs.set(id,{page,owner}); pageIds.set(page,id); state.active = id;
+  tabs.set(id,{page,owner,leased:owner==="agent"}); pageIds.set(page,id); state.active = id;
   page.on("close", () => { tabs.delete(id); titles.delete(id); update(); });
   page.on("response", response => {
     const tab = tabs.get(id); if (!tab) return;
@@ -121,7 +121,7 @@ async function createHeadless(owner: "user" | "agent") {
   });
   page.on("framenavigated", frame => { const tab = tabs.get(id); if (tab && frame === page.mainFrame()) tab.checkSerial = (tab.checkSerial ?? 0) + 1; });
   page.on("domcontentloaded", async () => { const url = page.url(), title = await page.title().catch(() => ""); if (page.isClosed() || page.url() !== url) return; titles.set(id,title); data.visit(url,title); await checkHeadless(id); update(); });
-  page.on("crash", () => { const t = tabs.get(id); if (t) { t.attention = "页面进程退出"; update(); } });
+  page.on("crash", () => { const t = tabs.get(id); if (t) { t.attention = "页面进程退出"; t.attentionKind = "crash"; update(); } });
   update(); return { page, context:c, id };
 }
 async function checkHeadless(id:string, manualCheck = false) {
@@ -189,7 +189,13 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
   };
   try { if (!desktop) {
     const t = await createHeadless("agent"); await t.page.setViewportSize(viewport);
-    return withCancellation(t.page,t.context,async () => { await checkHeadless(t.id); if (!tabs.get(t.id)?.attention) await t.page.close().catch(() => {}); });
+    return withCancellation(t.page,t.context,async () => {
+      await checkHeadless(t.id);
+      const tab = tabs.get(t.id); if (!tab) return;
+      const duplicate = [...tabs.values()].some(other => other !== tab && other.owner === "agent" && !other.leased && other.page.url() === tab.page.url() && retainBrowserAttention(other));
+      tab.leased = false;
+      if (!retainBrowserAttention(tab) || duplicate) await t.page.close().catch(() => {});
+    });
   }
   const lease = await rpc({ action:"lease" });
   try {
@@ -209,10 +215,15 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
   }
 }
 
-export async function browserAttention(page: Page, message: string) {
+export async function inspectBrowserAttention(page: Page): Promise<{ url: string; issue: string; kind?: BrowserAttentionKind }> {
+  return page.evaluate(browserAttentionProbe);
+}
+
+export async function browserAttention(page: Page, message: string, kind?: BrowserAttentionKind) {
   const id = pageIds.get(page); if (!id) return;
-  if (desktop) await rpc({action:"attention",id,message});
-  else { const t = tabs.get(id); if (t) { t.attention = message; t.manualAttention = true; update(); } }
+  kind ??= browserAttentionKind(message);
+  if (desktop) await rpc({action:"attention",id,message,kind});
+  else { const t = tabs.get(id); if (t) { t.attention = message; t.attentionKind = kind; t.manualAttention = true; update(); } }
 }
 /** Hold real compositor frames while capturing an occluded native task page. */
 export async function withBrowserFrames<T>(page:Page, capture:()=>Promise<T>):Promise<T> {

@@ -28,6 +28,8 @@ import { configureAgentStations } from "./agent-station.ts";
 import { preflight } from "./preflight.ts";
 import type { Alert } from "../shared/types.ts";
 import type { BrowserState } from "../shared/browser.ts";
+import { BatchSupervisor } from './batch.ts';
+import { browserCommand } from './browser.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -50,6 +52,7 @@ export class Factory {
   docs!: Docs;
   lessons!: Lessons;
   toolbox!: Toolbox;
+  batch!: BatchSupervisor;
 
   constructor() {
     const readOnly = process.env.FACTORY_READONLY === "1";
@@ -92,6 +95,8 @@ export class Factory {
       return def ? (ctx) => runAgentStation(def, ctx) : null;
     };
     this.runtime = new Runtime(this.compiled, this.journal, this.broker, pack.conditions, executors);
+    this.batch = new BatchSupervisor(this);
+    this.runtime.onTick = () => { this.resumeVerifiedCandidates(); this.batch.pump(); };
     this.wireRecovery();
     if (process.env.FACTORY_READONLY === "1") { this.catalog = loadCatalog(); return; }
     this.wireDocs();
@@ -106,8 +111,10 @@ export class Factory {
       const failure=classifyFailure(c.failure.message,{url:c.url});
       if(failure.tag!=="tool_error")this.journal.append({kind:"candidate.disposition",candidate:{...c,failure}});
     }
+    this.reconcileFailureAlerts();
     this.restore();
     this.runtime.tick();
+    this.batch.schedule();
   }
 
   /* -------------------------------------------------------------- stock (候选层 / 已发布) */
@@ -134,12 +141,14 @@ export class Factory {
 
   private wireDocs() {
     this.journal.subscribe((e) => {
+      if (e.kind === 'token.finished') queueMicrotask(() => this.resumeVerifiedCandidates());
       const a = e.kind === "attempt.finished" || e.kind === "attempt.started" || e.kind === "attempt.progress" ? this.state.attempts[e.attempt] : undefined;
       if (a) { if (e.kind !== "attempt.progress") this.docs.schedule("context", a.node); const t = this.state.tokens[a.token]; if (t) this.docs.schedule("case", t.item); }
       else if (e.kind === "case.noted") this.docs.schedule("case", e.caseId);
       else if (e.kind === "context.noted") this.docs.schedule("context", e.node);
       else if (e.kind === "report.ready") queueMicrotask(() => { try { this.lessons.draftRun(e.runId); } catch (error) { this.lessonIssue(error); } });
       else if (e.kind === "run.started" || e.kind === "run.paused" || e.kind === "run.resumed" || e.kind === "run.ended") {
+        if (e.kind === 'run.resumed') queueMicrotask(() => this.resumeVerifiedCandidates());
         // Delay journal reads and disk work until the batch timer/flush, including
         // records that have notes but no token.created event (legacy tool calls).
         for (const item of new Set([...Object.values(this.state.tokens).map((t) => t.item), ...Object.keys(this.state.cases)])) this.docs.schedule("case", item);
@@ -194,25 +203,88 @@ export class Factory {
     return true;
   }
 
+  /** Old versions labeled every owner-facing problem as login. Keep the audit trail,
+   * but make the live action list reflect the failure that actually occurred. */
+  reconcileFailureAlerts() {
+    for (const candidate of Object.values(this.state.recoveries)) {
+      const old = candidate.failure;
+      if (!old || !['auth_required', 'network_connection'].includes(old.tag)) continue;
+      const classified = classifyFailure(old.message, { url: old.url ?? candidate.url, status: old.status });
+      if (classified.tag !== old.tag || classified.owner !== old.owner) {
+        const failure = { ...old, ...classified };
+        this.journal.append({ kind: 'candidate.disposition', candidate: { ...candidate, failure } });
+        this.journal.append({ kind: 'token.data', token: candidate.token, patch: { failure } });
+      }
+    }
+    for (const alert of Object.values(this.state.alerts)) {
+      const candidate = alert.item ? this.state.recoveries[alert.item] : undefined;
+      if (alert.kind === 'auth' && candidate && (candidate.disposition !== 'retry' || candidate.failure?.tag !== 'auth_required')) {
+        this.clearAlert(alert.id, '按实际失败原因重新核对：这不是需要用户登录的任务');
+      }
+    }
+  }
+
+  async recheckAlert(id: string) {
+    const alert = this.state.alerts[id];
+    if (!alert) throw new ControlError(404, 'alert_not_found', '该提醒已经解除');
+    if (alert.kind === 'auth') {
+      const sameSite = (url: string) => { try { const host = new URL(alert.url ?? '').hostname.replace(/^www\./, ''); const actual = new URL(url).hostname.replace(/^www\./, ''); return !!host && (actual === host || actual.endsWith('.' + host)); } catch { return false; } };
+      let browser = await browserCommand({ action: 'state' }) as BrowserState;
+      const matches = browser.tabs.filter(tab => (!alert.tab || tab.id === alert.tab) && sameSite(tab.url));
+      if (!matches.length) return { cleared: false, resumed: false, message: '原验证页面已关闭，尚无成功访问的证据；请打开对应页面后重新检查' };
+      for (const tab of matches) browser = await browserCommand({ action: 'attention.check', id: tab.id }) as BrowserState;
+      const checked = browser.tabs.filter(tab => sameSite(tab.url) && matches.some(original => original.id === tab.id));
+      if (!checked.length || checked.some(tab => tab.loading || tab.attention || !/^https?:/.test(tab.url))) return { cleared: false, resumed: false, message: '页面仍有访问限制或仍在加载，已保留现场与检查点' };
+      const candidate = alert.item ? this.state.recoveries[alert.item] : undefined;
+      if (candidate?.disposition === 'retry') this.journal.append({ kind: 'token.data', token: candidate.token, patch: { accessVerified: { at: Date.now(), tab: checked[0].id, url: checked[0].url } } });
+      this.clearAlert(id, '共享浏览器重新检查确认页面可访问，已保存恢复标记');
+      if (this.runtime.paused) return { cleared: true, resumed: false, message: '页面可访问；已保存恢复标记，继续本轮后将从检查点恢复' };
+      if (this.state.batch?.runId === this.state.run.id && this.state.batch.mode !== 'running') return { cleared: true, resumed: false, message: '页面可访问；托管已停止，恢复任务后再继续此条目' };
+      if (!this.runtime.running) await this.ensureReady();
+      const tasks = this.resumeVerifiedCandidates();
+      return { cleared: true, resumed: tasks.some(token => token.item === alert.item), message: tasks.some(token => token.item === alert.item) ? '访问已恢复，已从失败工位继续' : candidate?.disposition === 'retry' ? '访问已恢复，已排入恢复队列；在途任务腾出空位后自动继续' : '访问已恢复，该任务已不在待重试队列' };
+    }
+    if (alert.kind === 'model' || alert.kind === 'preflight') {
+      try { await this.ensureReady(true); } catch { /* Preserve the concrete preflight result. */ }
+      const cleared = !this.state.alerts[id];
+      return { cleared, resumed: false, message: cleared ? '体检已通过，提醒已解除' : '体检仍未通过，请查看当前检测结果' };
+    }
+    return { cleared: false, resumed: false, message: alert.nextAction ?? '问题尚未有修复证据，提醒保持' };
+  }
+
   /** Verification walls go to the owner: red light, page kept in the built-in browser.
    *  Once that page loads normally again (the owner passed the check), continue the
    *  candidate from its failed station instead of waiting for a manual retry. */
   private walled = new Set<string>();
   private resuming = false;
+  resumeVerifiedCandidates() {
+    if (!this.runtime.running || this.runtime.paused || this.runtime.ending) return [];
+    if (this.state.batch?.runId === this.state.run.id && this.state.batch.mode !== 'running') return [];
+    const items = this.candidateFailures({ disposition: 'retry' }).filter(candidate => candidate.failure?.tag === 'auth_required' && this.state.tokens[candidate.token]?.data.accessVerified).map(candidate => candidate.item);
+    const goal = this.state.batch?.runId === this.state.run.id ? this.state.batch : undefined;
+    const slots = goal ? Math.max(0, goal.maxInFlight - [...this.runtime.tokens.values()].filter(token => !token.finished).length) : 12;
+    return items.length && slots ? this.retryCandidates({ items, count: Math.min(items.length, slots) }) : [];
+  }
   async resumeVerified(browser: BrowserState) {
     const alerts = Object.values(this.state.alerts ?? {}).filter((a) => a.kind === "auth" && a.item && (a.url || a.tab));
     if (!alerts.length) { this.walled.clear(); return; }
     if (this.resuming) return;
     const hostOf = (u: string) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } };
     for (const a of alerts) {
-      const tabs = browser.tabs.filter((t) => (a.tab && t.id === a.tab) || (a.url && hostOf(t.url) === hostOf(a.url)));
+      const tabs = browser.tabs.filter((t) => (!a.tab || t.id === a.tab) && a.url && hostOf(t.url) === hostOf(a.url));
       if (tabs.some((t) => t.attention)) { this.walled.add(a.id); continue; }
       if (!this.walled.has(a.id) || !tabs.some((t) => !t.loading)) continue;
+      if (this.runtime.paused || this.state.batch?.runId === this.state.run.id && this.state.batch.mode !== 'running') continue;
       this.walled.delete(a.id);
       this.resuming = true;
       try {
         if (!this.runtime.running) await this.ensureReady();
-        if (this.retryCandidates({ items: [a.item!], count: 1 }).length) this.journal.append({ kind: "dispatch.note", node: a.node, tone: "info", text: `${a.item}：内置浏览器里的验证已通过，自动从失败工位继续` });
+        const candidate = this.state.recoveries[a.item!];
+        if (candidate?.disposition === 'retry') {
+          this.journal.append({ kind: 'token.data', token: candidate.token, patch: { accessVerified: { at: Date.now(), tab: tabs[0].id, url: tabs[0].url } } });
+          this.clearAlert(a.id, '内置浏览器里的验证已通过，已排入恢复队列');
+          if (this.resumeVerifiedCandidates().some(token => token.item === a.item)) this.journal.append({ kind: "dispatch.note", node: a.node, tone: "info", text: `${a.item}：内置浏览器里的验证已通过，自动从失败工位继续` });
+        }
       } catch { /* Paused, preflight failed or no longer waiting: the red light and manual retry remain. */ }
       finally { this.resuming = false; }
     }
@@ -239,7 +311,8 @@ export class Factory {
   private wireRecovery() {
     this.runtime.onRecovery = (token, failure) => this.recordRecovery(token, failure);
     this.runtime.onAlert = (token, node, failure) => {
-      const kind: Alert["kind"] = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" ? "model" : "auth";
+      const kind: Alert["kind"] | undefined = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" ? "model" : failure.tag === "auth_required" ? "auth" : undefined;
+      if (!kind) return;
       this.raiseAlert({ id: kind === "model" ? "model" : `${kind}:${token.item}`, level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: failure.url ?? token.url });
     };
     this.runtime.onPark = token => this.recordRecovery(token, {tag:"run_ended",category:"system",message:"本轮结束，工作尚未完成",url:token.url,retryable:true});
@@ -299,7 +372,7 @@ export class Factory {
     return this.retryCandidates({items:[item],count:1,preview:{role,url:selected.href}})[0];
   }
 
-  retryCandidates(filter:{tag?:string;items?:string[];count:number;preview?:{role:"breadth"|"proof";url:string}}) {
+  retryCandidates(filter:{tag?:string;items?:string[];count:number;preview?:{role:"breadth"|"proof";url:string};automatic?:boolean;replan?:boolean}) {
     if(this.runtime.paused&&this.runtime.running)throw new ControlError(409,"run_paused","请先继续或结束当前暂停的轮次");
     const selected=this.candidateFailures({tag:filter.tag,disposition:"retry"}).filter(c=>!filter.items||filter.items.includes(c.item)).slice(0,filter.count);
     if(!selected.length)return [];
@@ -308,10 +381,16 @@ export class Factory {
     return selected.map(c=>{
       const previous=this.state.tokens[c.token];
       const legacy:Record<string,string>={"curation/fetch":"curation/scout"};
-      const failedAt=filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode&&(legacy[previous.finishedAtNode]??previous.finishedAtNode);
+      const failedAt=filter.replan?'curation/reader':filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode&&(legacy[previous.finishedAtNode]??previous.finishedAtNode);
       const checkpoint=previous?.data.canonical&&failedAt&&this.compiled.nodes.some(n=>n.key===failedAt&&this.runtime.runnable(n))?failedAt:"candidates/tidy";
       const data:Record<string,unknown>=checkpoint==="candidates/tidy"?(previous?.data.rerunPublished === true ? { rerunPublished: true } : {}):structuredClone(previous.data);
       delete data.failure;delete data.gate;delete data.digest;
+      delete data.accessVerified;
+      if (filter.automatic && previous?.data.batchRecovery) data.batchRecovery = { ...(previous.data.batchRecovery as object), nextAt: 0 };
+      if (filter.replan) {
+        data.repairContext = { failure: c.failure, tried: previous?.data.needsPick, plan: previous?.data.readerPlan, access: previous?.data.candidateAccessFailures };
+        for (const key of ['previewChoices','shotRepairs','readerPlan','breadthVisual','breadthCompared','needsPick']) delete data[key];
+      }
       if(filter.preview){
         data.previewChoices={...(data.previewChoices as object??{}),[filter.preview.role]:filter.preview.url};
         const repairs={...(data.shotRepairs as Record<string,unknown>??{})};delete repairs[filter.preview.role];data.shotRepairs=repairs;
@@ -379,7 +458,8 @@ export class Factory {
     rt.ensureWorkers(live.map((w) => ({ node: w.node, worker: w.id, label: w.label })));
     const run = this.state.run;
     const resumable=run.status === "running" || run.status === "paused";
-    rt.running = resumable; rt.paused = resumable&&(run.status === "paused" || process.env.FACTORY_START_PAUSED === "1"); rt.runStartedAt = run.startedAt;
+    const managedResume = process.env.FACTORY_RESUME_MANAGED === '1' && this.state.batch?.runId === run.id && this.state.batch.mode === 'running';
+    rt.running = resumable; rt.paused = resumable&&(run.status === "paused" || process.env.FACTORY_START_PAUSED === "1" && !managedResume); rt.runStartedAt = run.startedAt;
     if (rt.paused && this.state.run.status === "running") this.journal.append({ kind: "run.paused", runId: run.id });
     // Which nodes each token has finished, per the journal (returns reset descendants).
     const done = new Map<string, Set<string>>(Object.values(this.state.tokens).map(t=>[t.id,new Set((t.data.checkpointDone as string[])??[])]));
@@ -480,6 +560,7 @@ export class Factory {
       for (const pool of previous.workers.values()) for (const w of pool) this.journal.append({ kind: "worker.retired", node: w.node, worker: w.id, reason: "规格新版本生效，重新配员" });
       this.compiled = trial;
       this.runtime = new Runtime(trial, this.journal, this.broker, pack.conditions, previous.executors);
+      this.runtime.onTick = () => { this.resumeVerifiedCandidates(); this.batch.pump(); };
       this.wireRecovery();
       this.runtime.stock = previous.stock;
       this.runtime.tokens = previous.tokens;

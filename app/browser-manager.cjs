@@ -9,16 +9,33 @@ const { BrowserData, webURL } = require('./browser-data.cjs');
 
 function browserAttentionProbe() {
   const text = (document.body?.innerText || '').slice(0, 6000), title = document.title || '';
-  const password = [...document.querySelectorAll('input[type=password]')].some(el => {
+  const visible = el => {
     const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
-  });
-  let issue = '';
-  if (/attention required|access denied|403 forbidden/i.test(title) || /sorry,?\s*you have been blocked|you are unable to access|your (?:request|access) (?:has been|was) blocked|访问被拒绝|拒绝访问|请求被拦截/i.test(text)) issue = '页面拒绝访问，请检查访问限制或验证状态';
-  else if (/just a moment/i.test(title) || /verify you are human|checking your browser|captcha|人机验证|安全验证/i.test(text)) issue = '页面需要完成验证';
-  else if (password || /sign in to continue|log in to view|登录后查看|登录后继续/i.test(text) || /\/(?:login|signin|sign-in)(?:[/?#]|$)|\/i\/flow\/login|\/i\/[^/]*onboarding/i.test(location.href)) issue = '登录状态需要检查';
-  return { url: location.href, issue };
+    const style = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && r.top < innerHeight && r.bottom > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const password = [...document.querySelectorAll('input[type=password]')].some(visible);
+  const authPath = /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(?:(?:account|auth)\/)?(?:login|signin|sign-in|log-in)(?:[/?#]|$)|^\/i\/flow\/login|^\/i\/[^/]*onboarding/i.test(location.pathname);
+  const authTitle = /^(?:log[ -]?in|sign[ -]?in|登录)(?:\b|\s|$)/i.test(title.trim());
+  const explicitWall = /sign in to (?:continue|view|access)|log in to (?:continue|view|access)|登录后查看|登录后继续/i.test(text);
+  const authDialog = [...document.querySelectorAll('[role=dialog],dialog')].some(el => visible(el) && /sign[ -]?in|log[ -]?in|登录/i.test(el.innerText || '') && el.querySelector('input[type=password]'));
+  let issue = '', kind;
+  // A password demo or an ordinary Sign in navigation item does not block public
+  // content. Require an authentication page, a blocking dialog or explicit wall.
+  if (/just a moment/i.test(title) || /verify you are human|checking your browser|人机验证|安全验证/i.test(text)) { issue = '页面需要完成人机验证'; kind = 'challenge'; }
+  else if (authPath || authDialog || (password && authTitle) || (explicitWall && (password || text.length < 1200))) { issue = '登录状态需要检查'; kind = 'auth'; }
+  else if (/attention required|access denied|403 forbidden/i.test(title) || /sorry,?\s*you have been blocked|you are unable to access|your (?:request|access) (?:has been|was) blocked|访问被拒绝|拒绝访问|请求被拦截/i.test(text)) { issue = '服务器拒绝访问，系统将核对公开入口与请求状态'; kind = 'http'; }
+  return { url: location.href, issue, kind };
 }
+
+function browserAttentionKind(message) {
+  if (/certificate|CERT_|ERR_(?:SSL|TLS)_|SSL_ERROR|证书/i.test(message)) return 'certificate';
+  if (/ERR_CONNECTION|ECONN|ERR_NAME|DNS|timeout|超时|连接|页面加载失败/i.test(message)) return 'network';
+  if (/人机验证|verify you are human|checking your browser|captcha|页面需要完成验证/i.test(message)) return 'challenge';
+  if (/登录|loginWall|sign in to|log in to/i.test(message) && !/403|拒绝访问|访问被拒绝/i.test(message)) return 'auth';
+  return 'http';
+}
+function retainBrowserAttention(tab) { return Boolean(tab.attention && ['auth', 'challenge', 'certificate'].includes(tab.attentionKind)); }
 
 function documentKey(url) { try { const parsed = new URL(url); parsed.hash = ''; return parsed.href; } catch { return url; } }
 function noteBrowserResponse(tab, { url, status, mainFrame, resourceType }) {
@@ -34,21 +51,28 @@ function noteBrowserResponse(tab, { url, status, mainFrame, resourceType }) {
   }
   if ([401, 403].includes(status)) {
     tab.denied.add(key);
-    tab.attention = `页面或授权请求被拒绝（HTTP ${status}），请检查访问限制或验证状态`;
+    // Anonymous /session checks are common on public pages. A same-origin XHR
+    // denial is evidence to inspect, not proof that the main content needs login.
+    if (!mainFrame) return true;
+    tab.attention = status === 401 ? '页面要求身份认证（HTTP 401）' : '服务器拒绝请求（HTTP 403），系统将检查公开入口';
+    tab.attentionKind = status === 401 ? 'auth' : 'http';
     return true;
   }
-  if (mainFrame && status >= 400) { tab.attention = `页面加载失败（HTTP ${status}）`; return true; }
+  if (mainFrame && status >= 400) { tab.attention = `页面加载失败（HTTP ${status}）`; tab.attentionKind = 'http'; return true; }
   if (status >= 200 && status < 400) return tab.denied.delete(key) || mainFrame;
   return false;
 }
 function applyBrowserAttention(tab, probe, currentUrl, loading, manualCheck = false) {
   // A failed/stale probe cannot prove that an existing alert has been resolved.
   if (!probe || probe.url !== currentUrl) return;
-  if (probe.issue) { tab.attention = probe.issue; return; }
+  if (probe.issue) {
+    if (tab.documentStatus === 401 && probe.kind === 'http') return;
+    tab.attention = probe.issue; tab.attentionKind = probe.kind || browserAttentionKind(probe.issue); return;
+  }
   const healthy = tab.documentStatus === undefined || (tab.documentStatus >= 200 && tab.documentStatus < 400 && documentKey(tab.documentUrl) === documentKey(currentUrl));
-  if (!loading && healthy && !tab.denied?.size) {
+  if (!loading && healthy) {
     if (manualCheck) tab.manualAttention = false;
-    if (!tab.manualAttention) tab.attention = undefined;
+    if (!tab.manualAttention) { tab.attention = undefined; tab.attentionKind = undefined; }
   }
 }
 
@@ -79,7 +103,7 @@ class BrowserManager {
     await dest.cookies.flushStore(); fs.writeFileSync(path.join(this.profile, 'browser-session-migrated'), '1');
   }
   attach(window) { this.window = window; }
-  snapshot() { return { mode: 'desktop', tabs: [...this.tabs.values()].map(t => ({ id: t.id, url: t.url, title: t.title, owner: t.owner, loading: t.loading, attention: t.attention, canGoBack: !t.view.webContents.isDestroyed() && t.view.webContents.navigationHistory.canGoBack(), canGoForward: !t.view.webContents.isDestroyed() && t.view.webContents.navigationHistory.canGoForward() })), active: this.active, bookmarks: this.data.bookmarks, history: this.data.history.slice(-200).reverse(), retentionDays: this.data.retentionDays }; }
+  snapshot() { return { mode: 'desktop', tabs: [...this.tabs.values()].map(t => ({ id: t.id, url: t.url, title: t.title, owner: t.owner, loading: t.loading, attention: t.attention, attentionKind: t.attentionKind, canGoBack: !t.view.webContents.isDestroyed() && t.view.webContents.navigationHistory.canGoBack(), canGoForward: !t.view.webContents.isDestroyed() && t.view.webContents.navigationHistory.canGoForward() })), active: this.active, bookmarks: this.data.bookmarks, history: this.data.history.slice(-200).reverse(), retentionDays: this.data.retentionDays }; }
   publish() { this.notify(this.snapshot()); }
   persistTabs() { this.data.tabs = [...this.tabs.values()].filter(t => t.owner === 'user' && /^https?:/.test(t.url)).map(t => ({url:t.url})); this.data.save(); }
   mount() {
@@ -101,7 +125,7 @@ class BrowserManager {
     if (this.tabs.size >= 30) throw new Error('已有 30 个标签页，请先关闭不需要的页面');
     const id = crypto.randomUUID();
     const view = new WebContentsView({ webPreferences: { partition: this.partition, nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true, backgroundThrottling: owner !== 'agent' } });
-    const t = { id, view, url, title: url === 'about:blank' ? '新标签页' : new URL(url).hostname, owner, loading: false, attention: undefined };
+    const t = { id, view, url, title: url === 'about:blank' ? '新标签页' : new URL(url).hostname, owner, leased: owner === 'agent', loading: false, attention: undefined };
     this.tabs.set(id,t); view.setBounds({x:0,y:0,width:1280,height:800});
     view.setVisible(false);
     // Detached WebContentsViews can navigate but have no composited frame to capture.
@@ -116,9 +140,9 @@ class BrowserManager {
     wc.on('page-title-updated', (_e,title) => { t.title = wc.getURL().startsWith('about:') ? '新标签页' : title || t.title; const visit=[...this.data.history].reverse().find(h=>h.url===wc.getURL()); if(visit){visit.title=t.title;this.data.save();} this.publish(); });
     const navigated = () => { t.url = wc.getURL(); t.title = t.url.startsWith('about:') ? '新标签页' : wc.getTitle() || t.title; this.data.visit(t.url,t.title); this.persistTabs(); this.publish(); void this.check(t); };
     wc.on('did-navigate', navigated); wc.on('did-navigate-in-page', navigated); wc.on('did-finish-load', () => void this.check(t));
-    wc.on('did-fail-load', (_e,code,description,_url,main) => { if (main && code !== -3) { t.attention = `页面加载失败：${description}`; this.publish(); } });
+    wc.on('did-fail-load', (_e,code,description,_url,main) => { if (main && code !== -3) { t.attention = `页面加载失败：${description}`; t.attentionKind = browserAttentionKind(description); this.publish(); } });
     wc.on('render-process-gone', (_event, details) => {
-      t.crashed = true; t.attention = `页面进程已退出（${details?.reason || 'crashed'}），点击重新加载`; t.loading = false;
+      t.crashed = true; t.attention = `页面进程已退出（${details?.reason || 'crashed'}），点击重新加载`; t.attentionKind = 'crash'; t.loading = false;
       this.publish();
       // Only disposable agent leases are replaced automatically. User/verification
       // tabs remain visible and retain their persistent session for manual reload.
@@ -191,13 +215,18 @@ class BrowserManager {
     else if (action === 'back') { if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack(); }
     else if (action === 'forward') { if (wc.navigationHistory.canGoForward()) wc.navigationHistory.goForward(); }
     else if (action === 'reload') wc.reload();
-    else if (action === 'attention') { t.attention = String(args.message || '页面需要检查').slice(0,200); t.manualAttention = true; }
+    else if (action === 'attention') { t.attention = String(args.message || '页面需要检查').slice(0,200); t.attentionKind = args.kind || browserAttentionKind(t.attention); t.manualAttention = true; }
     else if (action === 'attention.check') await this.check(t, true);
     else if (action === 'tab.move') { const entries=[...this.tabs]; const i=entries.findIndex(([id])=>id===t.id); const [entry]=entries.splice(i,1); const j=entries.findIndex(([id])=>id===args.before); if(j<0)throw new Error('目标标签不存在'); entries.splice(j,0,entry); this.tabs=new Map(entries); this.persistTabs(); }
     else if (action === 'release') {
       if (args.discard || t.crashed) { this.discardAgent(t); return this.snapshot(); }
       if(t.captureDepth){wc.endFrameSubscription();t.captureDepth=0;}
-      await this.check(t); if (!t.attention) wc.close();
+      await this.check(t);
+      if (t.owner === 'agent') {
+        const duplicate = [...this.tabs.values()].some(other => other !== t && other.owner === 'agent' && other.leased === false && other.url === t.url && retainBrowserAttention(other));
+        t.leased = false;
+        if (!retainBrowserAttention(t) || duplicate) wc.close();
+      }
     }
     else if (action === 'close') wc.close();
     else throw new Error('未知浏览器操作');
@@ -205,4 +234,4 @@ class BrowserManager {
   }
   async close() { clearInterval(this.timer);clearInterval(this.authTimer); this.persistTabs(); for (const t of [...this.tabs.values()]) { t.view.webContents.removeAllListeners('destroyed'); t.view.webContents.close(); } this.tabs.clear(); await session.fromPartition(this.partition).cookies.flushStore(); }
 }
-module.exports = { BrowserManager, browserAttentionProbe, noteBrowserResponse, applyBrowserAttention };
+module.exports = { BrowserManager, browserAttentionProbe, browserAttentionKind, retainBrowserAttention, noteBrowserResponse, applyBrowserAttention };

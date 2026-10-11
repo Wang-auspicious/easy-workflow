@@ -111,6 +111,13 @@ export function piStatus() {
   }
 }
 
+/** Provider errors may echo credentials; never forward them to conversation/SSE. */
+export function redactModelError(message: string): string {
+  let secret: string | undefined;
+  try { secret = credential(piSelection().provider)?.key; } catch { /* Invalid credential configuration is itself reportable. */ }
+  return redactText(message, [secret, process.env.FACTORY_TOKEN]).replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [redacted]");
+}
+
 /** A bounded authenticated request: a reachable provider homepage proves no model capability. */
 export async function probeModelConnection(timeoutMs = 20000): Promise<{ ok: boolean; detail: string; fix?: string }> {
   const status = piStatus();

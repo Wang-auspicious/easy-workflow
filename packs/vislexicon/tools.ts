@@ -8,7 +8,7 @@ import type { EvidenceRef, Usage } from "../../shared/types.ts";
 import { EvidenceStore, aHash, hamming } from "../../server/evidence.ts";
 import { openPage } from "../../server/browser.ts";
 import { webGet } from "../../server/network.ts";
-import { classifyFailure, type Failure } from "../../shared/failures.ts";
+import { classifyFailure, candidateFailure, type Failure } from "../../shared/failures.ts";
 import { pickByImages, pickOne } from "../../server/agent-station.ts";
 import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { KIND_ZH, PREVIEW_RULES, loadPublished } from "./env.ts";
@@ -17,7 +17,7 @@ import { repoOf } from "../../server/repo.ts";
 import { ALL_AXES, CHOSEN_AXES, derivedFacets, loadTaxonomy, validateV3, webpSize } from "./v3.ts";
 import {
   VIEW, bestScrollFrame, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, breadthPreviewIssues, recordScroll, sameSite,
-  scoreLinks, shoot, stageClip, visit, pageKey, type BreadthVisual, type Link,
+  scoreLinks, shoot, stageClip, visit, pageKey, locateCaptureTarget, type CaptureLocation, type BreadthVisual, type Link,
 } from "./capture.ts";
 
 export interface Services {
@@ -233,14 +233,22 @@ function shotEvidence(ctx: StationContext, svc: Services, png: Buffer, role: str
   return ctx.addEvidence({ id: `img-${card.sha.slice(0, 12)}-${ctx.attempt.slice(2, 8)}`, kind: "image", src: card.src, card: card.src, label: ROLE_ZH[role] ?? role, meta: { role, ...meta } });
 }
 const ROLE_ZH: Record<string, string> = { identity: "首屏", breadth: "目录", proof: "组件特写" };
-type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number; title?: string; previews?: number; visual?: BreadthVisual };
+type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number; title?: string; previews?: number; visual?: BreadthVisual; location?: CaptureLocation };
 type ReaderPlan = { identity?: { url: string }; breadth?: { url: string; alternatives?: { url: string }[] }; proof?: { url: string; locate?: string; alternatives?: { url: string; locate?: string }[] } };
 const readerPlanOf = (ctx: StationContext) => ctx.token.data.readerPlan as ReaderPlan | undefined;
 const shotsOf = (ctx: StationContext) => ({ ...((ctx.token.data.shots as Record<string, ShotData>) ?? {}) });
 
-async function visitCandidate(page:Parameters<typeof visit>[0],href:string,host:string,ctx:StationContext,errors:Failure[]) {
+async function visitCandidate(page:Parameters<typeof visit>[0],href:string,host:string,ctx:StationContext,errors:Failure[]):Promise<Awaited<ReturnType<typeof visit>> & {failure?:Failure;retainPage?:boolean}> {
   try{return await visit(page,href,host,t=>ctx.progress(t,{tool:"browser",text:t}));}
-  catch(error){ctx.signal.throwIfAborted();const failure=(error as {failure?:Failure}).failure??classifyFailure(error,{url:href});if(["auth_required","network_tls"].includes(failure.tag))throw error;errors.push(failure);return {issues:[`${failure.tag}: ${failure.message}`],hidden:[]};}
+  catch(error){
+    ctx.signal.throwIfAborted();
+    const raw=(error as {failure?:Failure}).failure??classifyFailure(error,{url:href,requestedUrl:href});
+    const entry=String(ctx.token.data.canonical??ctx.token.url);
+    const failure=candidateFailure({...raw,requestedUrl:raw.requestedUrl??href},entry);
+    if(["auth_required","network_tls"].includes(failure.tag))throw error;
+    errors.push(failure);
+    return {issues:[`${failure.tag}: ${failure.message}`],hidden:[],failure,retainPage:raw.tag==="auth_required"};
+  }
 }
 
 /** Same-site links with text, one per page, for the numbered needsPick list. */
@@ -353,7 +361,8 @@ const breadth: Tool = async (ctx, svc) => {
   }
   let usage: Usage | undefined;
   const options = dedupeLinks(pool).filter((l) => !exclude.has(pageKey(l.href)) && !homeKeys.has(pageKey(l.href))).slice(0, 30);
-  const { page, close } = await openPage(VIEW, "en-US", ctx.signal);
+  let { page, close } = await openPage(VIEW, "en-US", ctx.signal);
+  let retainedPage = false;
   try {
     const hashes = [shots.identity?.hash ?? ""];
     const accessFailures: Failure[] = [];
@@ -369,7 +378,8 @@ const breadth: Tool = async (ctx, svc) => {
     const direct = explicit ? { href: explicit, why: "explicit-choice" } : repair && repair.action !== "replace-page" && repair.url && !exclude.has(pageKey(repair.url)) ? { href: repair.url, why: "review-reframe" } : null;
     if (direct) {
       const v = await visitCandidate(page, direct.href, host, ctx, accessFailures);
-      if (!v.issues.some((i) => /^(network_|http_|page_)/.test(i))) {
+      retainedPage = Boolean(v.retainPage);
+      if (!v.failure) {
         if (direct.why === "review-reframe") {
           const stage = await findStage(page);
           if (stage) await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
@@ -387,7 +397,7 @@ const breadth: Tool = async (ctx, svc) => {
           const pageLinks = (await links(page)).filter((l) => sameSite(l.href, host));
           save(png, check.hash, page.url(), direct.why === "explicit-choice" ? "已指定目录页" : "按复审重新取景", previews, visual);
           shots.breadth!.title = await page.title().catch(() => "");
-          return { ok: true, summary: `目录 ✓ ${pathOf(page.url())}`, data: { shots, breadthLinks: pageLinks.slice(0, 200) } };
+          return { ok: true, summary: `目录 ✓ ${pathOf(page.url())}`, data: { shots, breadthLinks: pageLinks.slice(0, 200), candidateAccessFailures: accessFailures } };
         }
         ctx.progress(`拒收 ${pathOf(direct.href)}：${issues.join("、")}`, { tool: "reject", text: issues.join(", "), ok: false });
       }
@@ -415,9 +425,11 @@ const breadth: Tool = async (ctx, svc) => {
     const deadline = Date.now() + 150_000;
     for (let i = 0; i < candidates.length && seen.length < 8; i++) {
       if (Date.now() > deadline && seen.length >= 2) { ctx.progress(`看页时间用完，按已看过的 ${seen.length} 页比较`, { tool: "rules", text: "150 秒" }); break; }
+      if (retainedPage) { await close(); ({page,close}=await openPage(VIEW,"en-US",ctx.signal)); retainedPage=false; }
       const c = candidates[i];
       const v = await visitCandidate(page, c.href, host, ctx, accessFailures);
-      if (v.issues.some((x) => /^(network_|http_|page_)/.test(x) || x === "notFound" || x === "offSite")) { ctx.progress(`略过 ${pathOf(c.href)}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
+      retainedPage = Boolean(v.retainPage);
+      if (v.failure || v.issues.some((x) => x === "notFound" || x === "offSite")) { ctx.progress(`略过 ${pathOf(c.href)}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
       const key = pageKey(page.url());
       if (seen.some((s) => pageKey(s.href) === key) || (!c.home && homeKeys.has(key))) { ctx.progress(`${pathOf(c.href)} 跳到了已看过的页面，略过`, { tool: "rules", text: page.url() }); continue; }
       const frame = await bestScrollFrame(page, { skipFirst: Boolean(c.home) });
@@ -436,7 +448,7 @@ const breadth: Tool = async (ctx, svc) => {
     const compared = seen.map((s) => ({ href: s.href, previews: s.previews, y: s.y }));
     const cleanup = () => { for (const s of seen) fs.rmSync(s.file, { force: true }); };
     if (!seen.length) {
-      return { ok: false, summary: "没有合格的目录页", error: candidates.length ? "所有候选都被拒收" : "规则和模型都没找到目录页（needsPick 交人）", failure: accessFailures.length && accessFailures.length >= candidates.length ? accessFailures.at(-1) : undefined, data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) }, candidateAccessFailures: accessFailures } };
+      return { ok: false, summary: "没有合格的目录页", error: candidates.length ? "所有候选都被拒收" : "需要重新选页：交阅读员重新查找公开目录页面", failure: accessFailures.length && accessFailures.length >= candidates.length ? accessFailures.at(-1) : undefined, data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) }, candidateAccessFailures: accessFailures } };
     }
     const pick = await pickByImages(ctx, BREADTH_LOOK(title, kind), seen.map((s) => ({ file: s.file, label: `${pathOf(s.href)}${s.y ? `（下滚 ${s.y}px）` : ""}` })));
     if (pick) usage = pick.usage;
@@ -457,7 +469,7 @@ const breadth: Tool = async (ctx, svc) => {
     save(chosen.png, chosen.hash, chosen.href, reason, chosen.previews, visual, compared);
     shots.breadth!.title = chosen.title;
     cleanup();
-    return { ok: true, summary: `目录 ✓ ${pathOf(chosen.href)}`, data: { shots, breadthLinks: chosen.links.slice(0, 200) }, usage };
+    return { ok: true, summary: `目录 ✓ ${pathOf(chosen.href)}`, data: { shots, breadthLinks: chosen.links.slice(0, 200), candidateAccessFailures: accessFailures }, usage };
   } finally { await close(); }
 };
 
@@ -482,7 +494,7 @@ const proof: Tool = async (ctx, svc) => {
   }
   const norm = pageKey;
   if(usesStage){const extra=scoreLinks([...breadthLinks,...homeLinks],{pathPatterns:['iframe[.]html','demo|example|playground','/components/'],linkText:['playground','examples','preview','demo','button','grid','dialog','table']}).map(l=>l.href);candidates=[...new Set([...extra,...candidates])];}
-  const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string}>|undefined)?.proof;
+  const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string;reason?:string}>|undefined)?.proof;
   const explicit=(ctx.token.data.previewChoices as Record<string,string>|undefined)?.proof;
   const taken = new Set([norm(String(ctx.token.data.canonical)), norm(shots.breadth?.href ?? ""), norm(shots.identity?.href ?? ""), ...(((ctx.token.data.rejectedPages as string[]) ?? []).map(norm))]);
   const planned=readerPlanOf(ctx)?.proof;
@@ -499,25 +511,39 @@ const proof: Tool = async (ctx, svc) => {
     if (pick) { usage = pick.usage; candidates = [norm(options[pick.index].href)]; }
   }
   ctx.progress(`特写候选 ${candidates.length} 页${usesStage ? "，只截舞台" : ""}`, { tool: "rules", text: candidates.map((c) => new URL(c).pathname).join("  ") });
-  const { page, close } = await openPage(VIEW, "en-US", ctx.signal);
+  let { page, close } = await openPage(VIEW, "en-US", ctx.signal);
+  let retainedPage = false;
   try {
     const hashes = [shots.identity?.hash ?? "", shots.breadth?.hash ?? ""];
-    let best: { href: string; png: Buffer; content: number; hash: string; framing: string; title: string } | null = null;
+    let best: { href: string; png: Buffer; content: number; hash: string; framing: string; title: string; location?: CaptureLocation } | null = null;
     let tried = 0;
     const accessFailures:Failure[]=[];
     for (const href of candidates) {
       if (ctx.signal.aborted) break;
+      if (retainedPage) { await close(); ({page,close}=await openPage(VIEW,"en-US",ctx.signal)); retainedPage=false; }
       tried++;
       const v = await visitCandidate(page,href,host,ctx,accessFailures);
+      retainedPage = Boolean(v.retainPage);
       if (v.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
       let png: Buffer | null = null;
       let framing = "viewport";
       const locate=locateOf.get(norm(href));
-      if(locate){const found=await page.evaluate((text)=>{const words=text.split(/[，,；;（）()]/).map(s=>s.trim()).filter(s=>s.length>=2);for(const w of words){const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let n:Node|null;while((n=walker.nextNode())){if((n.textContent??"").toLowerCase().includes(w.toLowerCase())&&n.parentElement&&!n.parentElement.closest("nav,aside,footer,header")){n.parentElement.scrollIntoView({block:"start"});return w;}}}return null;},locate).catch(()=>null);if(found){await sleep(800);ctx.progress(`按阅读员提示定位到「${found}」附近`,{tool:"browser",text:locate});}}
+      const hints = [repair?.action === "reframe" ? repair.reason : undefined, locate].filter((hint):hint is string=>Boolean(hint));
+      const location = hints.length ? await locateCaptureTarget(page,hints) : undefined;
+      if (location?.matched) {
+        await sleep(800);
+        framing = `定位到「${location.matched}」（滚动 ${Math.round(location.scrollY ?? 0)}px）`;
+        ctx.progress(framing,{tool:"browser",text:hints.join("\n")});
+      } else if (location && (location.anchors.length || repair?.action === "reframe")) {
+        const failure = classifyFailure(`没有合格的特写取景：未找到指定文本「${location.anchors[0] ?? hints[0]}」，需要阅读员重新定位公开页面，未使用首屏替代。`,{url:page.url(),requestedUrl:href});
+        accessFailures.push(failure);
+        ctx.progress(failure.message,{tool:"reject",text:hints.join("\n"),ok:false});
+        continue;
+      }
       const stageDeadline = Date.now() + 45000;
-      const stageWait = { deadline: stageDeadline, signal: ctx.signal };
+      const stageWait = { deadline: stageDeadline, signal: ctx.signal, anchorY: location?.y };
       if (usesStage) ctx.progress("等待实际舞台与 iframe 内容就绪（共用最多 45 秒）", { tool: "browser", text: "stage discovery and rendering" });
-      let stage = usesStage ? await findStage(page, stageWait) : kind === "tool" ? await findStage(page, { signal: ctx.signal }) : null;
+      let stage = usesStage ? await findStage(page, stageWait) : kind === "tool" ? await findStage(page, { signal: ctx.signal, anchorY: location?.y }) : null;
       if (stage) {
         await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
         const settleBudget = Math.min(8000, stageDeadline - Date.now());
@@ -536,18 +562,18 @@ const proof: Tool = async (ctx, svc) => {
       const check = checkImage(png, hashes, { stage: Boolean(stage) });
       if (check.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${check.issues.join("、")}`, { tool: "reject", text: check.issues.join(", "), ok: false }); continue; }
       ctx.progress(`候选 ${new URL(href).pathname}：${framing}，内容占比 ${(check.stats.content * 100).toFixed(1)}%`, { tool: "shot", text: framing, ok: true });
-      if (!best || check.stats.content > best.content || (locateOf.has(norm(href)) && !locateOf.has(norm(best.href)))) best = { href, png, content: check.stats.content, hash: check.hash, framing, title: await page.title().catch(() => "") };
+      if (!best || check.stats.content > best.content || (locateOf.has(norm(href)) && !locateOf.has(norm(best.href)))) best = { href, png, content: check.stats.content, hash: check.hash, framing, title: await page.title().catch(() => ""), location };
       if (locateOf.has(norm(href)) && check.stats.content > 0.05) break;
       if (!usesStage) break;
       if (best && tried >= 3 && best.content > 0.12) break;
     }
-    if (!best) return { ok: false, summary: "没有合格的特写", error: tried ? `试了 ${tried} 页都不合格` : "规则和模型都没找到特写页（needsPick 交人）",failure:accessFailures.length===tried?accessFailures.at(-1):undefined, data:{needsPick:{proof:candidates},candidateAccessFailures:accessFailures},usage };
+    if (!best) return { ok: false, summary: "没有合格的特写", error: tried ? `试了 ${tried} 页都不合格` : "需要重新选页：交阅读员重新查找公开特写页面",failure:accessFailures.length===tried?accessFailures.at(-1):undefined, data:{needsPick:{proof:candidates},candidateAccessFailures:accessFailures},usage };
     const file = path.join(workDir(svc, ctx), "proof.png");
     fs.writeFileSync(file, best.png);
-    const ev = shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, content: Number(best.content.toFixed(3)), tried });
+    const ev = shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, location: best.location, content: Number(best.content.toFixed(3)), tried });
     ctx.progress(`选中 ${new URL(best.href).pathname}（试 ${tried} 页，内容占比最高 ${(best.content * 100).toFixed(1)}%）`, { tool: "shot", text: best.framing, ok: true, evidence: [ev.id] });
-    shots.proof = { file, href: best.href, hash: best.hash, evidence: ev.id, framing: best.framing, content: best.content, title: best.title };
-    return { ok: true, summary: `特写 ✓ ${new URL(best.href).pathname}`, data: { shots }, usage };
+    shots.proof = { file, href: best.href, hash: best.hash, evidence: ev.id, framing: best.framing, content: best.content, title: best.title, location: best.location };
+    return { ok: true, summary: `特写 ✓ ${new URL(best.href).pathname}`, data: { shots, candidateAccessFailures: accessFailures }, usage };
   } finally { await close(); }
 };
 

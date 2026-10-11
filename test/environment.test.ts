@@ -40,7 +40,7 @@ test("browser pages default to 8 and shrink with free memory, then recover", () 
 test("every failure says what to do next and who owns the fix", () => {
   const tls = classifyFailure(new Error("fetch failed", { cause: Object.assign(new Error("certificate has expired"), { code: "CERT_HAS_EXPIRED" }) }));
   assert.equal(tls.tag, "network_tls"); assert.equal(tls.owner, "user"); assert.match(tls.nextAction!, /红灯/);
-  assert.equal(classifyFailure("HTTP 403", { status: 403 }).owner, "user");
+  assert.equal(classifyFailure("HTTP 403", { status: 403 }).owner, "system");
   assert.equal(classifyFailure("试了 3 页都不合格").owner, "agent");
   const model = classifyFailure("401 Unauthorized: invalid api key", { stage: "model" });
   assert.equal(model.tag, "model_unavailable"); assert.equal(model.owner, "user");

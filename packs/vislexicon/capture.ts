@@ -9,7 +9,7 @@ import { setTimeout as wait } from "node:timers/promises";
 import type { ElementHandle, Frame, Page } from "playwright-core";
 import { aHash, hamming, imageStats } from "../../server/evidence.ts";
 import { PREVIEW_RULES } from "./env.ts";
-import { browserAttention, withBrowserFrames } from "../../server/browser.ts";
+import { browserAttention, inspectBrowserAttention, withBrowserFrames } from "../../server/browser.ts";
 import { ClassifiedFailure, classifyFailure } from "../../shared/failures.ts";
 
 export const VIEW = { width: PREVIEW_RULES.viewport.width, height: PREVIEW_RULES.viewport.height };
@@ -19,18 +19,20 @@ export const STAGE_SELECTORS: string[] = PREVIEW_RULES.kinds["component-source"]
 export function pageKey(href:string) {try{const u=new URL(href);for(const k of [...u.searchParams.keys()])if(/^utm_|^(ref|fbclid|gclid)$/i.test(k))u.searchParams.delete(k);u.searchParams.sort();if(!/^#(?:\/|!)/.test(u.hash))u.hash="";return u.origin+u.pathname.replace(/\/+$/,"")+u.search+u.hash;}catch{return href;}}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const runFile = promisify(execFile);
+const visitedPages = new WeakMap<Page, { requestedUrl: string; finalUrl: string }>();
 
 export interface Link { href: string; text: string; inNav: boolean; inMain: boolean; hasImage: boolean; visible: boolean; order: number }
 
 export async function pageVerdict(page: Page, entryHost: string): Promise<string[]> {
-  return page.evaluate(({ entryHost }) => {
+  const access = await inspectBrowserAttention(page);
+  return page.evaluate(({ entryHost, access }) => {
     const text = (document.body?.innerText || "").slice(0, 4000);
     const issues: string[] = [];
     if (/\b404\b|not found|page not found|找不到页面/i.test(document.title + " " + text.slice(0, 400))) issues.push("notFound");
     const shown = (el: Element) => (el as HTMLElement).checkVisibility?.({ opacityProperty: true, visibilityProperty: true }) ?? (el as HTMLElement).offsetParent !== null;
-    const pw = [...document.querySelectorAll("input[type=password]")].some((el) => { const r = el.getBoundingClientRect(); return shown(el) && r.width > 0 && r.top < innerHeight; });
-    if (pw || /sign in to continue|log in to view|登录后查看/i.test(text)) issues.push("loginWall");
-    if (/verify you are human|checking your browser|captcha|人机验证/i.test(text)) issues.push("challenge");
+    if (access.url === location.href && access.kind === "auth") issues.push("loginWall");
+    if (access.url === location.href && access.kind === "challenge") issues.push("challenge");
+    if (access.url === location.href && access.kind === "http") issues.push("accessDenied");
     if (/^\s*(loading|加载中)[.…]*\s*$/i.test(text)) issues.push("loading");
     const host = location.hostname.replace(/^www\./, "");
     if (!(host === entryHost || host.endsWith("." + entryHost) || entryHost.endsWith("." + host))) issues.push("offSite");
@@ -44,7 +46,7 @@ export async function pageVerdict(page: Page, entryHost: string): Promise<string
     });
     if (cover.length) issues.push("consentOverlay");
     return issues;
-  }, { entryHost });
+  }, { entryHost, access });
 }
 
 export async function settle(page: Page) {
@@ -148,10 +150,18 @@ export function scoreLinks(candidates: Pick<Link, "href" | "text" | "inNav">[], 
 export async function visit(page: Page, url: string, entryHost: string, say?: (t: string) => void) {
   say?.(`打开 ${url.replace(/^https?:\/\//, "")}`);
   const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 }).catch((error: Error) => ({ error }));
-  if (response && "error" in response) throw new ClassifiedFailure(classifyFailure(response.error,{url}));
+  if (response && "error" in response) throw new ClassifiedFailure(classifyFailure(response.error,{url,requestedUrl:url}));
+  visitedPages.set(page, { requestedUrl: url, finalUrl: page.url() });
   if (response && response.status() >= 400) {
-    if ([401,403].includes(response.status())) await browserAttention(page, `访问被拒绝（${response.status()}），请检查登录或验证状态`);
-    throw new ClassifiedFailure(classifyFailure(`HTTP ${response.status()}`,{url,status:response.status()}));
+    if ([401,403].includes(response.status())) {
+      const access = await inspectBrowserAttention(page);
+      if (access.kind === "auth" || access.kind === "challenge" || response.status() === 401) {
+        const message = access.kind === "challenge" ? "页面需要完成人机验证" : "页面要求登录认证";
+        await browserAttention(page, message, access.kind === "challenge" ? "challenge" : "auth");
+        throw new ClassifiedFailure(classifyFailure(message,{url:page.url(),requestedUrl:url,status:response.status()}));
+      }
+    }
+    throw new ClassifiedFailure(classifyFailure(`HTTP ${response.status()}`,{url:page.url(),requestedUrl:url,status:response.status()}));
   }
   await settle(page);
   const declined = await declineCookies(page);
@@ -159,7 +169,11 @@ export async function visit(page: Page, url: string, entryHost: string, say?: (t
   await sleep(400);
   const hidden = await hideFloating(page);
   const issues = await pageVerdict(page, entryHost);
-  if (issues.includes("loginWall") || issues.includes("challenge")) { await browserAttention(page, issues.includes("loginWall") ? "登录状态需要检查" : "页面需要完成验证"); throw new Error("页面需要登录或验证，已保留在内置浏览器"); }
+  if (issues.includes("loginWall") || issues.includes("challenge")) {
+    await browserAttention(page, issues.includes("loginWall") ? "登录状态需要检查" : "页面需要完成验证");
+    throw new ClassifiedFailure(classifyFailure("页面需要登录或验证，已保留在内置浏览器", { url: page.url(), requestedUrl: url }));
+  }
+  if (issues.includes("accessDenied")) throw new ClassifiedFailure(classifyFailure("服务器拒绝请求（HTTP 403）", { url: page.url(), requestedUrl: url, status: 403 }));
   return { issues, hidden };
 }
 
@@ -167,11 +181,13 @@ export async function visit(page: Page, url: string, entryHost: string, say?: (t
  * the visit policy immediately before each captured frame; never hide an access wall. */
 async function prepareScreenshot(page: Page) {
   const issues = await pageVerdict(page, new URL(page.url()).hostname.replace(/^www\./, ""));
+  const visited = visitedPages.get(page), requestedUrl = visited?.finalUrl === page.url() ? visited.requestedUrl : undefined;
   if (issues.includes("loginWall") || issues.includes("challenge")) {
     const message = "页面需要登录或验证，已保留在内置浏览器";
     await browserAttention(page, message);
-    throw new ClassifiedFailure(classifyFailure(message, { url: page.url() }));
+    throw new ClassifiedFailure(classifyFailure(message, { url: page.url(), requestedUrl }));
   }
+  if (issues.includes("accessDenied")) throw new ClassifiedFailure(classifyFailure("服务器拒绝请求（HTTP 403）", { url: page.url(), requestedUrl, status: 403 }));
   await declineCookies(page);
   await hideFloating(page);
 }
@@ -284,14 +300,50 @@ export async function bestScrollFrame(page: Page, { skipFirst = false } = {}) {
 
 /* ------------------------------------------------------------------ stage (component close-up) */
 
+export interface CaptureLocation { matched?: string; anchors: string[]; y?: number; scrollY?: number }
+
+/** Reader/reviewer prose contains quoted visible text, not a literal DOM text
+ * node. Match the complete rendered heading (including nested spans and breaks)
+ * and verify that scrolling actually brought it into the viewport. */
+export async function locateCaptureTarget(page: Page, hints: string[]): Promise<CaptureLocation> {
+  const quoted = (text: string) => [...text.matchAll(/[「『“\"]([^」』”\"]{2,240})[」』”\"]/g)].map(match => match[1].trim());
+  const anchors = [...new Set(hints.flatMap(text => {
+    const directed = [...text.matchAll(/(?:滚到|滚动到|滚动至|定位到|scroll(?:ing)? to|(?:L[1-6]|H[1-6])\s*(?:标题|heading))[^，。；\n「『“\"]{0,60}[「『“\"]([^」』”\"]{2,240})[」』”\"]/gi)].map(match => match[1].trim());
+    return [...directed, ...quoted(text)];
+  }))];
+  const candidates = [...new Set([...anchors, ...hints.flatMap(text => text.split(/[，,；;（）()]/).map(part => part.trim()).filter(part => part.length >= 2 && part.length <= 240))])];
+  return page.evaluate(async ({ anchors, candidates }) => {
+    const normalize = (text: string) => text.normalize('NFKC').toLowerCase().replace(/[\s\u200b]+/g, ' ').replace(/[.。…]+$/g, '').trim();
+    const eligible = (el: Element) => {
+      if (el.closest('nav,header,footer,aside,script,style,noscript,pre,code')) return false;
+      const box = el.getBoundingClientRect(), style = getComputedStyle(el);
+      return box.width > 0 && box.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
+    };
+    const elements = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role=heading],p,label,span,strong,a,div,section')].filter(eligible);
+    for (const candidate of candidates) {
+      const wanted = normalize(candidate); if (wanted.length < 2) continue;
+      const matches = elements.map(element => ({ element, text: normalize((element as HTMLElement).innerText || '') }))
+        .filter(({ text }) => text.length <= 1000 && text.includes(wanted))
+        .sort((a, b) => Number(!a.element.matches('h1,h2,h3,h4,h5,h6,[role=heading]')) - Number(!b.element.matches('h1,h2,h3,h4,h5,h6,[role=heading]')) || a.text.length - b.text.length);
+      const target = matches[0]?.element; if (!target) continue;
+      target.scrollIntoView({ block: 'start', behavior: 'instant' });
+      window.scrollBy({ top: -Math.min(96, innerHeight / 6), behavior: 'instant' });
+      await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      const box = target.getBoundingClientRect();
+      if (box.bottom > 0 && box.top < innerHeight) return { matched: candidate, anchors, y: box.top + scrollY, scrollY };
+    }
+    return { anchors };
+  }, { anchors, candidates });
+}
+
 export interface Stage { sel: string; x: number; y: number; w: number; h: number; painted: number; media: number; locked: boolean }
-export interface CaptureWait { timeoutMs?: number; deadline?: number; signal?: AbortSignal }
+export interface CaptureWait { timeoutMs?: number; deadline?: number; signal?: AbortSignal; anchorY?: number }
 // Selectors are descriptive (and can match several examples). Retain the exact
 // chosen DOM node for frame checks without adding attributes to the source page.
 const stageElements = new WeakMap<Stage, ElementHandle<Element>>();
 
-async function findStageOnce(page: Page): Promise<Stage | null> {
-  const selection = await page.evaluateHandle((selectors) => {
+async function findStageOnce(page: Page, anchorY?: number): Promise<Stage | null> {
+  const selection = await page.evaluateHandle(({ selectors, anchorY }) => {
     const seen = new Set<Element>();
     const boxes: { stage: Stage; element: Element }[] = [];
     const roots:(Document|ShadowRoot)[]=[document];
@@ -342,6 +394,7 @@ async function findStageOnce(page: Page): Promise<Stage | null> {
         seen.add(el);
         const r = el.getBoundingClientRect();
         if (r.width < 80 || r.height < 24 || r.height > innerHeight * 1.5 || getComputedStyle(el).visibility==="hidden") continue;
+        if (anchorY !== undefined && (r.bottom <= 0 || r.top >= innerHeight)) continue;
         const painted = el.querySelectorAll("*").length;
         const media = el.querySelectorAll("canvas, img, svg, video").length + (el.matches("iframe,canvas,img,svg,video") ? 1 : 0);
         if (painted < 1 && !media && !el.matches("button,input,[role=button]")) continue;
@@ -350,9 +403,9 @@ async function findStageOnce(page: Page): Promise<Stage | null> {
         boxes.push({ stage: { sel, x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height, painted, media, locked }, element: el });
       }
     }
-    boxes.sort((a, b) => (a.stage.y<innerHeight?0:1)-(b.stage.y<innerHeight?0:1) || b.stage.w*b.stage.h-a.stage.w*a.stage.h);
+    boxes.sort((a, b) => (anchorY === undefined ? (a.stage.y<innerHeight?0:1)-(b.stage.y<innerHeight?0:1) : Math.abs(a.stage.y-anchorY)-Math.abs(b.stage.y-anchorY)) || b.stage.w*b.stage.h-a.stage.w*a.stage.h);
     return boxes.find((b) => !b.stage.locked) || { stage: null, element: null };
-  }, STAGE_SELECTORS).catch(() => null);
+  }, { selectors: STAGE_SELECTORS, anchorY }).catch(() => null);
   if (!selection) return null;
   try {
     const info = await selection.getProperty("stage");
@@ -371,7 +424,7 @@ export async function findStage(page: Page, opts: CaptureWait = {}): Promise<Sta
   const deadline = opts.deadline ?? Date.now() + Math.max(0, opts.timeoutMs ?? 0);
   while (true) {
     opts.signal?.throwIfAborted();
-    const stage = await boundedFrameRead(() => findStageOnce(page).catch(() => null), opts.signal, bounded ? deadline - Date.now() : undefined);
+    const stage = await boundedFrameRead(() => findStageOnce(page, opts.anchorY).catch(() => null), opts.signal, bounded ? deadline - Date.now() : undefined);
     opts.signal?.throwIfAborted();
     if (stage || !bounded) return stage;
     const remaining = deadline - Date.now();

@@ -5,6 +5,33 @@ import type { Attachment } from "./types.ts";
 export type PiMessage = Exclude<Message, { role: "system" }>;
 export interface ConversationEntry { id: string; turn: string; message: PiMessage; attachments?: Attachment[] }
 
+export interface DispatcherStatus {
+  turn: string;
+  status: "idle" | "running" | "recovering" | "interrupted" | "failed" | "completed" | "aborted";
+  busy: boolean;
+  attempt: number;
+  maxAttempts: number;
+  recoverable: boolean;
+  message: string;
+  updatedAt: number;
+  nextRetryAt?: number;
+  error?: string;
+}
+
+/** Private recovery metadata; native messages and user input remain in the journal. */
+export interface DispatcherCheckpoint {
+  state: DispatcherStatus;
+  prompted: boolean;
+  messageNumber: number;
+  request: { text: string; attachments: Attachment[] };
+  scope: string;
+  inputs: { id: string; text: string; attachments: Attachment[]; timestamp: number; delivered: boolean; mode: "steer" | "followUp" }[];
+  operations: {
+    key: string; scope: string; callId: string; name: string; phase: "started" | "completed" | "uncertain";
+    result?: { content: { type: "text"; text: string }[]; details: Record<string, unknown> };
+  }[];
+}
+
 export function legacyReply(text: string, timestamp: number): AssistantMessage {
   return { role: "assistant", content: [{ type: "text", text }], timestamp,
     api: "openai-completions", provider: "legacy", model: "legacy", stopReason: "stop",

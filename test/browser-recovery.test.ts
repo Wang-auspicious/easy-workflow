@@ -159,11 +159,11 @@ test("browser process loss invalidates an attempt and resumes its checkpoint wit
       const { BrowserManager } = createRequire(import.meta.url)("../app/browser-manager.cjs");
       const manager = Object.create(BrowserManager.prototype);
       let closes = 0, frameReleases = 0;
-      const page = { id: "agent", owner: "agent", ready: Promise.resolve(), readyError: "fixture renderer unavailable", crashed: true, captureDepth: 1, attention: "crashed", view: { webContents: { isDestroyed: () => false, close: () => { closes++; }, endFrameSubscription: () => { frameReleases++; } } } };
+      const page = { id: "agent", owner: "agent", ready: Promise.resolve(), readyError: "fixture renderer unavailable", crashed: true, captureDepth: 1, attention: "crashed", attentionKind: "crash", view: { webContents: { isDestroyed: () => false, close: () => { closes++; }, endFrameSubscription: () => { frameReleases++; } } } };
       manager.tabs = new Map([[page.id, page]]); manager.create = () => page; manager.snapshot = () => ({}); manager.publish = () => {}; manager.check = async () => {};
       await assert.rejects(manager.command({ action: "lease" }), /BROWSER_LEASE_FAILED/);
       assert.equal(closes, 1); assert.equal(frameReleases, 1);
-      page.crashed = false; page.readyError = ""; page.attention = "access denied";
+      page.crashed = false; page.readyError = ""; page.attention = "login required"; page.attentionKind = "auth";
       await manager.command({ action: "release", id: page.id }); assert.equal(closes, 1, "healthy access-check tabs stay visible");
       await manager.command({ action: "release", id: page.id, discard: true }); assert.equal(closes, 2);
       page.owner = "user";

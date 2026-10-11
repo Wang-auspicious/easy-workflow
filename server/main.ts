@@ -97,7 +97,7 @@ const server = http.createServer(async (req, res) => {
       const pi = piStatus();
       return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: pi.id, pi, keyPresent: pi.ready, patches: factory.patches });
     }
-    if (p === "/api/state") return send(res, 200, factory.state);
+    if (p === "/api/state") return send(res, 200, { ...factory.state, dispatcher: dispatcher.status });
     if (p === "/api/browser" && req.method === "GET") return send(res, 200, await browserCommand({action:"state"}));
     if (p === "/api/events") {
       const since = Number(req.headers["last-event-id"] ?? url.searchParams.get("since") ?? 0);
@@ -107,9 +107,11 @@ const server = http.createServer(async (req, res) => {
       for (const e of factory.journal.read(since)) res.write(`id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`);
       clients.add(res);
       if (dispatcher.busy) {
-        res.write(`event: live\ndata: ${JSON.stringify({ kind: "chat.start", id: dispatcher.live?.turn ?? "active" })}\n\n`);
+        res.write(`event: live\ndata: ${JSON.stringify({ kind: "chat.start", id: dispatcher.status.turn })}\n\n`);
         if (dispatcher.live) res.write(`event: live\ndata: ${JSON.stringify({ kind: "chat.pi", ...dispatcher.live })}\n\n`);
       }
+      // Reconnecting after chat.end must clear the client's stale busy state too.
+      res.write(`event: live\ndata: ${JSON.stringify({ kind: "chat.status", ...dispatcher.status })}\n\n`);
       req.on("close", () => clients.delete(res));
       return;
     }
@@ -134,11 +136,21 @@ const server = http.createServer(async (req, res) => {
       switch (p) {
         case "/api/browser": return send(res, 200, (await control.execute("browser", b, "user")).result);
         case "/api/chat/abort": dispatcher.abort(); return send(res, 200, { ok: true });
+        case "/api/chat/continue": {
+          if (dispatcher.busy) return send(res, 202, { ok: true, accepted: true, turn: dispatcher.status.turn, status: dispatcher.status });
+          if (!dispatcher.status.recoverable) throw new ControlError(409, "nothing_to_resume", "没有需要恢复的回答");
+          chatTask = dispatcher.resume().finally(() => { chatTask = null; });
+          return send(res, 202, { ok: true, accepted: true, turn: dispatcher.status.turn, status: dispatcher.status });
+        }
         case "/api/chat": {
-          if (dispatcher.busy) throw new ControlError(409, "dispatcher_busy", "主调度还在回答上一条");
           if (typeof b.text !== "string" || !b.text.trim() || b.attachments !== undefined && !Array.isArray(b.attachments)) throw new ControlError(400, "invalid_chat", "消息不能为空，attachments 必须是数组");
-          chatTask = dispatcher.chat(b.text, b.attachments ?? []).finally(() => { chatTask = null; });
-          return send(res, 202, { ok: true });
+          if (b.requestId !== undefined && (typeof b.requestId !== "string" || !/^[a-zA-Z0-9_-]{8,120}$/.test(b.requestId))) throw new ControlError(400, "invalid_request_id", "requestId 格式不正确");
+          if (b.mode !== undefined && !["steer", "followUp"].includes(b.mode)) throw new ControlError(400, "invalid_chat_mode", "mode 必须是 steer 或 followUp");
+          const receipt = b.requestId ? dispatcher.receipt(b.requestId) : null;
+          if (receipt) return send(res, 202, receipt);
+          if (dispatcher.busy) return send(res, 202, dispatcher.steer(b.text, b.attachments ?? [], b.mode ?? "steer", b.requestId));
+          chatTask = dispatcher.chat(b.text, b.attachments ?? [], b.requestId).finally(() => { chatTask = null; });
+          return send(res, 202, { ok: true, accepted: true, id: dispatcher.status.turn, turn: dispatcher.status.turn, status: dispatcher.status });
         }
         case "/api/run": {
           const receipt = await control.execute("run_control", b, "user");
@@ -190,6 +202,7 @@ server.listen(PORT, "127.0.0.1", () => {
   removeConnection = publishConnection(url, TOKEN);
   console.log(`Easy Workflow server on ${url}  (var: ${VAR})`);
   process.send?.({ type: "ready", url });
+  chatTask = dispatcher.recover().finally(() => { chatTask = null; });
 });
 
 let stopping = false;
@@ -198,7 +211,7 @@ const shutdown = async () => {
   removeConnection();
   clearInterval(ping);
   factory.runtime.paused = true;
-  dispatcher.agent?.abort();
+  dispatcher.interrupt();
   for (const c of clients) c.end();
   server.close(); server.closeAllConnections();
   await Promise.all([factory.runtime.close(), chatTask]);

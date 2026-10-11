@@ -188,6 +188,7 @@ export type JournalEvent =
   | { kind: "run.paused"; runId: string }
   | { kind: "run.resumed"; runId: string }
   | { kind: "run.ended"; runId: string; manual: boolean }
+  | { kind: "batch.configured"; batch: import("./batch.ts").BatchGoal }
   | { kind: "stock.set"; node: string; stock: number; note?: string }
   | { kind: "token.created"; token: string; line: string; item: string; url: string; title?: string; source: string; category?: string }
   | { kind: "token.queued"; token: string; node: string; from?: string; returned?: boolean }
@@ -212,6 +213,7 @@ export type JournalEvent =
   | { kind: "chat.user"; id: string; text: string; attachments: Attachment[] }
   | { kind: "chat.assistant"; id: string; text: string; tools: { name: string; summary: string }[]; usage?: Usage }
   | { kind: "chat.message"; id: string; turn: string; message: import("./conversation.ts").PiMessage }
+  | { kind: "chat.checkpoint"; checkpoint: import("./conversation.ts").DispatcherCheckpoint }
   | { kind: "spec.patched"; patch: string; summary: string; status: "proposed" | "accepted" | "rejected" }
   | { kind: "resource.sample"; used: Record<string, number>; limits: Record<string, number>; freeMemMB: number; waiting?: Record<string, string> }
   | { kind: "report.ready"; runId: string }
