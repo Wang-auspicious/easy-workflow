@@ -260,16 +260,39 @@ export function breadthPreviewIssues(kind: string, previews: unknown): string[] 
 /* ------------------------------------------------------------------ stage (component close-up) */
 
 export interface Stage { sel: string; x: number; y: number; w: number; h: number; painted: number; media: number; locked: boolean }
+export interface CaptureWait { timeoutMs?: number; deadline?: number; signal?: AbortSignal }
 // Selectors are descriptive (and can match several examples). Retain the exact
 // chosen DOM node for frame checks without adding attributes to the source page.
 const stageElements = new WeakMap<Stage, ElementHandle<Element>>();
 
-export async function findStage(page: Page): Promise<Stage | null> {
+async function findStageOnce(page: Page): Promise<Stage | null> {
   const selection = await page.evaluateHandle((selectors) => {
     const seen = new Set<Element>();
     const boxes: { stage: Stage; element: Element }[] = [];
     const roots:(Document|ShadowRoot)[]=[document];
     for(let i=0;i<roots.length;i++)for(const el of roots[i].querySelectorAll('*'))if(el.shadowRoot)roots.push(el.shadowRoot);
+    // A standalone story can render several complete variants in one tall root.
+    // Descend only those known render roots, stop at the first eligible container
+    // on each branch, and never split a list/table/form into constituent rows.
+    const storyGroups = new Set<Element>();
+    const structures = "ul,ol,table,form,fieldset,[role=list],[role=grid],[role=tree],[role=menu],[role=dialog]";
+    const fragments = "li,tr,td,th,dt,dd,button,input,select,textarea,svg,canvas,img,video,iframe,[role=row],[role=cell],[role=gridcell],[role=listitem],[role=option],[role=menuitem]";
+    for (const story of roots.flatMap(root => [...root.querySelectorAll("#storybook-root,#root > .sb-story")])) {
+      if (story.getBoundingClientRect().height <= innerHeight * 1.5 || story.closest("nav,header,footer,aside,article,pre,code")) continue;
+      const queue = [...story.children].map(element => ({ element, depth: 1 }));
+      let checked = 0;
+      while (queue.length && checked++ < 200) {
+        const { element, depth } = queue.shift()!;
+        if (element.matches(`nav,header,footer,aside,article,pre,code,${fragments}`)) continue;
+        const r = element.getBoundingClientRect(), css = getComputedStyle(element);
+        if (css.display === "none" || css.visibility === "hidden" || Number(css.opacity) === 0 || !((element as HTMLElement).checkVisibility?.({ opacityProperty: true, visibilityProperty: true }) ?? true)) continue;
+        const containsComponent = element.matches(structures) || Boolean(element.querySelector(structures)) || [...element.querySelectorAll("canvas,img,svg,video,iframe")].some(media => { const box = media.getBoundingClientRect(); return box.width >= 80 && box.height >= 24; });
+        if (element.matches("div,section,ul,ol,table,form,fieldset") && r.width >= 80 && r.height >= 24 && r.height <= innerHeight * 1.5 && containsComponent && !element.querySelector("article,pre,code")) {
+          storyGroups.add(element); continue;
+        }
+        if (depth < 4 && !element.matches(structures)) queue.push(...[...element.children].map(child => ({ element: child, depth: depth + 1 })));
+      }
+    }
     // Documentation frameworks often put an unnamed live example directly before
     // its code block. Recognise that relationship, without treating docs text or
     // the code toolbar itself as a rendered component.
@@ -286,9 +309,9 @@ export async function findStage(page: Page): Promise<Stage | null> {
         if(rendered.length)examples.add(preview);
       }
     }
-    for (const sel of ["example-before-code", ".bd-example", "[data-preview]", ".sp-preview-container", ".sp-preview-iframe", "#storybook-root", "#root > .sb-story", "canvas", "svg", "[class*=playground]", ...selectors]) {
+    for (const sel of ["example-before-code", ".bd-example", "[data-preview]", ".sp-preview-container", ".sp-preview-iframe", "#storybook-root", "#root > .sb-story", "canvas", "svg", "[class*=playground]", ...selectors, "storybook-component-group"]) {
       let found: Element[] = [];
-      try { found = sel==='example-before-code'?[...examples]:roots.flatMap(root=>[...root.querySelectorAll(sel)]); } catch { continue; }
+      try { found = sel==='example-before-code'?[...examples]:sel==='storybook-component-group'?[...storyGroups]:roots.flatMap(root=>[...root.querySelectorAll(sel)]); } catch { continue; }
       for (const el of found) {
         if (seen.has(el) || el.closest("nav, header, footer, aside, pre, code")) continue;
         seen.add(el);
@@ -314,6 +337,22 @@ export async function findStage(page: Page): Promise<Stage | null> {
     stageElements.set(stage, element as ElementHandle<Element>);
     return stage;
   } finally { await selection.dispose(); }
+}
+
+/** Discover a genuinely rendered stage using the unchanged qualification rules.
+ * An absolute deadline lets discovery and iframe rendering share one budget. */
+export async function findStage(page: Page, opts: CaptureWait = {}): Promise<Stage | null> {
+  const bounded = opts.deadline !== undefined || (opts.timeoutMs ?? 0) > 0;
+  const deadline = opts.deadline ?? Date.now() + Math.max(0, opts.timeoutMs ?? 0);
+  while (true) {
+    opts.signal?.throwIfAborted();
+    const stage = await boundedFrameRead(() => findStageOnce(page).catch(() => null), opts.signal, bounded ? deadline - Date.now() : undefined);
+    opts.signal?.throwIfAborted();
+    if (stage || !bounded) return stage;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    await wait(Math.min(200, remaining), undefined, { signal: opts.signal });
+  }
 }
 
 export function stageClip(stage: Stage, pageWidth: number) {
@@ -397,8 +436,9 @@ async function boundedFrameRead<T>(read: () => Promise<T>, signal?: AbortSignal,
 /** Load/networkidle can precede async Storybook rendering. Re-check this stage's
  * current frames until the original threshold is met or the one deadline expires.
  * Frame attachment and navigation are sampled again, never satisfied by siblings. */
-export async function iframeEmpty(page: Page, stage: Stage, opts: { timeoutMs?: number; signal?: AbortSignal } = {}) {
-  const budget = Math.max(0, opts.timeoutMs ?? 0), deadline = Date.now() + budget;
+export async function iframeEmpty(page: Page, stage: Stage, opts: CaptureWait = {}) {
+  const bounded = opts.deadline !== undefined || (opts.timeoutMs ?? 0) > 0;
+  const deadline = opts.deadline ?? Date.now() + Math.max(0, opts.timeoutMs ?? 0);
   let hadFrames = false;
   while (true) {
     opts.signal?.throwIfAborted();
@@ -412,7 +452,7 @@ export async function iframeEmpty(page: Page, stage: Stage, opts: { timeoutMs?: 
         // selected element must become readable again within the same budget.
         return { hasFrames: true, ready: false };
       }
-    }, opts.signal, budget ? deadline - Date.now() : undefined);
+    }, opts.signal, bounded ? deadline - Date.now() : undefined);
     opts.signal?.throwIfAborted();
     if (!sample) return true;
     hadFrames ||= sample.hasFrames;

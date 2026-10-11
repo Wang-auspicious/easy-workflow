@@ -442,13 +442,16 @@ const proof: Tool = async (ctx, svc) => {
       let framing = "viewport";
       const locate=locateOf.get(norm(href));
       if(locate){const found=await page.evaluate((text)=>{const words=text.split(/[，,；;（）()]/).map(s=>s.trim()).filter(s=>s.length>=2);for(const w of words){const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let n:Node|null;while((n=walker.nextNode())){if((n.textContent??"").toLowerCase().includes(w.toLowerCase())&&n.parentElement&&!n.parentElement.closest("nav,aside,footer,header")){n.parentElement.scrollIntoView({block:"start"});return w;}}}return null;},locate).catch(()=>null);if(found){await sleep(800);ctx.progress(`按阅读员提示定位到「${found}」附近`,{tool:"browser",text:locate});}}
-      let stage = usesStage || kind==="tool" ? await findStage(page) : null;
+      const stageDeadline = Date.now() + 45000;
+      const stageWait = { deadline: stageDeadline, signal: ctx.signal };
+      if (usesStage) ctx.progress("等待实际舞台与 iframe 内容就绪（共用最多 45 秒）", { tool: "browser", text: "stage discovery and rendering" });
+      let stage = usesStage ? await findStage(page, stageWait) : kind === "tool" ? await findStage(page, { signal: ctx.signal }) : null;
       if (stage) {
         await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
-        await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
-        stage = (await findStage(page)) || stage;
-        ctx.progress("检查选中舞台，必要时等待 iframe 渲染（最多 45 秒）", { tool: "browser", text: "stage iframe readiness" });
-        if (await iframeEmpty(page, stage, { timeoutMs: 45000, signal: ctx.signal })) { ctx.progress(`拒收 ${new URL(href).pathname}：舞台 iframe 是空的`, { tool: "reject", text: "iframe-empty", ok: false }); continue; }
+        const settleBudget = Math.min(8000, stageDeadline - Date.now());
+        if (settleBudget > 0) await page.waitForLoadState("networkidle", { timeout: settleBudget }).catch(() => {});
+        stage = (await findStage(page, stageWait)) || stage;
+        if (await iframeEmpty(page, stage, stageWait)) { ctx.progress(`拒收 ${new URL(href).pathname}：舞台 iframe 是空的`, { tool: "reject", text: "iframe-empty", ok: false }); continue; }
         const pageWidth = await page.evaluate(() => document.documentElement.scrollWidth);
         const clip = stageClip(stage, pageWidth);
         png = letterbox(await shoot(page, clip), clip);

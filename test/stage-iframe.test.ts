@@ -6,7 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import type { StationContext } from "../server/runtime.ts";
 
-test("proof checks only the selected component stage's iframe content", { timeout: 30000 }, async t => {
+test("proof checks only the selected component stage's iframe content", { timeout: 60000 }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "easy-workflow-stage-iframe-"));
   process.env.FACTORY_VAR = root;
   const { findStage, iframeEmpty } = await import("../packs/vislexicon/capture.ts");
@@ -18,6 +18,7 @@ test("proof checks only the selected component stage's iframe content", { timeou
     res.setHeader("content-type", "text/html");
     if (req.url === "/empty") { res.end("<!doctype html><body></body>"); return; }
     if (req.url === "/delayed") { res.end('<!doctype html><body><script>setTimeout(()=>{document.body.innerHTML="<main><h1>Delayed component</h1><p>One real item</p><p>Another real item</p><button>Action</button></main>"},350)</script></body>'); return; }
+    if (req.url === "/delayed-document" || req.url === "/slow-document") { const ms = req.url === "/slow-document" ? 6500 : 350; res.end(`<!doctype html><title>Delayed story</title><main></main><script>setTimeout(()=>{document.querySelector('main').innerHTML=${JSON.stringify(component)}},${ms})</script>`); return; }
     if (req.url === "/rendered") { res.end(`<!doctype html><main>${component}</main>`); return; }
     res.end(`<!doctype html><title>Stage fixture</title><main>${component}</main><iframe title="Unrelated analytics" src="/empty" style="display:none"></iframe>`);
   });
@@ -90,6 +91,54 @@ test("proof checks only the selected component stage's iframe content", { timeou
         await assert.rejects(waiting, /cancel iframe readiness|abort/i);
         assert.ok(Date.now() - cancelStarted < 500, "cancellation releases the caller immediately");
       } finally { await close(); }
+    });
+    await t.test("stage discovery waits for actual main-document rendering without delaying an existing stage", async () => {
+      const { page, close } = await openPage();
+      try {
+        await page.goto(`${base}/delayed-document`);
+        const started = Date.now(), stage = await findStage(page, { timeoutMs: 2000 });
+        assert.equal(stage?.sel, ".bd-example"); assert.ok(Date.now() - started >= 250);
+        const readyAt = Date.now();
+        assert.equal((await findStage(page, { timeoutMs: 2000 }))?.sel, ".bd-example");
+        assert.ok(Date.now() - readyAt < 1000, "a ready stage must not incur the requested wait budget");
+      } finally { await close(); }
+    });
+    await t.test("stage discovery has a deadline and rejects immediate cancellation", async () => {
+      const { page, close } = await openPage();
+      try {
+        await page.setContent("<main>Only ordinary document text</main>");
+        const started = Date.now();
+        assert.equal(await findStage(page, { timeoutMs: 120 }), null);
+        assert.ok(Date.now() - started >= 100);
+        const ctrl = new AbortController(), cancelAt = Date.now();
+        const waiting = findStage(page, { timeoutMs: 10000, signal: ctrl.signal });
+        setTimeout(() => ctrl.abort(new Error("cancel stage discovery")), 30);
+        await assert.rejects(waiting, /cancel stage discovery|abort/i);
+        assert.ok(Date.now() - cancelAt < 500);
+      } finally { await close(); }
+    });
+    await t.test("stage discovery and iframe content consume one shared deadline", async () => {
+      const { page, close } = await openPage();
+      try {
+        await page.setContent("<main></main>");
+        await page.evaluate(url => { setTimeout(() => { document.querySelector("main")!.innerHTML = `<iframe data-preview src="${url}/empty" style="width:500px;height:300px"></iframe>`; }, 250); }, base);
+        const started = Date.now(), deadline = started + 700;
+        const stage = await findStage(page, { deadline }); assert.ok(stage);
+        assert.equal(await iframeEmpty(page, stage, { deadline }), true);
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed >= 600 && elapsed < 1000, `shared wait took ${elapsed}ms instead of adding a new iframe budget`);
+      } finally { await close(); }
+    });
+    await t.test("production proof waits for a stage that appears after initial visit settling", async () => {
+      const messages: string[] = [];
+      const ctx = {
+        token: { id: "late-main-stage", url: base, data: { canonical: base, host: "127.0.0.1", kind: "component-source", previewChoices: { proof: `${base}/slow-document` } } },
+        signal: new AbortController().signal, attempt: "a-late-main",
+        progress: (message: string) => messages.push(message), addEvidence: (e: unknown) => e,
+      } as unknown as StationContext;
+      const result = await TOOLS["curation.proof"](ctx, { store: new EvidenceStore(path.join(root, "evidence")), workDir: path.join(root, "work"), publishDir: path.join(root, "publish"), inFlight: () => new Set<string>() });
+      assert.equal(result.ok, true, messages.join("\n"));
+      assert.ok(fs.existsSync((result.data?.shots as { proof: { file: string } }).proof.file));
     });
   } finally {
     await closeBrowser(); fixture.closeAllConnections(); await new Promise<void>(resolve => fixture.close(() => resolve()));

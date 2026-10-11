@@ -727,8 +727,8 @@ export class Runtime {
     const n = this.nodes.get(target.node);
     if (!n || !this.runnable(n) || !t.closure.has(target.node)) return { ok: false, message: "纠错目标必须是这件货经过的可执行工位" };
     const correction = `c-${short()}`;
-    this.journal.append({ kind: "correction.created", correction, evidence: target.evidence, token: t.id, node: target.node, reason, note });
     if (!this.running) this.start("纠错重做");
+    this.journal.append({ kind: "correction.created", correction, evidence: target.evidence, token: t.id, node: target.node, reason, note });
     const ok = this.returnToken(t, "human", target.node, note ? `${reason}：${note}` : reason, true, note);
     return { ok, message: ok ? `已退回 ${this.nodes.get(target.node)?.name}` : "已超过纠错轮数，转待人工" };
   }
