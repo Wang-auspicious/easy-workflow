@@ -156,7 +156,7 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       f.broker.memoryFloorMB=0;
       const until=async(check:()=>boolean)=>{for(let i=0;i<200&&!check();i++)await delay(10);assert.ok(check(),"runtime must reach the expected checkpoint");};
       f.runtime.start("checkpoint review recovery");
-      f.runtime.executors=n=>async()=>n.key==="curation/process"
+      f.runtime.executors=n=>async()=>n.key==="curation/proof"
         ? {ok:false,summary:"missing artifact",error:"identity.png missing"}
         : {ok:true,summary:"fixture evidence"};
       const first=f.runtime.create("curation/identity",{item:"checkpoint-item",url:base,source:"candidates/pool",data:{canonical:base,kind:"tool",mode:"shots",needsProof:true}});
@@ -170,13 +170,14 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       };
       const [retry]=f.retryCandidates({items:["checkpoint-item"],count:1});
       await until(()=>f.runtime.queues.get("curation/identity")!.includes(retry.id));
-      assert.equal(f.state.attempts[f.state.tokens[retry.id].attempts[0]].node,"curation/process");
+      assert.equal(f.state.attempts[f.state.tokens[retry.id].attempts[0]].node,"curation/proof");
       await f.runtime.close();f.journal.close();factory=undefined;
       factory=new Factory();await factory.boot();f=factory;
       f.broker.memoryFloorMB=0;
       const resumed=f.runtime.tokens.get(retry.id)!;
       assert.ok(resumed.closure.has("curation/identity"));
       assert.ok(!resumed.done.has("curation/identity"),"return invalidation must survive restart");
+      assert.equal(resumed.notes.get("curation/identity")?.reason,"fixture review","review instructions must survive restart");
       const executed:string[]=[];
       f.runtime.executors=n=>async()=>{executed.push(n.key);return {ok:true,summary:"fixture complete",data:n.key==="curation/gate"?{gate:"pass"}:undefined};};
       f.runtime.resume();await until(()=>f.state.tokens[retry.id].status!=="active");
@@ -187,6 +188,31 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       assert.equal(report?.totals.created,1,"retry is not a second logical item");
       assert.equal(report?.totals.parked,0,"superseded failure is no longer pending");
       assert.ok(report?.attempts.some(a=>a.token===first.id&&!a.ok),"original failed work stays in the cost/audit record");
+    });
+    await t.test("a facts review return does not cancel the independent style branch",async()=>{
+      const f=factory!;f.broker.memoryFloorMB=0;f.runtime.start("independent review branches");
+      let factReviews=0;
+      f.runtime.executors=n=>async()=>{
+        if(n.key==="curation/style")await delay(100);
+        if(n.key==="curation/fact-review"&&factReviews++===0)return {ok:true,summary:"fix facts",verdict:{verdict:"return",returnTo:"curation/facts",reason:"fixture missing quote"}};
+        return {ok:true,summary:"fixture complete",data:n.key==="curation/gate"?{gate:"pass"}:undefined};
+      };
+      const token=f.runtime.create("curation/shot-review",{item:"branched-review",url:base,source:"manual"});
+      for(let i=0;i<300&&f.state.tokens[token.id].status==="active";i++)await delay(10);
+      assert.equal(f.state.tokens[token.id].status,"published");
+      const styles=f.state.tokens[token.id].attempts.map(id=>f.state.attempts[id]).filter(a=>a.node==="curation/style");
+      assert.equal(styles.length,1);assert.equal(styles[0].ok,true);
+      assert.equal(factReviews,2);
+      await endRun(f);
+    });
+    await t.test("completed items remain correctable after restarting an ended run",async()=>{
+      let f=factory!;
+      const previous=Object.values(f.state.tokens).find(t=>t.item==="branched-review")!;
+      await f.runtime.close();f.journal.close();factory=undefined;
+      factory=new Factory();await factory.boot();f=factory;
+      f.runtime.executors=()=>async()=>({ok:true,summary:"fixture corrected",finish:{status:"published",reason:"fixture"}});
+      assert.equal(f.runtime.correct({token:previous.id,node:"curation/facts"},"Verify the source again").ok,true);
+      await f.runtime.settle();const report=await endRun(f);assert.equal(report?.totals.created,1,"historical corrections still appear in the current report");
     });
   } finally {
     if(factory){await factory.runtime.close();factory.journal.close();}

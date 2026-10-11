@@ -120,6 +120,17 @@ export class Factory {
     // paths once, without rewriting evidence or rerunning paid model work.
     const latest = new Map(Object.values(this.state.tokens).sort((a,b)=>a.createdAt-b.createdAt).map(t=>[t.item,t]));
     for(const token of latest.values()) {
+      if(token.status==="manual"&&token.data.recoveryStation&&token.reason==="没有可走的下一步（分支条件都不成立）"){
+        const last=this.state.attempts[token.attempts.at(-1)??""];
+        const next=last&&(this.runtime.outFlow.get(last.node)??[]).filter(e=>!e.when||pack.conditions[e.when]?.(token.data));
+        const station=next?.length===1&&this.runtime.runnable(this.runtime.nodes.get(next[0].to)!)?next[0].to:last?.node;
+        if(station){
+          const parkedAt=token.finishedAtNode;
+          if(parkedAt&&this.runtime.nodes.get(parkedAt)?.kind==="store")this.runtime.stockDelta(parkedAt,-1,`${token.item}：恢复调度后移回候选`);
+          this.journal.append({kind:"token.finished",token:token.id,node:station,status:"parked",reason:"恢复分支状态不完整，现已修复；保留产物并从后续工位继续"});
+          this.recordRecovery(token,{tag:"tool_error",category:"system",message:"恢复分支状态不完整，现已修复；从后续工位继续",retryable:true,url:token.url});
+        }
+      }
       if(this.state.recoveries[token.item]||!["rejected","manual","parked"].includes(token.status))continue;
       const attempts=token.attempts.map(id=>this.state.attempts[id]).filter(Boolean);
       const failed=[...attempts].reverse().find(a=>a.ok===false||/^打不开[：:]|^HTTP [45]\d\d/.test(a.summary??""));
@@ -155,7 +166,7 @@ export class Factory {
         t.entry=recoveryRoot;t.closure=this.runtime.closureOf(recoveryRoot);
         const invalidated=this.runtime.descendants(t,checkpoint);
         t.done=new Set([...(previous.data.checkpointDone as string[]??[]),...[...completed].filter(([,ok])=>ok).map(([key])=>key)].filter(key=>!invalidated.has(key)));
-        for(const key of t.done)for(const edge of this.runtime.outFlow.get(key)??[])t.edgeLive.set(edge.key,!edge.when||Boolean(pack.conditions[edge.when]?.(t.data)));
+        this.runtime.restoreFlow(t);
         t.data.checkpointDone=[...t.done];this.journal.append({kind:"token.data",token:t.id,patch:{checkpointDone:[...t.done]}});
       }
       if(previous&&checkpoint!=="candidates/tidy"){
@@ -210,12 +221,18 @@ export class Factory {
     const live = Object.values(this.state.workers).filter((w) => !w.retiredAt);
     rt.ensureWorkers(live.map((w) => ({ node: w.node, worker: w.id, label: w.label })));
     const run = this.state.run;
-    if (run.status !== "running" && run.status !== "paused") return;
-    rt.running = true; rt.paused = run.status === "paused" || process.env.FACTORY_START_PAUSED === "1"; rt.runStartedAt = run.startedAt;
+    const resumable=run.status === "running" || run.status === "paused";
+    rt.running = resumable; rt.paused = resumable&&(run.status === "paused" || process.env.FACTORY_START_PAUSED === "1"); rt.runStartedAt = run.startedAt;
     if (rt.paused && this.state.run.status === "running") this.journal.append({ kind: "run.paused", runId: run.id });
     // Which nodes each token has finished, per the journal (returns reset descendants).
     const done = new Map<string, Set<string>>(Object.values(this.state.tokens).map(t=>[t.id,new Set((t.data.checkpointDone as string[])??[])]));
-    for (const e of this.journal.read(0, run.id)) {
+    const notes=new Map<string,TokenRun["notes"]>();
+    for (const e of this.journal.read(0)) {
+      if(e.kind==="token.returned"){
+        const entries=notes.get(e.token)??new Map();entries.set(e.to,{reason:e.reason,byHuman:e.byHuman});notes.set(e.token,entries);
+      }else if(e.kind==="attempt.finished"&&e.error!=="restart"&&e.error!=="stale"){
+        const a=this.state.attempts[e.attempt];if(a)notes.get(a.token)?.delete(a.node);
+      }
       if (e.kind === "attempt.finished" && e.ok && e.error !== "stale") {
         const a = this.state.attempts[e.attempt];
         if (a) (done.get(a.token) ?? done.set(a.token, new Set()).get(a.token)!).add(a.node);
@@ -224,15 +241,16 @@ export class Factory {
     }
     let requeued = 0, voided = 0;
     for (const ts of Object.values(this.state.tokens)) {
-      if (ts.status !== "active") continue;
       const entry = String(ts.data.recoveryRoot??this.state.attempts[ts.attempts[0]]?.node ?? (ts.source === "manual" ? "candidates/tidy" : "candidates/route"));
       const t: TokenRun = {
         id: ts.id, item: ts.item, url: ts.url, title: ts.title, source: ts.source, entry, data: { ...ts.data },
         closure: rt.closureOf(entry), done: done.get(ts.id) ?? new Set(), dead: new Set(), edgeLive: new Map(), inflight: new Set(),
-        queuedAt: new Map(), failures: new Map(), rounds: { ...ts.rounds }, epoch: 0, finished: false, notes: new Map(),
+        queuedAt: new Map(), failures: new Map(), rounds: { ...ts.rounds }, epoch: 0, finished: ts.status!=="active", notes: notes.get(ts.id)??new Map(),
+        finishedStore:ts.finishedAtNode&&rt.nodes.get(ts.finishedAtNode)?.kind==="store"?ts.finishedAtNode:undefined,
       };
-      for (const k of t.done) for (const e of rt.outFlow.get(k) ?? []) if (t.closure.has(e.to)) t.edgeLive.set(e.key, !e.when || Boolean(pack.conditions[e.when]?.(t.data)));
+      rt.restoreFlow(t);
       rt.tokens.set(t.id, t);
+      if(t.finished||!resumable)continue;
       for (const aid of ts.attempts) {
         const a = this.state.attempts[aid];
         if (a && a.endedAt === undefined) {

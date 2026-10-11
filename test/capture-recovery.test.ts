@@ -1,12 +1,31 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import http from 'node:http';
 import {compile} from '../server/spec/compile.ts';import {pack} from '../packs/vislexicon/pack.ts';import {readRole} from '../server/roles.ts';
 import {findStage,links,pageKey,shoot} from '../packs/vislexicon/capture.ts';import {TOOLS} from '../packs/vislexicon/tools.ts';import {EvidenceStore} from '../server/evidence.ts';import type {StationContext} from '../server/runtime.ts';
+import {facts,factReview,shotReview} from '../packs/vislexicon/agents.ts';
 
 test('all default nodes have distinct task roles and dispatcher has bounded recovery duties',()=>{
  const f=compile([pack]);assert.equal(f.nodes.length,66);
  for(const n of f.nodes){const role=readRole(n.key);assert.match(role.content,new RegExp(n.key));assert.match(role.content,/情况判断与处理/);assert.match(role.content,/完成和交接/);}
  assert.match(readRole('curation/classify-review').content,/独立/);assert.match(readRole('curation/proof').content,/Storybook/);assert.match(readRole('dispatcher').content,/实时状态/);
  assert.throws(()=>readRole('../../auth'));assert.throws(()=>readRole('missing/station'));
+});
+
+test('facts and reviewer share the same evidence; reframing does not blacklist a valid page',async()=>{
+ const quote='Code licensed under MIT license conditions';
+ const ctx={token:{data:{canonical:'https://fixture.test',home:{text:'Header '.repeat(270)+quote}}},progress:()=>{},addEvidence:()=>({})} as unknown as StationContext;
+ await facts.input(ctx);
+ const out={price:'unknown',sourceCode:'unknown',license:'MIT',commercial:'unknown',sources:[{fact:'license',url:'https://fixture.test',quote}]};
+ assert.deepEqual(facts.check!(out,ctx),[]);
+ const result=await facts.after!(out,ctx,{rounds:1} as never);Object.assign(ctx.token.data,result.data);
+ assert.ok((await factReview.input(ctx)).text.includes(quote),'the reviewer must see quotes beyond character 1800');
+ assert.ok(facts.check!({...out,sources:[{...out.sources[0],quote:quote+'; invented permission'}]},ctx).length,'a real prefix cannot validate an invented quote tail');
+ const review=shotReview({} as EvidenceStore),url='https://fixture.test/demo';
+ ctx.token.data.shots={proof:{href:url}};
+ const reframe=await review.after!({verdict:'return',returnTo:'proof',repair:'reframe',reason:'Scroll to the actual demo',perImage:[]},ctx,{rounds:1} as never);
+ assert.deepEqual(reframe.data?.rejectedPages,undefined);
+ assert.equal((reframe.data?.shotRepairs as any).proof.url,url);
+ const replace=await review.after!({verdict:'return',returnTo:'proof',repair:'replace-page',reason:'This page only contains installation',perImage:[]},ctx,{rounds:1} as never);
+ assert.deepEqual(replace.data?.rejectedPages,[url]);
 });
 
 test('capture chooses a bounded demo, keeps SPA routes and survives review reshoots',{timeout:30000},async t=>{
@@ -18,6 +37,10 @@ test('capture chooses a bounded demo, keeps SPA routes and survives review resho
    await page.goto(`http://127.0.0.1:${(fixture.address() as {port:number}).port}`);
    await t.test('5000px document wrapper cannot win over the rendered component',async()=>{const stage=await findStage(page);assert.equal(stage?.sel,'.bd-example');assert.ok(stage!.h<=200);});
    await t.test('Storybook index exposes docs and real iframe examples without losing query identity',async()=>{const l=await links(page);assert.ok(l.some(x=>x.href.includes('path=%2Fdocs%2Fbutton--docs')));assert.ok(l.some(x=>x.href.includes('iframe.html?id=button--primary')));assert.notEqual(pageKey('https://x.test/?path=/docs/a'),pageKey('https://x.test/?path=/docs/b'));});
+   await t.test('unnamed live examples before source blocks are detected without capturing source',async()=>{
+     await page.setContent('<main><h1>Button</h1><div><button style="width:100px;height:40px;background:blue;color:white">Click me</button></div><div><pre>const source = 1</pre></div></main>');
+     const stage=await findStage(page);assert.equal(stage?.sel,'example-before-code');assert.ok(stage!.h<=40);
+   });
    await t.test('image processing stores durable references and reuses unaffected roles after a reshoot',async()=>{
      const work=path.join(dir,'work');fs.mkdirSync(work);const original=path.join(work,'identity.png');fs.writeFileSync(original,await shoot(page));
      const store=new EvidenceStore(path.join(dir,'evidence'));

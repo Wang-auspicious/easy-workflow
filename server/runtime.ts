@@ -29,7 +29,9 @@ export interface TokenRun {
   rounds: Record<string, number>;
   /** Bumped on every return; attempts from an older epoch are void. */
   epoch: number;
+  nodeEpochs?:Map<string,number>;
   finished: boolean;
+  finishedStore?:string;
   notes: Map<string, { reason: string; note?: string; byHuman: boolean }>;
 }
 
@@ -229,6 +231,25 @@ export class Runtime {
     return seen;
   }
 
+  /** Rebuild both live and skipped branches before a checkpoint or restart resumes.
+   * A join must know that an unselected sibling (e.g. video vs screenshots) is
+   * resolved; otherwise it waits forever for work that should never run. */
+  restoreFlow(t:TokenRun) {
+    t.dead.clear();t.edgeLive.clear();
+    for(const key of t.done)for(const edge of this.outFlow.get(key)??[])
+      t.edgeLive.set(edge.key,!edge.when||Boolean(this.conditions[edge.when]?.(t.data)));
+    let changed=true;
+    while(changed){changed=false;
+      for(const key of t.closure){
+        if(t.done.has(key)||t.dead.has(key))continue;
+        const ins=(this.inFlow.get(key)??[]).filter(e=>t.closure.has(e.from));
+        if(!ins.length||!ins.every(e=>t.edgeLive.get(e.key)===false))continue;
+        t.dead.add(key);changed=true;
+        for(const edge of this.outFlow.get(key)??[])t.edgeLive.set(edge.key,false);
+      }
+    }
+  }
+
   create(entry: string, item: { item: string; url: string; title?: string; source: string; category?: string; data?: Record<string, unknown> }): TokenRun {
     const t: TokenRun = {
       id: `t-${short()}`, item: item.item, url: item.url, title: item.title, source: item.source, entry,
@@ -262,6 +283,7 @@ export class Runtime {
     // A store with outgoing edges is a buffer: express tokens (hand-pasted) pass straight through.
     if (t.data.express && (this.outFlow.get(n.key) ?? []).length) { this.complete(t, n.key); return; }
     t.finished = true;
+    t.finishedStore=n.key;
     const status: TokenStatus = n.key.endsWith("/published") ? "published" : n.key.endsWith("/manual") ? "manual" : "parked";
     if (status === "published") t.data.published = true;
     this.journal.append({ kind: "token.finished", token: t.id, status, node: n.key, reason: status === "published" ? "通过发布闸门" : String(t.data.manualReason ?? "等候处理") });
@@ -323,7 +345,7 @@ export class Runtime {
 
   private async run(w: Worker, t: TokenRun, n: CompiledNode, lease: Lease) {
     const attempt = `a-${short()}`;
-    const epoch = t.epoch;
+    const epoch = t.nodeEpochs?.get(n.key)??0;
     const queuedMs = Date.now() - (t.queuedAt.get(n.key) ?? Date.now());
     const ctrl = new AbortController();
     this.aborts.set(attempt, ctrl);
@@ -341,11 +363,11 @@ export class Runtime {
       res = await exec({
         token: t, node: n, attempt, worker: w, signal: ctrl.signal, redo: t.notes.get(n.key),
         progress: (text, step) => {
-          if (!ctrl.signal.aborted && t.epoch === epoch && !t.finished) this.journal.append({ kind: "attempt.progress", attempt, text, step });
+          if (!ctrl.signal.aborted && (t.nodeEpochs?.get(n.key)??0) === epoch && !t.finished) this.journal.append({ kind: "attempt.progress", attempt, text, step });
         },
         addEvidence: (ev) => {
           ctrl.signal.throwIfAborted();
-          if (t.epoch !== epoch || t.finished) throw new Error("stale attempt");
+          if ((t.nodeEpochs?.get(n.key)??0) !== epoch || t.finished) throw new Error("stale attempt");
           const full: EvidenceRef = { ...ev, station: n.key, token: t.id, attempt, at: Date.now() };
           this.journal.append({ kind: "evidence.added", evidence: full });
           return full;
@@ -361,9 +383,9 @@ export class Runtime {
       w.busy = null; w.idleSince = Date.now();
     }
     const ms = Date.now() - t0;
-    if (ctrl.signal.aborted || t.epoch !== epoch || t.finished) {
+    if (ctrl.signal.aborted || (t.nodeEpochs?.get(n.key)??0) !== epoch || t.finished) {
       this.journal.append({ kind: "attempt.finished", attempt, ok: false, cancelled:true, summary: "已取消：任务已退回或本轮已结束", ms, queuedMs, usage: res.usage, error: "stale" });
-      t.inflight.delete(n.key);
+      if((t.nodeEpochs?.get(n.key)??0)===epoch)t.inflight.delete(n.key);
       this.schedule();
       return;
     }
@@ -467,13 +489,21 @@ export class Runtime {
     t.rounds[to] = round;
     t.epoch++;
     const reset = this.descendants(t, to);
+    t.nodeEpochs??=new Map();
     for (const k of reset) {
+      t.nodeEpochs.set(k,(t.nodeEpochs.get(k)??0)+1);
+      for(const worker of this.workers.get(k)??[])if(worker.busy&&this.attemptTokens.get(worker.busy)===t.id)this.aborts.get(worker.busy)?.abort();
       t.done.delete(k); t.dead.delete(k); t.inflight.delete(k);
       const q = this.queues.get(k)!; const i = q.indexOf(t.id); if (i >= 0) q.splice(i, 1);
       for (const e of this.outFlow.get(k) ?? []) t.edgeLive.delete(e.key);
     }
     t.notes.set(to, { reason, note, byHuman });
-    if (t.finished) { t.finished = false; if (t.data.published) this.stockDelta(`${this.nodes.get(to)!.line}/published`, -1, `${t.item} 被纠错撤回`); }
+    if (t.finished) {
+      t.finished = false;
+      const store=t.finishedStore??(t.data.published?`${this.nodes.get(to)!.line}/published`:undefined);
+      if(store)this.stockDelta(store,-1,`${t.item} 被纠错撤回`);
+      t.finishedStore=undefined;
+    }
     this.journal.append({ kind: "token.returned", token: t.id, from, to, reason, round, byHuman, reset: [...reset] });
     this.enqueue(t, to, from, true);
     return true;

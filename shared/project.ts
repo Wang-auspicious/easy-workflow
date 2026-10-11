@@ -41,6 +41,7 @@ export interface AttemptState {
 
 export interface TokenState {
   id: string;
+  touchedAt?:number;
   line: string;
   item: string;
   url: string;
@@ -214,6 +215,7 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
     case "token.queued": {
       const t = s.tokens[e.token];
       if (!t) break;
+      t.touchedAt=e.at;
       const n = node(e.node);
       if (e.from) {
         remove(t.at, e.from);
@@ -422,7 +424,9 @@ export function nodeLight(n: NodeState | undefined, dormant: boolean, now: numbe
 /** A retry is another attempt at the same item, not another unresolved item. */
 export function latestRunTokens(s:FactoryState) {
   const latest=new Map<string,TokenState>();
-  for(const id of s.tokenOrder){const t=s.tokens[id];if(t&&t.createdAt>=s.run.startedAt)latest.set(t.item,t);}
+  for(const id of s.tokenOrder){const t=s.tokens[id];if(!t||(t.touchedAt??t.createdAt)<s.run.startedAt)continue;
+    const prior=latest.get(t.item);if(!prior||(t.touchedAt??t.createdAt)>=(prior.touchedAt??prior.createdAt))latest.set(t.item,t);
+  }
   return [...latest.values()];
 }
 

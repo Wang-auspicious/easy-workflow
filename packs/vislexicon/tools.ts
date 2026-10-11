@@ -201,7 +201,7 @@ function dedupeLinks(links: Link[]) {
   const seen = new Set<string>();
   return links.filter((l) => {
     const k = pageKey(l.href);
-    if (!l.text || seen.has(k) || /\.(pdf|zip|png|jpe?g|svg|mp4)$/i.test(k) || /login|signin|sign-in|signup|register|account|cart|checkout/i.test(k)) return false;
+    if (!l.text || seen.has(k) || /\.(pdf|zip|png|jpe?g|svg|mp4|txt|md|json|xml|js|css)(?:[?#]|$)/i.test(k) || /login|signin|sign-in|signup|register|account|cart|checkout/i.test(k)) return false;
     seen.add(k);
     return true;
   });
@@ -258,7 +258,8 @@ const breadth: Tool = async (ctx, svc) => {
   const host = String(ctx.token.data.host);
   const shots = shotsOf(ctx);
   const exclude = new Set<string>((ctx.token.data.rejectedPages as string[]) ?? []);
-  if (ctx.redo && shots.breadth?.href) exclude.add(shots.breadth.href.replace(/\/+$/, ""));
+  const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string}>|undefined)?.breadth;
+  if (ctx.redo && shots.breadth?.href && (!repair||repair.action==="replace-page")) exclude.add(pageKey(shots.breadth.href));
   // The home page itself never counts as the catalogue.
   for (const h of [shots.identity?.href, String(ctx.token.data.canonical), (ctx.token.data.home as { finalUrl?: string })?.finalUrl]) if (h) exclude.add(pageKey(h));
   const pool = [...((ctx.token.data.homeLinks as Link[]) ?? []), ...(((ctx.token.data.home as { navLinks?: Link[] })?.navLinks) ?? [])];
@@ -266,11 +267,14 @@ const breadth: Tool = async (ctx, svc) => {
     const probe=await openPage(VIEW,'en-US',ctx.signal);try{await visit(probe.page,shots.identity?.href??ctx.token.url,host);pool.push(...await links(probe.page));}finally{await probe.close();}
   }
   const ranked: { href: string; score: number; reasons: string[]; text: string }[] = scoreLinks(pool, role).filter((c) => !exclude.has(c.href)).slice(0, 4);
+  if(repair&&repair.action!=="replace-page"&&repair.url&&!exclude.has(pageKey(repair.url)))ranked.unshift({href:repair.url,text:"按复审重新取景",score:10,reasons:['review-reframe']});
   for(const link of pool.filter(l=>new URL(l.href).searchParams.get('path')?.startsWith('/docs/')).slice(0,4))if(!exclude.has(pageKey(link.href))&&!ranked.some(r=>pageKey(r.href)===pageKey(link.href)))ranked.push({href:link.href,text:link.text,score:8,reasons:['storybook-docs']});
   ctx.progress(`目录候选 ${ranked.length} 个：${ranked.map((r) => new URL(r.href).pathname).join("  ") || "无"}`, { tool: "rules", text: "path +3 · text +2 · nav +1" });
   let usage: Usage | undefined;
+  let selectionCalls=0;
   const options = dedupeLinks(pool).filter((l) => !exclude.has(l.href.replace(/\/+$/, "")) && l.href.replace(/\/+$/, "") !== String(ctx.token.data.canonical)).slice(0, 30);
   if (!ranked.length) {
+    selectionCalls++;
     const pick = await pickOne(ctx, `Website ${ctx.token.data.title} is a ${KIND_ZH[kind] ?? kind} (${kind}). Which link leads to the catalogue / overview page that best shows the RANGE of what it offers?`, options.map((l) => `${l.text} → ${l.href}`));
     if (pick) { usage = pick.usage; ranked.push({ href: options[pick.index].href, score: 0, reasons: ["needsPick"], text: options[pick.index].text }); }
   }
@@ -284,16 +288,25 @@ const breadth: Tool = async (ctx, svc) => {
       tried.add(c.href.replace(/\/+$/, ""));
       const v = await visitCandidate(page,c.href,host,ctx,accessFailures);
       if(v.issues.some(i=>/^(network_|http_|page_)/.test(i))){ctx.progress(`候选访问失败，继续下一页：${c.href}`,{tool:"reject",text:v.issues.join(", "),ok:false});continue;}
+      if(c.reasons.includes('review-reframe')){
+        const stage=await findStage(page);
+        if(stage)await page.evaluate(y=>window.scrollTo(0,Math.max(0,y-120)),stage.y);
+        await page.waitForLoadState('networkidle',{timeout:5000}).catch(()=>{});
+        await sleep(1000);
+        ctx.progress('按复审保留原页，等待预览并重新取景',{tool:'browser',text:'保留 URL，更新画面'});
+      }
       const png = await shoot(page);
       const check = checkImage(png, hashes);
       const issues = [...v.issues, ...check.issues];
       if (issues.length) {
         ctx.progress(`拒收 ${new URL(c.href).pathname}：${issues.join("、")}`, { tool: "reject", text: issues.join(", "), ok: false });
         // Rules ran out: one needsPick round over the links not tried yet.
-        if (i === ranked.length - 1 && !ranked.some((r) => r.reasons.includes("needsPick"))) {
-          const rest = options.filter((l) => !tried.has(l.href.replace(/\/+$/, "")));
-          const pick = await pickOne(ctx, `Website ${ctx.token.data.title} is a ${KIND_ZH[kind] ?? kind}. The obvious catalogue pages were rejected. Which remaining link best shows the RANGE of what it offers?`, rest.map((l) => `${l.text} → ${l.href}`));
-          if (pick) { usage = pick.usage; ranked.push({ href: rest[pick.index].href, score: 0, reasons: ["needsPick"], text: rest[pick.index].text }); }
+        tried.add(pageKey(page.url()));
+        if (i === ranked.length - 1 && selectionCalls<2) {
+          const rest = options.filter((l) => !tried.has(pageKey(l.href))&&!exclude.has(pageKey(l.href)));
+          selectionCalls++;
+          const pick = await pickOne(ctx, `Website ${ctx.token.data.title} is a ${KIND_ZH[kind] ?? kind}. Previous choice ${c.href} led to ${page.url()} and was rejected: ${issues.join(', ')}. Choose a DIFFERENT remaining catalogue, module overview or usage page that adds information beyond the home page. Return no choice if none exists.`, rest.map((l) => `${l.text} → ${l.href}`));
+          if (pick) { usage = {input:(usage?.input??0)+pick.usage.input,output:(usage?.output??0)+pick.usage.output,cost:(usage?.cost??0)+pick.usage.cost}; ranked.push({ href: rest[pick.index].href, score: 0, reasons: ["needsPick"], text: rest[pick.index].text }); }
         }
         continue;
       }
@@ -327,7 +340,7 @@ const proof: Tool = async (ctx, svc) => {
   const role = PREVIEW_RULES.kinds[kind]?.roles.proof ?? {};
   const host = String(ctx.token.data.host);
   const shots = shotsOf(ctx);
-  const usesStage = ["component-source", "design-system"].includes(kind) || Boolean(role.stageSelectors);
+  const usesStage = ["component-source", "design-system", "tool"].includes(kind) || Boolean(role.stageSelectors);
   const breadthLinks = (ctx.token.data.breadthLinks as Link[]) ?? [];
   const homeLinks = (ctx.token.data.homeLinks as Link[]) ?? [];
   let candidates: string[];
@@ -340,9 +353,11 @@ const proof: Tool = async (ctx, svc) => {
     candidates = [...new Set((under.length ? under : inGrid).map((l) => l.href))].slice(0, 8);
   }
   const norm = pageKey;
-  if(usesStage){const extra=scoreLinks([...breadthLinks,...homeLinks],{pathPatterns:['iframe[.]html','demo|example|playground','/components/'],linkText:['playground','examples','preview','demo']}).map(l=>l.href);candidates=[...new Set([...extra,...candidates])];}
+  if(usesStage){const extra=scoreLinks([...breadthLinks,...homeLinks],{pathPatterns:['iframe[.]html','demo|example|playground','/components/'],linkText:['playground','examples','preview','demo','button','grid','dialog','table']}).map(l=>l.href);candidates=[...new Set([...extra,...candidates])];}
+  const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string}>|undefined)?.proof;
   const taken = new Set([norm(String(ctx.token.data.canonical)), norm(shots.breadth?.href ?? ""), norm(shots.identity?.href ?? ""), ...(((ctx.token.data.rejectedPages as string[]) ?? []).map(norm))]);
-  if (ctx.redo && shots.proof?.href) taken.add(norm(shots.proof.href));
+  if(repair&&repair.action!=="replace-page"&&repair.url)candidates.unshift(repair.url);
+  else if (ctx.redo && shots.proof?.href) taken.add(norm(shots.proof.href));
   candidates = [...new Set(candidates.map(norm))].filter((h) => !taken.has(h)).slice(0, 6);
   let usage: Usage | undefined;
   if (!candidates.length) {

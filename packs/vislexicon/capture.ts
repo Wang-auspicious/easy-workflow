@@ -201,9 +201,25 @@ export async function findStage(page: Page): Promise<Stage | null> {
     const boxes: Stage[] = [];
     const roots:(Document|ShadowRoot)[]=[document];
     for(let i=0;i<roots.length;i++)for(const el of roots[i].querySelectorAll('*'))if(el.shadowRoot)roots.push(el.shadowRoot);
-    for (const sel of [".bd-example", "[data-preview]", "#storybook-root", "#root > .sb-story", "canvas", "svg", "[class*=playground]", ...selectors]) {
+    // Documentation frameworks often put an unnamed live example directly before
+    // its code block. Recognise that relationship, without treating docs text or
+    // the code toolbar itself as a rendered component.
+    const examples=new Set<Element>();
+    for(const pre of document.querySelectorAll('main pre,article pre')){
+      let block:Element|null=pre;
+      for(let depth=0;block&&depth<3;depth++,block=block.parentElement){
+        const preview=block.previousElementSibling;
+        if(!preview||!preview.matches('div,section')||preview.querySelector('pre,code,h1,h2,h3'))continue;
+        const rendered=[...preview.querySelectorAll('*')].filter(el=>{
+          const r=el.getBoundingClientRect(),style=getComputedStyle(el);
+          return r.width>20&&r.height>20&&(el.matches('button,input,select,canvas,svg,iframe')||!['transparent','rgba(0, 0, 0, 0)'].includes(style.backgroundColor));
+        });
+        if(rendered.length)examples.add(preview);
+      }
+    }
+    for (const sel of ["example-before-code", ".bd-example", "[data-preview]", ".sp-preview-container", ".sp-preview-iframe", "#storybook-root", "#root > .sb-story", "canvas", "svg", "[class*=playground]", ...selectors]) {
       let found: Element[] = [];
-      try { found = roots.flatMap(root=>[...root.querySelectorAll(sel)]); } catch { continue; }
+      try { found = sel==='example-before-code'?[...examples]:roots.flatMap(root=>[...root.querySelectorAll(sel)]); } catch { continue; }
       for (const el of found) {
         if (seen.has(el) || el.closest("nav, header, footer, aside, pre, code")) continue;
         seen.add(el);

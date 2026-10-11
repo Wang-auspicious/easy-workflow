@@ -49,7 +49,7 @@ export function buildReport(f: Factory, runId: string): RunReport {
   if (pauseAt) pausedMs += endedAt - pauseAt;
   const netMs = Math.max(0, endedAt - startedAt - pausedMs);
   const nodeOf = new Map(f.compiled.nodes.map((n) => [n.key, n]));
-  const tokenIds = new Set(events.flatMap(e=>e.kind==="token.created"?[e.token]:[]));
+  const tokenIds = new Set(events.flatMap(e=>e.kind==="token.created"||e.kind==="token.queued"?[e.token]:[]));
   const attemptIds = new Set(events.flatMap(e=>e.kind==="attempt.started"?[e.attempt]:[]));
   const tokens = [...new Map(Object.values(s.tokens).filter((t) => tokenIds.has(t.id)).map(t=>[t.item,t])).values()];
   const attempts = Object.values(s.attempts).filter((a) => attemptIds.has(a.id));

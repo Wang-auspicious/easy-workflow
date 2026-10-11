@@ -55,6 +55,7 @@ function definitions(f: Factory): Tool[] {
           return ok({
             run: { ...s.run, elapsedMin: +(elapsed(s.run, now) / 60000).toFixed(1) }, totals: {...s.totals,
               published:items.filter(t=>t.status==="published").length,parked:items.filter(t=>t.status==="parked").length,
+              manual:items.filter(t=>t.status==="manual").length,merged:items.filter(t=>t.status==="merged").length,rejected:items.filter(t=>t.status==="rejected").length,
               failedAttempts:stations.reduce((n,station)=>n+station.failed,0)},
             phase:items.length&&items.every(t=>t.status!=="active")?"settled":items.length?"working":"waiting",
             tokensActive: Object.values(s.tokens).filter((t) => t.status === "active").length, stations,

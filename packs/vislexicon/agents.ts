@@ -108,7 +108,7 @@ export const arbiter: AgentStationDef<ArbOut> = {
 
 /* ------------------------------------------------------------------ ⑪ shot review */
 
-type ShotReviewOut = { perImage: { role: string; ok: boolean; reason: string }[]; verdict: "pass" | "return"; returnTo?: string; reason: string };
+type ShotReviewOut = { perImage: { role: string; ok: boolean; reason: string }[]; verdict: "pass" | "return"; returnTo?: string; repair?:"reframe"|"replace-page"|"wait-for-render"; reason: string };
 function imagesOf(ctx: StationContext, store: EvidenceStore) {
   const d = data(ctx);
   if (d.mode === "video") return d.video ? [{ file: store.resolve(d.video.posterCard)!, label: "video poster" }] : [];
@@ -119,7 +119,7 @@ export const shotReview = (store: EvidenceStore): AgentStationDef<ShotReviewOut>
   system: contextPack(prompt("shot-review.md"), ["vislexicon:Spec.md#4.8"]),
   schema: Type.Object({
     perImage: Type.Array(Type.Object({ role: lit("identity", "breadth", "proof", "poster"), ok: Type.Boolean(), reason: Type.String() })),
-    verdict: lit("pass", "return"), returnTo: Type.Optional(lit("identity", "breadth", "proof")), reason: Type.String(),
+    verdict: lit("pass", "return"), returnTo: Type.Optional(lit("identity", "breadth", "proof")), repair:Type.Optional(lit("reframe","replace-page","wait-for-render")), reason: Type.String(),
   }),
   input: (ctx) => {
     const imgs = imagesOf(ctx, store);
@@ -128,16 +128,18 @@ export const shotReview = (store: EvidenceStore): AgentStationDef<ShotReviewOut>
       images: imgs,
     };
   },
-  check: (o) => (o.verdict === "return" && (!o.returnTo || o.reason.trim().length < 6) ? ["a return must name returnTo and a concrete reason"] : []),
+  check: (o) => (o.verdict === "return" && (!o.returnTo || !o.repair || o.reason.trim().length < 6) ? ["a return must name returnTo, repair (reframe | replace-page | wait-for-render), and a concrete reason"] : []),
   describe: (o) => (o.verdict === "pass" ? `通过：${o.perImage.map((p) => `${p.role} ${p.ok ? "✓" : "✗"}`).join(" ")}` : `退回 ${o.returnTo}：${o.reason.slice(0, 70)}`),
   after: (out, ctx) => {
     const d = data(ctx);
-    const rejected = out.verdict === "return" && out.returnTo ? [...((d.rejectedPages as string[]) ?? []), d.shots?.[out.returnTo]?.href].filter(Boolean) : d.rejectedPages;
+    const rejected = out.verdict === "return" && out.repair==="replace-page" && out.returnTo ? [...((d.rejectedPages as string[]) ?? []), d.shots?.[out.returnTo]?.href].filter(Boolean) : d.rejectedPages;
+    const shotRepairs={...d.shotRepairs};
+    if(out.verdict==="return"&&out.returnTo)shotRepairs[out.returnTo]={action:out.repair,url:d.shots?.[out.returnTo]?.href,reason:out.reason};
     ctx.addEvidence({ id: `sr-${ctx.attempt}`, kind: "verdict", label: "截图审查", verdict: out.verdict === "pass" ? "三张图 ✓" : `退回 ${({ identity: "首屏", breadth: "目录", proof: "特写" } as D)[out.returnTo ?? ""] ?? ""}`, tone: out.verdict === "pass" ? "ok" : "warn", meta: { ...out } });
     if (d.mode === "video" && out.verdict === "return") return { ok: true, summary: "录屏封面不合格 → 交人", data: { shotReview: "escalate" }, verdict: { verdict: "escalate", reason: out.reason } };
     return {
       ok: true, summary: out.verdict === "pass" ? "截图通过" : `退回${out.returnTo}：${out.reason.slice(0, 60)}`,
-      data: { shotReview: out.verdict, rejectedPages: rejected, reviews: reviewsWith(ctx, { station: "shot-review", verdict: out.verdict, reason: out.reason }) },
+      data: { shotReview: out.verdict, shotRepairs, rejectedPages: rejected, reviews: reviewsWith(ctx, { station: "shot-review", verdict: out.verdict, reason: out.reason }) },
       verdict: { verdict: out.verdict, returnTo: out.returnTo ? `curation/${out.returnTo}` : undefined, reason: out.reason },
     };
   },
@@ -246,7 +248,7 @@ export const facts: AgentStationDef<FactsOut> = {
       if (!src) { issues.push(`${f}="${v}" has no source`); continue; }
       const page = pages.find((p) => p.url.replace(/\/+$/, "") === src.url.replace(/\/+$/, ""));
       if (!page) issues.push(`${f}: source url ${src.url} is not one of the fetched pages`);
-      else if (src.quote.trim().length >= 6 && !page.text.toLowerCase().includes(src.quote.toLowerCase().trim().slice(0, 40))) issues.push(`${f}: quote is not verbatim in ${src.url}`);
+      else if (src.quote.trim().length<3 || !page.text.toLowerCase().replace(/\s+/g," ").includes(src.quote.toLowerCase().trim().replace(/\s+/g," "))) issues.push(`${f}: complete quote is not verbatim in ${src.url}`);
     }
     return issues;
   },
@@ -260,7 +262,7 @@ export const facts: AgentStationDef<FactsOut> = {
   describe: (o) => `价格 ${o.price} · 源码 ${o.sourceCode} · 许可 ${o.license} · 商用 ${o.commercial}（${o.sources.length} 条出处）`,
   after: (out, ctx) => {
     ctx.addEvidence({ id: `fa-${ctx.attempt}`, kind: "verdict", label: "事实", verdict: `${out.price} · ${out.license}`, tone: out.sources.length ? "ok" : "warn", meta: { ...out, pages: (pagesCache.get(ctx.token) ?? []).map((p) => p.url) } });
-    return { ok: true, summary: `${out.price} · ${out.sourceCode} · ${out.license} · ${out.commercial}`, data: { facts: out, factPages: (pagesCache.get(ctx.token) ?? []).map((p) => ({ url: p.url, text: p.text.slice(0, 1800) })) } };
+    return { ok: true, summary: `${out.price} · ${out.sourceCode} · ${out.license} · ${out.commercial}`, data: { facts: out, factPages: structuredClone(pagesCache.get(ctx.token) ?? []) } };
   },
 };
 
