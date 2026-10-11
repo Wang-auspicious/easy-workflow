@@ -63,18 +63,18 @@ const FRAMEWORK_PROBE = () => {
   return out;
 };
 
-/** "连接中断" alone does not tell the owner what to fix. Probe the direct path once and
- *  name the broken side: the proxy node for this host, or the host itself. */
+/** Compare one direct request with the configured exit, retaining uncertainty when
+ * both fail. A transient failure is still system work, not a request to log in. */
 async function explainUnreachable(f: Failure, url: string, ctx: StationContext): Promise<Failure> {
   if (!["network_connection", "network_timeout"].includes(f.tag)) return f;
   const probe = await diagnoseReach(url, ctx.signal).catch(() => null);
   if (!probe) return f;
   const host = hostOf(url);
   const nextAction = probe.directOk
-    ? `经代理 ${probe.proxy} 连不上 ${host}，但${probe.direct}：在代理软件里把 ${host} 设为直连或换一个节点，然后按原因重试。`
-    : `经代理 ${probe.proxy} 和直连都连不上 ${host}（${probe.direct}）。其他站点正常时，多半是当前代理节点访问不到这个站：在代理软件里给 ${host} 换节点或分流规则，然后按原因重试。`;
+    ? `配置出口 ${probe.proxy} 的本次请求失败，${probe.direct}。系统稍后从当前工位重试并核对共享浏览器；这次探测只说明两条请求结果不同，不能证明需要登录。`
+    : `配置出口 ${probe.proxy} 与本次直连探测都未成功（${probe.direct}）。系统稍后从当前工位重试并保留已有成果；暂不能确定是站点、出口还是临时连接问题，不要求用户登录或修改代理。`;
   ctx.progress(`网络诊断：${nextAction}`, { tool: "network", text: f.message.slice(0, 160), ok: false });
-  return { ...f, message: `${host} 连不上（${probe.directOk ? "代理线路的问题" : "代理与直连都失败"}）：${f.message.slice(0, 160)}`, owner: "user", nextAction, tried: [...(f.tried ?? []), "经代理访问", probe.direct] };
+  return { ...f, message: `${host} 本次连接失败（${probe.directOk ? "直连探测收到响应" : "配置出口与直连均未成功"}）：${f.message.slice(0, 160)}`, owner: "system", nextAction, tried: [...(f.tried ?? []), "经配置出口访问", probe.direct] };
 }
 
 export async function scout(ctx: StationContext, svc: {

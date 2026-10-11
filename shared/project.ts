@@ -112,6 +112,7 @@ export interface ChatMessage {
 export interface Transfer { seq: number; at: number; token: string; from: string; to: string; returned: boolean }
 
 export interface FactoryState {
+  batch?: import('./batch.ts').BatchGoal;
   seq: number;
   digest: string;
   run: { id: string; title: string; startedAt: number; endedAt?: number; pausedAt?: number; pausedMs: number; status: "idle" | "running" | "paused" | "ended"; manualEnd?: boolean };
@@ -185,6 +186,9 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
   s.seq = e.seq;
   const node = (key: string) => (s.nodes[key] ??= emptyNode(key));
   switch (e.kind) {
+    case 'batch.configured':
+      s.batch = e.batch;
+      break;
     case "factory.loaded":
       s.digest = e.digest;
       break;
@@ -471,6 +475,7 @@ export function nodeLight(n: NodeState | undefined, dormant: boolean, now: numbe
 export function latestRunTokens(s:FactoryState) {
   const latest=new Map<string,TokenState>();
   for(const id of s.tokenOrder){const t=s.tokens[id];if(!t||(t.touchedAt??t.createdAt)<s.run.startedAt)continue;
+    if (typeof t.data.retriedBy === 'string' && s.tokens[t.data.retriedBy]?.item === t.item) continue;
     const prior=latest.get(t.item);if(!prior||(t.touchedAt??t.createdAt)>=(prior.touchedAt??prior.createdAt))latest.set(t.item,t);
   }
   return [...latest.values()];

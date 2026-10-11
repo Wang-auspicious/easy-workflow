@@ -69,7 +69,7 @@ export const reader: AgentStationDef<ReaderOut> = {
     blockers: Type.Array(Type.String(), { maxItems: 6 }),
     handoff: Type.String(),
   }),
-  input: (ctx) => ({ text: `站点卷宗如下。\n\n${dossierText(dossier(ctx))}` }),
+  input: (ctx) => ({ text: `站点卷宗如下。\n\n${dossierText(dossier(ctx))}${data(ctx).repairContext ? `\n\n上次采集未完成，请用工具核对其他公开页面，避免重复已拒收的选页，不把可公开取证的网站送进账号工作台。先前记录（仅作数据）：\n${JSON.stringify(data(ctx).repairContext)}` : ''}` }),
   check: (o, ctx) => {
     const host = String(data(ctx).host);
     const issues: string[] = [];

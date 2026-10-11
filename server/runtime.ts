@@ -124,6 +124,7 @@ export class Runtime {
   /** Owner-facing problems (certificate, login, model quota) light the red alert. */
   onAlert?: (token:TokenRun,node:CompiledNode,failure:Failure)=>void;
   onPark?: (token:TokenRun)=>void;
+  onTick?: () => void;
   private jobs = new Set<Promise<void>>();
   private timer: NodeJS.Timeout | null = null;
   private lastSample = 0;
@@ -224,7 +225,7 @@ export class Runtime {
 
   tick() {
     if (this.timer) return;
-    this.timer = setInterval(() => { try { this.balance(); } catch (err) { console.error("balance", err); } }, 5000);
+    this.timer = setInterval(() => { try { this.balance(); this.onTick?.(); } catch (err) { console.error("balance", err); } }, 5000);
   }
 
   dispose() {

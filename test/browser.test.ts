@@ -12,7 +12,7 @@ test("independent service shares a persistent browser, retains auth failures and
   let reloadAllowed = false;
   const server=http.createServer((req,res)=>{
     res.setHeader("content-type","text/html");
-    if(req.url==="/blocked"||(req.url==="/reload-target"&&!reloadAllowed)){res.statusCode=403;res.end("<!doctype html><title>Attention Required! | Cloudflare</title><h1>Sorry, you have been blocked</h1><p>You are unable to access fixture.test</p>");return;}
+    if(req.url==="/blocked"||(req.url==="/reload-target"&&!reloadAllowed)){res.statusCode=403;res.end("<!doctype html><title>Just a moment... | Cloudflare</title><h1>Verify you are human</h1><p>Checking your browser before accessing fixture.test</p>");return;}
     if(req.url==="/status-only"){res.statusCode=403;res.end("<!doctype html><title>Service response</title><p>This request was not accepted.</p>");return;}
     if(req.url==="/challenge"){res.end("<!doctype html><title>Just a moment...</title><p>Checking your browser before accessing the site.</p>");return;}
     res.end("<!doctype html><title>Shared browser fixture</title><p>Browser fixture</p>");
@@ -33,7 +33,7 @@ test("independent service shares a persistent browser, retains auth failures and
     assert.equal((await browserCommand({action:"state"})).tabs.length,0);
     await closeBrowser();
     const again=await openPage();await again.page.goto(url);assert.match(await again.page.evaluate(()=>document.cookie),/shared-fixture=present/);await again.close();
-    await t.test("real HTTP 403 and blocked text survive automatic checks and preserve the tab",async()=>{
+    await t.test("real HTTP 403 with a verification wall survives automatic checks and preserves the tab",async()=>{
       const heldPage=await openPage();
       assert.equal((await heldPage.page.goto(`${url}/blocked`))?.status(),403);
       await browserAttention(heldPage.page,"HTTP 403，需要检查验证或访问限制");

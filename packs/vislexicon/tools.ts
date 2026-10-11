@@ -8,7 +8,7 @@ import type { EvidenceRef, Usage } from "../../shared/types.ts";
 import { EvidenceStore, aHash, hamming } from "../../server/evidence.ts";
 import { openPage } from "../../server/browser.ts";
 import { webGet } from "../../server/network.ts";
-import { classifyFailure, type Failure } from "../../shared/failures.ts";
+import { classifyFailure, candidateFailure, type Failure } from "../../shared/failures.ts";
 import { pickByImages, pickOne } from "../../server/agent-station.ts";
 import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { KIND_ZH, PREVIEW_RULES, loadPublished } from "./env.ts";
@@ -238,9 +238,17 @@ type ReaderPlan = { identity?: { url: string }; breadth?: { url: string; alterna
 const readerPlanOf = (ctx: StationContext) => ctx.token.data.readerPlan as ReaderPlan | undefined;
 const shotsOf = (ctx: StationContext) => ({ ...((ctx.token.data.shots as Record<string, ShotData>) ?? {}) });
 
-async function visitCandidate(page:Parameters<typeof visit>[0],href:string,host:string,ctx:StationContext,errors:Failure[]) {
+async function visitCandidate(page:Parameters<typeof visit>[0],href:string,host:string,ctx:StationContext,errors:Failure[]):Promise<Awaited<ReturnType<typeof visit>> & {failure?:Failure;retainPage?:boolean}> {
   try{return await visit(page,href,host,t=>ctx.progress(t,{tool:"browser",text:t}));}
-  catch(error){ctx.signal.throwIfAborted();const failure=(error as {failure?:Failure}).failure??classifyFailure(error,{url:href});if(["auth_required","network_tls"].includes(failure.tag))throw error;errors.push(failure);return {issues:[`${failure.tag}: ${failure.message}`],hidden:[]};}
+  catch(error){
+    ctx.signal.throwIfAborted();
+    const raw=(error as {failure?:Failure}).failure??classifyFailure(error,{url:href,requestedUrl:href});
+    const entry=String(ctx.token.data.canonical??ctx.token.url);
+    const failure=candidateFailure({...raw,requestedUrl:raw.requestedUrl??href},entry);
+    if(["auth_required","network_tls"].includes(failure.tag))throw error;
+    errors.push(failure);
+    return {issues:[`${failure.tag}: ${failure.message}`],hidden:[],failure,retainPage:raw.tag==="auth_required"};
+  }
 }
 
 /** Same-site links with text, one per page, for the numbered needsPick list. */
@@ -353,7 +361,8 @@ const breadth: Tool = async (ctx, svc) => {
   }
   let usage: Usage | undefined;
   const options = dedupeLinks(pool).filter((l) => !exclude.has(pageKey(l.href)) && !homeKeys.has(pageKey(l.href))).slice(0, 30);
-  const { page, close } = await openPage(VIEW, "en-US", ctx.signal);
+  let { page, close } = await openPage(VIEW, "en-US", ctx.signal);
+  let retainedPage = false;
   try {
     const hashes = [shots.identity?.hash ?? ""];
     const accessFailures: Failure[] = [];
@@ -369,7 +378,8 @@ const breadth: Tool = async (ctx, svc) => {
     const direct = explicit ? { href: explicit, why: "explicit-choice" } : repair && repair.action !== "replace-page" && repair.url && !exclude.has(pageKey(repair.url)) ? { href: repair.url, why: "review-reframe" } : null;
     if (direct) {
       const v = await visitCandidate(page, direct.href, host, ctx, accessFailures);
-      if (!v.issues.some((i) => /^(network_|http_|page_)/.test(i))) {
+      retainedPage = Boolean(v.retainPage);
+      if (!v.failure) {
         if (direct.why === "review-reframe") {
           const stage = await findStage(page);
           if (stage) await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
@@ -387,7 +397,7 @@ const breadth: Tool = async (ctx, svc) => {
           const pageLinks = (await links(page)).filter((l) => sameSite(l.href, host));
           save(png, check.hash, page.url(), direct.why === "explicit-choice" ? "已指定目录页" : "按复审重新取景", previews, visual);
           shots.breadth!.title = await page.title().catch(() => "");
-          return { ok: true, summary: `目录 ✓ ${pathOf(page.url())}`, data: { shots, breadthLinks: pageLinks.slice(0, 200) } };
+          return { ok: true, summary: `目录 ✓ ${pathOf(page.url())}`, data: { shots, breadthLinks: pageLinks.slice(0, 200), candidateAccessFailures: accessFailures } };
         }
         ctx.progress(`拒收 ${pathOf(direct.href)}：${issues.join("、")}`, { tool: "reject", text: issues.join(", "), ok: false });
       }
@@ -415,9 +425,11 @@ const breadth: Tool = async (ctx, svc) => {
     const deadline = Date.now() + 150_000;
     for (let i = 0; i < candidates.length && seen.length < 8; i++) {
       if (Date.now() > deadline && seen.length >= 2) { ctx.progress(`看页时间用完，按已看过的 ${seen.length} 页比较`, { tool: "rules", text: "150 秒" }); break; }
+      if (retainedPage) { await close(); ({page,close}=await openPage(VIEW,"en-US",ctx.signal)); retainedPage=false; }
       const c = candidates[i];
       const v = await visitCandidate(page, c.href, host, ctx, accessFailures);
-      if (v.issues.some((x) => /^(network_|http_|page_)/.test(x) || x === "notFound" || x === "offSite")) { ctx.progress(`略过 ${pathOf(c.href)}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
+      retainedPage = Boolean(v.retainPage);
+      if (v.failure || v.issues.some((x) => x === "notFound" || x === "offSite")) { ctx.progress(`略过 ${pathOf(c.href)}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
       const key = pageKey(page.url());
       if (seen.some((s) => pageKey(s.href) === key) || (!c.home && homeKeys.has(key))) { ctx.progress(`${pathOf(c.href)} 跳到了已看过的页面，略过`, { tool: "rules", text: page.url() }); continue; }
       const frame = await bestScrollFrame(page, { skipFirst: Boolean(c.home) });
@@ -457,7 +469,7 @@ const breadth: Tool = async (ctx, svc) => {
     save(chosen.png, chosen.hash, chosen.href, reason, chosen.previews, visual, compared);
     shots.breadth!.title = chosen.title;
     cleanup();
-    return { ok: true, summary: `目录 ✓ ${pathOf(chosen.href)}`, data: { shots, breadthLinks: chosen.links.slice(0, 200) }, usage };
+    return { ok: true, summary: `目录 ✓ ${pathOf(chosen.href)}`, data: { shots, breadthLinks: chosen.links.slice(0, 200), candidateAccessFailures: accessFailures }, usage };
   } finally { await close(); }
 };
 
@@ -499,7 +511,8 @@ const proof: Tool = async (ctx, svc) => {
     if (pick) { usage = pick.usage; candidates = [norm(options[pick.index].href)]; }
   }
   ctx.progress(`特写候选 ${candidates.length} 页${usesStage ? "，只截舞台" : ""}`, { tool: "rules", text: candidates.map((c) => new URL(c).pathname).join("  ") });
-  const { page, close } = await openPage(VIEW, "en-US", ctx.signal);
+  let { page, close } = await openPage(VIEW, "en-US", ctx.signal);
+  let retainedPage = false;
   try {
     const hashes = [shots.identity?.hash ?? "", shots.breadth?.hash ?? ""];
     let best: { href: string; png: Buffer; content: number; hash: string; framing: string; title: string } | null = null;
@@ -507,8 +520,10 @@ const proof: Tool = async (ctx, svc) => {
     const accessFailures:Failure[]=[];
     for (const href of candidates) {
       if (ctx.signal.aborted) break;
+      if (retainedPage) { await close(); ({page,close}=await openPage(VIEW,"en-US",ctx.signal)); retainedPage=false; }
       tried++;
       const v = await visitCandidate(page,href,host,ctx,accessFailures);
+      retainedPage = Boolean(v.retainPage);
       if (v.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
       let png: Buffer | null = null;
       let framing = "viewport";
@@ -547,7 +562,7 @@ const proof: Tool = async (ctx, svc) => {
     const ev = shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, content: Number(best.content.toFixed(3)), tried });
     ctx.progress(`选中 ${new URL(best.href).pathname}（试 ${tried} 页，内容占比最高 ${(best.content * 100).toFixed(1)}%）`, { tool: "shot", text: best.framing, ok: true, evidence: [ev.id] });
     shots.proof = { file, href: best.href, hash: best.hash, evidence: ev.id, framing: best.framing, content: best.content, title: best.title };
-    return { ok: true, summary: `特写 ✓ ${new URL(best.href).pathname}`, data: { shots }, usage };
+    return { ok: true, summary: `特写 ✓ ${new URL(best.href).pathname}`, data: { shots, candidateAccessFailures: accessFailures }, usage };
   } finally { await close(); }
 };
 

@@ -9,7 +9,7 @@ import { setTimeout as wait } from "node:timers/promises";
 import type { ElementHandle, Frame, Page } from "playwright-core";
 import { aHash, hamming, imageStats } from "../../server/evidence.ts";
 import { PREVIEW_RULES } from "./env.ts";
-import { browserAttention, withBrowserFrames } from "../../server/browser.ts";
+import { browserAttention, inspectBrowserAttention, withBrowserFrames } from "../../server/browser.ts";
 import { ClassifiedFailure, classifyFailure } from "../../shared/failures.ts";
 
 export const VIEW = { width: PREVIEW_RULES.viewport.width, height: PREVIEW_RULES.viewport.height };
@@ -19,18 +19,20 @@ export const STAGE_SELECTORS: string[] = PREVIEW_RULES.kinds["component-source"]
 export function pageKey(href:string) {try{const u=new URL(href);for(const k of [...u.searchParams.keys()])if(/^utm_|^(ref|fbclid|gclid)$/i.test(k))u.searchParams.delete(k);u.searchParams.sort();if(!/^#(?:\/|!)/.test(u.hash))u.hash="";return u.origin+u.pathname.replace(/\/+$/,"")+u.search+u.hash;}catch{return href;}}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const runFile = promisify(execFile);
+const visitedPages = new WeakMap<Page, { requestedUrl: string; finalUrl: string }>();
 
 export interface Link { href: string; text: string; inNav: boolean; inMain: boolean; hasImage: boolean; visible: boolean; order: number }
 
 export async function pageVerdict(page: Page, entryHost: string): Promise<string[]> {
-  return page.evaluate(({ entryHost }) => {
+  const access = await inspectBrowserAttention(page);
+  return page.evaluate(({ entryHost, access }) => {
     const text = (document.body?.innerText || "").slice(0, 4000);
     const issues: string[] = [];
     if (/\b404\b|not found|page not found|找不到页面/i.test(document.title + " " + text.slice(0, 400))) issues.push("notFound");
     const shown = (el: Element) => (el as HTMLElement).checkVisibility?.({ opacityProperty: true, visibilityProperty: true }) ?? (el as HTMLElement).offsetParent !== null;
-    const pw = [...document.querySelectorAll("input[type=password]")].some((el) => { const r = el.getBoundingClientRect(); return shown(el) && r.width > 0 && r.top < innerHeight; });
-    if (pw || /sign in to continue|log in to view|登录后查看/i.test(text)) issues.push("loginWall");
-    if (/verify you are human|checking your browser|captcha|人机验证/i.test(text)) issues.push("challenge");
+    if (access.url === location.href && access.kind === "auth") issues.push("loginWall");
+    if (access.url === location.href && access.kind === "challenge") issues.push("challenge");
+    if (access.url === location.href && access.kind === "http") issues.push("accessDenied");
     if (/^\s*(loading|加载中)[.…]*\s*$/i.test(text)) issues.push("loading");
     const host = location.hostname.replace(/^www\./, "");
     if (!(host === entryHost || host.endsWith("." + entryHost) || entryHost.endsWith("." + host))) issues.push("offSite");
@@ -44,7 +46,7 @@ export async function pageVerdict(page: Page, entryHost: string): Promise<string
     });
     if (cover.length) issues.push("consentOverlay");
     return issues;
-  }, { entryHost });
+  }, { entryHost, access });
 }
 
 export async function settle(page: Page) {
@@ -148,10 +150,18 @@ export function scoreLinks(candidates: Pick<Link, "href" | "text" | "inNav">[], 
 export async function visit(page: Page, url: string, entryHost: string, say?: (t: string) => void) {
   say?.(`打开 ${url.replace(/^https?:\/\//, "")}`);
   const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 }).catch((error: Error) => ({ error }));
-  if (response && "error" in response) throw new ClassifiedFailure(classifyFailure(response.error,{url}));
+  if (response && "error" in response) throw new ClassifiedFailure(classifyFailure(response.error,{url,requestedUrl:url}));
+  visitedPages.set(page, { requestedUrl: url, finalUrl: page.url() });
   if (response && response.status() >= 400) {
-    if ([401,403].includes(response.status())) await browserAttention(page, `访问被拒绝（${response.status()}），请检查登录或验证状态`);
-    throw new ClassifiedFailure(classifyFailure(`HTTP ${response.status()}`,{url,status:response.status()}));
+    if ([401,403].includes(response.status())) {
+      const access = await inspectBrowserAttention(page);
+      if (access.kind === "auth" || access.kind === "challenge" || response.status() === 401) {
+        const message = access.kind === "challenge" ? "页面需要完成人机验证" : "页面要求登录认证";
+        await browserAttention(page, message, access.kind === "challenge" ? "challenge" : "auth");
+        throw new ClassifiedFailure(classifyFailure(message,{url:page.url(),requestedUrl:url,status:response.status()}));
+      }
+    }
+    throw new ClassifiedFailure(classifyFailure(`HTTP ${response.status()}`,{url:page.url(),requestedUrl:url,status:response.status()}));
   }
   await settle(page);
   const declined = await declineCookies(page);
@@ -159,7 +169,11 @@ export async function visit(page: Page, url: string, entryHost: string, say?: (t
   await sleep(400);
   const hidden = await hideFloating(page);
   const issues = await pageVerdict(page, entryHost);
-  if (issues.includes("loginWall") || issues.includes("challenge")) { await browserAttention(page, issues.includes("loginWall") ? "登录状态需要检查" : "页面需要完成验证"); throw new Error("页面需要登录或验证，已保留在内置浏览器"); }
+  if (issues.includes("loginWall") || issues.includes("challenge")) {
+    await browserAttention(page, issues.includes("loginWall") ? "登录状态需要检查" : "页面需要完成验证");
+    throw new ClassifiedFailure(classifyFailure("页面需要登录或验证，已保留在内置浏览器", { url: page.url(), requestedUrl: url }));
+  }
+  if (issues.includes("accessDenied")) throw new ClassifiedFailure(classifyFailure("服务器拒绝请求（HTTP 403）", { url: page.url(), requestedUrl: url, status: 403 }));
   return { issues, hidden };
 }
 
@@ -167,11 +181,13 @@ export async function visit(page: Page, url: string, entryHost: string, say?: (t
  * the visit policy immediately before each captured frame; never hide an access wall. */
 async function prepareScreenshot(page: Page) {
   const issues = await pageVerdict(page, new URL(page.url()).hostname.replace(/^www\./, ""));
+  const visited = visitedPages.get(page), requestedUrl = visited?.finalUrl === page.url() ? visited.requestedUrl : undefined;
   if (issues.includes("loginWall") || issues.includes("challenge")) {
     const message = "页面需要登录或验证，已保留在内置浏览器";
     await browserAttention(page, message);
-    throw new ClassifiedFailure(classifyFailure(message, { url: page.url() }));
+    throw new ClassifiedFailure(classifyFailure(message, { url: page.url(), requestedUrl }));
   }
+  if (issues.includes("accessDenied")) throw new ClassifiedFailure(classifyFailure("服务器拒绝请求（HTTP 403）", { url: page.url(), requestedUrl, status: 403 }));
   await declineCookies(page);
   await hideFloating(page);
 }

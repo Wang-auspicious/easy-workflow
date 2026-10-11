@@ -36,7 +36,7 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
         assert.equal(canonical(u),null,u);
       const dns=classifyFailure(new Error("fetch failed",{cause:Object.assign(new Error("name lookup failed"),{code:"ENOTFOUND"})}));
       assert.equal(dns.tag,"network_dns");assert.equal(dns.retryable,true);assert.match(dns.message,/ENOTFOUND/);
-      for(const [status,tag,retryable] of [[404,"http_not_found",false],[410,"http_not_found",false],[429,"http_rate_limit",true],[503,"http_server",true],[403,"auth_required",true]] as const){
+      for(const [status,tag,retryable] of [[404,"http_not_found",false],[410,"http_not_found",false],[429,"http_rate_limit",true],[503,"http_server",true],[403,"http_forbidden",true]] as const){
         const f=classifyFailure(`HTTP ${status}`,{status});assert.equal(f.tag,tag);assert.equal(f.retryable,retryable);
       }
       assert.equal(classifyFailure("page.screenshot: Timeout 30000ms exceeded").tag,"browser_capture");

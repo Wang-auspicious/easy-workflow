@@ -98,8 +98,12 @@ export function readText(url: string) { return reads.get(url.replace(/[#].*$/, "
 /** A site that fails through the proxy is tried once directly, only to say which path is
  *  broken. Stations never switch to the direct path on their own (one network exit). */
 export async function diagnoseReach(url: string, signal?: AbortSignal): Promise<{ proxy: string; directOk: boolean; direct: string } | null> {
-  const proxy = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy;
-  if (!proxy) return null;
+  const configuredProxy = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy;
+  if (!configuredProxy) return null;
+  // Diagnostics are persisted in failures and shown to agents. A proxy URL can
+  // contain credentials or private query parameters, so expose only its origin.
+  let proxy = '已配置的代理';
+  try { const endpoint = new URL(configuredProxy); proxy = `${endpoint.protocol}//${endpoint.host}`; } catch { /* Keep malformed values private too. */ }
   const direct = new DirectAgent({ connect: { timeout: 8000 } });
   try {
     const res = await proxyFetch(url, { redirect: "follow", dispatcher: direct, signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10000)]), headers: { "User-Agent": UA } });

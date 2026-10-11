@@ -29,11 +29,13 @@ test("passing a verification wall in the built-in browser continues that candida
   const { Factory } = await import("../server/factory.ts");
   const retried: string[][] = [], notes: string[] = [];
   const fake = {
-    state: { alerts: { "auth:uiverse.io": { id: "auth:uiverse.io", level: "red", kind: "auth", message: "HTTP 403", item: "uiverse.io", node: "curation/scout", url: "https://uiverse.io/" } } },
+    state: { run: { id: 'test' }, recoveries: { 'uiverse.io': { disposition: 'retry', token: 't' } }, alerts: { "auth:uiverse.io": { id: "auth:uiverse.io", level: "red", kind: "auth", message: "HTTP 403", item: "uiverse.io", node: "curation/scout", url: "https://uiverse.io/" } } },
     walled: new Set<string>(), resuming: false, runtime: { running: true },
     ensureReady: async () => null,
     retryCandidates: (filter: { items: string[] }) => { retried.push(filter.items); return [{ id: "t", item: filter.items[0] }]; },
-    journal: { append: (e: { text: string }) => notes.push(e.text) },
+    resumeVerifiedCandidates: () => { retried.push(['uiverse.io']); return [{ id: 't', item: 'uiverse.io' }]; },
+    clearAlert: () => { delete (fake.state.alerts as Record<string, unknown>)['auth:uiverse.io']; },
+    journal: { append: (e: { kind: string; text: string }) => { if (e.kind === 'dispatch.note') notes.push(e.text); } },
   };
   const resume = (tabs: BrowserState["tabs"]) => Factory.prototype.resumeVerified.call(fake as never, { tabs, active: null, bookmarks: [], history: [], retentionDays: 30, mode: "desktop" });
   const tab = (attention?: string, url = "https://uiverse.io/") => ({ id: "t1", url, title: "Uiverse", loading: false, owner: "agent" as const, attention });
