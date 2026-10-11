@@ -75,8 +75,8 @@ function definitions(f: Factory): Tool[] {
         },
       },
       {
-        name: "feed_urls", label: "投料", description: "Feed hand-pasted URLs into the candidate layer (they pass the pool express).",
-        parameters: Type.Object({ urls: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 200 }) }),
+        name: "feed_urls", label: "投料", description: "Feed hand-pasted URLs into the candidate layer (they pass the pool express). rerunPublished=true re-curates sites that are already published (for comparison runs); in-flight duplicates are still merged.",
+        parameters: Type.Object({ urls: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 200 }), rerunPublished: Type.Optional(Type.Boolean()) }),
         execute: async (_id, p) => {
           for (const raw of p.urls) {
             let url: URL;
@@ -84,7 +84,7 @@ function definitions(f: Factory): Tool[] {
             if (!/^https?:$/.test(url.protocol) || url.username || url.password || /\s/.test(raw) || raw.includes("://") && !/^https?:\/\//i.test(raw)) throw new ControlError(400, "invalid_url", `只接受不含账号密码的 HTTP(S) 网址：${raw}`);
           }
           if (!f.runtime.running) await f.ensureReady();
-          const got = f.feed(p.urls);
+          const got = f.feed(p.urls, { rerunPublished: p.rerunPublished });
           return ok({ fed: got.length, tokens: got.map((t) => ({ id: t.id, item: t.item })) }, `投料 ${got.length} 个网址`);
         },
       },

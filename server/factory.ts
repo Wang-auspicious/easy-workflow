@@ -293,11 +293,11 @@ export class Factory {
   }
 
   /** Hand-pasted URLs enter the candidate layer at 整理 and pass the pool express. */
-  feed(urls: string[]) {
+  feed(urls: string[], opts: { rerunPublished?: boolean } = {}) {
     const clean = [...new Set(urls.map((u) => u.trim()).filter(Boolean))];
     if (!clean.length) return [];
     if (!this.runtime.running) this.runtime.start(`手贴 × ${clean.length}`);
-    return clean.map((u) => this.runtime.create("candidates/tidy", { item: this.hostOf(canonical(u) ?? u), url: u, source: "manual", data: { express: true } }));
+    return clean.map((u) => this.runtime.create("candidates/tidy", { item: this.hostOf(canonical(u) ?? u), url: u, source: "manual", data: { express: true, ...(opts.rerunPublished ? { rerunPublished: true } : {}) } }));
   }
 
   /* -------------------------------------------------------------- restart */

@@ -120,7 +120,7 @@ const dedupe: Tool = async (ctx, svc) => {
   const url = canonical(String(ctx.token.data.canonical ?? ctx.token.url));
   if (!url) return { ok: false, summary: "网址无法解析", failure:classifyFailure("网址无法解析",{url:ctx.token.url,stage:"url"}) };
   const host = hostOf(url), key = itemKey(url);
-  if (published(svc.publishDir).has(key)) return { ok: true, summary: `${key} 已发布，合并`, data: { canonical: url, host, key }, finish: { status: "merged", reason: `${key} 已是发布条目（处置：合并到已发布条目，不重复入库）` } };
+  if (!ctx.token.data.rerunPublished && published(svc.publishDir).has(key)) return { ok: true, summary: `${key} 已发布，合并`, data: { canonical: url, host, key }, finish: { status: "merged", reason: `${key} 已是发布条目（处置：合并到已发布条目，不重复入库）` } };
   const others = svc.inFlight(ctx.token.id);
   if (others.has(key)) return { ok: true, summary: `${key} 正在线上，合并`, data: { canonical: url, host, key }, finish: { status: "merged", reason: `${key} 已有另一件货在线上（处置：合并）` } };
   ctx.progress(`身份键 ${key}：不在已发布 ${published(svc.publishDir).size} 条里，也不在线上`, { tool: "dedupe", text: key, ok: true });
@@ -552,7 +552,7 @@ export function buildV3(d: Record<string, any>, token: { id: string; url: string
     editorial: { name: copy.name || d.title, descriptionZh: copy.descriptionZh, descriptionEn: copy.descriptionEn, takeawayZh: copy.takeawayZh, noteZh: copy.noteZh, recommendation: null, pricing: d.pricingNote || facts.pricing?.value || "unknown", pricingNote: null },
     classification: {
       recordLevel: "entry", primaryCategory: cat.primaryCategory, subcategory: cat.subcategory, status: "confirmed", alternatives: [],
-      reasons: copy.reasons ?? [], curatorId: "h2:curation/classify", reviewerId: d.kindAgreed ? "h2:curation/classify-review" : "h2:curation/arbiter", confirmedAt: now, independentlyReviewed: true, kindV1: d.kind,
+      reasons: copy.reasons ?? [], curatorId: "h2:curation/classify", reviewerId: d.kindAgreed ? "h2:curation/classify-review" : "h2:curation/arbiter", confirmedAt: now,
     },
     facets: Object.fromEntries(ALL_AXES.map((a) => [a, a === "access" ? derived.access : a === "licenses" ? derived.licenses : (cat.facets?.[a] ?? [])])),
     pages, facts: factList,
@@ -560,7 +560,7 @@ export function buildV3(d: Record<string, any>, token: { id: string; url: string
     style: d.style ?? null,
     preview: d.mode === "video" ? { mode: "video", video: d.video } : { mode: "shots" },
     editorialVoice: { status: "written", writtenAt: now.slice(0, 10) },
-    h2: { token: token.id, reviews: d.reviews ?? [], note: "H2 工厂产出；写入 VisLexicon 正式目录前需站长确认（Spec R4）" },
+    h2: { token: token.id, kindV1: d.kind, reviews: d.reviews ?? [], note: "H2 工厂产出；写入 VisLexicon 正式目录前需站长确认（Spec R4）" },
   };
 }
 

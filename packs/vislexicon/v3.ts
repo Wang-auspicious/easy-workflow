@@ -121,8 +121,10 @@ export function validateV3(rec: Record<string, any>, tax: Taxonomy): V3Problem[]
   (rec.classification?.reasons ?? []).forEach((r: any, i: number) => need(`classification.reasons[${i}].evidenceUrl`, isHttp(r.evidenceUrl), "收录理由缺少证据网址"));
   const facets = rec.facets ?? {};
   for (const axis of ALL_AXES) need(`facets.${axis}`, Array.isArray(facets[axis]), `facets 缺少轴 ${axis}`);
-  for (const e of tax.facetsErrors(facets)) { const axis = /facets\.(\w+)|unknown (\w+) facet/.exec(e); out.push({ field: `facets.${axis?.[1] ?? axis?.[2] ?? "?"}`, problem: e }); }
-  for (const e of tax.classificationErrors({ ...rec.classification, entityId: rec.entityId, entryId: rec.entryId, name: rec.editorial?.name })) out.push({ field: /subcategory|does not belong/.test(e) ? "classification.subcategory" : "classification.primaryCategory", problem: e });
+  // Structural problems in fields the program builds are bugs for the system, not tasks for an agent.
+  const sys = (e: string) => /is not allowed|must be a canonical|requires (curatorId|reviewerId|entityId)|unknown record level|unknown classification status/.test(e);
+  for (const e of tax.facetsErrors(facets)) { const axis = /facets\.(\w+)|unknown (\w+) facet/.exec(e); out.push({ field: sys(e) ? "system:facets" : `facets.${axis?.[1] ?? axis?.[2] ?? "?"}`, problem: e }); }
+  for (const e of tax.classificationErrors({ ...rec.classification, entityId: rec.entityId, entryId: rec.entryId, name: rec.editorial?.name })) out.push({ field: sys(e) ? "system:classification" : /subcategory|does not belong/.test(e) ? "classification.subcategory" : "classification.primaryCategory", problem: e });
   const t = rec.editorial?.takeawayZh ?? "";
   need("editorial.takeawayZh", [...t].length > 0 && [...t].length <= 28 && !/\d/.test(t), "takeawayZh 必须 1–28 字且不含数字");
   const note = rec.editorial?.noteZh ?? "";

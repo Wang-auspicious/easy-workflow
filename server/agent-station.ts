@@ -14,8 +14,8 @@ import { models } from "./pi.ts";
 import { readRole } from "./roles.ts";
 export { models, MODEL_ID, apiKeyPresent } from "./pi.ts";
 
-export async function promptAgent(agent: Agent, text: string, images?: { type: "image"; data: string; mimeType: string }[], signal?: AbortSignal) {
-  const timeout = AbortSignal.timeout(120_000);
+export async function promptAgent(agent: Agent, text: string, images?: { type: "image"; data: string; mimeType: string }[], signal?: AbortSignal, timeoutMs = 120_000) {
+  const timeout = AbortSignal.timeout(timeoutMs);
   const stop = signal ? AbortSignal.any([signal, timeout]) : timeout;
   stop.throwIfAborted();
   const abort = () => agent.abort();
@@ -40,6 +40,8 @@ export interface AgentStationDef<T = any> {
   describe?: (out: T) => string;
   /** Environment tools this station may call besides the four document tools (Spec §30.2). */
   tools?: string[];
+  /** Time budget for one answer including tool calls; tool-using stations need more than a plain reply. */
+  timeoutMs?: number;
 }
 
 /** Cards are WebP; the endpoint takes JPEG reliably. */
@@ -57,7 +59,20 @@ export function estimateTokens(text: string) {
 
 const MAX_TOOL_CALLS = 10;
 
+const TRANSIENT = /connection error|ECONNRESET|ECONNREFUSED|socket hang up|fetch failed|terminated|50[0-9]|overloaded|temporarily|rate.?limit|429/i;
+
+/** Model hiccups are the environment's problem, not the item's: retry once after a pause (Spec §30.6). */
 export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationContext): Promise<StationResult> {
+  const first = await runAgentStationOnce(def, ctx);
+  if (first.ok || ctx.signal.aborted || !TRANSIENT.test(`${first.error ?? ""} ${first.summary}`)) return first;
+  ctx.progress(`模型连接中断（${String(first.error).slice(0, 60)}），5 秒后自动重试一次`, { tool: "recover", text: String(first.error ?? ""), ok: false });
+  await new Promise((r) => setTimeout(r, 5000));
+  ctx.signal.throwIfAborted();
+  const second = await runAgentStationOnce(def, ctx);
+  return second.ok ? second : { ...second, error: `${second.error ?? second.summary}（已自动重试一次）` };
+}
+
+async function runAgentStationOnce<T>(def: AgentStationDef<T>, ctx: StationContext): Promise<StationResult> {
   const skipped = def.skip?.(ctx);
   if (skipped) return skipped;
   const { stream, model } = models();
@@ -142,7 +157,8 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
     },
     time: { firstTokenMs, outputMs, toolMs, programMs: 0, modelCalls, toolCalls },
   });
-  await promptAgent(agent, input.text + redo, images.length ? images : undefined, ctx.signal);
+  const budget = def.timeoutMs ?? (def.tools?.length ? 240_000 : 120_000);
+  await promptAgent(agent, input.text + redo, images.length ? images : undefined, ctx.signal, budget);
   if (!submitted && !agent.state.errorMessage) {
     ctx.progress("模型没有调用 submit，提醒一次", { tool: "repair", text: "" });
     await promptAgent(agent, "You did not call submit. Call submit now with your answer.", undefined, ctx.signal);

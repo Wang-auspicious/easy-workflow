@@ -28,7 +28,8 @@ export async function preflight(dir: string, broker: Broker): Promise<{ ok: bool
       return { ok: true, detail: proxy ? `走代理 ${proxy.replace(/\/\/[^@]*@/, "//")}` : "直连（未设置代理环境变量）" };
     }),
     check("web", "外网可达", async () => {
-      const r = await within(12000, networkFetch("https://api.github.com/zen", { signal: AbortSignal.timeout(11000) }));
+      const once = () => within(12000, networkFetch("https://api.github.com/zen", { signal: AbortSignal.timeout(11000) }));
+      const r = await once().catch(async () => { await new Promise((x) => setTimeout(x, 1500)); return once(); });
       return { ok: r.status < 500, detail: `api.github.com HTTP ${r.status}`, fix: r.status >= 500 ? "稍后再试，或检查代理" : undefined };
     }),
     check("model", "模型凭据与接口", async () => {

@@ -28,7 +28,7 @@
 
 先看卷宗；卷宗不够时再用工具，每次处理最多 10 次调用。
 
-- `env_call("page_text", {url})`：在共享浏览器里渲染一页，读全文、标题和链接区域。想知道"目录页里到底有没有渲染出来的预览""这一页是不是只有安装说明"时用它。
+- `env_call("page_text", {url})`：在共享浏览器里渲染一页，读全文、标题和链接区域。它还返回 `media` 计数：正文里较大的图片、画布、iframe、视频、SVG 各有多少，首屏有几个（`firstScreen`）。想知道"目录页里到底有没有渲染出来的预览""这一页是不是只有安装说明"时看它；`firstScreen` 是 0 的目录页，多半只有一列名字。
 - `env_call("page_find", {url, query})`：在页面里找一段文字，返回它所在的标题、离页顶多远、是否在代码块里。用来写 proof 的位置提示最准。
 - `env_call("site_files", {url})`：卷宗里没有 sitemap 而你需要页面清单时用。
 - `env_call("repo_meta", {repo})`：卷宗里没有仓库信息，但你在页面上看到了仓库链接时用。
@@ -71,6 +71,7 @@
 ## 判断规则与真实案例
 
 - **链接文字会骗人。** Mysten 的"目录"链接点进去还是首页。目标页的标题和正文与首页相同，就排除它。
+- **只有名字列表的目录不当 breadth。** Magic UI 的 `/docs/components` 是一列组件名，没有预览；截出来风格判定员说"看不到组件"。组件源的 breadth 要选首屏能看到一批渲染预览的页（首页的组件展示区、showcase、按类别的预览墙），用 `page_text` 的 `media.firstScreen` 确认。
 - **入门文档页几乎从不当 proof。** Getting Started、Installation、API、Usage 这类页上只有文字和代码。driverjs、quill、swiper、react-hot-toast 等 20 个站，就因为第三张拍了这种页，后来全部要重拍。
 - **演示和源码常常挨在一起。** Kuma UI 的 Grid 示例紧贴在代码块上方。文字里出现 Example、Preview、Demo、Playground，或者组件名单独占一行，往往就是演示的标题。把这个标题写进 locate。
 - **Storybook 的参数就是页面本身。** `?path=/story/...` 和 `iframe.html?id=...` 一个字都不能删。iframe 地址直接就是演示本身，适合当 proof。

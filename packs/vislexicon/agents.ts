@@ -60,6 +60,7 @@ export const reader: AgentStationDef<ReaderOut> = {
 - blockers：登录墙、证书、地区限制、找不到演示页等，没有就空数组。
 - handoff：写给后面工位的一句提醒（中文，可空）。`, "vislexicon:Spec.md#4.8"),
   tools: ["page_text", "page_find", "fetch_text", "site_files", "repo_meta"],
+  timeoutMs: 300_000,
   schema: Type.Object({
     understanding: Type.Object({ who: Said, takeaway: Said, size: Said, terms: Said }),
     plan: Type.Object({ identity: PickT, breadth: Type.Intersect([PickT, Type.Object({ alternatives: Type.Array(PickT, { maxItems: 2 }) })]), proof: Type.Intersect([PickT, Type.Object({ alternatives: Type.Array(PickT, { maxItems: 2 }) })]) }),
@@ -504,7 +505,7 @@ export const audit = (store: EvidenceStore): AgentStationDef<ReviewOut> => {
       if (!problems.length) return null;
       ctx.progress(`结构校验发现 ${problems.length} 处问题，直接交负责工位修改`, { tool: "schema", text: problems.map((p) => `${p.field}: ${p.problem}`).join("\n"), ok: false });
       const reason = problems.map((p) => `${p.field}：${p.problem}`).join("；");
-      return { ok: true, summary: `结构校验要求修改 ${problems.length} 处`, data: { reviews: reviewsWith(ctx, { station: "audit", verdict: "fix", reason }) }, verdict: { verdict: "fix", reason, fixes: fixesOf(problems, "curation/copy", ["curation/assemble"]) } };
+      return { ok: true, summary: `结构校验要求修改 ${problems.length} 处`, data: { reviews: reviewsWith(ctx, { station: "audit", verdict: "fix", reason }) }, verdict: { verdict: "fix", reason, fixes: fixesOf(problems, "curation/manual", ["curation/assemble"]) } };
     },
   };
 };

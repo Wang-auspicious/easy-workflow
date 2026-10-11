@@ -93,7 +93,7 @@ ${p.text}`);
     return [
       {
         name: "page_text",
-        description: "在共享浏览器里渲染页面，返回可见全文、标题、最终地址、标题层级，以及每个链接所在区域（nav / main / aside / footer）。读站点内容、找目录页和演示页时用它。浏览器名额满时自动退回 HTTP 读取并注明。",
+        description: "在共享浏览器里渲染页面，返回可见全文、标题、最终地址、标题层级、每个链接所在区域（nav / main / aside / footer），以及 media 计数（正文里较大的图片、画布、iframe、视频、SVG 各有多少，首屏有几个）。判断一页是不是有渲染出来的预览、是不是只有文字时看 media。浏览器名额满时自动退回 HTTP 读取并注明。",
         parameters: Type.Object({ url: S("完整网址"), max: N("最多返回多少字，默认 12000", 1000, 40000) }),
         run: async (a: { url: string; max?: number }, c) => {
           const max = a.max ?? 12000;
@@ -111,7 +111,11 @@ ${p.text}`);
                 .filter((l) => l.text && /^https?:/.test(l.href) && !seen.has(l.href) && seen.add(l.href)).slice(0, 250);
               const headings = [...document.querySelectorAll("h1,h2,h3")].slice(0, 80).map((h) => ({ level: Number(h.tagName[1]), text: ((h as HTMLElement).innerText || "").trim().slice(0, 120) })).filter((h) => h.text);
               const text = (document.body?.innerText || "").replace(/\n{3,}/g, "\n\n");
-              return { title: document.title, text: text.slice(0, max), truncated: text.length > max, links, headings, iframes: document.querySelectorAll("iframe").length };
+              // How visual the page is: rendered previews show up as images, canvases, iframes, videos and inline SVG in the main area.
+              const main = document.querySelector("main,[role=main],article") ?? document.body;
+              const big = (el: Element) => { const r = el.getBoundingClientRect(); return r.width >= 80 && r.height >= 60; };
+              const media = { images: [...main.querySelectorAll("img,picture")].filter(big).length, canvases: [...main.querySelectorAll("canvas")].filter(big).length, iframes: [...main.querySelectorAll("iframe")].filter(big).length, videos: [...main.querySelectorAll("video")].filter(big).length, svgs: [...main.querySelectorAll("svg")].filter(big).length, firstScreen: [...main.querySelectorAll("img,picture,canvas,iframe,video,svg")].filter((el) => big(el) && el.getBoundingClientRect().top < innerHeight).length };
+              return { title: document.title, text: text.slice(0, max), truncated: text.length > max, links, headings, media };
             }, max);
             rememberRead(a.url, `${data.title}
 ${data.text}`); rememberRead(page.url(), `${data.title}
