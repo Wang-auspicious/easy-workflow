@@ -100,7 +100,7 @@ const curation = line({
     }),
     station({
       id: "breadth", num: "⑧", name: "目录摄影", role: "capture", kind: "program", resource: "browser", estimateSeconds: 15, input: "Shot", output: "Shot",
-      tool: "curation.breadth", rules: [`${R}#kinds.*.roles.breadth`], accept: ["reader plan first", "second hop when a better page appears"],
+      tool: "curation.breadth", rules: [`${R}#kinds.*.roles.breadth`], accept: ["compare candidate screenshots side by side", "reader plan, rules, sitemap and home page all join the comparison"],
       workers: { min: 1, max: 4, initial: 2, policy: "auto" },
     }),
     station({

@@ -250,11 +250,36 @@ export async function previewsInViewport(page: Page) {
   }, STAGE_SELECTORS).catch(() => 0);
 }
 
-/** The numeric gate is independent of a model's visual approval. */
-export function breadthPreviewIssues(kind: string, previews: unknown): string[] {
+/** How the catalogue shot was chosen. `rendered-items` / `name-list` come from the
+ *  side-by-side visual comparison of candidate pages; `owner-choice` from 指定采集页. */
+export interface BreadthVisual { basis: "rendered-items" | "name-list" | "owner-choice"; reason: string; compared: number }
+
+/** The element count is a program hint. It decides alone only when no one has looked:
+ *  pure CSS effects and SVG icon grids count as 0 even when the screen is full of them. */
+export function breadthPreviewIssues(kind: string, previews: unknown, visual?: Partial<BreadthVisual> | null): string[] {
   if (kind !== "component-source") return [];
+  if (visual?.basis && ["rendered-items", "name-list", "owner-choice"].includes(visual.basis)) return [];
   if (typeof previews !== "number" || !Number.isInteger(previews) || previews < 0) return ["breadth-previews-missing（没有可核验的首屏预览计数）"];
   return previews < 4 ? [`breadth-previews-below-minimum（首屏渲染预览 ${previews} 个，至少需要 4 个）`] : [];
+}
+
+/** Scroll the way a person would: try the first few screens and stay on the one with the
+ *  most rendered previews. `skipFirst` skips the first screen (the home page's own first
+ *  screen is already the identity shot). */
+export async function bestScrollFrame(page: Page, { skipFirst = false } = {}) {
+  const view = await page.evaluate(() => ({ h: innerHeight, total: document.documentElement.scrollHeight })).catch(() => ({ h: VIEW.height, total: VIEW.height }));
+  const offsets = [0, 0.85, 1.7, 2.55].map((f) => Math.round(f * view.h)).filter((y, i) => (i === 0 || y + view.h * 0.5 < view.total) && !(skipFirst && i === 0));
+  if (!offsets.length) return null;
+  let best = { y: offsets[0], previews: -1 };
+  for (const y of offsets) {
+    await page.evaluate((top) => window.scrollTo(0, top), y).catch(() => {});
+    await sleep(500);
+    const previews = await previewsInViewport(page);
+    if (previews > best.previews) best = { y, previews };
+  }
+  await page.evaluate((top) => window.scrollTo(0, top), best.y).catch(() => {});
+  await sleep(600);
+  return { y: best.y, previews: Math.max(0, best.previews) };
 }
 
 /* ------------------------------------------------------------------ stage (component close-up) */

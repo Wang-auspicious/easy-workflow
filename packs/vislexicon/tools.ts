@@ -9,15 +9,15 @@ import { EvidenceStore, aHash, hamming } from "../../server/evidence.ts";
 import { openPage } from "../../server/browser.ts";
 import { webGet } from "../../server/network.ts";
 import { classifyFailure, type Failure } from "../../shared/failures.ts";
-import { pickOne } from "../../server/agent-station.ts";
+import { pickByImages, pickOne } from "../../server/agent-station.ts";
 import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { KIND_ZH, PREVIEW_RULES, loadPublished } from "./env.ts";
 import { scout } from "./scout.ts";
 import { repoOf } from "../../server/repo.ts";
 import { ALL_AXES, CHOSEN_AXES, derivedFacets, loadTaxonomy, validateV3, webpSize } from "./v3.ts";
 import {
-  VIEW, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, breadthPreviewIssues, recordScroll, sameSite,
-  scoreLinks, shoot, stageClip, visit, pageKey, type Link,
+  VIEW, bestScrollFrame, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, breadthPreviewIssues, recordScroll, sameSite,
+  scoreLinks, shoot, stageClip, visit, pageKey, type BreadthVisual, type Link,
 } from "./capture.ts";
 
 export interface Services {
@@ -233,7 +233,7 @@ function shotEvidence(ctx: StationContext, svc: Services, png: Buffer, role: str
   return ctx.addEvidence({ id: `img-${card.sha.slice(0, 12)}-${ctx.attempt.slice(2, 8)}`, kind: "image", src: card.src, card: card.src, label: ROLE_ZH[role] ?? role, meta: { role, ...meta } });
 }
 const ROLE_ZH: Record<string, string> = { identity: "首屏", breadth: "目录", proof: "组件特写" };
-type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number; title?: string; previews?: number };
+type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number; title?: string; previews?: number; visual?: BreadthVisual };
 type ReaderPlan = { identity?: { url: string }; breadth?: { url: string; alternatives?: { url: string }[] }; proof?: { url: string; locate?: string; alternatives?: { url: string; locate?: string }[] } };
 const readerPlanOf = (ctx: StationContext) => ctx.token.data.readerPlan as ReaderPlan | undefined;
 const shotsOf = (ctx: StationContext) => ({ ...((ctx.token.data.shots as Record<string, ShotData>) ?? {}) });
@@ -299,93 +299,165 @@ const identity: Tool = async (ctx, svc) => {
 
 /* ------------------------------------------------------------------ ⑦ breadth */
 
+const pathOf = (u: string) => { try { const x = new URL(u); return x.pathname + x.search; } catch { return u; } };
+const docsPath = (href: string) => { try { return new URL(href).searchParams.get("path")?.startsWith("/docs/") ?? false; } catch { return false; } };
+
+/** Pages listed in sitemap.xml and llms.txt: a person who cannot find the catalogue in the
+ *  navigation would look there next. llms.txt often links the Markdown twin of a page. */
+function siteFileLinks(ctx: StationContext, host: string): Link[] {
+  const d = ctx.token.data.dossier as { finalUrl?: string; files?: { sitemap?: string[]; llms?: string | null } } | undefined;
+  if (!d?.finalUrl) return [];
+  let origin: string;
+  try { origin = new URL(d.finalUrl).origin; } catch { return []; }
+  const hrefs = [
+    ...(d.files?.sitemap ?? []).map((p) => { try { return new URL(p, origin).href; } catch { return ""; } }),
+    ...((d.files?.llms ?? "").match(/https?:\/\/[^\s)\]>"'`]+/g) ?? []).map((h) => h.replace(/\.mdx?$/i, "")),
+  ];
+  const out: Link[] = [];
+  for (const href of hrefs) {
+    if (!href || !sameSite(href, host) || /\.(txt|json|xml|pdf|zip|png|jpe?g|svg|mp4)(?:[?#]|$)/i.test(href)) continue;
+    let text = "";
+    try { text = decodeURIComponent(new URL(href).pathname.split("/").filter(Boolean).pop() ?? "").replace(/[-_]+/g, " "); } catch { /* keep empty */ }
+    out.push({ href, text, inNav: false, inMain: true, hasImage: false, visible: false, order: out.length });
+  }
+  return out;
+}
+
+const BREADTH_LOOK = (title: string, kind: string) => `Website "${title}" is a ${KIND_ZH[kind] ?? kind} (${kind}). Below is one screenshot per candidate page (some are scrolled down, as a person would scroll). Pick the ONE image where a person sees at a glance the RANGE of what this site offers: many of its actual items at once.
+- Prefer an image where the items themselves are rendered: component previews or demos, works, icons or other assets, templates. Then basis = "rendered-items".
+- Customer websites or "made with" showcases, company logos, testimonials, pricing, blog posts and marketing copy are NOT the site's items.
+- Only if no image shows rendered items, pick the page that lists the most item names (for example an index of all components). Then basis = "name-list".
+- If no image shows the range at all, submit index 0 with basis "none".
+In reason, say in one Chinese sentence what the chosen image shows.`;
+
+type Survey = { href: string; png: Buffer; hash: string; previews: number; y: number; file: string; links: Link[]; why: string; title: string };
+
 const breadth: Tool = async (ctx, svc) => {
   const kind = String(ctx.token.data.kind || "work");
   const role = PREVIEW_RULES.kinds[kind]?.roles.breadth ?? {};
   const host = String(ctx.token.data.host);
+  const title = String(ctx.token.data.title ?? host);
   const shots = shotsOf(ctx);
-  const exclude = new Set<string>((ctx.token.data.rejectedPages as string[]) ?? []);
-  const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string}>|undefined)?.breadth;
-  const explicit=(ctx.token.data.previewChoices as Record<string,string>|undefined)?.breadth;
-  if(explicit)exclude.delete(pageKey(explicit));
-  if (ctx.redo && shots.breadth?.href && (!repair||repair.action==="replace-page")) exclude.add(pageKey(shots.breadth.href));
-  // The home page itself never counts as the catalogue.
-  for (const h of [shots.identity?.href, String(ctx.token.data.canonical), (ctx.token.data.home as { finalUrl?: string })?.finalUrl]) if (h) exclude.add(pageKey(h));
+  const exclude = new Set<string>(((ctx.token.data.rejectedPages as string[]) ?? []).map(pageKey));
+  const repair = (ctx.token.data.shotRepairs as Record<string, { action: string; url?: string }> | undefined)?.breadth;
+  const explicit = (ctx.token.data.previewChoices as Record<string, string> | undefined)?.breadth;
+  if (explicit) exclude.delete(pageKey(explicit));
+  if (ctx.redo && shots.breadth?.href && (!repair || repair.action === "replace-page")) exclude.add(pageKey(shots.breadth.href));
+  // The home page's first screen is the identity shot. Further down it can still be the
+  // best catalogue (a component wall on the home page), so it is surveyed scrolled.
+  const homeUrl = String((ctx.token.data.home as { finalUrl?: string })?.finalUrl ?? shots.identity?.href ?? ctx.token.data.canonical ?? ctx.token.url);
+  const homeKeys = new Set([shots.identity?.href, String(ctx.token.data.canonical ?? ""), homeUrl].filter(Boolean).map((h) => pageKey(h!)));
   const pool = [...((ctx.token.data.homeLinks as Link[]) ?? []), ...(((ctx.token.data.home as { navLinks?: Link[] })?.navLinks) ?? [])];
-  if(!pool.some(l=>new URL(l.href).searchParams.has('path'))&&String(ctx.token.data.title).toLowerCase().includes('storybook')) {
-    const probe=await openPage(VIEW,'en-US',ctx.signal);try{await visit(probe.page,shots.identity?.href??ctx.token.url,host);pool.push(...await links(probe.page));}finally{await probe.close();}
+  if (!pool.some((l) => { try { return new URL(l.href).searchParams.has("path"); } catch { return false; } }) && title.toLowerCase().includes("storybook")) {
+    const probe = await openPage(VIEW, "en-US", ctx.signal); try { await visit(probe.page, shots.identity?.href ?? ctx.token.url, host); pool.push(...await links(probe.page)); } finally { await probe.close(); }
   }
-  const ranked: { href: string; score: number; reasons: string[]; text: string }[] = scoreLinks(pool, role).filter((c) => !exclude.has(c.href)).slice(0, 4);
-  const plan=readerPlanOf(ctx)?.breadth;
-  if(plan&&!explicit)for(const u of [plan.url,...(plan.alternatives??[]).map(a=>a.url)].reverse())if(u&&sameSite(u,host)&&!exclude.has(pageKey(u))){const i=ranked.findIndex(r=>pageKey(r.href)===pageKey(u));if(i>=0)ranked.splice(i,1);ranked.unshift({href:u,text:"阅读员拍摄单",score:20,reasons:['reader-plan']});}
-  if(repair&&repair.action!=="replace-page"&&repair.url&&!exclude.has(pageKey(repair.url)))ranked.unshift({href:repair.url,text:"按复审重新取景",score:10,reasons:['review-reframe']});
-  if(explicit)ranked.splice(0,ranked.length,{href:explicit,text:"已指定目录页",score:100,reasons:['explicit-choice']});
-  for(const link of pool.filter(l=>new URL(l.href).searchParams.get('path')?.startsWith('/docs/')).slice(0,4))if(!exclude.has(pageKey(link.href))&&!ranked.some(r=>pageKey(r.href)===pageKey(link.href)))ranked.push({href:link.href,text:link.text,score:8,reasons:['storybook-docs']});
-  ctx.progress(`目录候选 ${ranked.length} 个：${ranked.map((r) => new URL(r.href).pathname).join("  ") || "无"}`, { tool: "rules", text: "path +3 · text +2 · nav +1" });
   let usage: Usage | undefined;
-  let selectionCalls=0;
-  const options = dedupeLinks(pool).filter((l) => !exclude.has(l.href.replace(/\/+$/, "")) && l.href.replace(/\/+$/, "") !== String(ctx.token.data.canonical)).slice(0, 30);
-  if (!ranked.length) {
-    selectionCalls++;
-    const pick = await pickOne(ctx, `Website ${ctx.token.data.title} is a ${KIND_ZH[kind] ?? kind} (${kind}). Which link leads to the catalogue / overview page that best shows the RANGE of what it offers?`, options.map((l) => `${l.text} → ${l.href}`));
-    if (pick) { usage = pick.usage; ranked.push({ href: options[pick.index].href, score: 0, reasons: ["needsPick"], text: options[pick.index].text }); }
-  }
+  const options = dedupeLinks(pool).filter((l) => !exclude.has(pageKey(l.href)) && !homeKeys.has(pageKey(l.href))).slice(0, 30);
   const { page, close } = await openPage(VIEW, "en-US", ctx.signal);
   try {
     const hashes = [shots.identity?.hash ?? ""];
-    const tried = new Set<string>();
-    const accessFailures:Failure[]=[];
-    for (let i = 0; i < ranked.length; i++) {
-      const c = ranked[i];
-      tried.add(c.href.replace(/\/+$/, ""));
-      const v = await visitCandidate(page,c.href,host,ctx,accessFailures);
-      if(v.issues.some(i=>/^(network_|http_|page_)/.test(i))){ctx.progress(`候选访问失败，继续下一页：${c.href}`,{tool:"reject",text:v.issues.join(", "),ok:false});continue;}
-      if(c.reasons.includes('review-reframe')){
-        const stage=await findStage(page);
-        if(stage)await page.evaluate(y=>window.scrollTo(0,Math.max(0,y-120)),stage.y);
-        await page.waitForLoadState('networkidle',{timeout:5000}).catch(()=>{});
-        await sleep(1000);
-        ctx.progress('按复审保留原页，等待预览并重新取景',{tool:'browser',text:'保留 URL，更新画面'});
-      }
-      const png = await shoot(page);
-      const check = checkImage(png, hashes);
-      let previews = await previewsInViewport(page);
-      const issues = [...v.issues, ...check.issues, ...breadthPreviewIssues(kind, previews)];
-      if (issues.length) {
-        ctx.progress(`拒收 ${new URL(c.href).pathname}：${issues.join("、")}`, { tool: "reject", text: issues.join(", "), ok: false });
-        // Rules ran out: one needsPick round over the links not tried yet.
-        tried.add(pageKey(page.url()));
-        if (i === ranked.length - 1 && selectionCalls<2 && !explicit) {
-          const rest = options.filter((l) => !tried.has(pageKey(l.href))&&!exclude.has(pageKey(l.href)));
-          selectionCalls++;
-          const pick = await pickOne(ctx, `Website ${ctx.token.data.title} is a ${KIND_ZH[kind] ?? kind}. Previous choice ${c.href} led to ${page.url()} and was rejected: ${issues.join(', ')}. Choose a DIFFERENT remaining catalogue, module overview or usage page that adds information beyond the home page. Return no choice if none exists.`, rest.map((l) => `${l.text} → ${l.href}`));
-          if (pick) { usage = {input:(usage?.input??0)+pick.usage.input,output:(usage?.output??0)+pick.usage.output,cost:(usage?.cost??0)+pick.usage.cost}; ranked.push({ href: rest[pick.index].href, score: 0, reasons: ["needsPick"], text: rest[pick.index].text }); }
-        }
-        continue;
-      }
-      let chosen = { png, hash: check.hash, href: page.url(), reason: c.reasons.includes("reader-plan") ? "阅读员拍摄单" : c.reasons.includes("needsPick") ? "模型从编号列表选的（needsPick）" : `score ${c.score}（${c.reasons.join("+")}）` };
-      const deeper = (await links(page)).filter((l) => sameSite(l.href, host));
-      let breadthLinks=deeper;
-      const better = scoreLinks(deeper, role).find((x) => x.score > c.score + 0.3 && x.href.replace(/\/+$/, "") !== c.href.replace(/\/+$/, "") && !exclude.has(x.href));
-      if (better) {
-        ctx.progress(`第二跳：${new URL(better.href).pathname} 分数 ${better.score} 高于 ${c.score}`, { tool: "rules", text: "second hop" });
-        const hop = await visitCandidate(page,better.href,host,ctx,accessFailures);
-        if(!hop.issues.length){const hopPng = await shoot(page);
-          const hopCheck = checkImage(hopPng, hashes);
-          const hopPreviews = await previewsInViewport(page);
-          const hopIssues = [...hopCheck.issues, ...breadthPreviewIssues(kind, hopPreviews)];
-          if (!hopIssues.length) {chosen = { png: hopPng, hash: hopCheck.hash, href: page.url(), reason: `第二跳 ${better.score} > ${c.score}` };breadthLinks=(await links(page)).filter(l=>sameSite(l.href,host));previews=hopPreviews;}
-          else ctx.progress(`第二跳拒收：${hopIssues.join("、")}`, { tool: "reject", text: hopIssues.join(", "), ok: false });
-        }
-      }
+    const accessFailures: Failure[] = [];
+    const save = (png: Buffer, hash: string, href: string, reason: string, previews: number, visual?: BreadthVisual, compared?: { href: string; previews: number; y: number }[]) => {
       const file = path.join(workDir(svc, ctx), "breadth.png");
-      fs.writeFileSync(file, chosen.png);
-      const ev = shotEvidence(ctx, svc, chosen.png, "breadth", { href: chosen.href, reason: chosen.reason, previews });
-      ctx.progress(`截目录 ✓ ${new URL(chosen.href).pathname}（${chosen.reason}）`, { tool: "shot", text: `首屏内预览 ${previews} 个`, ok: true, evidence: [ev.id] });
-      shots.breadth = { file, href: chosen.href, hash: chosen.hash, evidence: ev.id, title: await page.title().catch(() => ""), previews };
-      return { ok: true, summary: `目录 ✓ ${new URL(chosen.href).pathname}`, data: { shots, breadthLinks: breadthLinks.slice(0, 200) }, usage };
+      fs.writeFileSync(file, png);
+      const ev = shotEvidence(ctx, svc, png, "breadth", { href, reason, previews, visual, compared });
+      ctx.progress(`截目录 ✓ ${pathOf(href)}（${reason}）`, { tool: "shot", text: `程序数到首屏预览 ${previews} 个${visual ? ` · 判定：${visual.basis === "name-list" ? "名称目录" : visual.basis === "owner-choice" ? "站长指定" : "渲染出的内容"}` : ""}`, ok: true, evidence: [ev.id] });
+      shots.breadth = { file, href, hash, evidence: ev.id, title: "", previews, visual };
+    };
+
+    // 1. A page the owner named, or the reviewer's "same page, reframe" request.
+    const direct = explicit ? { href: explicit, why: "explicit-choice" } : repair && repair.action !== "replace-page" && repair.url && !exclude.has(pageKey(repair.url)) ? { href: repair.url, why: "review-reframe" } : null;
+    if (direct) {
+      const v = await visitCandidate(page, direct.href, host, ctx, accessFailures);
+      if (!v.issues.some((i) => /^(network_|http_|page_)/.test(i))) {
+        if (direct.why === "review-reframe") {
+          const stage = await findStage(page);
+          if (stage) await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
+          await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+          await sleep(1000);
+          ctx.progress("按复审保留原页，等待预览并重新取景", { tool: "browser", text: "保留 URL，更新画面" });
+        }
+        const png = await shoot(page);
+        const check = checkImage(png, hashes);
+        const previews = await previewsInViewport(page);
+        const previous = shots.breadth?.visual && pageKey(shots.breadth.href) === pageKey(page.url()) ? shots.breadth.visual : undefined;
+        const visual: BreadthVisual | undefined = direct.why === "explicit-choice" ? { basis: "owner-choice", reason: "站长通过指定采集页给出", compared: 1 } : previous;
+        const issues = [...v.issues, ...check.issues, ...breadthPreviewIssues(kind, previews, visual)];
+        if (!issues.length) {
+          const pageLinks = (await links(page)).filter((l) => sameSite(l.href, host));
+          save(png, check.hash, page.url(), direct.why === "explicit-choice" ? "已指定目录页" : "按复审重新取景", previews, visual);
+          shots.breadth!.title = await page.title().catch(() => "");
+          return { ok: true, summary: `目录 ✓ ${pathOf(page.url())}`, data: { shots, breadthLinks: pageLinks.slice(0, 200) } };
+        }
+        ctx.progress(`拒收 ${pathOf(direct.href)}：${issues.join("、")}`, { tool: "reject", text: issues.join(", "), ok: false });
+      }
+      if (explicit) return { ok: false, summary: "指定的目录页不合格", error: "所有候选都被拒收：指定页不合格", failure: accessFailures.at(-1), data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) }, candidateAccessFailures: accessFailures } };
+      exclude.add(pageKey(direct.href));
     }
-    return { ok: false, summary: "没有合格的目录页", error: ranked.length ? "所有候选都被拒收" : "规则和模型都没找到目录页（needsPick 交人）", failure:accessFailures.length===tried.size?accessFailures.at(-1):undefined,usage, data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) },candidateAccessFailures:accessFailures } };
+
+    // 2. Survey: open the likely pages, scroll each like a person, and compare the screens.
+    const candidates: { href: string; why: string; home?: boolean }[] = [];
+    const add = (href: string | undefined, why: string, home = false) => {
+      if (!href || !sameSite(href, host)) return;
+      const k = pageKey(href);
+      if (exclude.has(k) || (!home && homeKeys.has(k)) || candidates.some((c) => pageKey(c.href) === k)) return;
+      candidates.push({ href, why, home });
+    };
+    const plan = readerPlanOf(ctx)?.breadth;
+    if (plan) for (const u of [plan.url, ...(plan.alternatives ?? []).map((a) => a.url)]) add(u, "阅读员拍摄单");
+    for (const r of scoreLinks(pool, role).slice(0, 4)) add(r.href, `规则 ${r.score}`);
+    for (const link of pool.filter((l) => docsPath(l.href)).slice(0, 2)) add(link.href, "Storybook 文档");
+    for (const r of scoreLinks(siteFileLinks(ctx, host), role).slice(0, 3)) add(r.href, "sitemap / llms.txt");
+    for (const l of options.filter((l) => l.inNav || l.inMain)) { if (candidates.length >= 6) break; add(l.href, "导航"); }
+    add(homeUrl, "首页往下滚", true);
+    ctx.progress(`目录候选 ${candidates.length} 个，逐页打开、往下滚、截图后一起比较：${candidates.map((c) => pathOf(c.href)).join("  ")}`, { tool: "rules", text: candidates.map((c) => `${pathOf(c.href)}（${c.why}）`).join("\n") });
+    const seen: Survey[] = [];
+    const deadline = Date.now() + 150_000;
+    for (let i = 0; i < candidates.length && seen.length < 8; i++) {
+      if (Date.now() > deadline && seen.length >= 2) { ctx.progress(`看页时间用完，按已看过的 ${seen.length} 页比较`, { tool: "rules", text: "150 秒" }); break; }
+      const c = candidates[i];
+      const v = await visitCandidate(page, c.href, host, ctx, accessFailures);
+      if (v.issues.some((x) => /^(network_|http_|page_)/.test(x) || x === "notFound" || x === "offSite")) { ctx.progress(`略过 ${pathOf(c.href)}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
+      const key = pageKey(page.url());
+      if (seen.some((s) => pageKey(s.href) === key) || (!c.home && homeKeys.has(key))) { ctx.progress(`${pathOf(c.href)} 跳到了已看过的页面，略过`, { tool: "rules", text: page.url() }); continue; }
+      const frame = await bestScrollFrame(page, { skipFirst: Boolean(c.home) });
+      if (!frame) continue;
+      const png = await shoot(page);
+      const check = checkImage(png, [...hashes, ...seen.map((s) => s.hash)]);
+      if (check.issues.length) { ctx.progress(`拒收 ${pathOf(page.url())}：${check.issues.join("、")}`, { tool: "reject", text: check.issues.join(", "), ok: false }); continue; }
+      const file = path.join(workDir(svc, ctx), `breadth-look-${seen.length + 1}.png`);
+      fs.writeFileSync(file, png);
+      const pageLinks = (await links(page)).filter((l) => sameSite(l.href, host));
+      seen.push({ href: page.url(), png, hash: check.hash, previews: frame.previews, y: frame.y, file, links: pageLinks, why: c.why, title: await page.title().catch(() => "") });
+      ctx.progress(`看过 ${pathOf(page.url())}${frame.y ? `（下滚 ${frame.y}px）` : ""}：程序数到预览 ${frame.previews} 个`, { tool: "browser", text: c.why, ok: true });
+      // Second hop, by eye: strong catalogue links inside the first pages join the comparison.
+      if (i < 3) for (const r of scoreLinks(pageLinks, role).slice(0, 2)) if (candidates.length < 10) add(r.href, `第二跳（从 ${pathOf(c.href)}）`);
+    }
+    const compared = seen.map((s) => ({ href: s.href, previews: s.previews, y: s.y }));
+    const cleanup = () => { for (const s of seen) fs.rmSync(s.file, { force: true }); };
+    if (!seen.length) {
+      return { ok: false, summary: "没有合格的目录页", error: candidates.length ? "所有候选都被拒收" : "规则和模型都没找到目录页（needsPick 交人）", failure: accessFailures.length && accessFailures.length >= candidates.length ? accessFailures.at(-1) : undefined, data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) }, candidateAccessFailures: accessFailures } };
+    }
+    const pick = await pickByImages(ctx, BREADTH_LOOK(title, kind), seen.map((s) => ({ file: s.file, label: `${pathOf(s.href)}${s.y ? `（下滚 ${s.y}px）` : ""}` })));
+    if (pick) usage = pick.usage;
+    let chosen: Survey | undefined, visual: BreadthVisual | undefined, reason = "";
+    if (pick && pick.index >= 0 && pick.basis !== "none") {
+      chosen = seen[pick.index]; visual = { basis: pick.basis, reason: pick.reason, compared: seen.length }; reason = `看图比较 ${seen.length} 页后选中：${pick.reason}`;
+    } else if (!pick) {
+      // Model unreachable: fall back to the program rules (rule order; component sources need the count).
+      const counted = [...seen].sort((a, b) => b.previews - a.previews)[0];
+      if (kind !== "component-source") { chosen = seen[0]; reason = `模型不可用，按规则顺序：${seen[0].why}`; }
+      else if (counted.previews >= 4) { chosen = counted; reason = `模型不可用，按程序计数：预览 ${counted.previews} 个`; }
+    }
+    if (!chosen) {
+      cleanup();
+      const why = pick ? `看了 ${seen.length} 页截图，没有一页能体现范围：${pick.reason}` : `模型不可用，程序计数也不足 4 个预览（看过 ${seen.length} 页）`;
+      return { ok: false, summary: "没有合格的目录页", error: `所有候选都被拒收：${why}`, usage, data: { needsPick: { breadth: [...seen.map((s) => s.href), ...options.map((l) => l.href)].filter((h, i, all) => all.indexOf(h) === i).map((h, i) => `${i + 1}. ${h}`) }, candidateAccessFailures: accessFailures, breadthCompared: compared } };
+    }
+    save(chosen.png, chosen.hash, chosen.href, reason, chosen.previews, visual, compared);
+    shots.breadth!.title = chosen.title;
+    cleanup();
+    return { ok: true, summary: `目录 ✓ ${pathOf(chosen.href)}`, data: { shots, breadthLinks: chosen.links.slice(0, 200) }, usage };
   } finally { await close(); }
 };
 
@@ -583,7 +655,7 @@ const gate: Tool = async (ctx, svc) => {
   const d = ctx.token.data as Record<string, any>;
   // A retry can resume at audit/gate with an old shotReview=pass. Certify the current
   // capture evidence again here; legacy approval never substitutes for a missing count.
-  const breadthIssues = d.mode === "video" ? [] : breadthPreviewIssues(String(d.kind), d.shots?.breadth?.previews);
+  const breadthIssues = d.mode === "video" ? [] : breadthPreviewIssues(String(d.kind), d.shots?.breadth?.previews, d.shots?.breadth?.visual);
   if (breadthIssues.length) {
     const reason = `${breadthIssues.join("；")}。历史截图审查通过不能覆盖当前目录证据，请重拍并复查受影响的风格、导览与终审。`;
     const shotRepairs = { ...d.shotRepairs, breadth: { action: typeof d.shots?.breadth?.previews === "number" ? "replace-page" : "reframe", url: d.shots?.breadth?.href, reason } };
