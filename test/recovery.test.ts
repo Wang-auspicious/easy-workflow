@@ -95,7 +95,7 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       assert.equal(result.result.count,1);
       const again=await control.execute("retry_candidates",{tag:"network_connection",count:10});assert.equal(again.result.count,0);
       await f.runtime.settle();
-      assert.equal(resumedAt,"curation/fetch","resume the failing station, not intake/classification");
+      assert.equal(resumedAt,"curation/scout","resume the failing station (legacy fetch is now the scout), not intake/classification");
       assert.ok(f.state.tokens[result.result.tokens[0].id].evidence.some(id=>f.state.evidence[id].meta?.reusedFrom==="before-retry"));
       assert.equal(f.state.recoveries.network.disposition,"resolved");
       assert.equal(f.state.recoveries.invalid.disposition,"removed");
@@ -139,7 +139,7 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
     });
     await t.test("recovery hooks remain active after graph activation and survive another restart",async()=>{
       const f=factory!;
-      const patch=f.proposePatch({author:"user",summary:"test rename",ops:[{op:"set",station:"curation/fetch",field:"name",value:"首页抓取"}]});
+      const patch=f.proposePatch({author:"user",summary:"test rename",ops:[{op:"set",station:"curation/scout",field:"name",value:"侦察"}]});
       f.decidePatch(patch.patch.id,true);
       f.runtime.start("park after activation");f.runtime.pause();
       f.feed([`${base}/pending`]);await endRun(f);
@@ -194,15 +194,20 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       let factReviews=0;
       f.runtime.executors=n=>async()=>{
         if(n.key==="curation/style")await delay(100);
-        if(n.key==="curation/fact-review"&&factReviews++===0)return {ok:true,summary:"fix facts",verdict:{verdict:"return",returnTo:"curation/facts",reason:"fixture missing quote"}};
+        if(n.key==="curation/fact-review"&&factReviews++===0)return {ok:true,summary:"fix facts",verdict:{verdict:"fix",reason:"fixture missing quote",fixes:[{station:"curation/facts",fields:["facts.license"],problem:"fixture missing quote"}]}};
         return {ok:true,summary:"fixture complete",data:n.key==="curation/gate"?{gate:"pass"}:undefined};
       };
-      const token=f.runtime.create("curation/shot-review",{item:"branched-review",url:base,source:"manual"});
+      const token=f.runtime.create("curation/plan",{item:"branched-review",url:base,source:"manual"});
       for(let i=0;i<300&&f.state.tokens[token.id].status==="active";i++)await delay(10);
       assert.equal(f.state.tokens[token.id].status,"published");
       const styles=f.state.tokens[token.id].attempts.map(id=>f.state.attempts[id]).filter(a=>a.node==="curation/style");
       assert.equal(styles.length,1);assert.equal(styles[0].ok,true);
       assert.equal(factReviews,2);
+      const consults=Object.values(f.state.consults).filter(c=>c.token===token.id);
+      assert.equal(consults.length,1);assert.equal(consults[0].owner,"curation/facts");assert.equal(consults[0].outcome,"resolved");
+      const facts=f.state.tokens[token.id].attempts.map(id=>f.state.attempts[id]).filter(a=>a.node==="curation/facts");
+      assert.equal(facts.length,2,"the owner re-runs once for the reviewer, without replaying unrelated stations");
+      assert.ok((f.state.cases["branched-review"]??[]).some(n=>n.section.startsWith("审核")),"reviews are written to the case file");
       await endRun(f);
     });
     await t.test("completed items remain correctable after restarting an ended run",async()=>{

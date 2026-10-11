@@ -237,7 +237,8 @@ export class Factory {
     if(!this.runtime.running)this.runtime.start(`失败重试 × ${selected.length}`);
     return selected.map(c=>{
       const previous=this.state.tokens[c.token];
-      const failedAt=filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode;
+      const legacy:Record<string,string>={"curation/fetch":"curation/scout"};
+      const failedAt=filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode&&(legacy[previous.finishedAtNode]??previous.finishedAtNode);
       const checkpoint=previous?.data.canonical&&failedAt&&this.compiled.nodes.some(n=>n.key===failedAt&&this.runtime.runnable(n))?failedAt:"candidates/tidy";
       const data:Record<string,unknown>=checkpoint==="candidates/tidy"?{}:structuredClone(previous.data);
       delete data.failure;delete data.gate;delete data.digest;
@@ -285,7 +286,7 @@ export class Factory {
       const url = canonical(c.canonicalUrl) ?? c.canonicalUrl;
       out.push(this.runtime.create("candidates/route", {
         item: c.id, url, title: c.name, source: "candidates/pool", category: c.category,
-        data: { canonical: url, host: this.hostOf(url), catalog: { category: c.category, subcategories: c.subcategories, descriptionZh: c.descriptionZh } },
+        data: { canonical: url, host: this.hostOf(url), catalogEntry: { category: c.category, subcategories: c.subcategories, descriptionZh: c.descriptionZh } },
       }));
     }
     return out;

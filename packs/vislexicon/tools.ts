@@ -12,6 +12,9 @@ import { classifyFailure, type Failure } from "../../shared/failures.ts";
 import { pickOne } from "../../server/agent-station.ts";
 import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { KIND_ZH, PREVIEW_RULES, loadPublished } from "./env.ts";
+import { scout } from "./scout.ts";
+import { repoOf } from "../../server/repo.ts";
+import { ALL_AXES, CHOSEN_AXES, derivedFacets, loadTaxonomy, validateV3, webpSize } from "./v3.ts";
 import {
   VIEW, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, recordScroll, sameSite,
   scoreLinks, shoot, stageClip, visit, pageKey, type Link,
@@ -54,15 +57,46 @@ function published(dir: string) {
 
 /* ------------------------------------------------------------------ layer 2 · candidates */
 
+/** Resource type of a raw link (Spec §36). */
+export function resourceType(url: string): "repo" | "npm" | "social" | "file" | "doc-page" | "website" {
+  try {
+    const u = new URL(url);
+    const h = u.hostname.replace(/^www\./, "");
+    if (["github.com", "gitlab.com", "bitbucket.org"].includes(h) && u.pathname.split("/").filter(Boolean).length >= 2) return "repo";
+    if (h === "npmjs.com" || h === "npmjs.org") return "npm";
+    if (/(^|\.)(x|twitter|xiaohongshu|douyin|bilibili|weibo|instagram|youtube)\.com$|xhslink\.com$|b23\.tv$/.test(h)) return "social";
+    if (/\.(md|pptx?|key|pdf|zip|psd|fig|sketch|json)$/i.test(u.pathname)) return "file";
+    if (u.pathname.split("/").filter(Boolean).length >= 2) return "doc-page";
+    return "website";
+  } catch { return "website"; }
+}
+
 const tidy: Tool = async (ctx) => {
-  const url = canonical(ctx.token.url);
-  if (!url) return { ok: false, summary: "网址无法解析", failure: classifyFailure(`无法解析的网址：${ctx.token.url}`,{url:ctx.token.url,stage:"url"}) };
-  ctx.progress("规范化网址", { tool: "normalize", text: url, ok: true });
+  const raw = ctx.token.url;
+  const url = canonical(raw);
+  if (!url) return { ok: false, summary: "网址无法解析", failure: classifyFailure(`无法解析的网址：${raw}`,{url:raw,stage:"url"}) };
+  const type = resourceType(url);
+  const repo = type === "repo" ? repoOf(url) : null;
+  const entityKey = repo ? `github:${repo.owner}/${repo.name}`.toLowerCase() : hostOf(url);
+  ctx.progress(`规范化：${url}（${({ repo: "代码仓库", npm: "npm 包", social: "社媒帖子", file: "文件", "doc-page": "文档单页", website: "网站" } as Record<string, string>)[type]}）`, { tool: "normalize", text: `原始：${raw}`, ok: true });
+  // Health precheck: unhealthy links never take a line slot (Spec §36).
+  let health: { status: number; finalUrl: string; checkedAt: string } | null = null;
+  if (type !== "social") {
+    try {
+      const r = await webGet(url, { signal: ctx.signal, timeout: 15000 });
+      health = { status: r.status, finalUrl: r.finalUrl, checkedAt: new Date().toISOString() };
+      if (r.status === 404 || r.status === 410) return { ok: false, summary: `入口 HTTP ${r.status}`, failure: classifyFailure(`首页返回 HTTP ${r.status}`, { url, status: r.status }) };
+      ctx.progress(`健康预检：HTTP ${r.status}${r.finalUrl !== url ? ` → ${r.finalUrl}` : ""}`, { tool: "health", text: r.finalUrl, ok: r.status < 400 });
+    } catch (err) {
+      ctx.signal.throwIfAborted();
+      const f = classifyFailure(err, { url });
+      if (f.tag === "network_tls" || f.tag === "network_dns") return { ok: false, summary: f.message, error: f.message, failure: f };
+      ctx.progress(`健康预检未通过（${f.tag}），留给侦察员用浏览器再试`, { tool: "health", text: f.message.slice(0, 120), ok: false });
+    }
+  }
   const title = ctx.token.title?.trim() || hostOf(url);
-  ctx.progress("提取标题与来源", { tool: "extract", text: `${title} · ${ctx.token.source}`, ok: true });
-  const candidate = { title, source: ctx.token.source, searchText: `${title} ${hostOf(url)} ${url}`.toLowerCase() };
-  ctx.progress("保存候选检索字段", { tool: "index", text: candidate.searchText, ok: true });
-  return { ok: true, summary: `候选已准备：${title}`, data: { canonical: url, host: hostOf(url), candidate } };
+  const candidate = { title, source: ctx.token.source, type, entityKey, repo: repo ? `${repo.owner}/${repo.name}` : null, raw: { url: raw, source: ctx.token.source, at: new Date().toISOString() }, health, searchText: `${title} ${hostOf(url)} ${url}`.toLowerCase() };
+  return { ok: true, summary: `候选已准备：${title}（${type}）`, data: { canonical: health?.finalUrl && sameSite(health.finalUrl, hostOf(url)) ? canonical(health.finalUrl) ?? url : url, host: hostOf(url), candidate } };
 };
 const extract: Tool = async (ctx) => ({ ok: true, summary: ctx.token.title ? `标题：${ctx.token.title}` : "只有网址，标题留给首页抓取", data: {} });
 const index: Tool = async (ctx) => ({ ok: true, summary: `按来源 ${ctx.token.source.split("/").pop()} 建索引`, data: {} });
@@ -97,7 +131,7 @@ const dedupe: Tool = async (ctx, svc) => {
 
 const decode = (s: string) => s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'").replace(/&nbsp;/g, " ").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
 
-export function parseHtml(html: string, base: string) {
+export function parseHtml(html: string, base: string, max = 3000) {
   const title = decode((/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? "").replace(/\s+/g, " ").trim()).slice(0, 160);
   const meta = (name: string) => decode(new RegExp(`<meta[^>]+(?:name|property)=["']${name}["'][^>]*content=["']([^"']*)["']`, "i").exec(html)?.[1] ?? new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]*(?:name|property)=["']${name}["']`, "i").exec(html)?.[1] ?? "").trim();
   const description = (meta("description") || meta("og:description")).slice(0, 300);
@@ -114,7 +148,7 @@ export function parseHtml(html: string, base: string) {
     const inNav = navStart >= 0 && m.index >= navStart && (navEnd < 0 ? m.index < navStart + 20000 : m.index < navEnd);
     if (!links.some((l) => l.href === href)) links.push({ href, text, inNav });
   }
-  const text = decode(html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 3000);
+  const text = decode(html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim().slice(0, max);
   return { title, description, links, text };
 }
 
@@ -157,7 +191,18 @@ const fetchHome: Tool = async (ctx,svc) => {
   };
 };
 
-/* ------------------------------------------------------------------ ⑤ plan (rules only) */
+/* ------------------------------------------------------------------ ④ kind join */
+
+const kindJoin: Tool = async (ctx) => {
+  const a = ctx.token.data.kind1 as { kind: string } | undefined, b = ctx.token.data.kind2 as { kind: string } | undefined;
+  const agree = Boolean(a?.kind) && a?.kind === b?.kind;
+  ctx.progress(agree ? `两人独立判定一致：${KIND_ZH[a!.kind]}` : `分类员 ${KIND_ZH[a?.kind ?? ""] ?? "?"} ≠ 复核员 ${KIND_ZH[b?.kind ?? ""] ?? "?"} → 仲裁`, { tool: "join", text: "", ok: agree });
+  ctx.addEvidence({ id: `kj-${ctx.attempt}`, kind: "verdict", label: "分类复核", verdict: agree ? `${KIND_ZH[a!.kind]} ✓ 一致` : `${KIND_ZH[a?.kind ?? ""] ?? "?"} ≠ ${KIND_ZH[b?.kind ?? ""] ?? "?"}`, tone: agree ? "ok" : "warn", meta: { a, b } });
+  const reviews = [...((ctx.token.data.reviews as unknown[]) ?? []), { station: "classify-review", verdict: agree ? "pass" : "disagree", reason: `③ ${a?.kind} / ④ ${b?.kind}`, at: new Date().toISOString() }];
+  return { ok: true, summary: agree ? `一致：${KIND_ZH[a!.kind]}` : "不一致，交仲裁", data: { kindAgreed: agree, ...(agree ? { kind: a!.kind } : {}), reviews } };
+};
+
+/* ------------------------------------------------------------------ ⑤ plan (reader's shot plan + rules) */
 
 const plan: Tool = async (ctx) => {
   const kind = String(ctx.token.data.kind || "work");
@@ -165,6 +210,8 @@ const plan: Tool = async (ctx) => {
   const home = ctx.token.data.home as { navLinks: Link[] } | undefined;
   const ranked = rules?.roles.breadth ? scoreLinks(home?.navLinks ?? [], rules.roles.breadth).slice(0, 4) : [];
   const mode = kind === "work" ? "video" : "shots";
+  const reader = ctx.token.data.readerPlan as { breadth?: { url: string }; proof?: { url: string; locate?: string } } | undefined;
+  if (reader) ctx.progress(`采用阅读员的拍摄单：目录 ${reader.breadth?.url ?? "-"}；特写 ${reader.proof?.url ?? "-"}${reader.proof?.locate ? `（${reader.proof.locate}）` : ""}`, { tool: "plan", text: "reader plan first, rules as fallback", ok: true });
   ctx.progress(`按 ${KIND_ZH[kind] ?? kind} 的规则选页：${mode === "video" ? "作品走录屏路线" : `目录候选 ${ranked.length} 个`}`, { tool: "rules", text: `preview-rules.kinds.${kind}` });
   return {
     ok: true, summary: mode === "video" ? "作品 → 录屏" : ranked.length ? `目录首选 ${new URL(ranked[0].href).pathname}` : "目录候选留给浏览器现场找",
@@ -185,7 +232,9 @@ function shotEvidence(ctx: StationContext, svc: Services, png: Buffer, role: str
   return ctx.addEvidence({ id: `img-${card.sha.slice(0, 12)}-${ctx.attempt.slice(2, 8)}`, kind: "image", src: card.src, card: card.src, label: ROLE_ZH[role] ?? role, meta: { role, ...meta } });
 }
 const ROLE_ZH: Record<string, string> = { identity: "首屏", breadth: "目录", proof: "组件特写" };
-type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number };
+type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number; title?: string };
+type ReaderPlan = { identity?: { url: string }; breadth?: { url: string; alternatives?: { url: string }[] }; proof?: { url: string; locate?: string; alternatives?: { url: string; locate?: string }[] } };
+const readerPlanOf = (ctx: StationContext) => ctx.token.data.readerPlan as ReaderPlan | undefined;
 const shotsOf = (ctx: StationContext) => ({ ...((ctx.token.data.shots as Record<string, ShotData>) ?? {}) });
 
 async function visitCandidate(page:Parameters<typeof visit>[0],href:string,host:string,ctx:StationContext,errors:Failure[]) {
@@ -239,7 +288,7 @@ const identity: Tool = async (ctx, svc) => {
     const mode = ctx.token.data.mode === "video" || motionVideo ? "video" : "shots";
     if (motionVideo) ctx.progress(`动效优先：${motion.scrollHijacked ? "滚动被劫持" : "画布盖住首屏"} → 改走录屏`, { tool: "rules", text: "motionFirstSignals" });
     const shots = shotsOf(ctx);
-    shots.identity = { file, href: page.url(), hash: check.hash, evidence: ev.id, content: check.stats.content };
+    shots.identity = { file, href: page.url(), hash: check.hash, evidence: ev.id, content: check.stats.content, title: await page.title().catch(() => "") };
     if (issues.length && mode === "shots" && !issues.every((i) => i === "consentOverlay")) {
       return { ok: false, summary: `首屏不合格：${issues.join("、")}`, error: issues.join(", "), data: { shots, homeLinks: homeLinks.slice(0, 150) } };
     }
@@ -266,6 +315,8 @@ const breadth: Tool = async (ctx, svc) => {
     const probe=await openPage(VIEW,'en-US',ctx.signal);try{await visit(probe.page,shots.identity?.href??ctx.token.url,host);pool.push(...await links(probe.page));}finally{await probe.close();}
   }
   const ranked: { href: string; score: number; reasons: string[]; text: string }[] = scoreLinks(pool, role).filter((c) => !exclude.has(c.href)).slice(0, 4);
+  const plan=readerPlanOf(ctx)?.breadth;
+  if(plan&&!explicit)for(const u of [plan.url,...(plan.alternatives??[]).map(a=>a.url)].reverse())if(u&&sameSite(u,host)&&!exclude.has(pageKey(u))){const i=ranked.findIndex(r=>pageKey(r.href)===pageKey(u));if(i>=0)ranked.splice(i,1);ranked.unshift({href:u,text:"阅读员拍摄单",score:20,reasons:['reader-plan']});}
   if(repair&&repair.action!=="replace-page"&&repair.url&&!exclude.has(pageKey(repair.url)))ranked.unshift({href:repair.url,text:"按复审重新取景",score:10,reasons:['review-reframe']});
   if(explicit)ranked.splice(0,ranked.length,{href:explicit,text:"已指定目录页",score:100,reasons:['explicit-choice']});
   for(const link of pool.filter(l=>new URL(l.href).searchParams.get('path')?.startsWith('/docs/')).slice(0,4))if(!exclude.has(pageKey(link.href))&&!ranked.some(r=>pageKey(r.href)===pageKey(link.href)))ranked.push({href:link.href,text:link.text,score:8,reasons:['storybook-docs']});
@@ -310,7 +361,7 @@ const breadth: Tool = async (ctx, svc) => {
         }
         continue;
       }
-      let chosen = { png, hash: check.hash, href: page.url(), reason: c.reasons.includes("needsPick") ? "模型从编号列表选的（needsPick）" : `score ${c.score}（${c.reasons.join("+")}）` };
+      let chosen = { png, hash: check.hash, href: page.url(), reason: c.reasons.includes("reader-plan") ? "阅读员拍摄单" : c.reasons.includes("needsPick") ? "模型从编号列表选的（needsPick）" : `score ${c.score}（${c.reasons.join("+")}）` };
       const deeper = (await links(page)).filter((l) => sameSite(l.href, host));
       let breadthLinks=deeper,previews=await previewsInViewport(page);
       const better = scoreLinks(deeper, role).find((x) => x.score > c.score + 0.3 && x.href.replace(/\/+$/, "") !== c.href.replace(/\/+$/, "") && !exclude.has(x.href));
@@ -326,7 +377,7 @@ const breadth: Tool = async (ctx, svc) => {
       fs.writeFileSync(file, chosen.png);
       const ev = shotEvidence(ctx, svc, chosen.png, "breadth", { href: chosen.href, reason: chosen.reason, previews });
       ctx.progress(`截目录 ✓ ${new URL(chosen.href).pathname}（${chosen.reason}）`, { tool: "shot", text: `首屏内预览 ${previews} 个`, ok: true, evidence: [ev.id] });
-      shots.breadth = { file, href: chosen.href, hash: chosen.hash, evidence: ev.id };
+      shots.breadth = { file, href: chosen.href, hash: chosen.hash, evidence: ev.id, title: await page.title().catch(() => "") };
       return { ok: true, summary: `目录 ✓ ${new URL(chosen.href).pathname}`, data: { shots, breadthLinks: breadthLinks.slice(0, 200) }, usage };
     }
     return { ok: false, summary: "没有合格的目录页", error: ranked.length ? "所有候选都被拒收" : "规则和模型都没找到目录页（needsPick 交人）", failure:accessFailures.length===tried.size?accessFailures.at(-1):undefined,usage, data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) },candidateAccessFailures:accessFailures } };
@@ -357,6 +408,9 @@ const proof: Tool = async (ctx, svc) => {
   const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string}>|undefined)?.proof;
   const explicit=(ctx.token.data.previewChoices as Record<string,string>|undefined)?.proof;
   const taken = new Set([norm(String(ctx.token.data.canonical)), norm(shots.breadth?.href ?? ""), norm(shots.identity?.href ?? ""), ...(((ctx.token.data.rejectedPages as string[]) ?? []).map(norm))]);
+  const planned=readerPlanOf(ctx)?.proof;
+  const locateOf=new Map<string,string>();
+  if(planned&&!explicit){const picks=[planned,...(planned.alternatives??[])].filter(p=>p.url&&sameSite(p.url,host));for(const p of picks)if(p.locate)locateOf.set(norm(p.url),p.locate);candidates=[...picks.map(p=>p.url),...candidates];}
   if(repair&&repair.action!=="replace-page"&&repair.url)candidates=[repair.url];
   else if (ctx.redo && shots.proof?.href) taken.add(norm(shots.proof.href));
   if(explicit){candidates=[explicit];taken.delete(norm(explicit));}
@@ -371,7 +425,7 @@ const proof: Tool = async (ctx, svc) => {
   const { page, close } = await openPage(VIEW, "en-US", ctx.signal);
   try {
     const hashes = [shots.identity?.hash ?? "", shots.breadth?.hash ?? ""];
-    let best: { href: string; png: Buffer; content: number; hash: string; framing: string } | null = null;
+    let best: { href: string; png: Buffer; content: number; hash: string; framing: string; title: string } | null = null;
     let tried = 0;
     const accessFailures:Failure[]=[];
     for (const href of candidates) {
@@ -381,6 +435,8 @@ const proof: Tool = async (ctx, svc) => {
       if (v.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
       let png: Buffer | null = null;
       let framing = "viewport";
+      const locate=locateOf.get(norm(href));
+      if(locate){const found=await page.evaluate((text)=>{const words=text.split(/[，,；;（）()]/).map(s=>s.trim()).filter(s=>s.length>=2);for(const w of words){const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let n:Node|null;while((n=walker.nextNode())){if((n.textContent??"").toLowerCase().includes(w.toLowerCase())&&n.parentElement&&!n.parentElement.closest("nav,aside,footer,header")){n.parentElement.scrollIntoView({block:"start"});return w;}}}return null;},locate).catch(()=>null);if(found){await sleep(800);ctx.progress(`按阅读员提示定位到「${found}」附近`,{tool:"browser",text:locate});}}
       let stage = usesStage || kind==="tool" ? await findStage(page) : null;
       if (stage) {
         await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
@@ -401,7 +457,8 @@ const proof: Tool = async (ctx, svc) => {
       const check = checkImage(png, hashes, { stage: Boolean(stage) });
       if (check.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${check.issues.join("、")}`, { tool: "reject", text: check.issues.join(", "), ok: false }); continue; }
       ctx.progress(`候选 ${new URL(href).pathname}：${framing}，内容占比 ${(check.stats.content * 100).toFixed(1)}%`, { tool: "shot", text: framing, ok: true });
-      if (!best || check.stats.content > best.content) best = { href, png, content: check.stats.content, hash: check.hash, framing };
+      if (!best || check.stats.content > best.content || (locateOf.has(norm(href)) && !locateOf.has(norm(best.href)))) best = { href, png, content: check.stats.content, hash: check.hash, framing, title: await page.title().catch(() => "") };
+      if (locateOf.has(norm(href)) && check.stats.content > 0.05) break;
       if (!usesStage) break;
       if (best && tried >= 3 && best.content > 0.12) break;
     }
@@ -410,7 +467,7 @@ const proof: Tool = async (ctx, svc) => {
     fs.writeFileSync(file, best.png);
     const ev = shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, content: Number(best.content.toFixed(3)), tried });
     ctx.progress(`选中 ${new URL(best.href).pathname}（试 ${tried} 页，内容占比最高 ${(best.content * 100).toFixed(1)}%）`, { tool: "shot", text: best.framing, ok: true, evidence: [ev.id] });
-    shots.proof = { file, href: best.href, hash: best.hash, evidence: ev.id, framing: best.framing, content: best.content };
+    shots.proof = { file, href: best.href, hash: best.hash, evidence: ev.id, framing: best.framing, content: best.content, title: best.title };
     return { ok: true, summary: `特写 ✓ ${new URL(best.href).pathname}`, data: { shots }, usage };
   } finally { await close(); }
 };
@@ -444,7 +501,7 @@ const processShots: Tool = async (ctx, svc) => {
   }
   const shots = shotsOf(ctx);
   const roles = ["identity", "breadth", "proof"].filter((r) => shots[r]);
-  const images: { role: string; src: string; card: string; sha256: string; ahash: string; href: string; evidence: string }[] = [];
+  const images: { role: string; src: string; card: string; sha256: string; ahash: string; href: string; evidence: string; title?: string }[] = [];
   const t0 = Date.now();
   const previous = (ctx.token.data.images ?? []) as typeof images;
   const temporary:string[]=[];
@@ -456,7 +513,7 @@ const processShots: Tool = async (ctx, svc) => {
     const png = fs.readFileSync(s.file);
     const full = svc.store.put(EvidenceStore.webp(png, 1280, 82), "webp");
     const card = svc.store.put(EvidenceStore.webp(png, 720, 80), "webp");
-    images.push({ role, src: full.src, card: card.src, sha256: full.sha, ahash: aHash(png), href: s.href, evidence: s.evidence });
+    images.push({ role, src: full.src, card: card.src, sha256: full.sha, ahash: aHash(png), href: s.href, evidence: s.evidence, title: s.title });
     shots[role]={...s,file:full.file};
     if(path.resolve(s.file).startsWith(path.resolve(svc.workDir)+path.sep)&&path.extname(s.file)===".png")temporary.push(s.file);
   }
@@ -468,7 +525,52 @@ const processShots: Tool = async (ctx, svc) => {
   return { ok: true, summary: `${images.length} 张互不重复 ✓`, data: { images,shots } };
 };
 
-/* ------------------------------------------------------------------ ⑰ gate */
+/* ------------------------------------------------------------------ ⑰ assemble + gate: VisLexicon v3 record */
+
+const slug = (v: string) => v.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+
+export function buildV3(d: Record<string, any>, token: { id: string; url: string }, store: EvidenceStore, tax: Awaited<ReturnType<typeof loadTaxonomy>>) {
+  const copy = d.copy ?? {}, facts = d.facts ?? {}, cat = d.catalogV3 ?? {};
+  const entryId = slug(copy.name || d.title || "") || slug(String(d.host));
+  const derived = derivedFacets(facts, tax);
+  const pages = ((d.images ?? []) as { role: string; src: string; card: string; sha256: string; href: string; title?: string }[]).map((im) => {
+    const file = store.resolve(im.src);
+    const size = file ? webpSize(file) : null;
+    return {
+      role: im.role, sourceUrl: im.href, finalUrl: im.href, title: im.title || d.title,
+      selectionRationale: copy.rationale?.[im.role] ?? "",
+      shot: { src: im.src, card: im.card, sha256: im.sha256, width: size?.width ?? null, height: size?.height ?? null, bytes: file && fs.existsSync(file) ? fs.statSync(file).size : null, alt: copy.alt?.[im.role] ?? "" },
+    };
+  });
+  const factList = Object.entries(facts as Record<string, { value: string; sourceUrl: string; quote: string; evidence: string; scope: string }>).map(([field, f]) => ({
+    field, value: f?.value ?? "unknown", sourceUrl: f?.sourceUrl && /^https?:/.test(f.sourceUrl) ? f.sourceUrl : d.canonical, evidence: [f?.evidence, f?.scope ? `适用范围：${f.scope}` : ""].filter(Boolean).join("；"), quote: f?.quote ?? "", confidence: f?.value && f.value !== "unknown" ? 1 : 0,
+  }));
+  const now = new Date().toISOString();
+  return {
+    schemaVersion: 3, entryId, entityId: `entity-${entryId}`, status: "APPROVED",
+    official: { inputUrl: token.url, finalUrl: d.dossier?.finalUrl ?? d.home?.finalUrl ?? d.canonical, checkedAt: now },
+    editorial: { name: copy.name || d.title, descriptionZh: copy.descriptionZh, descriptionEn: copy.descriptionEn, takeawayZh: copy.takeawayZh, noteZh: copy.noteZh, recommendation: null, pricing: d.pricingNote || facts.pricing?.value || "unknown", pricingNote: null },
+    classification: {
+      recordLevel: "entry", primaryCategory: cat.primaryCategory, subcategory: cat.subcategory, status: "confirmed", alternatives: [],
+      reasons: copy.reasons ?? [], curatorId: "h2:curation/classify", reviewerId: d.kindAgreed ? "h2:curation/classify-review" : "h2:curation/arbiter", confirmedAt: now, independentlyReviewed: true, kindV1: d.kind,
+    },
+    facets: Object.fromEntries(ALL_AXES.map((a) => [a, a === "access" ? derived.access : a === "licenses" ? derived.licenses : (cat.facets?.[a] ?? [])])),
+    pages, facts: factList,
+    curation: { atlasTerms: [], atlasTermsStatus: "editor-draft" },
+    style: d.style ?? null,
+    preview: d.mode === "video" ? { mode: "video", video: d.video } : { mode: "shots" },
+    editorialVoice: { status: "written", writtenAt: now.slice(0, 10) },
+    h2: { token: token.id, reviews: d.reviews ?? [], note: "H2 工厂产出；写入 VisLexicon 正式目录前需站长确认（Spec R4）" },
+  };
+}
+
+const assemble: Tool = async (ctx, svc) => {
+  const tax = await loadTaxonomy();
+  const rec = buildV3(ctx.token.data as Record<string, any>, ctx.token, svc.store, tax);
+  const problems = validateV3(rec, tax);
+  ctx.progress(problems.length ? `结构校验 ${problems.length} 处问题：${problems.slice(0, 3).map((p) => p.field).join("、")}` : "v3 记录组装完成，结构校验全部通过", { tool: "schema", text: problems.map((p) => `${p.field}: ${p.problem}`).join("\n") || "VisLexicon assertBundle + taxonomy validators", ok: !problems.length });
+  return { ok: true, summary: problems.length ? `结构问题 ${problems.length} 处，交终审分派` : `v3 记录就绪：${rec.entryId}`, data: { draftV3: rec, draftProblems: problems } };
+};
 
 const gate: Tool = async (ctx, svc) => {
   const d = ctx.token.data as Record<string, any>;
@@ -476,28 +578,25 @@ const gate: Tool = async (ctx, svc) => {
   if (!d.kind) missing.push("分类");
   if (!(d.kindAgreed || d.arbiterDecided)) missing.push("分类复核");
   if (d.mode === "video" ? !d.video : (d.images?.length ?? 0) < 3) missing.push(d.mode === "video" ? "录屏" : "三张图");
-  for (const k of ["shotReview", "factReview", "copyReview"]) if (d[k] !== "pass") missing.push(k);
-  if (!d.copy?.descriptionZh) missing.push("中文文案");
-  if (!d.facts) missing.push("事实");
-  const entry = {
-    id: String(d.host).replace(/[^a-z0-9]+/gi, "-"), name: d.title || d.host, canonicalUrl: d.canonical, kind: d.kind, kindZh: KIND_ZH[d.kind],
-    descriptionZh: d.copy?.descriptionZh, takeawayZh: d.copy?.takeawayZh, descriptionEn: d.copy?.descriptionEn,
-    style: d.style ?? null, facts: d.facts ?? null,
-    preview: d.mode === "video" ? { mode: "video", video: d.video } : { mode: "shots", shots: d.images },
-    source: ctx.token.source, token: ctx.token.id,
-  };
-  const digest = crypto.createHash("sha256").update(JSON.stringify(entry)).digest("hex");
-  ctx.progress(`检查 ${6 - Math.min(6, missing.length)}/6 项；内容摘要 ${digest.slice(0, 12)}`, { tool: "gate", text: missing.length ? `缺：${missing.join("、")}` : "全部通过", ok: !missing.length });
+  if (d.shotReview !== "pass") missing.push("截图审查");
+  for (const [k, label] of [["fact-reviewVerdict", "事实审查"], ["copy-reviewVerdict", "文案审查"], ["auditVerdict", "终审"]]) if (d[k] !== "pass") missing.push(label);
+  const tax = await loadTaxonomy();
+  const record = buildV3(d, ctx.token, svc.store, tax);
+  const problems = validateV3(record, tax);
+  if (problems.length) missing.push(`结构 ${problems.length} 处（${problems.slice(0, 2).map((p) => p.field).join("、")}）`);
+  const digest = crypto.createHash("sha256").update(JSON.stringify({ ...record, official: { ...record.official, checkedAt: "" }, classification: { ...record.classification, confirmedAt: "" }, editorialVoice: null })).digest("hex");
+  ctx.progress(`检查 ${missing.length ? "未通过" : "全部通过"}；内容摘要 ${digest.slice(0, 12)}`, { tool: "gate", text: missing.length ? `缺：${missing.join("、")}` : "审核与结构全部通过", ok: !missing.length });
   if (missing.length) return { ok: true, summary: `不发布：缺 ${missing.join("、")}`, data: { gate: "fail", manualReason: `发布闸门：缺 ${missing.join("、")}` } };
-  const record = { ...entry, reviews: d.reviews ?? [], digest, publishedAt: new Date().toISOString(), note: "H2 工厂产出；写入 VisLexicon 前需站长确认目录（Spec R4）" };
+  const out = { ...record, h2: { ...record.h2, digest, publishedAt: new Date().toISOString() } };
   fs.mkdirSync(svc.publishDir, { recursive: true });
-  fs.writeFileSync(path.join(svc.publishDir, `${String(d.key ?? d.host).replace(/[\/:*?"<>|]+/g, "~")}.json`), JSON.stringify(record, null, 2));
-  ctx.addEvidence({ id: `gate-${digest.slice(0, 12)}`, kind: "verdict", label: "发布闸门", verdict: "可发布 ✓", tone: "ok", meta: { digest } });
-  return { ok: true, summary: `发布 ✓ ${d.host}`, data: { gate: "pass", digest } };
+  fs.writeFileSync(path.join(svc.publishDir, `${String(d.key ?? d.host).replace(/[\/:*?"<>|]+/g, "~")}.json`), JSON.stringify(out, null, 2));
+  ctx.addEvidence({ id: `gate-${digest.slice(0, 12)}`, kind: "verdict", label: "发布闸门", verdict: "可发布 ✓", tone: "ok", meta: { digest, entryId: record.entryId } });
+  return { ok: true, summary: `发布 ✓ ${record.entryId}`, data: { gate: "pass", digest } };
 };
 
 export const TOOLS: Record<string, Tool> = {
   "candidates.tidy": tidy, "candidates.extract": extract, "candidates.index": index, "candidates.route": route,
-  "curation.dedupe": dedupe, "curation.fetch": fetchHome, "curation.plan": plan, "curation.identity": identity,
+  "curation.dedupe": dedupe, "curation.fetch": fetchHome, "curation.scout": (ctx, svc) => scout(ctx, svc), "curation.kind-join": kindJoin, "curation.assemble": assemble,
+  "curation.plan": plan, "curation.identity": identity,
   "curation.breadth": breadth, "curation.proof": proof, "curation.record": record, "curation.process": processShots, "curation.gate": gate,
 };

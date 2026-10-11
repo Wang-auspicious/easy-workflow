@@ -6,7 +6,8 @@ import { Check, Errors } from "typebox/value";
 import type { Journal } from "./journal.ts";
 import type { Broker, Lease } from "./broker.ts";
 import type { Docs } from "./docs.ts";
-import { webGet } from "./network.ts";
+import { rememberRead, webGet } from "./network.ts";
+import { fetchRepoMeta, RepoError } from "./repo.ts";
 import { openPage } from "./browser.ts";
 import { classifyFailure, type Failure } from "../shared/failures.ts";
 import { visit } from "../packs/vislexicon/capture.ts";
@@ -78,8 +79,13 @@ export class Toolbox {
     try { r = await webGet(url, { signal }); } catch (err) { throw fail(err, url); }
     if (r.status >= 400) throw fail(`HTTP ${r.status}`, url, r.tried);
     const html = /html/i.test(r.contentType) || /^\s*</.test(r.body);
-    if (!html) return { url, finalUrl: r.finalUrl, status: r.status, via: r.via, contentType: r.contentType, text: r.body.slice(0, max), truncated: r.body.length > max };
-    const p = parseHtml(r.body, r.finalUrl);
+    if (!html) { rememberRead(url, r.body); rememberRead(r.finalUrl, r.body); return { url, finalUrl: r.finalUrl, status: r.status, via: r.via, contentType: r.contentType, text: r.body.slice(0, max), truncated: r.body.length > max }; }
+    const p = parseHtml(r.body, r.finalUrl, 60000);
+    rememberRead(url, `${p.title}
+${p.description}
+${p.text}`); rememberRead(r.finalUrl, `${p.title}
+${p.description}
+${p.text}`);
     return { url, finalUrl: r.finalUrl, status: r.status, via: r.via, title: p.title, description: p.description, text: p.text.slice(0, max), links: p.links.slice(0, 120).map((l) => ({ text: l.text, href: l.href, region: l.inNav ? "nav" : "body" })) };
   }
 
@@ -107,6 +113,9 @@ export class Toolbox {
               const text = (document.body?.innerText || "").replace(/\n{3,}/g, "\n\n");
               return { title: document.title, text: text.slice(0, max), truncated: text.length > max, links, headings, iframes: document.querySelectorAll("iframe").length };
             }, max);
+            rememberRead(a.url, `${data.title}
+${data.text}`); rememberRead(page.url(), `${data.title}
+${data.text}`);
             return { url: a.url, finalUrl: page.url(), via: "browser", issues, ...data };
           } finally { await close(); lease.release(); }
         },
@@ -174,25 +183,8 @@ export class Toolbox {
         description: "读取 GitHub 仓库元数据：描述、主页、所有者类型（个人 / 组织）、星数、最近推送、是否归档、SPDX 许可与 LICENSE 原文节选（附原文网址）、package.json 的 name / license / author / repository / homepage。参数可以是 owner/name 或仓库网址。",
         parameters: Type.Object({ repo: S("owner/name 或 https://github.com/owner/name") }),
         run: async (a: { repo: string }, c) => {
-          const m = /(?:github\.com\/)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[/#?].*)?$/.exec(a.repo.replace(/^git\+/, "").replace(/^https?:\/\/(www\.)?/, ""));
-          if (!m || /github\.com$/.test(m[1])) throw new ToolError({ tag: "invalid_url", category: "invalid", message: `看不出仓库：${a.repo}`, retryable: false, owner: "agent", nextAction: "传 owner/name，例如 shadcn-ui/ui" });
-          const [owner, name] = [m[1], m[2]];
-          const api = `https://api.github.com/repos/${owner}/${name}`;
-          const json = async (u: string) => { const r = await webGet(u, { signal: c.signal, accept: "application/vnd.github+json", timeout: 15000 }); if (r.status === 404) throw fail("HTTP 404", u); if (r.status >= 400) throw fail(`HTTP ${r.status}`, u); return JSON.parse(r.body); };
-          c.progress?.(`读取仓库 ${owner}/${name}`, { tool: "repo_meta", text: api });
-          const repo = await json(api);
-          let license: Record<string, unknown> | null = null;
-          try {
-            const l = await json(`${api}/license`);
-            const text = Buffer.from(String(l.content ?? ""), "base64").toString("utf8");
-            license = { spdx: l.license?.spdx_id ?? null, name: l.license?.name ?? null, path: l.path, url: l.html_url, excerpt: text.slice(0, 2500) };
-          } catch { license = repo.license ? { spdx: repo.license.spdx_id, name: repo.license.name, path: null, url: null, excerpt: null } : null; }
-          let pkg: Record<string, unknown> | null = null;
-          try {
-            const r = await webGet(`https://raw.githubusercontent.com/${owner}/${name}/${repo.default_branch}/package.json`, { signal: c.signal, timeout: 12000 });
-            if (r.status < 400) { const p = JSON.parse(r.body); pkg = { name: p.name, license: p.license, author: p.author, repository: p.repository, homepage: p.homepage, url: `https://github.com/${owner}/${name}/blob/${repo.default_branch}/package.json` }; }
-          } catch { /* no package.json */ }
-          return { repo: `${owner}/${name}`, url: repo.html_url, description: repo.description, homepage: repo.homepage, ownerType: repo.owner?.type, ownerLogin: repo.owner?.login, stars: repo.stargazers_count, pushedAt: repo.pushed_at, archived: repo.archived, defaultBranch: repo.default_branch, license, packageJson: pkg };
+          c.progress?.(`读取仓库 ${a.repo}`, { tool: "repo_meta", text: a.repo });
+          try { return await fetchRepoMeta(a.repo, c.signal); } catch (err) { throw err instanceof RepoError ? new ToolError(err.failure) : fail(err); }
         },
       },
       {

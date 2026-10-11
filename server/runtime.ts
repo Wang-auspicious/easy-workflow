@@ -57,6 +57,8 @@ export interface StationResult {
   data?: Record<string, unknown>;
   usage?: Usage;
   metrics?: AttemptMetrics;
+  /** Structured notes for the item's case file (Spec §33). */
+  caseNotes?: { section: string; text: string }[];
   error?: string;
   failure?:Failure;
   verdict?: { verdict: "pass" | "return" | "escalate" | "fix"; returnTo?: string; reason: string; fixes?: Fix[] };
@@ -402,6 +404,7 @@ export class Runtime {
     if (res.data && Object.keys(res.data).length) { Object.assign(t.data, res.data); this.journal.append({ kind: "token.data", token: t.id, patch: res.data }); }
     const metrics = res.metrics ?? (n.kind === "agent" || n.kind === "review" ? undefined : { time: { firstTokenMs: 0, outputMs: 0, toolMs: 0, programMs: ms, modelCalls: 0, toolCalls: 0 } });
     this.journal.append({ kind: "attempt.finished", attempt, ok: res.ok, summary: res.summary, ms, queuedMs, usage: res.usage, error: res.error, metrics });
+    for (const c of res.ok ? res.caseNotes ?? [] : []) this.journal.append({ kind: "case.noted", caseId: t.item, token: t.id, note: { station: n.key, section: c.section, text: c.text, by: n.key } });
     if (res.ok && n.kind !== "store") this.journal.append({ kind: "case.noted", caseId: t.item, token: t.id, note: { station: n.key, section: res.verdict ? `审核：${({ pass: "通过", return: "退回", escalate: "交人", fix: "要求修改" } as Record<string, string>)[res.verdict.verdict]}` : "结果", text: res.verdict?.reason && res.verdict.verdict !== "pass" ? `${res.summary}\n${res.verdict.reason}` : res.summary, by: "runtime" } });
     t.inflight.delete(n.key);
     t.notes.delete(n.key);
@@ -434,7 +437,10 @@ export class Runtime {
         else if (res.verdict.verdict === "escalate") this.toManual(t, n, res.verdict.reason);
         else this.complete(t, n.key);
       }
-    } else this.complete(t, n.key);
+    } else {
+      if (t.consult?.reviewer === n.key) this.closeConsult(t, "resolved", "复查通过");
+      this.complete(t, n.key);
+    }
     this.schedule();
   }
 
@@ -534,7 +540,8 @@ export class Runtime {
   /** A reviewer names fields and their owners; owners re-run in repair mode and reply straight back. */
   openConsult(t: TokenRun, reviewer: CompiledNode, fixes: Fix[], reason: string) {
     const usable = fixes.filter((f) => { const o = this.nodes.get(f.station); return o && this.runnable(o) && t.closure.has(f.station) && f.station !== reviewer.key; });
-    if (!usable.length) { this.toManual(t, reviewer, `审核要求修改，但没有指向可执行的负责工位：${reason}`); return; }
+    const unroutable = fixes.filter((f) => !usable.includes(f));
+    if (!usable.length || unroutable.length) { this.closeConsult(t, "manual", "需要站长处理"); this.toManual(t, reviewer, `${reviewer.name}发现需要站长处理的问题：${(unroutable.length ? unroutable : fixes).map((f) => f.problem).join("；") || reason}`); return; }
     const queue: (Fix & { id: string })[] = [];
     for (const f of usable) {
       const key = `consult:${reviewer.key}>${f.station}`;

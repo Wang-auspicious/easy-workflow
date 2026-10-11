@@ -42,7 +42,7 @@ const isTls = (e: unknown) => /certificate|CERT_|TLS|SSL/i.test(errorText(e));
 const transientError = (e: unknown) => !isTls(e) && /timeout|ECONNRESET|ECONNREFUSED|socket|fetch failed|UND_ERR/i.test(errorText(e));
 
 /** GET a URL as text. Throws the underlying error (classified by callers) after one retry. */
-export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?: number; ttlMs?: number; cache?: boolean; accept?: string } = {}): Promise<WebResult> {
+export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?: number; ttlMs?: number; cache?: boolean; accept?: string; headers?: Record<string, string> } = {}): Promise<WebResult> {
   const key = crypto.createHash("sha1").update(url).digest("hex");
   const file = cacheDir && opts.cache !== false ? path.join(cacheDir, key.slice(0, 2), `${key}.json`) : null;
   const ttl = opts.ttlMs ?? defaultTtl;
@@ -62,7 +62,7 @@ export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?
     try {
       tried.push(round ? "http-retry" : "http");
       const signal = AbortSignal.any([...(opts.signal ? [opts.signal] : []), AbortSignal.timeout(opts.timeout ?? 20000)]);
-      const res = await networkFetch(url, { redirect: "follow", signal, headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.6", ...(opts.accept ? { Accept: opts.accept } : {}) } });
+      const res = await networkFetch(url, { redirect: "follow", signal, headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.6", ...(opts.accept ? { Accept: opts.accept } : {}), ...(opts.headers ?? {}) } });
       const body = await res.text();
       const out: WebResult = { status: res.status, finalUrl: res.url || url, body, contentType: res.headers.get("content-type") ?? "", via: "http", tried };
       if (round === 0 && transient(res.status)) retry = true;
@@ -84,3 +84,13 @@ export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?
   }
   throw Object.assign(new Error(`request failed twice: ${url}`), { tried });
 }
+
+/* Pages an agent actually read during recent work, so checks can verify quotes against
+ * what was read through the toolbox, not only against pre-fetched excerpts. */
+const reads = new Map<string, string>();
+export function rememberRead(url: string, text: string) {
+  const key = url.replace(/[#].*$/, "").replace(/\/+$/, "");
+  reads.delete(key); reads.set(key, text.slice(0, 60000));
+  while (reads.size > 400) reads.delete(reads.keys().next().value!);
+}
+export function readText(url: string) { return reads.get(url.replace(/[#].*$/, "").replace(/\/+$/, "")); }
