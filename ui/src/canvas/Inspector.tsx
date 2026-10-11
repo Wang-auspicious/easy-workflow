@@ -3,9 +3,10 @@
 // sub-agent view: input, thoughts, folded tool steps with their evidence, current activity.
 // A token card shows that item's evidence chain from URL to publication.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
 import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, CircleMinus, Check, AlertTriangle, Loader2, ExternalLink } from "lucide-react";
 import type { CompiledNode, EvidenceRef } from "../../../shared/types.ts";
-import { median, quantile, type AttemptState } from "../../../shared/project.ts";
+import { median, quantile, type AttemptState, type TokenState } from "../../../shared/project.ts";
 import { roleColors } from "../../../shared/palette.ts";
 import { attach, getState, setState, useStore, type Inspector } from "../store.ts";
 import { actions, api } from "../api.ts";
@@ -236,13 +237,15 @@ function Trace({ a, node, c, now }: { a: AttemptState; node: CompiledNode; c: st
   const [inputOpen, setInputOpen] = useState(false);
   const token = s.fs.tokens[a.token];
   const groups = useMemo(() => {
-    const out: { kind: "say" | "tools"; items: AttemptState["steps"] }[] = [];
+    const out: { kind: "say" | "tools" | "think"; items: AttemptState["steps"] }[] = [];
     for (const st of a.steps) {
       const tool = st.step?.tool ?? "say";
       const isTool = ["browser", "shot", "reject", "http", "record", "webp"].includes(tool);
+      const kind = isTool ? "tools" : tool === "think" ? "think" : "say";
       const last = out[out.length - 1];
-      if (isTool && last?.kind === "tools") last.items.push(st);
-      else out.push({ kind: isTool ? "tools" : "say", items: [st] });
+      // Streamed reasoning arrives in fragments; one train of thought is one block.
+      if ((kind === "tools" || kind === "think") && last?.kind === kind) last.items.push(st);
+      else out.push({ kind, items: [st] });
     }
     return out;
   }, [a.steps.length, a.id]);
@@ -257,7 +260,7 @@ function Trace({ a, node, c, now }: { a: AttemptState; node: CompiledNode; c: st
       </button>
       {inputOpen && <div className="trace-input-body sel">{a.input}{token?.url ? `\n${token.url}` : ""}</div>}
       <div className="trace-steps">
-        {groups.map((g, gi) => g.kind === "say" ? g.items.map((st, i) => <SayRow key={`${gi}-${i}`} st={st} />) : (
+        {groups.map((g, gi) => g.kind === "say" ? g.items.map((st, i) => <SayRow key={`${gi}-${i}`} st={st} />) : g.kind === "think" ? <ThinkRow key={gi} items={g.items} /> : (
           <div key={gi} className="tool-group">
             <button className="tool-sum" onClick={() => setOpen((o) => ({ ...o, [gi]: !o[gi] }))}>
               <ChevronRight size={13} className={open[gi] ? "rot" : ""} />
@@ -299,6 +302,27 @@ function SayRow({ st }: { st: AttemptState["steps"][number] }) {
   );
 }
 
+/** Filler that carries no content once fragments are joined ("Hmm, but", "Actually", "H."). */
+const FILLER = /^(hmm+|actually|wait|ok(ay)?|so|but|well|right|good|fine|let me( think| see| check)?|hmm, but|[a-z]\.?|[a-z]\. ?\w{0,6})[\s,.:;!?…—-]*$/i;
+
+function thought(items: AttemptState["steps"]) {
+  return items.map((st) => st.text.trim()).filter((t) => t.length > 3 && !FILLER.test(t)).join(" ").replace(/\s+/g, " ").trim();
+}
+
+function ThinkRow({ items }: { items: AttemptState["steps"] }) {
+  const [open, setOpen] = useState(false);
+  const text = thought(items);
+  if (!text) return null;
+  const first = (text.match(/^.{12,}?[。.!?！？](\s|$)/)?.[0] ?? text).slice(0, 110);
+  return (
+    <button className={`think ${open ? "is-open" : ""}`} onClick={() => setOpen((o) => !o)}>
+      <ChevronRight size={13} className={open ? "rot" : ""} />
+      <span className="think-label">思考</span>
+      <span className="think-text sel">{open ? text : `${first}${first.length < text.length ? "…" : ""}`}</span>
+    </button>
+  );
+}
+
 function summarize(items: AttemptState["steps"]) {
   const count = (t: string) => items.filter((x) => x.step?.tool === t).length;
   const opened = items.filter((x) => x.text.startsWith("打开") || x.step?.tool === "http").length;
@@ -310,8 +334,13 @@ function EvThumb({ id, small }: { id: string; small?: boolean }) {
   const ev = getState().fs.evidence[id];
   if (!ev) return null;
   const tok = getState().fs.tokens[ev.token];
+  return <EvThumbBody ev={ev} tok={tok} small={small} />;
+}
+
+function EvThumbBody({ ev, tok, small }: { ev: EvidenceRef; tok?: TokenState; small?: boolean }) {
+  const hover = useHoverPreview(() => previewSet(ev));
   return (
-    <span className={`ev-thumb ${small ? "is-small" : ""}`}>
+    <span className={`ev-thumb ${small ? "is-small" : ""}`} {...(ev.kind === "image" || ev.kind === "video" ? hover : {})}>
       {ev.kind === "image" || ev.kind === "video" ? <img src={ev.poster ?? ev.card ?? ev.src} alt="" draggable={false} /> : <b>{ev.verdict}</b>}
       {!small && <button className="ev-wrong" onClick={(e) => { e.stopPropagation(); openCorrection([{ token: ev.token, node: ev.station, evidence: ev.id, label: `${tok?.item} · ${ev.label}` }], e.currentTarget); }}>不对</button>}
     </span>

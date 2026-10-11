@@ -1,5 +1,6 @@
 // Station identity first, execution metadata second, comparable workload metrics below.
 import { memo } from "react";
+import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
 import type { CompiledNode, EvidenceRef } from "../../../shared/types.ts";
 import { nodeLight, type NodeState } from "../../../shared/project.ts";
 import { roleColors } from "../../../shared/palette.ts";
@@ -99,26 +100,27 @@ function lightTip(l: string, waiting?: string) {
 
 
 function Strip({ items }: { items: EvidenceRef[] }) {
+  useStore((s) => s.flashes);
+  return <div className="strip">{items.map((ev, i) => <StripThumb key={`${ev.id}:${i}`} ev={ev} />)}</div>;
+}
+
+function StripThumb({ ev }: { ev: EvidenceRef }) {
   const flashes = useStore((s) => s.flashes);
-  const now = Date.now();
+  const tok = getState().fs.tokens[ev.token];
+  const isNew = flashes[ev.id] && Date.now() - flashes[ev.id] < 1600;
+  const open = () => toggleInspector(ev.token, "token");
+  const hover = useHoverPreview(() => previewSet(ev), open);
   return (
-    <div className="strip">
-      {items.map((ev, i) => {
-        const tok = getState().fs.tokens[ev.token];
-        const isNew = flashes[ev.id] && now - flashes[ev.id] < 1600;
-        return (
-          <div key={`${ev.id}:${i}`} className={`thumb tone-${ev.tone ?? "none"} ${isNew ? "is-new" : ""}`} data-tip={`${tok?.item ?? ""} · ${ev.label}${ev.verdict ? `：${ev.verdict}` : ""}`}
-            onPointerEnter={() => setState({ trail: ev.token })} onPointerLeave={() => setState({ trail: null })}
-            onClick={(e) => { e.stopPropagation(); toggleInspector(ev.token, "token"); }}>
-            <img src={ev.poster ?? ev.card ?? ev.src} alt="" draggable={false} loading="lazy" />
-            {ev.kind === "video" && <span className="play">▶</span>}
-            <div className="thumb-actions">
-              <button data-tip="加到对话附件" onClick={(e) => { e.stopPropagation(); attach({ type: "evidence", id: ev.id, label: `${tok?.item ?? ""} · ${ev.label}`, thumb: ev.poster ?? ev.card, tone: ev.tone === "bad" ? "bad" : undefined }); }}>＋</button>
-              <button data-tip="不对：纠错退回" onClick={(e) => { e.stopPropagation(); openCorrection([{ token: ev.token, node: ev.station, evidence: ev.id, label: `${tok?.item} · ${ev.label}` }], e.currentTarget as HTMLElement); }}>不对</button>
-            </div>
-          </div>
-        );
-      })}
+    <div className={`thumb tone-${ev.tone ?? "none"} ${isNew ? "is-new" : ""}`} data-tip={`${tok?.item ?? ""} · ${ev.label}${ev.verdict ? `：${ev.verdict}` : ""}`}
+      {...hover}
+      onPointerEnter={(e) => { hover.onPointerEnter(e); setState({ trail: ev.token }); }} onPointerLeave={() => { hover.onPointerLeave(); setState({ trail: null }); }}
+      onClick={(e) => { e.stopPropagation(); open(); }}>
+      <img src={ev.poster ?? ev.card ?? ev.src} alt="" draggable={false} loading="lazy" />
+      {ev.kind === "video" && <span className="play">▶</span>}
+      <div className="thumb-actions">
+        <button data-tip="加到对话附件" onClick={(e) => { e.stopPropagation(); attach({ type: "evidence", id: ev.id, label: `${tok?.item ?? ""} · ${ev.label}`, thumb: ev.poster ?? ev.card, tone: ev.tone === "bad" ? "bad" : undefined }); }}>＋</button>
+        <button data-tip="不对：纠错退回" onClick={(e) => { e.stopPropagation(); openCorrection([{ token: ev.token, node: ev.station, evidence: ev.id, label: `${tok?.item} · ${ev.label}` }], e.currentTarget as HTMLElement); }}>不对</button>
+      </div>
     </div>
   );
 }

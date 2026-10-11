@@ -320,3 +320,25 @@
 .rp-thumbs img { width: 64px; height: 40px; border-radius: 6px; object-fit: cover; object-position: top; box-shadow: 0 0 0 1px var(--line); }
 .rp-item-main { display: flex; flex-direction: column; min-width: 0; font-size: 12.5px; }
 .rp-item-main .muted { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------------------------------------------------------------- hover preview (rest 1s on an image) */
+.hp { position: fixed; z-index: 90; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-l); box-shadow: var(--shadow-3); overflow: hidden; cursor: zoom-in; animation: hp-in 140ms var(--ease) both; }
+.hp-stage { flex: 1; min-height: 0; background: var(--panel-2); display: grid; place-items: center; }
+.hp-stage img, .hp-stage video { width: 100%; height: 100%; object-fit: contain; display: block; }
+.hp-head { height: 34px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--ink); }
+.hp-head b { font-weight: 600; }
+.hp-where { color: var(--ink-3); font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.hp-ticks { display: inline-flex; gap: 3px; }
+.hp-ticks i { width: 18px; height: 3px; border-radius: 2px; background: var(--line-2); transition: background 120ms var(--ease); }
+.hp-ticks i.is-on { background: var(--accent); }
+@keyframes hp-in { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .hp { animation: none; } .hp-ticks i { transition: none; } }
+
+/* ---------------------------------------------------------------- folded reasoning in the work trace */
+.think { display: flex; gap: 6px; align-items: flex-start; width: 100%; text-align: left; padding: 3px 0; border: 0; background: none; color: var(--ink-3); font: inherit; font-size: 12.5px; line-height: 1.55; cursor: pointer; }
+.think svg { flex: none; margin-top: 3px; color: var(--ink-4); transition: transform 120ms var(--ease); }
+.think svg.rot { transform: rotate(90deg); }
+.think-label { flex: none; color: var(--ink-4); font-size: 11.5px; margin-top: 1px; }
+.think-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.think.is-open .think-text { white-space: normal; color: var(--ink-2); }
+.think:hover .think-label { color: var(--ink-2); }

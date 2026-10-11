@@ -80,7 +80,9 @@
      - 修好 runtime 的 `consultStep`：链上的审查员（如 shot-review）若返回 `return` / `fix`，现在会被忽略，需要正确处理（不能吞掉审查员的判定）。
    - 阅读员 ROLE.md 已补上"只有名字列表的目录不当 breadth，用 `media.firstScreen` 确认"。
 4. **截图审查员放行了没有预览的目录页。** 加一条程序检查：组件源的 breadth 首屏渲染预览少于 4 个时直接拒收（capture.ts 有 `previewsInViewport`）。
-5. **候选准备的健康预检让 tidy 变慢**（6.6s）。把 tidy 的资源改成 `http`，或者改为异步预检。
+5. **工作过程里的"思考"会丢内容**（站长截图里的半截句子）：`server/agent-station.ts` 的叙述只发出缓冲区最后一行（`thought.trim().split(/
+/).filter(Boolean).pop()`），前面几行直接丢掉。应改为发出完整缓冲内容，或只在一段说完时发一次，并过滤掉 "Hmm"、"Actually" 这类口头语。界面已经把连续的思考折叠成一段（Claude，`ui/src/canvas/Inspector.tsx`），后端修好后内容会完整。
+6. **候选准备的健康预检让 tidy 变慢**（6.6s）。把 tidy 的资源改成 `http`，或者改为异步预检。
 
 ### P2 规范里还没做的
 
