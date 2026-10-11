@@ -93,9 +93,9 @@ test("the factory composes a dense working area with a short vertical review bra
   for (const { node, place } of g.nodes) if (node.kind !== "source") {
     assert.ok(place.w >= 240 && place.h >= 170, `${node.key} must fit its title, metrics and status`);
   }
-  const review = g.place["curation/classify-review"], arbiter = g.place["curation/arbiter"];
+  const review = g.place["curation/kind-join"], arbiter = g.place["curation/arbiter"];
   assert.equal(review.x, arbiter.x);
-  const branch = g.edges.find((e) => e.edge.from === "curation/classify-review" && e.edge.to === "curation/arbiter")!;
+  const branch = g.edges.find((e) => e.edge.from === "curation/kind-join" && e.edge.to === "curation/arbiter")!;
   assert.equal(branch.fromPort.dir, "down");
   assert.equal(branch.toPort.dir, "up");
   assert.ok(branch.length <= arbiter.y - review.y - review.h + 1, "vertical neighbours must not detour sideways");
@@ -168,7 +168,7 @@ test("opening several capsules allocates separate line areas and preserves every
     const a = rectangles[i], b = rectangles[j];
     assert.ok(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y, `stations ${g.nodes[i].node.key} and ${g.nodes[j].node.key} overlap after expansion`);
   }
-  assert.equal(g.nodes.length, 29 + 9 + 5);
+  assert.equal(g.nodes.length, 34 + 9 + 5);
   assert.equal(g.capsules.length, 4);
 });
 
@@ -181,7 +181,7 @@ test("an empty compiled graph has finite canvas bounds", () => {
 test("logical phase bounds still contain their stations in the compact layout", () => {
   const f = compile([pack]), def = layoutFactory(f.nodes, f.edges, f.ui.order, f.ui.hints, f.ui.collapsed);
   const bays = def.bays!;
-  assert.deepEqual(bays.slice(0, 6).map((b) => b.name), ["来源接入", "候选与分流", "分类校验", "资源采集", "内容生成", "发布管理"]);
+  assert.deepEqual(bays.slice(0, 6).map((b) => b.name), ["来源接入", "候选与分流", "读懂与判定", "资源采集", "核验与著录", "终审与发布"]);
   for (const b of bays) for (const k of b.stations) {
     const p = def.pos[k] ?? def.capsules[b.line];
     assert.ok(p.x >= b.x && p.x + p.w <= b.x + b.w && p.y >= b.y && p.y + p.h <= b.y + b.h, `${k} sits inside bay ${b.name}`);

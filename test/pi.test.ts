@@ -55,8 +55,8 @@ test("Pi profile, structured station submission, repair and cancellation", { tim
       const result = await runAgentStation(definition, ctx(new AbortController().signal));
       assert.equal(result.ok, true); assert.deepEqual(result.data, { value: 7 });
       assert.equal(requestCount, 2);
-      assert.ok(JSON.stringify(bodies[0]).includes("H2 station contract v1"));
-      assert.ok(JSON.stringify(bodies[0]).includes("职责与场景"),"each model receives its own ROLE.md");
+      assert.ok(JSON.stringify(bodies[0]).includes("H2 station contract v2"));
+      assert.ok(JSON.stringify(bodies[0]).includes("七个问题"),"each model receives its own ROLE.md");
       assert.equal(bodies[0].tools.length, 1, "station agents get only their own submit tool");
       assert.ok(JSON.stringify(bodies[1]).includes("value must be positive"));
       assert.equal(fs.readFileSync(path.join(dir, "auth.json"), "utf8"), authBefore);

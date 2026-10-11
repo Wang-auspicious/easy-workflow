@@ -120,7 +120,7 @@ export interface CompiledEdge {
 
 /* ------------------------------------------------------------------ journal */
 
-export interface Usage { input: number; output: number; cost: number }
+export interface Usage { input: number; output: number; cost: number; cacheRead?: number; cacheWrite?: number }
 
 export interface EvidenceRef {
   id: string;
@@ -143,6 +143,16 @@ export interface EvidenceRef {
 
 export type StepDetail = { tool: string; text: string; ok?: boolean; evidence?: string[] };
 
+/** Token and time breakdown of one attempt (Spec §37). Estimated parts are char-based. */
+export interface AttemptMetrics {
+  tokens?: { system: number; context: number; caseFile: number; input: number; images: number; toolDefs: number; toolResults: number; output: number; actualInput: number; actualOutput: number; cacheRead: number; cacheWrite: number };
+  time?: { firstTokenMs: number; outputMs: number; toolMs: number; programMs: number; modelCalls: number; toolCalls: number };
+}
+
+export interface Alert { id: string; level: "red"; kind: "tls" | "auth" | "model" | "preflight" | "browser"; message: string; nextAction?: string; token?: string; item?: string; node?: string; url?: string; tab?: string }
+export interface PreflightCheck { id: string; label: string; ok: boolean; detail: string; fix?: string; ms: number }
+export interface CaseNote { station: string; section: string; text: string; by: string }
+
 export type JournalEvent =
   | { kind: "factory.loaded"; digest: string; specVersion: string }
   | { kind: "run.started"; runId: string; title: string }
@@ -154,7 +164,7 @@ export type JournalEvent =
   | { kind: "token.queued"; token: string; node: string; from?: string; returned?: boolean }
   | { kind: "attempt.started"; attempt: string; token: string; node: string; worker: string; input: string }
   | { kind: "attempt.progress"; attempt: string; text: string; step?: StepDetail }
-  | { kind: "attempt.finished"; attempt: string; ok: boolean; summary: string; ms: number; queuedMs: number; usage?: Usage; error?: string; output?: Record<string, unknown>; cancelled?:boolean }
+  | { kind: "attempt.finished"; attempt: string; ok: boolean; summary: string; ms: number; queuedMs: number; usage?: Usage; error?: string; output?: Record<string, unknown>; cancelled?:boolean; metrics?: AttemptMetrics }
   | { kind: "candidate.disposition"; candidate: Omit<import("./failures.ts").CandidateRecovery,"at"|"attempts"> }
   | { kind: "evidence.added"; evidence: EvidenceRef }
   | { kind: "review.verdict"; token: string; node: string; verdict: "pass" | "return" | "escalate"; returnTo?: string; reason: string }
@@ -174,7 +184,15 @@ export type JournalEvent =
   | { kind: "chat.message"; id: string; turn: string; message: import("./conversation.ts").PiMessage }
   | { kind: "spec.patched"; patch: string; summary: string; status: "proposed" | "accepted" | "rejected" }
   | { kind: "resource.sample"; used: Record<string, number>; limits: Record<string, number>; freeMemMB: number; waiting?: Record<string, string> }
-  | { kind: "report.ready"; runId: string };
+  | { kind: "report.ready"; runId: string }
+  | { kind: "alert.raised"; alert: Alert }
+  | { kind: "alert.cleared"; id: string; reason: string }
+  | { kind: "preflight.checked"; ok: boolean; checks: PreflightCheck[] }
+  | { kind: "case.noted"; caseId: string; token: string; note: CaseNote }
+  | { kind: "context.noted"; node: string; note: { kind: "note" | "instruction" | "lesson" | "issue"; text: string; by: string } }
+  | { kind: "consult.opened"; consult: string; token: string; reviewer: string; owner: string; fields: string[]; problem: string; round: number }
+  | { kind: "consult.replied"; consult: string; token: string; owner: string; reply: string; ok: boolean }
+  | { kind: "consult.closed"; consult: string; token: string; outcome: "resolved" | "manual"; reason: string };
 
 export type Stamped<E extends JournalEvent = JournalEvent> = E & { seq: number; at: number; run: string };
 

@@ -2,6 +2,7 @@
 // per row, its preview images in order) or image-only tiles; filter, single / Ctrl / Shift /
 // box select — the selection *is* the chat's attachment strip — and one-click correction.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
 import { Rows3, LayoutGrid, Search, AlertTriangle, X, Undo2, ArrowRight, FileText, ClipboardCheck } from "lucide-react";
 import type { Attachment, EvidenceRef } from "../../../shared/types.ts";
 import type { TokenState } from "../../../shared/project.ts";
@@ -220,8 +221,10 @@ function goCanvas(t: TokenState) {
 function Ev({ e, t, sel, cur, tile, onClick, onZoom }: { e: EvidenceRef; t: TokenState; sel: boolean; cur: boolean; tile?: boolean; onClick: (ev: React.MouseEvent) => void; onZoom: () => void }) {
   const corrected = t.corrections > 0 && Object.keys(t.rounds).includes(e.station);
   const returning = t.status === "active" && t.at.includes(e.station);
+  const visual = e.kind === "image" || e.kind === "video";
+  const hover = useHoverPreview(() => previewSet(e), onZoom);
   return (
-    <div className={`ev ${sel ? "is-sel" : ""} ${cur ? "is-cur" : ""} ${tile ? "is-tile" : ""}`} data-ev={e.id} onClick={onClick} onDoubleClick={onZoom}>
+    <div className={`ev ${sel ? "is-sel" : ""} ${cur ? "is-cur" : ""} ${tile ? "is-tile" : ""}`} data-ev={e.id} onClick={onClick} onDoubleClick={onZoom} {...(visual ? hover : {})}>
       {e.kind==="image"||e.kind==="video"?<img src={e.poster ?? e.card ?? e.src} alt="" draggable={false} loading="lazy" />:<div className={`ev-document tone-${e.tone??"none"}`}><header>{e.kind==="verdict"?<ClipboardCheck size={17}/>:<FileText size={17}/>}<b>{e.label}</b></header><span>{e.verdict||"查看文字证据"}</span></div>}
       {(e.kind==="image"||e.kind==="video")&&<span className="ev-role">{ROLE_ZH[String(e.meta?.role)] ?? (e.kind === "video" ? "录屏" : e.label)}</span>}
       {e.kind === "video" && <span className="play">▶</span>}

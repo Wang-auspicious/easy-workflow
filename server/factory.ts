@@ -19,6 +19,13 @@ import { loadCatalog, loadPublished, type CatalogEntry } from "../packs/vislexic
 import { ControlError } from "./errors.ts";
 import { classifyFailure, type Failure } from "../shared/failures.ts";
 import { readRole } from "./roles.ts";
+import { ensureProject, projectPaths, type ProjectInfo } from "./workspace.ts";
+import { configureNetwork } from "./network.ts";
+import { Docs } from "./docs.ts";
+import { Toolbox } from "./toolbox.ts";
+import { configureAgentStations } from "./agent-station.ts";
+import { preflight } from "./preflight.ts";
+import type { Alert } from "../shared/types.ts";
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -37,12 +44,21 @@ export class Factory {
   patches: Patch[] = [];
   settings: Settings;
   ephemeral = new Set<(e: Record<string, unknown>) => void>();
+  project: ProjectInfo;
+  docs!: Docs;
+  toolbox!: Toolbox;
 
   constructor() {
     fs.mkdirSync(VAR, { recursive: true });
-    this.journal = new Journal(path.join(VAR, "journal.db"), process.env.FACTORY_READONLY === "1");
+    const readOnly = process.env.FACTORY_READONLY === "1";
+    this.project = readOnly ? { name: path.basename(VAR), dir: VAR, pack: "vislexicon", createdAt: "" } : ensureProject(VAR, process.env.FACTORY_PROJECT_NAME ?? path.basename(VAR));
+    if (!readOnly && process.env.FACTORY_HTTP_CACHE !== "0") configureNetwork({ cacheDir: projectPaths(VAR).cache });
+    this.journal = new Journal(path.join(VAR, "journal.db"), readOnly);
     this.store = new EvidenceStore(path.join(VAR, "evidence"));
-    this.settings = { browser: 3, model: 8, cpu: 4, http: 6, memoryFloorMB: 1024, socialPerMinute: 6, socialPerDay: 300, ...this.readJson(path.join(VAR, "settings.json"), {}) };
+    const saved = this.readJson<Partial<Settings> & { browserCapV2?: boolean }>(path.join(VAR, "settings.json"), {});
+    // Browser pages were capped at three before Spec §30.6; lift old saved caps once to the new default.
+    if (!saved.browserCapV2 && (saved.browser ?? 0) <= 3) delete saved.browser;
+    this.settings = { browser: 8, model: 8, cpu: 4, http: 6, memoryFloorMB: 1024, socialPerMinute: 6, socialPerDay: 300, ...saved };
     this.patches = this.readJson(path.join(VAR, "patches.json"), []);
   }
 
@@ -56,6 +72,9 @@ export class Factory {
     this.journal.subscribe((e) => apply(this.state, e));
     if (process.env.FACTORY_READONLY !== "1" && this.state.digest !== this.compiled.digest) this.journal.append({ kind: "factory.loaded", digest: this.compiled.digest, specVersion: this.compiled.specVersion });
     this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
+    this.docs = new Docs(this, VAR, this.project.name);
+    this.toolbox = new Toolbox({ journal: this.journal, broker: this.broker, docs: () => this.docs });
+    configureAgentStations({ docs: () => this.docs, toolbox: () => this.toolbox });
     const defs = agentDefs(this.store);
     const services: Services = {
       store: this.store, workDir: path.join(VAR, "work"), publishDir: path.join(VAR, "published"),
@@ -70,6 +89,7 @@ export class Factory {
     this.runtime = new Runtime(this.compiled, this.journal, this.broker, pack.conditions, executors);
     this.wireRecovery();
     if (process.env.FACTORY_READONLY === "1") { this.catalog = loadCatalog(); return; }
+    this.wireDocs();
     void warmStyleLib();
     this.loadStock();
     this.recoverLegacyFailures();
@@ -101,8 +121,57 @@ export class Factory {
 
   private hostOf(u: string) { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return u; } }
 
+  /* -------------------------------------------------------------- documents, alerts, preflight (Spec §30–§31) */
+
+  private wireDocs() {
+    this.journal.subscribe((e) => {
+      const a = e.kind === "attempt.finished" || e.kind === "attempt.started" ? this.state.attempts[e.attempt] : undefined;
+      if (a) { this.docs.schedule("context", a.node); const t = this.state.tokens[a.token]; if (t) this.docs.schedule("case", t.item); }
+      else if (e.kind === "case.noted") this.docs.schedule("case", e.caseId);
+      else if (e.kind === "context.noted") this.docs.schedule("context", e.node);
+      else if (e.kind === "token.finished" || e.kind === "consult.opened" || e.kind === "consult.replied" || e.kind === "consult.closed") { const t = this.state.tokens[e.token]; if (t) this.docs.schedule("case", t.item); }
+    });
+    try { this.docs.writeAllContexts(); } catch (err) { console.warn("contexts", (err as Error).message); }
+  }
+
+  raiseAlert(alert: Alert) {
+    if (this.state.alerts?.[alert.id]) return;
+    this.journal.append({ kind: "alert.raised", alert });
+    if (alert.kind === "model") this.broker.modelHold = alert.message;
+  }
+
+  clearAlert(id: string, reason: string) {
+    const a = this.state.alerts?.[id];
+    if (!a) return false;
+    this.journal.append({ kind: "alert.cleared", id, reason });
+    if (a.kind === "model" && !Object.values(this.state.alerts ?? {}).some((x) => x.kind === "model")) { this.broker.modelHold = null; this.runtime.schedule(); }
+    return true;
+  }
+
+  private lastPreflight = 0;
+  /** Runs the health check before a run starts or resumes; throws with the failed items. */
+  async ensureReady(force = false) {
+    if (process.env.FACTORY_PREFLIGHT === "0" || process.env.FACTORY_READONLY === "1") return null;
+    if (!force && this.state.preflight?.ok && Date.now() - this.lastPreflight < 10 * 60_000) return this.state.preflight;
+    const r = await preflight(VAR, this.broker);
+    this.lastPreflight = Date.now();
+    this.journal.append({ kind: "preflight.checked", ok: r.ok, checks: r.checks });
+    if (!r.ok) {
+      const bad = r.checks.filter((c) => !c.ok);
+      this.raiseAlert({ id: "preflight", level: "red", kind: "preflight", message: `开跑体检未通过：${bad.map((c) => `${c.label}（${c.detail}）`).join("；")}`, nextAction: bad.map((c) => c.fix).filter(Boolean).join("；") || "按 ENV.md 修复后重试" });
+      throw new ControlError(412, "preflight_failed", `开跑体检未通过：${bad.map((c) => c.label).join("、")}`, bad);
+    }
+    this.clearAlert("preflight", "体检通过");
+    if (r.checks.find((c) => c.id === "model")?.ok) for (const a of Object.values(this.state.alerts ?? {})) if (a.kind === "model") this.clearAlert(a.id, "体检确认模型可用");
+    return r;
+  }
+
   private wireRecovery() {
     this.runtime.onRecovery = (token, failure) => this.recordRecovery(token, failure);
+    this.runtime.onAlert = (token, node, failure) => {
+      const kind: Alert["kind"] = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" ? "model" : "auth";
+      this.raiseAlert({ id: kind === "model" ? "model" : `${kind}:${token.item}`, level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: failure.url ?? token.url });
+    };
     this.runtime.onPark = token => this.recordRecovery(token, {tag:"run_ended",category:"system",message:"本轮结束，工作尚未完成",url:token.url,retryable:true});
   }
 
@@ -164,10 +233,12 @@ export class Factory {
     if(this.runtime.paused&&this.runtime.running)throw new ControlError(409,"run_paused","请先继续或结束当前暂停的轮次");
     const selected=this.candidateFailures({tag:filter.tag,disposition:"retry"}).filter(c=>!filter.items||filter.items.includes(c.item)).slice(0,filter.count);
     if(!selected.length)return [];
+    for(const c of selected)for(const k of ["tls","auth"])this.clearAlert(`${k}:${c.item}`,"站长已处理，按原因重试");
     if(!this.runtime.running)this.runtime.start(`失败重试 × ${selected.length}`);
     return selected.map(c=>{
       const previous=this.state.tokens[c.token];
-      const failedAt=filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode;
+      const legacy:Record<string,string>={"curation/fetch":"curation/scout"};
+      const failedAt=filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode&&(legacy[previous.finishedAtNode]??previous.finishedAtNode);
       const checkpoint=previous?.data.canonical&&failedAt&&this.compiled.nodes.some(n=>n.key===failedAt&&this.runtime.runnable(n))?failedAt:"candidates/tidy";
       const data:Record<string,unknown>=checkpoint==="candidates/tidy"?{}:structuredClone(previous.data);
       delete data.failure;delete data.gate;delete data.digest;
@@ -215,18 +286,18 @@ export class Factory {
       const url = canonical(c.canonicalUrl) ?? c.canonicalUrl;
       out.push(this.runtime.create("candidates/route", {
         item: c.id, url, title: c.name, source: "candidates/pool", category: c.category,
-        data: { canonical: url, host: this.hostOf(url), catalog: { category: c.category, subcategories: c.subcategories, descriptionZh: c.descriptionZh } },
+        data: { canonical: url, host: this.hostOf(url), catalogEntry: { category: c.category, subcategories: c.subcategories, descriptionZh: c.descriptionZh } },
       }));
     }
     return out;
   }
 
   /** Hand-pasted URLs enter the candidate layer at 整理 and pass the pool express. */
-  feed(urls: string[]) {
+  feed(urls: string[], opts: { rerunPublished?: boolean } = {}) {
     const clean = [...new Set(urls.map((u) => u.trim()).filter(Boolean))];
     if (!clean.length) return [];
     if (!this.runtime.running) this.runtime.start(`手贴 × ${clean.length}`);
-    return clean.map((u) => this.runtime.create("candidates/tidy", { item: this.hostOf(canonical(u) ?? u), url: u, source: "manual", data: { express: true } }));
+    return clean.map((u) => this.runtime.create("candidates/tidy", { item: this.hostOf(canonical(u) ?? u), url: u, source: "manual", data: { express: true, ...(opts.rerunPublished ? { rerunPublished: true } : {}) } }));
   }
 
   /* -------------------------------------------------------------- restart */
@@ -295,7 +366,7 @@ export class Factory {
 
   saveSettings(next: Partial<Settings>) {
     this.settings = { ...this.settings, ...next };
-    fs.writeFileSync(path.join(VAR, "settings.json"), JSON.stringify(this.settings, null, 2));
+    fs.writeFileSync(path.join(VAR, "settings.json"), JSON.stringify({ ...this.settings, browserCapV2: true }, null, 2));
     Object.assign(this.broker.limits, { browser: this.settings.browser, model: this.settings.model, cpu: this.settings.cpu, http: this.settings.http });
     this.broker.memoryFloorMB = this.settings.memoryFloorMB;
     this.runtime.schedule();

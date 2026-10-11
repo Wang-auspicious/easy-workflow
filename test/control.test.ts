@@ -13,7 +13,7 @@ const secret = "factory-test-only";
 async function start(dir: string, readOnly = false) {
   const child = fork(path.join(root, "server/main.ts"), [], {
     cwd: root, execArgv: [], stdio: ["ignore", "pipe", "pipe", "ipc"],
-    env: { ...process.env, FACTORY_DISCOVERY: "0", FACTORY_ROOT: root, FACTORY_PORT: "0", FACTORY_TOKEN: secret,
+    env: { ...process.env, FACTORY_DISCOVERY: "0", FACTORY_PREFLIGHT: "0", FACTORY_HTTP_CACHE: "0", FACTORY_ROOT: root, FACTORY_PORT: "0", FACTORY_TOKEN: secret,
       FACTORY_VAR: dir, FACTORY_LAYOUT: path.join(dir, "layout.json"), FACTORY_START_PAUSED: "1", FACTORY_READONLY: readOnly ? "1" : "0" },
   });
   let output = "";

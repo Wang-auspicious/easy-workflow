@@ -2,7 +2,7 @@
 // materialized view, the dashboard keeps another fed by SSE, and offline replay feeds
 // a recorded journal through the very same function (Spec §10.11, §11).
 import type {
-  Attachment, CompiledFactory, EvidenceRef, Stamped, StepDetail, TokenStatus, Usage,
+  Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, PreflightCheck, Stamped, StepDetail, TokenStatus, Usage,
 } from "./types.ts";
 import { legacyReply, type ConversationEntry } from "./conversation.ts";
 
@@ -37,7 +37,10 @@ export interface AttemptState {
   ms?: number;
   queuedMs?: number;
   output?: Record<string, unknown>;
+  metrics?: AttemptMetrics;
 }
+
+export interface ConsultState { id: string; token: string; reviewer: string; owner: string; fields: string[]; problem: string; round: number; openedAt: number; reply?: string; replyOk?: boolean; closedAt?: number; outcome?: "resolved" | "manual"; reason?: string }
 
 export interface TokenState {
   id: string;
@@ -129,10 +132,17 @@ export interface FactoryState {
   patches: { id: string; summary: string; status: string; at: number }[];
   reportReady: string | null;
   lockedStations: string[];
+  alerts: Record<string, Alert & { at: number }>;
+  preflight: { at: number; ok: boolean; checks: PreflightCheck[] } | null;
+  /** Case files keyed by item, so retries continue the same dossier (Spec §33). */
+  cases: Record<string, (CaseNote & { at: number; token: string })[]>;
+  /** Notes, instructions and issues per node for CONTEXT.md (Spec §31). */
+  contextNotes: Record<string, { kind: string; text: string; by: string; at: number }[]>;
+  consults: Record<string, ConsultState>;
 }
 
 const zeroUsage = (): Usage => ({ input: 0, output: 0, cost: 0 });
-const addUsage = (a: Usage, b?: Usage) => { if (b) { a.input += b.input; a.output += b.output; a.cost += b.cost; } };
+const addUsage = (a: Usage, b?: Usage) => { if (b) { a.input += b.input; a.output += b.output; a.cost += b.cost; if (b.cacheRead) a.cacheRead = (a.cacheRead ?? 0) + b.cacheRead; if (b.cacheWrite) a.cacheWrite = (a.cacheWrite ?? 0) + b.cacheWrite; } };
 
 export function emptyNode(key: string): NodeState {
   return {
@@ -152,6 +162,7 @@ export function initialState(factory?: CompiledFactory): FactoryState {
     totals: { usage: zeroUsage(), published: 0, manual: 0, failed: 0, rejected: 0, merged: 0, returned: 0, corrections: 0 },
     resources: { used: {}, limits: {}, freeMemMB: 0, at: 0, waiting: {} },
     transfers: [], patches: [], reportReady: null, lockedStations: [],
+    alerts: {}, preflight: null, cases: {}, contextNotes: {}, consults: {},
   };
 }
 
@@ -256,7 +267,7 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       if (!a) break;
       const ok = e.ok && !/^(打不开[：:]|HTTP [45]\d\d|网址无法解析)/.test(e.summary);
       a.cancelled = e.cancelled || e.error === "stale";
-      a.endedAt = e.at; a.ok = ok; a.summary = e.summary; a.error = e.error; a.ms = e.ms; a.queuedMs = e.queuedMs; a.output = e.output;
+      a.endedAt = e.at; a.ok = ok; a.summary = e.summary; a.error = e.error; a.ms = e.ms; a.queuedMs = e.queuedMs; a.output = e.output; a.metrics = e.metrics;
       addUsage(a.usage, e.usage);
       const n = node(a.node);
       remove(n.active, a.id);
@@ -388,6 +399,34 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       break;
     case "channel.emitted":
       break;
+    case "alert.raised":
+      (s.alerts ??= {})[e.alert.id] = { ...e.alert, at: e.at };
+      break;
+    case "alert.cleared":
+      if (s.alerts) delete s.alerts[e.id];
+      break;
+    case "preflight.checked":
+      s.preflight = { at: e.at, ok: e.ok, checks: e.checks };
+      break;
+    case "case.noted":
+      pushCap(((s.cases ??= {})[e.caseId] ??= []), { ...e.note, at: e.at, token: e.token }, 400);
+      break;
+    case "context.noted":
+      pushCap(((s.contextNotes ??= {})[e.node] ??= []), { ...e.note, at: e.at }, 40);
+      break;
+    case "consult.opened":
+      (s.consults ??= {})[e.consult] = { id: e.consult, token: e.token, reviewer: e.reviewer, owner: e.owner, fields: e.fields, problem: e.problem, round: e.round, openedAt: e.at };
+      break;
+    case "consult.replied": {
+      const c = s.consults?.[e.consult];
+      if (c) { c.reply = e.reply; c.replyOk = e.ok; }
+      break;
+    }
+    case "consult.closed": {
+      const c = s.consults?.[e.consult];
+      if (c) { c.closedAt = e.at; c.outcome = e.outcome; c.reason = e.reason; }
+      break;
+    }
   }
   return s;
 }

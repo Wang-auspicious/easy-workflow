@@ -14,6 +14,7 @@ import { Settings } from "./views/Settings.tsx";
 import { Report } from "./report/Report.tsx";
 import { Tooltip } from "./shell/Tooltip.tsx";
 import { Toasts } from "./shell/Toasts.tsx";
+import { HoverPreviewHost } from "./shell/HoverPreview.tsx";
 
 export function App() {
   const ready = useStore((s) => s.ready);
@@ -53,6 +54,7 @@ export function App() {
       <Chat />
       <Tooltip />
       <Toasts />
+      <HoverPreviewHost />
     </div>
   );
 }

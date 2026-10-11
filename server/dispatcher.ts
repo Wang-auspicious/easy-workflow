@@ -36,7 +36,7 @@ export class Dispatcher {
     if (this.agent) return this.agent;
     const { stream, model } = models();
     this.agent = new Agent({
-      initialState: { systemPrompt: readRole("dispatcher").content + "\n\n" + SYSTEM + "\n\n" + this.control.bootstrap().instructions, model, thinkingLevel: "off", tools: this.control.agentTools() as never },
+      initialState: { systemPrompt: (this.f.docs ? this.f.docs.envelope("dispatcher").text : readRole("dispatcher").content) + "\n\n" + SYSTEM + "\n\n" + this.control.bootstrap().instructions, model, thinkingLevel: "off", tools: this.control.agentTools() as never },
       streamFn: stream,
       sessionId: "factory-dispatcher",
       // Bounded memory view: keep the newest turns (Spec §5.1 — OptChat evaluation pending, R8).
