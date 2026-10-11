@@ -356,7 +356,7 @@ const proof: Tool = async (ctx, svc) => {
   if(usesStage){const extra=scoreLinks([...breadthLinks,...homeLinks],{pathPatterns:['iframe[.]html','demo|example|playground','/components/'],linkText:['playground','examples','preview','demo','button','grid','dialog','table']}).map(l=>l.href);candidates=[...new Set([...extra,...candidates])];}
   const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string}>|undefined)?.proof;
   const taken = new Set([norm(String(ctx.token.data.canonical)), norm(shots.breadth?.href ?? ""), norm(shots.identity?.href ?? ""), ...(((ctx.token.data.rejectedPages as string[]) ?? []).map(norm))]);
-  if(repair&&repair.action!=="replace-page"&&repair.url)candidates.unshift(repair.url);
+  if(repair&&repair.action!=="replace-page"&&repair.url)candidates=[repair.url];
   else if (ctx.redo && shots.proof?.href) taken.add(norm(shots.proof.href));
   candidates = [...new Set(candidates.map(norm))].filter((h) => !taken.has(h)).slice(0, 6);
   let usage: Usage | undefined;

@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { shoot } from '../packs/vislexicon/capture.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -141,6 +142,13 @@ try {
     await checkNativeLayers(app);
     await app.evaluate((_electron,id)=>globalThis.__factoryBrowser({action:'capture.begin',id}),lease.id);
     await workerPage.screenshot({path:path.join(artifacts,'background-capture.png'),timeout:4000});
+    await workerPage.setContent('<style>body{margin:0;background:#e02020;height:2400px}header{position:fixed;top:0;left:0;width:100%;height:120px;background:blue;z-index:99}#target{position:absolute;left:280px;top:500px;width:400px;height:1200px;background:#20d040}</style><header></header><div id="target"></div>');
+    const crop=await shoot(workerPage,{x:280,y:500,width:400,height:1000});
+    const pixel=await app.evaluate(({nativeImage},png)=>{const im=nativeImage.createFromBuffer(Buffer.from(png,'base64'));const b=im.toBitmap(),samples=Array.from({length:50},(_,n)=>{const i=((n*20+10)*400+200)*4;return b[i+1]>150&&b[i+2]<80;});return {size:im.getSize(),correct:samples.every(Boolean)};},crop.toString('base64'));
+    assert.deepEqual(pixel.size,{width:400,height:1000});
+    assert.ok(pixel.correct,'native clipped capture must contain the target across tiles, without the fixed header or page origin');
+    results.checks.push('native screenshot crop preserves offset coordinates and excludes the sidebar');
+    await workerPage.goto(fixtureURL);
     const screencast=await workerPage.context().newCDPSession(workerPage);let frameCount=0;
     screencast.on('Page.screencastFrame',e=>{frameCount++;void screencast.send('Page.screencastFrameAck',{sessionId:e.sessionId}).catch(()=>{});});
     await screencast.send('Page.startScreencast',{format:'jpeg',quality:80,everyNthFrame:1});

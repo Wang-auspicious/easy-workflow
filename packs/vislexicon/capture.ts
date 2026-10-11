@@ -163,7 +163,34 @@ export async function visit(page: Page, url: string, entryHost: string, say?: (t
 }
 
 export async function shoot(page: Page, clip?: { x: number; y: number; width: number; height: number }) {
-  return withBrowserFrames(page,()=>clip ? page.screenshot({ clip, fullPage: true }) : page.screenshot({ fullPage: false }));
+  return withBrowserFrames(page,async()=>{
+    if(!clip)return page.screenshot({fullPage:false});
+    // Full-page capture can reposition responsive/sticky content after the DOM
+    // coordinates were measured. Crop the real viewport pixels instead, and tile
+    // taller stages without changing viewport dimensions or reflowing the page.
+    const original=await page.evaluate(()=>({x:scrollX,y:scrollY}));
+    const width=Math.round(clip.width),height=Math.round(clip.height);
+    if(width<1||height<1||width*height>16_000_000)throw new Error('截图裁剪范围无效或过大');
+    const pixels=Buffer.alloc(width*height*4);
+    try{
+      for(let dy=0;dy<height;){
+        let rowHeight=height-dy;
+        for(let dx=0;dx<width;){
+          const x=Math.round(clip.x)+dx,y=Math.round(clip.y)+dy;
+          const view=await page.evaluate(async({x,y})=>{window.scrollTo(Math.max(0,x-32),Math.max(0,y-Math.min(160,innerHeight/4)));await new Promise<void>(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r())));return {x:scrollX,y:scrollY,w:innerWidth,h:innerHeight};},{x,y});
+          const sx=Math.round(x-view.x),sy=Math.round(y-view.y);
+          const w=Math.min(width-dx,view.w-sx),h=Math.min(height-dy,view.h-sy);
+          if(sx<0||sy<0||w<1||h<1)throw new Error('舞台裁剪超出页面范围');
+          const viewport=await page.screenshot({fullPage:false,scale:'css'});
+          const raw=execFileSync('ffmpeg',['-loglevel','error','-f','image2pipe','-i','pipe:0','-vf',`scale=${view.w}:${view.h}`,'-f','rawvideo','-pix_fmt','rgba','pipe:1'],{input:viewport,maxBuffer:1<<26});
+          for(let row=0;row<h;row++)raw.copy(pixels,((dy+row)*width+dx)*4,((sy+row)*view.w+sx)*4,((sy+row)*view.w+sx+w)*4);
+          dx+=w;rowHeight=Math.min(rowHeight,h);
+        }
+        dy+=rowHeight;
+      }
+      return execFileSync('ffmpeg',['-loglevel','error','-f','rawvideo','-pix_fmt','rgba','-s',`${width}x${height}`,'-i','pipe:0','-frames:v','1','-f','image2','-c:v','png','pipe:1'],{input:pixels,maxBuffer:1<<26});
+    }finally{await page.evaluate(p=>window.scrollTo(p.x,p.y),original).catch(()=>{});}
+  });
 }
 
 export function checkImage(png: Buffer, others: string[], { stage = false } = {}) {
