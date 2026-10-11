@@ -376,3 +376,67 @@
 .alert-item .alert-next { color: var(--ink-3); }
 .alert-actions { display: flex; gap: 6px; margin-top: 8px; }
 .is-recovery>.rail-alert-dot,.is-recovery .alert-kind>.rail-alert-dot{background:var(--ink-3);animation:none}.alert-summary{font-size:11.5px;color:var(--ink-3);margin:0 0 7px}.alert-kind .muted{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.alert-diagnostics{font-size:11px;color:var(--ink-3);margin-top:7px}.alert-diagnostics summary{cursor:pointer}.alert-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 var(--mono);max-height:160px;overflow:auto}.alert-pop{max-width:calc(100vw - 88px)}
+
+/* ---------------------------------------------- 工位卡片：人和他的实时输出 */
+/* 一个工位可能有好几个人（含自动 fork 出来的、被撤下的）。人一排，过程一块，记录一条时间线。 */
+.crew { display: flex; flex-direction: column; gap: 1px; margin-bottom: 10px; }
+.crew-title { display: flex; align-items: baseline; justify-content: space-between; font-size: 11px; color: var(--ink-3); padding: 0 2px 5px; }
+.crew-row { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto auto; align-items: center; gap: 9px; padding: 5px 7px 5px 4px; border-radius: 10px; text-align: left; font-size: 12.5px; color: var(--ink); }
+.crew-row:hover { background: var(--panel-2); }
+.crew-row.is-on { background: var(--panel-3); box-shadow: inset 0 0 0 1px var(--line-2); }
+.crew-row.is-retired { color: var(--ink-3); }
+.crew-row.is-retired .crew-name { text-decoration: line-through; text-decoration-color: var(--ink-4); }
+.crew-name { font-weight: 600; white-space: nowrap; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.crew-tag { display: inline-flex; align-items: center; gap: 2px; font-style: normal; font-size: 9.5px; font-weight: 600; padding: 1px 5px; border-radius: 5px; }
+.crew-tag--fork { background: oklch(0.95 0.04 150); color: oklch(0.45 0.12 150); }
+.crew-tag--gone { background: var(--panel-3); color: var(--ink-4); }
+.crew-now { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); max-width: 190px; }
+.crew-item { font-weight: 500; }
+.crew-done { font-size: 11px; }
+
+/* 一个人的过程：头（谁/在干什么/多久）、日志（可滚）、脚（结果）。 */
+.wt { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.wt-input { display: flex; align-items: center; gap: 7px; padding: 8px 11px; font-size: 12px; background: var(--panel-2); border-bottom: 1px solid var(--line); }
+.wt-input .grow { flex: 1; }
+.wt-item { font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wt-log { display: flex; flex-direction: column; gap: 5px; padding: 9px 11px 5px; max-height: 320px; overflow-y: auto; overscroll-behavior: contain; }
+.wt-empty { font-size: 12px; padding: 6px 2px; }
+.wt-say { display: flex; gap: 8px; align-items: flex-start; font-size: 12.5px; line-height: 1.55; color: var(--ink-2); }
+.wt-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 7px; flex: none; background: var(--tc); }
+.wt-say.is-ok .wt-dot { background: var(--ok); }
+.wt-say.is-bad { color: oklch(0.5 0.15 30); }
+.wt-say.is-bad .wt-dot { background: var(--bad); }
+.wt-say.is-submit { color: var(--ink); font-weight: 550; }
+.wt-say.is-model .wt-dot { background: oklch(0.65 0.12 285); }
+.wt-think > button { display: flex; align-items: flex-start; gap: 5px; width: 100%; text-align: left; font-size: 12px; color: var(--ink-3); padding: 1px 0; }
+.wt-think > button:hover { color: var(--ink-2); }
+.wt-think-label { flex: none; }
+.wt-think-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 展开也只在内部滚，卡片高度不炸。 */
+.wt-think-body { max-height: 150px; overflow-y: auto; overscroll-behavior: contain; margin: 4px 0 2px 17px; padding-left: 9px; border-left: 2px solid var(--line-2); font-size: 12px; line-height: 1.6; color: var(--ink-3); }
+.wt-tools-sum { display: flex; align-items: center; gap: 6px; width: 100%; padding: 3px 5px; margin-left: -5px; border-radius: 7px; font-size: 12.5px; color: var(--ink-2); text-align: left; }
+.wt-tools-sum:hover { background: var(--panel-2); }
+.wt-thumbs { display: flex; gap: 3px; margin-left: auto; }
+.wt-tools-body { margin: 2px 0 5px 16px; padding-left: 10px; border-left: 1.5px solid var(--line-2); display: flex; flex-direction: column; gap: 3px; max-height: 200px; overflow-y: auto; overscroll-behavior: contain; }
+.wt-tool-line { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-2); flex-wrap: wrap; }
+.wt-tool-line.is-bad { color: oklch(0.52 0.15 30); }
+.wt-tool-line.is-ok { color: var(--ink); }
+.wt-tool-name { font-size: 10.5px; padding: 0 5px; border-radius: 4px; background: var(--panel-3); color: var(--ink-3); }
+.wt-foot { display: flex; align-items: center; gap: 8px; padding: 8px 11px; font-size: 12px; border-top: 1px solid var(--line); background: var(--panel-2); }
+.wt-foot span:nth-child(2) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wt-foot.is-ok { color: oklch(0.42 0.12 150); }
+.wt-foot.is-bad { color: oklch(0.5 0.16 30); }
+.wt-foot.is-cancelled { color: var(--ink-3); }
+.wt-foot.is-running { color: var(--ink-2); }
+
+/* 人员与工位记录：fork / 到岗 / 撤下 / 提示，按时间排。 */
+.crew-log { margin-top: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
+.crew-log > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 10px; font-size: 11.5px; color: var(--ink-3); cursor: pointer; list-style: none; }
+.crew-log > summary::-webkit-details-marker { display: none; }
+.crew-log > summary:hover { color: var(--ink-2); }
+.crew-log-body { max-height: 168px; overflow-y: auto; overscroll-behavior: contain; padding: 0 10px 8px; display: flex; flex-direction: column; gap: 4px; }
+.crew-event { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--ink-3); }
+.crew-event span { flex: 1; min-width: 0; }
+.crew-event--fork { color: oklch(0.45 0.12 150); }
+.crew-event--retire { color: var(--ink-4); }
+.crew-event--note.is-warn { color: color-mix(in oklab, var(--bad) 78%, #333); }

@@ -5,7 +5,7 @@
 // 数据来自 transcript.ts；这里只负责显示和展开交互。
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, GitFork, Info, Wrench, Loader2, Check, X, User } from "lucide-react";
+import { AlertTriangle, GitFork, Info, Wrench, Loader2, Check, X, ChevronsDownUp, ChevronsUpDown, User } from "lucide-react";
 import type { CompiledFactory, Role } from "../../../shared/types.ts";
 import type { ConversationEntry } from "../../../shared/conversation.ts";
 import type { ChatMessage } from "../../../shared/project.ts";
@@ -15,6 +15,7 @@ import { botState } from "../canvas/Node.tsx";
 import { toggleInspector } from "../canvas/Canvas.tsx";
 import { Avatar, STATE_TEXT, grokShape } from "./Avatar.tsx";
 import { buildTranscript, DISPATCHER_HUE, type AvatarState, type TranscriptItem, type TranscriptPart } from "./transcript.ts";
+import { USER_AVATARS, userAvatarSrc } from "./user-avatars.ts";
 import { useNow } from "../util/useNow.ts";
 import type { DispatcherStatus, LiveChat } from "./live.ts";
 import "./PiBlocks.ts";
@@ -27,6 +28,10 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
 }) {
   const host = useRef<HTMLDivElement>(null);
   const [container, setContainer] = useState<HTMLElement | null>(null);
+  const [picker, setPicker] = useState(false);
+  const pick = (id?: string) => { if (id) { setState({ userAvatar: id }); setPicker(false); } else setPicker((p) => !p); };
+  /** null = 每张卡片各记各的；true/false = 全部展开 / 全部收起。 */
+  const [toolsOpen, setToolsOpen] = useState<boolean | null>(null);
   useStore((s) => s.version);
   const now = useNow(2000);
   const state = getState();
@@ -36,6 +41,7 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
     }),
     [entries, entries.length, live, dispatcher, state.fs.activity, state.factory, state.version, now],
   );
+  const tools = items.reduce((n, item) => n + (item.parts?.filter((p) => p.type === "tool").length ?? 0), 0);
   useLayoutEffect(() => {
     const el = host.current!;
     const shadow = el.shadowRoot ?? el.attachShadow({ mode: "open" });
@@ -52,7 +58,23 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
   return (
     <>
       <div className="pi-conversation" ref={host} aria-label="与 Easy Workflow 主调度的对话" />
-      {container ? createPortal(<div className="tr">{items.map((item) => <Row key={item.id} item={item} />)}</div>, container) : null}
+      {container ? createPortal(
+        <div className="tr">
+          {tools > 0 && (
+            <div className="tr-bar">
+              <span className="muted">{tools} 次工具调用</span>
+              <span className="grow" />
+              <button className="tr-bar-btn" onClick={() => setToolsOpen(toolsOpen === false ? true : false)}>
+                {toolsOpen === false ? <ChevronsUpDown size={12} /> : <ChevronsDownUp size={12} />}
+                {toolsOpen === false ? "全部展开" : "全部收起"}
+              </button>
+            </div>
+          )}
+          {items.map((item) => (
+            <Row key={item.id} item={item} toolsOpen={toolsOpen}
+              picker={picker && item.actor.kind === "user"} onPick={pick} />
+          ))}
+        </div>, container) : null}
     </>
   );
 }
@@ -73,15 +95,37 @@ function stationLook(factory: CompiledFactory | null, bots: Record<string, numbe
 
 const time = (t: number) => new Date(t).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 
-function Row({ item }: { item: TranscriptItem }) {
+function Row({ item, toolsOpen, picker, onPick }: {
+  item: TranscriptItem; toolsOpen: boolean | null; picker: boolean; onPick: (id?: string) => void;
+}) {
   const station = item.actor.kind === "station";
+  const me = item.actor.kind === "user";
+  const userAvatar = useStore((s) => s.userAvatar);
   const open = () => { const key = item.actor.node; if (!key) return; setState({ view: "canvas" }); toggleInspector(key); };
   return (
     <article className={`tr-row tr-row--${item.actor.kind}${item.tone ? ` tr-row--${item.tone}` : ""}`} style={{ ["--hue" as string]: item.actor.hue }}>
       <div className="tr-av">
-        {item.actor.kind === "user"
-          ? <span className="tr-av-user" title="你"><User size={15} /></span>
-          : <Avatar shape={item.actor.shape} hue={item.actor.hue} state={item.actor.state} size={34} title={`${item.actor.name} · ${STATE_TEXT[item.actor.state]}`} />}
+        {me ? (
+          <span className="tr-av-pick">
+            <button onClick={() => onPick()} data-tip="换一张你的头像" aria-label="换一张你的头像" aria-expanded={picker}>
+              <img src={userAvatarSrc(userAvatar)} alt="" draggable={false} />
+            </button>
+            {picker && (
+              <span className="tr-av-menu" role="menu">
+                <span className="tr-av-menu-title">选一张你的头像</span>
+                {USER_AVATARS.map((a) => (
+                  <button key={a.id} role="menuitemradio" aria-checked={a.id === userAvatar} className={a.id === userAvatar ? "is-on" : ""}
+                    onClick={() => onPick(a.id)} title={a.hint}>
+                    <img src={userAvatarSrc(a.id)} alt="" draggable={false} />
+                    <span>{a.name}</span>
+                  </button>
+                ))}
+              </span>
+            )}
+          </span>
+        ) : (
+          <Avatar shape={item.actor.shape} hue={item.actor.hue} state={item.actor.state} size={34} title={`${item.actor.name} · ${STATE_TEXT[item.actor.state]}`} />
+        )}
       </div>
       <div className="tr-main">
         <header className="tr-head">
@@ -89,20 +133,22 @@ function Row({ item }: { item: TranscriptItem }) {
             ? <button className="tr-who tr-who--link" onClick={open} data-tip="在画布上打开这个工位">{item.actor.name}</button>
             : <b className="tr-who">{item.actor.name}</b>}
           <time className="tr-time num">{time(item.at)}</time>
-          {item.actor.kind !== "user" && <span className={`tr-state tr-state--${item.actor.state}`}>{STATE_TEXT[item.actor.state]}</span>}
+          {!me && <span className={`tr-state tr-state--${item.actor.state}`}>{STATE_TEXT[item.actor.state]}</span>}
           {item.tone === "fork" && <GitFork size={11} className="tr-tone" />}
           {item.tone === "warn" && <AlertTriangle size={11} className="tr-tone" />}
           {item.tone === "info" && station && <Info size={11} className="tr-tone" />}
         </header>
         {item.notice !== undefined
           ? <p className="tr-notice">{item.notice}</p>
-          : (item.parts ?? []).map((part, i) => <Part key={i} part={part} streaming={Boolean(item.streaming) && i === (item.parts?.length ?? 0) - 1} />)}
+          : (item.parts ?? []).map((part, i) => (
+            <Part key={i} part={part} toolsOpen={toolsOpen} streaming={Boolean(item.streaming) && i === (item.parts?.length ?? 0) - 1} />
+          ))}
       </div>
     </article>
   );
 }
 
-function Part({ part, streaming }: { part: TranscriptPart; streaming?: boolean }) {
+function Part({ part, streaming, toolsOpen }: { part: TranscriptPart; streaming?: boolean; toolsOpen: boolean | null }) {
   if (part.type === "text") return <div className={`tr-text${streaming ? " is-streaming" : ""}`}><Markdown text={part.text} /></div>;
   if (part.type === "attachments") {
     return <div className="tr-atts">{part.items.map((a) => <span key={`${a.type}:${a.id}`} className="tr-att" title={a.label}>{a.label}</span>)}</div>;
@@ -111,7 +157,8 @@ function Part({ part, streaming }: { part: TranscriptPart; streaming?: boolean }
     return (
       <details className="tr-think" open={part.streaming}>
         <summary><span className={`tr-arrow${part.streaming ? " is-live" : ""}`}>›</span><span className={part.streaming ? "is-live" : ""}>思考过程</span></summary>
-        <Markdown text={part.text} />
+        {/* 内部滚动：思考再长也只占一小块，不把整屏推开。 */}
+        <div className="tr-think-body"><Markdown text={part.text} /></div>
       </details>
     );
   }
@@ -119,30 +166,43 @@ function Part({ part, streaming }: { part: TranscriptPart; streaming?: boolean }
     return <div className="pi-turn-notice" role="status"><span>{part.label}</span>
       {part.detail ? <details><summary>技术详情</summary><pre>{part.detail}</pre></details> : null}</div>;
   }
+  return <ToolCard part={part} toolsOpen={toolsOpen} />;
+}
+
+/** 工具卡片：默认收起；报错也不自动展开，只在摘要下面留一行原因。 */
+function ToolCard({ part, toolsOpen }: { part: Extract<TranscriptPart, { type: "tool" }>; toolsOpen: boolean | null }) {
+  const [open, setOpen] = useState(false);
+  const isOpen = toolsOpen ?? open;
   const Icon = part.status === "pending" ? Loader2 : part.status === "error" ? X : Check;
+  const reason = part.detail ?? (part.status === "error" ? firstLine(part.result) : "");
   return (
-    <details className={`tr-tool tr-tool--${part.status}`} open={part.status === "error"}>
-      <summary>
-        <span className={`tr-tool-status${part.status === "pending" ? " spin-i" : ""}`}><Icon size={12} /></span>
-        <Wrench size={11} className="tr-tool-wrench" />
-        <span className="tr-tool-name">{part.label}</span>
-        <span className="tr-tool-state">{part.status === "pending" ? "执行中" : part.status === "error" ? "未返回" : "完成"}</span>
-      </summary>
-      <div className="tr-tool-body">
-        <span className="tr-label">调用参数</span>
-        <Code code={part.args || "{}"} />
-        {part.result !== undefined ? <><span className="tr-label">返回结果</span><Code code={part.result} /></> : null}
-        {part.detail ? <p className="tr-tool-note">{part.detail}</p> : null}
-      </div>
-    </details>
+    <div className={`tr-tool-wrap tr-tool--${part.status}`}>
+      <details className="tr-tool" open={isOpen}
+        onToggle={(e) => { if (toolsOpen === null) setOpen((e.currentTarget as HTMLDetailsElement).open); }}>
+        <summary>
+          <span className={`tr-tool-status${part.status === "pending" ? " spin-i" : ""}`}><Icon size={12} /></span>
+          <Wrench size={11} className="tr-tool-wrench" />
+          <span className="tr-tool-name">{part.label}</span>
+          <span className="tr-tool-state">{part.status === "pending" ? "执行中" : part.status === "error" ? "未返回" : "完成"}</span>
+        </summary>
+        <div className="tr-tool-body">
+          <span className="tr-label">调用参数</span>
+          <Code code={part.args || "{}"} />
+          {part.result !== undefined ? <><span className="tr-label">返回结果</span><Code code={part.result} /></> : null}
+        </div>
+      </details>
+      {/* 收起时也要能看到原因，所以放在 details 外面（details 收起时内容不显示）。 */}
+      {reason && !isOpen ? <p className="tr-tool-reason">{reason}</p> : null}
+    </div>
   );
 }
 
+const firstLine = (text?: string) => {
+  const line = (text ?? "").split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+  return line.length > 160 ? `${line.slice(0, 160)}…` : line;
+};
+
 /** Lit 组件的属性只能通过实例赋值，用 ref 同步，避免 React 把它当成属性字符串。 */
-/**
- * 自定义元素可能还没升级完成（PiBlocks.ts 的 define 晚于 React 首次渲染）。
- * 直接把值写成普通属性会被随后的 upgrade 忽略，所以先 upgrade，再落到 Lit 的访问器上。
- */
 function bindProp(el: HTMLElement | null, prop: "content" | "code", value: string) {
   if (!el) return;
   if (!el.hasAttribute("data-upgraded") && customElements.get(el.localName)) {

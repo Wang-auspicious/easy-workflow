@@ -19,6 +19,7 @@ import { toggleInspector } from "./Canvas.tsx";
 import { useNow } from "../util/useNow.ts";
 import { toast } from "../shell/Toasts.tsx";
 import { inspectPart, partTone } from "../../../shared/parts.ts";
+import { CrewStrip, CrewTimeline, WorkerTrace } from "./CrewTrace.tsx";
 
 export function Inspectors({ geo, cam }: { geo: Geometry; cam: Camera }) {
   const list = useStore((s) => s.inspectors);
@@ -97,7 +98,9 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
   const node = s.factory!.nodes.find((n) => n.key === insp.key) as CompiledNode;
   const n = s.fs.nodes[insp.key];
   const c = roleColors(node.role);
-  const workers = (n?.workers ?? []).map((w) => s.fs.workers[w]).filter(Boolean);
+  // 含已撤下的人：撤下的人不在 n.workers 里了，但卡片要能看到"减员"这件事。
+  const workers = Object.values(s.fs.workers).filter((w) => w.node === insp.key).sort((a, b) => a.spawnedAt - b.spawnedAt);
+  const onDuty = n?.workers?.length ?? 0;
   const attempts = Object.values(s.fs.attempts).filter((a) => a.node === insp.key);
   const recent = attempts.slice(-10).reverse();
   const worker = workers.find((w) => w.id === insp.worker) ?? workers.find((w) => w.busy) ?? workers[0];
@@ -115,7 +118,7 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
         </div>
       </Head>
       <div className="insp-stats num">
-        <Stat k="工人" v={`${workers.length}`} />
+        <Stat k="在岗" v={`${onDuty}${workers.length > onDuty ? ` / ${workers.length}` : ""}`} />
         <Stat k="队列" v={`${n?.queue.length ?? 0}`} />
         <Stat k="中位" v={durations.length ? secs(median(durations)) : "—"} />
         <Stat k="P90" v={durations.length ? secs(quantile(durations, 0.9)) : "—"} />
@@ -140,26 +143,16 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
       {tab === "spec" ? <SpecView node={node} /> : tab === "metrics" ? <NodeMetrics attempts={attempts.filter(a=>a.startedAt>=s.fs.run.startedAt)} onSelect={id=>{setAttemptSel(id);setTab("work");}}/> : (
         <div className="insp-body">
           {workers.length > 0 && (
-            <div className="workers">
-              {workers.map((w, i) => {
-                const a = w.busy ? s.fs.attempts[w.busy] : null;
-                return (
-                  <button key={w.id} className={`worker ${worker?.id === w.id ? "is-on" : ""}`} onClick={() => { setAttemptSel(null); onWorker(w.id); }}>
-                    <StationIcon role={node.role} size={15} />
-                    <span className="w-label">{w.label}{w.forked && <i className="w-fork" data-tip="自动 fork 出来的">fork</i>}</span>
-                    <span className="w-now">{a ? s.fs.tokens[a.token]?.item : <span className="muted">空闲</span>}</span>
-                    <span className="w-n num muted">{w.done} 件</span>
-                  </button>
-                );
-              })}
-            </div>
+            <CrewStrip node={node} workers={workers} attempts={attempts} current={worker?.id}
+              onPick={(id) => { setAttemptSel(null); onWorker(id); }} />
           )}
-          {current ? <Trace a={current} node={node} c={c.border} now={now} /> : (
+          {current ? <WorkerTrace a={current} node={node} now={now} /> : (
             node.kind === "store" ? <div className="insp-empty">库存 {fmt(n?.stock ?? 0)}。这是一个存储库，不运行执行器。</div> :
             node.dormant ? <div className="insp-empty">休眠：不占任何资源，不发任何请求。需要时让主调度激活。</div> : (
               <div className="insp-empty">{lineWired ? "尚无处理记录。任务经过这个工位后，会在这里显示真实步骤与证据。" : "这条线尚未接入执行器，暂时不会处理任务。"}</div>
             )
           )}
+          <CrewTimeline notes={s.fs.activity.filter((m) => m.node === insp.key)} workers={workers} now={now} />
           {recent.length > 0 && (
             <div className="recent">
               <div className="sec-title">最近处理</div>
