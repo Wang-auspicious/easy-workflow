@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import { Type, type TSchema } from "typebox";
 import type { AttemptMetrics, Usage } from "../shared/types.ts";
 import type { Docs } from "./docs.ts";
@@ -44,8 +44,10 @@ export interface AgentStationDef<T = any> {
   describe?: (out: T) => string;
   /** Environment tools this station may call besides the four document tools (Spec §30.2). */
   tools?: string[];
-  /** Shared model-session budget, including tools, repair and one bounded continuation. */
+  /** Absolute model/tool work budget after input preparation, including repair and continuation. Never renewed by retry. */
   timeoutMs?: number;
+  /** Deadline of EACH Pi provider request; tool execution does not consume it. Defaults to 120 seconds. */
+  requestTimeoutMs?: number;
 }
 
 /** Cards are WebP; the endpoint takes JPEG reliably. */
@@ -80,7 +82,7 @@ export function createStationNarration(emit: (text: string) => void, now = Date.
   };
 }
 
-const TRANSIENT = /connection error|ECONNRESET|ECONNREFUSED|socket hang up|fetch failed|terminated|50[0-9]|overloaded|temporarily|rate.?limit|429/i;
+const TRANSIENT = /timeout|timed? ?out|超时|connection error|ECONNRESET|ECONNREFUSED|socket hang up|fetch failed|terminated|\b50[0-9]\b|overloaded|temporarily|rate.?limit|\b429\b/i;
 
 function throwStationAbort(signal: AbortSignal, partial: StationResult): never {
   const error = signal.reason instanceof Error ? signal.reason : new DOMException("Station attempt cancelled", "AbortError");
@@ -90,6 +92,7 @@ function throwStationAbort(signal: AbortSignal, partial: StationResult): never {
 
 /** Recover a Pi model turn in its existing transcript; completed tools are never replayed. */
 export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationContext): Promise<StationResult> {
+  ctx.signal.throwIfAborted();
   const skipped = def.skip?.(ctx);
   if (skipped) return skipped;
   const input = await def.input(ctx);
@@ -98,6 +101,30 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
   const allowed = [...BASE_TOOLS, ...(def.tools ?? [])];
   const docs = wired.docs?.();
   const toolbox = wired.toolbox?.();
+  const requestTimeoutMs = def.requestTimeoutMs ?? 120_000;
+  // Ten environment calls can each lead to another model request. Reserve
+  // separate slots for submit, validation repair, a missing-submit reminder,
+  // and one transport continuation. Even roles with no EXTRA tools can use
+  // the four base document tools; def.tools.length was the wrong budget gate.
+  const budget = def.timeoutMs ?? requestTimeoutMs * ((toolbox ? MAX_TOOL_CALLS : 0) + 4);
+  const sessionSignal = AbortSignal.any([ctx.signal, AbortSignal.timeout(budget)]);
+  let requestTimedOut = false;
+  const boundRequest = (stream: StreamFn): StreamFn => async (model, context, options) => {
+    sessionSignal.throwIfAborted();
+    requestTimedOut = false;
+    const timeout = AbortSignal.timeout(requestTimeoutMs);
+    const markTimeout = () => { requestTimedOut = true; };
+    timeout.addEventListener("abort", markTimeout, { once: true });
+    const cleanup = () => timeout.removeEventListener("abort", markTimeout);
+    const signal = AbortSignal.any([sessionSignal, timeout, ...(options?.signal ? [options.signal] : [])]);
+    try {
+      const response = await stream(model, context, { ...options, signal });
+      // Remove the observer when this request finishes. An old request timer
+      // firing during a long tool must not be mistaken for a new model failure.
+      void response.result().then(cleanup, cleanup);
+      return response;
+    } catch (error) { cleanup(); throw error; }
+  };
   const external = closedAgentConfig(path.join(docs?.dir ?? process.env.FACTORY_VAR ?? process.cwd(), "work", ctx.token.id.replace(/[^a-zA-Z0-9_-]/g, "_")));
   const selection = external ? null : models();
   const activity = new StationActivity(ctx.activity);
@@ -136,9 +163,15 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
   );
   for (const tool of tools) {
     const execute = tool.execute;
-    tool.execute = (id: string, params: any, signal?: AbortSignal, ...rest: unknown[]) => activity.tool(tool.name,
-      () => execute(id, params, signal, ...rest), signal ? AbortSignal.any([ctx.signal, signal]) : ctx.signal,
-      tool.name === "env_call" && allowed.includes(params.name) ? params.name : undefined);
+    tool.execute = (id: string, params: any, signal?: AbortSignal, ...rest: unknown[]) => {
+      const toolSignal = signal ? AbortSignal.any([sessionSignal, signal]) : sessionSignal;
+      return activity.tool(tool.name, async () => {
+        toolSignal.throwIfAborted();
+        const result = await execute(id, params, toolSignal, ...rest);
+        toolSignal.throwIfAborted();
+        return result;
+      }, toolSignal, tool.name === "env_call" && allowed.includes(params.name) ? params.name : undefined);
+    };
   }
   const narration = createStationNarration(text => ctx.progress(text, { tool: "think", text: "" }));
   let firstTokenMs = 0, outputMs = 0, modelCalls = 0;
@@ -154,7 +187,7 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
     ctx.progress(`闭源 Agent 返回；实际模型 ${reply.model}`, { tool: "model", text: reply.usage ? "已接收接口用量" : "客户端未报告用量；保持未知" });
   }) : new Agent({
     initialState: { systemPrompt: `${env.text}\n\n${contract}`, model: selection!.model, thinkingLevel: "off", tools },
-    streamFn: activity.wrapStream(selection!.stream),
+    streamFn: boundRequest(activity.wrapStream(selection!.stream)),
     sessionId: `${ctx.worker.id}-${ctx.attempt}`,
   });
   if (agent instanceof Agent) agent.subscribe((e) => {
@@ -196,31 +229,38 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
     time: { firstTokenMs: external ? firstTokenMs : activity.duration("first_token"), outputMs: external ? outputMs : activity.duration("model_output"),
       toolMs: activity.duration("tool"), programMs: 0, modelCalls: external ? modelCalls : activity.count("model_request"), toolCalls: activity.count("tool") },
   });
-  const budget = def.timeoutMs ?? (def.tools?.length ? 240_000 : 120_000);
-  const deadline = Date.now() + budget;
-  const sessionSignal = AbortSignal.any([ctx.signal, AbortSignal.timeout(budget)]);
   let continued = false;
+  const modelError = () => requestTimedOut ? `模型单次请求超时（${requestTimeoutMs}ms）${continued ? "；本工位的原地续答次数已用完" : ""}` : agent.state.errorMessage;
+  const invoke = async (run: () => Promise<void>) => {
+    sessionSignal.throwIfAborted();
+    const abort = () => agent.abort();
+    sessionSignal.addEventListener("abort", abort, { once: true });
+    try { await run(); sessionSignal.throwIfAborted(); }
+    finally { sessionSignal.removeEventListener("abort", abort); }
+  };
   const ask = async (text: string, pictures?: typeof images) => {
     promptCalls++;
-    await promptAgent(agent, text, pictures, sessionSignal, Math.max(1, deadline - Date.now()));
-    if (!(agent instanceof Agent) || continued || submitted !== null || sessionSignal.aborted || !TRANSIENT.test(agent.state.errorMessage ?? "")) return;
+    await invoke(() => agent.prompt(text, pictures));
+    if (!(agent instanceof Agent)) return;
+    if (continued || submitted !== null || sessionSignal.aborted || !TRANSIENT.test(modelError() ?? "")) return;
     const messages = agent.state.messages, failed = messages.at(-1), previous = messages.at(-2);
-    if (failed?.role !== "assistant" || failed.stopReason !== "error" || !previous || !["user", "toolResult"].includes(previous.role)) return;
+    if (failed?.role !== "assistant" || !["error", "aborted"].includes(failed.stopReason) || !previous || !["user", "toolResult"].includes(previous.role)) return;
     continued = true;
-    ctx.progress("模型连接中断；保留已完成的工具结果，1 秒后续答一次", { tool: "recover", text: "仅移除失败的模型回复；续答与原请求共用时间预算", ok: false });
+    ctx.progress("模型请求超时或连接中断；保留已完成的工具结果，1 秒后续答一次", { tool: "recover", text: "仅移除失败的模型回复；下一次模型请求使用新的请求计时，工位总截止时间不变", ok: false });
     await delay(1000, undefined, { signal: sessionSignal });
     sessionSignal.throwIfAborted();
     // Pi 1.1 exposes the copying messages setter rather than replaceMessages().
     agent.state.messages = messages.slice(0, -1);
-    await promptAgent({ prompt: () => agent.continue(), abort: () => agent.abort() }, "", undefined, sessionSignal, Math.max(1, deadline - Date.now()));
+    await invoke(() => agent.continue());
   };
   try {
   await ask(input.text + redo, images.length ? images : undefined);
-  if (!submitted && !agent.state.errorMessage) {
+  if (!submitted && !modelError()) {
     ctx.progress("模型没有调用 submit，提醒一次", { tool: "repair", text: "" });
     await ask("You did not call submit. Call submit now with your answer.");
   }
-  if (agent.state.errorMessage && !submitted) return { ok: false, summary: "模型调用失败", error: agent.state.errorMessage.slice(0, 240), usage: usageReported ? usage : undefined, metrics: metrics() };
+  const error = modelError();
+  if (error && !submitted) return { ok: false, summary: "模型调用失败", error: error.slice(0, 240), usage: usageReported ? usage : undefined, metrics: metrics() };
   if (!submitted) return { ok: false, summary: "模型没有提交结果", error: "no submit", usage: usageReported ? usage : undefined, metrics: metrics() };
   let out = submitted as T;
   if (def.describe) ctx.progress(def.describe(out), { tool: "submit", text: "", ok: true });
@@ -230,6 +270,8 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
     ctx.progress(`程序检查发现 ${issues.length} 个问题：${issues.slice(0, 3).join("；")} → 让它重答一次`, { tool: "check", text: issues.join("\n"), ok: false });
     submitted = null;
     await ask(`Your submission failed these program checks:\n- ${issues.join("\n- ")}\nFix them and call submit again.`);
+    const repairError = modelError();
+    if (repairError && !submitted) return { ok: false, summary: "模型重答失败", error: repairError.slice(0, 240), usage: usageReported ? usage : undefined, metrics: metrics() };
     rounds = 2;
     if (submitted) {
       out = submitted as T;
@@ -243,13 +285,15 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
       out = saved;
     } else ctx.progress("程序检查全部通过 ✓", { tool: "check", text: "", ok: true });
   } else if (def.check) ctx.progress("程序检查全部通过 ✓", { tool: "check", text: "", ok: true });
-  const res = await def.after(out, ctx, { rounds, issues });
+  sessionSignal.throwIfAborted();
+  const res = await def.after(out, { ...ctx, signal: sessionSignal }, { rounds, issues });
+  sessionSignal.throwIfAborted();
   return { ...res, usage: usageReported ? usage : undefined, metrics: metrics() };
   } catch (err) {
     activity.close(ctx.signal.aborted || ["AbortError", "TimeoutError"].includes((err as Error)?.name) ? "cancelled" : "failed");
     if (ctx.signal.aborted) throwStationAbort(ctx.signal, { ok: false, summary: "模型调用已取消", usage: usageReported ? usage : undefined, metrics: metrics() });
     const failure = sessionSignal.aborted ? sessionSignal.reason : err;
-    return { ok: false, summary: "模型调用失败", error: failure instanceof Error ? failure.message : String(failure), usage: usageReported ? usage : undefined, metrics: metrics() };
+    return { ok: false, summary: sessionSignal.aborted ? "工位工作预算已用完" : "模型调用失败", error: sessionSignal.aborted ? `工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留` : failure instanceof Error ? failure.message : String(failure), usage: usageReported ? usage : undefined, metrics: metrics() };
   } finally { activity.close("failed"); narration.flush(); }
 }
 

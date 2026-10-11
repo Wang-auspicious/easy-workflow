@@ -58,7 +58,11 @@ export class BatchSupervisor {
     try {
       const items = latestRunTokens(f.state);
       let active = items.filter(t => t.status === 'active').length;
-      for (const token of items) {
+      // Reuse late-stage evidence first instead of filling every recovery slot
+      // with early reading attempts while downstream review stations sit idle.
+      const recoveryOrder = [...items].sort((a, b) =>
+        f.compiled.nodes.findIndex(node => node.key === b.finishedAtNode) - f.compiled.nodes.findIndex(node => node.key === a.finishedAtNode));
+      for (const token of recoveryOrder) {
         if (token.status !== 'parked') continue;
         const candidate = f.state.recoveries[token.item];
         if (!candidate || candidate.disposition !== 'retry' || candidate.token !== token.id) continue;

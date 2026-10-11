@@ -162,3 +162,20 @@ test('desktop restart resumes an explicitly managed running goal, while a ended 
     for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
   }
 });
+
+test('late review recovery gets the available slot before another early reading attempt', async () => {
+  const factory = new Factory();
+  try {
+    await factory.boot(); factory.runtime.start('prioritize completed evidence');
+    factory.runtime.executors = () => async () => ({ ok: false, summary: 'timeout', failure: { tag: 'network_timeout', category: 'network', message: 'timeout', retryable: true, owner: 'system' } });
+    for (const [item, node] of [['early', 'curation/reader'], ['late', 'curation/copy-review']]) factory.runtime.create(node, { item, url: `https://${item}.example/`, source: 'manual', data: { canonical: `https://${item}.example/` } });
+    await factory.runtime.settle();
+    const resumed: string[] = [];
+    factory.runtime.executors = node => async () => { resumed.push(node.key); return { ok: true, summary: 'fixture', finish: { status: 'published', reason: 'fixture' } }; };
+    factory.batch.configure({ target: 2, maxInFlight: 1, intakeWindow: 1 });
+    factory.batch.pump(Date.now() + 60000); await factory.runtime.settle();
+    assert.deepEqual(resumed, ['curation/copy-review']);
+    assert.equal(batchSummary(factory.state)?.admitted, 2);
+    assert.equal(batchSummary(factory.state)?.completed, 1);
+  } finally { await close(factory); fs.rmSync(dir, { recursive: true, force: true }); }
+});
