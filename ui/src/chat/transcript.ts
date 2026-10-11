@@ -152,7 +152,10 @@ export function buildTranscript(input: BuildTranscriptInput): TranscriptItem[] {
           type: "tool", id: chunk.id, name: chunk.name, label: toolLabel(chunk.name, chunk.arguments),
           args: pretty(chunk.arguments), result: result ? pretty(output) || "(无输出)" : undefined,
           status: result?.isError ? "error" : result ? "done" : pending ? "pending" : "error",
-          detail: message.stopReason === "aborted" && !result ? "回答被停止，这个调用没有返回结果。" : undefined,
+          // 没有结果又不是当前这轮在跑的调用：如实说明它没有返回，供卡片折叠时显示一行原因。
+          detail: !result && !pending
+            ? message.stopReason === "aborted" ? "回答被停止，这个调用没有返回结果。" : "这次调用没有返回结果。"
+            : undefined,
         });
       }
     }

@@ -50,6 +50,12 @@ fs.activity = [
 ];
 
 const partial = legacyReply("已核对这批网站的状态。现有图片和已经完成的工具结果已保留，接下来从失败工位继续。", now - 6000); partial.stopReason = "aborted";
+// 已经结束的那一轮里留一个没返回的工具调用：验收"报错不自动展开，只在摘要下留一行原因"。
+const dangling = legacyReply("查一下浏览器状态。", now - 9000);
+dangling.content = [
+  { type: "text", text: "查一下浏览器状态。" },
+  { type: "toolCall", id: "call-2", name: "easy_workflow_call", arguments: { name: "browser" } },
+];
 const error = legacyReply("", now - 5000); error.stopReason = "error"; error.errorMessage = "The operation was aborted due to timeout";
 // 一轮带思考与工具调用的回答：验收思考折叠、工具卡片和结果配对。
 const withTools = legacyReply("先看一下当前状态。", now - 8000);
@@ -64,6 +70,7 @@ const toolResult = {
   isError: false, timestamp: now - 7500,
 };
 fs.conversation = [
+  { id: "fixture-dangling", turn: "fixture-old", message: dangling },
   { id: "fixture-tools", turn: "fixture-tools", message: withTools },
   { id: "fixture-tools-result", turn: "fixture-tools", message: toolResult },
   { id: "fixture-turn", turn: "fixture-turn", message: { role: "user", content: "把 100 个网站持续处理完，有问题自行恢复。", timestamp: now - 7000 } },

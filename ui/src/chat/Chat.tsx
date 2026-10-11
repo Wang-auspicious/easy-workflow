@@ -1,29 +1,42 @@
 // The fixed right column (Spec §10.2): always the main dispatcher. Resizable, collapses to an
 // avatar. Above the input sits the attachment strip — evidence, nodes and items selected
 // anywhere in the app arrive here like files attached to an agent chat.
+//
+// 顶部原来那块（批次卡片 / 注意力提示 / 运行记录）已去掉：批次控制在工作区工具条上，
+// 工位的提示与去向已经作为对话行出现在转录里，不再重复一份。
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowUp, Square, PanelRightClose, PanelRightOpen, X, Image as ImageIcon, Box, Package, ScrollText, GitFork, AlertTriangle, Info, Loader2, RotateCw } from "lucide-react";
+import { ArrowUp, Square, PanelRightClose, PanelRightOpen, X, Image as ImageIcon, Box, Package, ScrollText, RotateCw, Info, Loader2, CornerDownLeft } from "lucide-react";
 import type { Attachment } from "../../../shared/types.ts";
 import { detach, getState, setState, useStore } from "../store.ts";
-import { actions, api } from "../api.ts";
-
+import { actions } from "../api.ts";
 import { CorrectionPopover } from "../board/Correction.tsx";
-import { toggleInspector } from "../canvas/Canvas.tsx";
 import { Transcript } from "./Transcript.tsx";
 import { Avatar } from "./Avatar.tsx";
 import { dispatcherState, DISPATCHER_HUE } from "./transcript.ts";
-import "./activity.css";
-import {latestRunTokens} from "../../../shared/project.ts";
-import { batchSummary } from "../../../shared/batch.ts";
 import { useNow } from "../util/useNow.ts";
-
-
+import "./activity.css";
 
 const SUGGEST = [
   "从候选库取 10 个「UI 组件与设计系统」开始入库",
   "现在怎么样了？哪个工位是瓶颈？",
   "给组件特写摄影加一个人",
   "这一轮结束，出报告",
+];
+
+/** 输入框里的命令。只做界面真能做的事：要么发一句话给主调度，要么调用已有接口。 */
+interface Command { cmd: string; title: string; hint: string; send?: string; run?: "abort" | "continue" | "pause" | "play" | "steer" | "followUp" | "clear" }
+
+const COMMANDS: Command[] = [
+  { cmd: "/status", title: "问主调度现在怎么样", hint: "瓶颈、在途、待恢复", send: "现在怎么样了？哪个工位是瓶颈？" },
+  { cmd: "/resume", title: "从失败工位继续", hint: "复用已有产物与证据", send: "从失败工位继续，把剩下的处理完" },
+  { cmd: "/report", title: "出这一轮的报告", hint: "结束本轮并打开报告", send: "这一轮结束，出报告" },
+  { cmd: "/stop", title: "停止当前回答", hint: "已完成的工具结果保留", run: "abort" },
+  { cmd: "/continue", title: "继续当前任务", hint: "从检查点恢复", run: "continue" },
+  { cmd: "/pause", title: "暂停流水线", hint: "在途任务跑完再停", run: "pause" },
+  { cmd: "/play", title: "恢复流水线", hint: "继续未完成的任务", run: "play" },
+  { cmd: "/steer", title: "改成「立即补充」", hint: "插进当前回答", run: "steer" },
+  { cmd: "/followup", title: "改成「完成后跟进」", hint: "等这轮结束再处理", run: "followUp" },
+  { cmd: "/clear", title: "清空输入与附件", hint: "不发送任何内容", run: "clear" },
 ];
 
 export function Chat() {
@@ -59,7 +72,6 @@ export function Chat() {
     <aside className="chat">
       <div className={`chat-resize ${drag ? "is-drag" : ""}`} onPointerDown={startResize} />
       <ChatHead />
-      <Activity />
       <Log />
       <Composer />
       <CorrectionPopover />
@@ -155,32 +167,6 @@ function ChatRecovery() {
   </div>;
 }
 
-function Activity() {
-  useStore((s) => s.version);
-  const replay = useStore(s => s.replay);
-  const connected = useStore(s => s.connected);
-  const fs = getState().fs;
-  const [open, setOpen] = useState(false);
-  const [dismissed, setDismissed] = useState("");
-  const [busy, setBusy] = useState(false);
-  const notes = fs.activity.filter(n => n.at >= fs.run.startedAt);
-  const warning = [...notes].reverse().find(n => n.tone === "warn" && (!n.node || (fs.nodes[n.node]?.lastOkAt ?? 0) <= n.at));
-  const batch=latestRunTokens(fs);
-  const blocked=batch.filter(t=>t.status==="parked"||t.status==="manual");
-  const settled=batch.length>0&&batch.every(t=>t.status!=="active");
-  const goal = batchSummary(fs);
-  const canResumeGoal = goal && fs.run.status !== "ended" && ["paused", "stopped", "blocked"].includes(goal.status);
-  const changeBatch = async (action: "pause" | "resume") => { if (replay || !connected) return; setBusy(true); try { await api.post("/api/tools/run_batch", { action }); } catch { /* API displays the reason. */ } finally { setBusy(false); } };
-  if (!notes.length&&!settled&&!goal) return null;
-  return <div className="chat-activity">
-    {goal ? <div className="batch-outcome" aria-label="持续任务进度"><b>目标 {goal.target} 个网站 · 已完成 {goal.completed}</b><p>已领取 {goal.admitted} · 在途 {goal.active} · 尚未领取 {goal.remaining}</p><p>发布 {goal.published} · 合并 {goal.merged} · 排除 {goal.rejected}{goal.blocked ? ` · 待恢复 ${goal.blocked}` : ""}</p><small>{goal.reason}{goal.retrying ? ` · ${goal.retrying} 件已安排重试` : ""}</small><div className="batch-actions">{["running", "recovering"].includes(goal.status) && <button disabled={busy || Boolean(replay) || !connected} onClick={() => void changeBatch("pause")}>暂停任务</button>}{canResumeGoal && <button disabled={busy || Boolean(replay) || !connected} onClick={() => void changeBatch("resume")}>{busy ? "正在恢复…" : "恢复任务"}</button>}{goal.blocked > 0 && <button onClick={() => setState({ view: "candidates" })}>查看恢复记录</button>}</div></div>
-      : settled&&<div className="batch-outcome"><b>已领取 {batch.length} 件{blocked.length ? ` · 待恢复 ${blocked.length}` : " · 已处理"}</b><p>发布 {batch.filter(t=>t.status==="published").length} · 合并 {batch.filter(t=>t.status==="merged").length} · 排除 {batch.filter(t=>t.status==="rejected").length}</p>{blocked.length>0&&<button onClick={()=>setState({view:"candidates"})}>查看恢复记录</button>}<small>这里只统计已领取条目，不代表整项任务已完成。</small></div>}
-    {warning && warning.id !== dismissed && <div className="chat-attention"><AlertTriangle size={13} /><button onClick={() => { if (warning.node) { setState({ view: "canvas" }); toggleInspector(warning.node); } else setOpen(true); }}>{warning.text}</button><button aria-label="收起提示" onClick={() => setDismissed(warning.id)}><X size={12} /></button></div>}
-    <button className="activity-toggle" onClick={() => setOpen(!open)} aria-expanded={open}><ScrollText size={12} />运行记录 <span>{notes.length}</span></button>
-    {open && <div className="activity-log">{notes.slice(-15).map(m => <Note key={m.id} m={m} />)}</div>}
-  </div>;
-}
-
 function Empty() {
   return (
     <div className="chat-intro">
@@ -194,21 +180,6 @@ function Empty() {
     </div>
   );
 }
-
-function Note({ m }: { m: ReturnType<typeof getState>["fs"]["chat"][number] }) {
-  const Icon = m.tone === "fork" ? GitFork : m.tone === "warn" ? AlertTriangle : Info;
-  const node = m.node ? getState().factory?.nodes.find((n) => n.key === m.node) : undefined;
-  const text = node ? m.text.replace(`[${node.name}] `, "") : m.text;
-  return (
-    <div className={`note note--${m.tone ?? "info"}`}>
-      <Icon size={13} style={{ marginTop: 2, flex: "none" }} />
-      <span>{node && <b className="note-node" onClick={() => { setState({ view: "canvas" }); toggleInspector(node.key); }}>{node.name}</b>}{node ? " · " : ""}{text}</span>
-      <span className="note-time num">{time(m.at)}</span>
-    </div>
-  );
-}
-
-const time = (t: number) => new Date(t).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 
 export function AttChip({ a, onRemove }: { a: Attachment; onRemove?: () => void }) {
   const Icon = a.type === "evidence" ? ImageIcon : a.type === "node" ? Box : a.type === "token" ? Package : ScrollText;
@@ -224,6 +195,7 @@ export function AttChip({ a, onRemove }: { a: Attachment; onRemove?: () => void 
 function Composer() {
   const atts = useStore((s) => s.attachments);
   const draft = useStore((s) => s.draft);
+  const history = useStore((s) => s.history);
   const live = useStore((s) => s.live.id);
   const replay = useStore((s) => s.replay);
   const connected = useStore((s) => s.connected);
@@ -232,29 +204,84 @@ function Composer() {
   const [stopping, setStopping] = useState(false);
   const [mode, setMode] = useState<"steer" | "followUp">("steer");
   const [sendError, setSendError] = useState("");
+  const [palette, setPalette] = useState(false);
+  const [cursor, setCursor] = useState(0);
+  const [walk, setWalk] = useState<number | null>(null);
   const pendingSend = useRef<{ requestId: string; text: string; attachments: string } | null>(null);
   const ta = useRef<HTMLTextAreaElement>(null);
-  useEffect(() => { if (draft && ta.current) { ta.current.focus(); } }, [draft]);
+  useEffect(() => { if (draft && ta.current) ta.current.focus(); }, [draft]);
+  useEffect(() => {
+    const focus = () => ta.current?.focus();
+    // Ctrl/Cmd+K 直接跳进输入框；对话收着时先展开。
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.key === "k" || e.key === "K") && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        setState({ chatOpen: true, unread: 0 });
+        requestAnimationFrame(focus);
+      }
+    };
+    window.addEventListener("easy:focus-composer", focus);
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("easy:focus-composer", focus); window.removeEventListener("keydown", onKey); };
+  }, []);
   useLayoutEffect(() => {
     const el = ta.current;
     if (!el) return;
     el.style.height = "0px";
     el.style.height = `${Math.min(180, el.scrollHeight)}px`;
   }, [draft]);
-  const send = async () => {
-    const text = draft.trim();
+  const matches = draft.startsWith("/") && !draft.includes(" ") && !draft.includes("\n")
+    ? COMMANDS.filter((c) => c.cmd.startsWith(draft.toLowerCase()) || c.title.includes(draft.slice(1)))
+    : [];
+  const showPalette = palette && matches.length > 0;
+  const remember = (text: string) => setState((s) => ({ history: [text, ...s.history.filter((h) => h !== text)].slice(0, 40) }));
+  const send = async (override?: string) => {
+    const text = (override ?? draft).trim();
     if (!text || replay || sending || !connected) return;
     const attachments = getState().attachments;
     const serialized = JSON.stringify(attachments);
     if (!pendingSend.current || pendingSend.current.text !== text || pendingSend.current.attachments !== serialized) pendingSend.current = { requestId: crypto.randomUUID(), text, attachments: serialized };
     setSending(true);
     setSendError("");
+    setPalette(false);
     setState({ draft: "", attachments: [] });
+    remember(text);
     try { await actions.chat(text, attachments, { requestId: pendingSend.current.requestId, mode: live ? mode : "steer" }); pendingSend.current = null; }
     catch {
       setSendError("消息未确认送达，内容已保留。再次发送时会核验接收记录，避免重复执行。");
       setState((s) => ({ draft: s.draft || text, attachments: [...s.attachments, ...attachments.filter((a) => !s.attachments.some((b) => b.type === a.type && b.id === a.id))] }));
     } finally { setSending(false); }
+  };
+  const run = async (command: Command) => {
+    setPalette(false);
+    setState({ draft: "" });
+    if (command.send) { await send(command.send); return; }
+    try {
+      if (command.run === "abort") await actions.abortChat();
+      else if (command.run === "continue") await actions.continueChat();
+      else if (command.run === "pause") await actions.run("pause");
+      else if (command.run === "play") await actions.run("resume");
+      else if (command.run === "steer") setMode("steer");
+      else if (command.run === "followUp") setMode("followUp");
+      else if (command.run === "clear") setState({ draft: "", attachments: [] });
+    } catch { /* 接口失败会自己弹提示 */ }
+  };
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (showPalette) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setCursor((c) => (c + 1) % matches.length); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); setCursor((c) => (c - 1 + matches.length) % matches.length); return; }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) { e.preventDefault(); void run(matches[Math.min(cursor, matches.length - 1)]); return; }
+      if (e.key === "Escape") { e.preventDefault(); setPalette(false); return; }
+    }
+    if (e.key === "Escape") { if (draft || atts.length) { e.preventDefault(); setState({ draft: "", attachments: [] }); } return; }
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send(); return; }
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); return; }
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && history.length && !draft.includes("\n")) {
+      e.preventDefault();
+      const next = e.key === "ArrowUp" ? (walk === null ? 0 : Math.min(walk + 1, history.length - 1)) : walk === null ? null : walk - 1;
+      setWalk(next);
+      setState({ draft: next === null ? "" : history[next] ?? "" });
+    }
   };
   const evidence = atts.filter((a) => a.type === "evidence");
   const others = atts.filter((a) => a.type !== "evidence");
@@ -264,6 +291,19 @@ function Composer() {
     <div className="composer">
       {sendError && <p className="composer-feedback" role="status">{sendError}</p>}
       <div className="composer-box">
+        {showPalette && (
+          <div className="cmd-palette" role="listbox" aria-label="命令">
+            {matches.map((c, i) => (
+              <button key={c.cmd} role="option" aria-selected={i === Math.min(cursor, matches.length - 1)}
+                className={i === Math.min(cursor, matches.length - 1) ? "is-on" : ""}
+                onMouseEnter={() => setCursor(i)} onClick={() => void run(c)}>
+                <code>{c.cmd}</code>
+                <span className="cmd-title">{c.title}</span>
+                <span className="cmd-hint">{c.hint}</span>
+              </button>
+            ))}
+          </div>
+        )}
         <div className="att-strip">
           {atts.length > 0 ? (
             <>
@@ -281,18 +321,21 @@ function Composer() {
         <textarea
           ref={ta}
           value={draft}
-          placeholder={replay ? "回放中：对话只读" : live ? "可补充要求，或安排完成后跟进…" : "描述任务，或选择画布内容后提问…"}
+          placeholder={replay ? "回放中：对话只读" : live ? "可补充要求，或安排完成后跟进…（输入 / 看命令）" : "描述任务，或选择画布内容后提问…（输入 / 看命令）"}
           disabled={Boolean(replay)}
-          onChange={(e) => setState({ draft: e.target.value })}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); } }}
+          onChange={(e) => { setState({ draft: e.target.value }); setPalette(e.target.value.startsWith("/")); setCursor(0); setWalk(null); }}
+          onKeyDown={onKeyDown}
           rows={1}
         />
         <div className="composer-foot">
           <button className="icon-btn" data-tip="从证据板选择附件" onClick={() => setState({ view: "board" })}><ImageIcon size={16} /></button>
-          {live ? <select className="composer-delivery" aria-label="消息送达方式" value={mode} onChange={e => setMode(e.target.value as "steer" | "followUp")}><option value="steer">立即补充</option><option value="followUp">完成后跟进</option></select> : <span className="composer-hint">Shift + Enter 换行</span>}
+          <button className="composer-cmd" onClick={() => { setState({ draft: "/" }); setPalette(true); ta.current?.focus(); }} data-tip="命令（也可以直接输入 /）"><CornerDownLeft size={12} />命令</button>
+          {live
+            ? <select className="composer-delivery" aria-label="消息送达方式" value={mode} onChange={e => setMode(e.target.value as "steer" | "followUp")}><option value="steer">立即补充</option><option value="followUp">完成后跟进</option></select>
+            : <span className="composer-hint">Shift + Enter 换行 · ↑ 回溯 · Esc 清空</span>}
           <span className="grow" />
           {live && <button className="send send--stop" disabled={stopping || !connected || Boolean(replay)} onClick={() => void stop()} aria-label="停止当前回答" data-tip="停止当前回答，流水线任务保留">{stopping ? <Loader2 size={13} className="spin-i" /> : <Square size={13} />}</button>}
-          {(!live || draft.trim() || sending) && <button className="send" disabled={!draft.trim() || Boolean(replay) || sending || !connected} onClick={send} aria-label={live ? mode === "steer" ? "发送补充要求" : "安排后续跟进" : "发送消息"} data-tip={live ? mode === "steer" ? "发送补充要求" : "安排后续跟进" : "发送"}>{sending ? <Loader2 size={15} className="spin-i" /> : <ArrowUp size={16} />}</button>}
+          {(!live || draft.trim() || sending) && <button className="send" disabled={!draft.trim() || Boolean(replay) || sending || !connected} onClick={() => void send()} aria-label={live ? mode === "steer" ? "发送补充要求" : "安排后续跟进" : "发送消息"} data-tip={live ? mode === "steer" ? "发送补充要求" : "安排后续跟进" : "发送"}>{sending ? <Loader2 size={15} className="spin-i" /> : <ArrowUp size={16} />}</button>}
         </div>
       </div>
     </div>

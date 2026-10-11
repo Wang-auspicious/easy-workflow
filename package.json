@@ -20,7 +20,8 @@
     "check:canvas": "node scripts/check-canvas.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test \"test/**/*.test.ts\"",
-    "test:ui": "node --test \"ui/test/*.test.ts\""
+    "test:ui": "node --test \"ui/test/*.test.ts\"",
+    "test:ui:browser": "node ui/test/chat-browser.mjs && node ui/test/inspector-browser.mjs"
   },
   "engines": {
     "node": ">=24"

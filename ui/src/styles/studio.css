@@ -159,16 +159,28 @@
 .msg--user .bubble { background: #f1f5fc; color: #4d627f; font-weight: 400; font-size: 12px; border-radius: 10px 10px 3px 10px; }
 .msg-head { font-size: 11px; color: #a0a9b6; }
 .msg--assistant .body { font-size: 12px; line-height: 1.85; }
-.composer { padding: 16px 18px 19px; border: 0; background: white; }
-.composer-box { border: 1px solid #dfe5ef; box-shadow: 0 2px 6px #20365904; border-radius: 11px; padding: 12px 11px 8px; background: #fff; }
-.composer-box:focus-within { border-color: #a6c0ec; box-shadow: 0 0 0 3px #3274ea07; }
-.composer textarea { font-size: 12px; min-height: 62px; line-height: 1.85; padding: 0 2px; }
-.composer textarea::placeholder { color: #adb5c1; }
+/* 输入区：一块安静的卡片，命令面板浮在它上面。 */
+.composer { padding: 14px 16px 16px; border: 0; background: #fff; }
+.composer-box { position: relative; border: 1px solid #e2e8f2; box-shadow: 0 1px 2px #20365905, 0 6px 18px #20365908; border-radius: 14px; padding: 11px 11px 8px; background: #fff; transition: border-color 140ms var(--ease), box-shadow 140ms var(--ease); }
+.composer-box:focus-within { border-color: #b9cdf0; box-shadow: 0 0 0 3px #3274ea0f, 0 6px 18px #2036590d; }
+.composer textarea { font-size: 12.5px; min-height: 44px; line-height: 1.8; padding: 2px 3px 0; border: 0; outline: 0; resize: none; background: transparent; display: block; width: 100%; }
+.composer textarea::placeholder { color: #b3bbc7; }
 .att-strip:empty { display: none; }
-.composer-foot { padding-top: 5px; gap: 5px; }
-.composer-hint { color: #bac1cb; font-size: 9px; }
-.send { width: 29px; height: 29px; border-radius: 7px; box-shadow: 0 2px 3px #3274ea15; }
-.send:disabled { background: #e9eef6; color: #9eacc1; opacity: 1; }
+.composer-foot { padding-top: 7px; gap: 6px; align-items: center; }
+.composer-hint { color: #c0c7d2; font-size: 9.5px; }
+.composer-cmd { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 7px; border: 1px solid var(--line-2); background: var(--panel); color: var(--ink-3); font-size: 10.5px; }
+.composer-cmd:hover { color: var(--accent); border-color: #b9cdf0; background: var(--accent-soft); }
+.composer-delivery { height: 22px; border: 1px solid var(--line-2); border-radius: 7px; background: var(--panel); color: var(--ink-3); padding: 0 6px; font-size: 10.5px; max-width: 128px; }
+.send { width: 30px; height: 30px; border-radius: 9px; box-shadow: 0 2px 4px #3274ea20; }
+.send:disabled { background: #eef1f7; color: #a8b3c4; opacity: 1; box-shadow: none; }
+/* 命令面板 */
+.cmd-palette { position: absolute; left: 8px; right: 8px; bottom: calc(100% + 8px); z-index: 6; padding: 5px; background: var(--panel); border: 1px solid var(--line-2); border-radius: 12px; box-shadow: var(--shadow-2); max-height: 258px; overflow-y: auto; }
+.cmd-palette button { display: grid; grid-template-columns: 92px 1fr; grid-template-rows: auto auto; gap: 1px 8px; width: 100%; text-align: left; padding: 6px 8px; border-radius: 8px; color: var(--ink-2); }
+.cmd-palette button:hover { background: var(--panel-3); }
+.cmd-palette button.is-on { background: var(--accent-soft); }
+.cmd-palette code { font: 11px/1.5 var(--mono); color: var(--accent); }
+.cmd-title { font-size: 12px; }
+.cmd-hint { grid-column: 2; font-size: 10px; color: var(--ink-4); }
 .att { font-size: 10.5px; background: #f4f7fc; border: 1px solid #e3eaf5; border-radius: 5px; color: #6c82a3; }
 .inspector { border: 1px solid #e1e7f0; border-radius: 12px; box-shadow: var(--shadow-3); }
 .inspector--part { width: 520px; }

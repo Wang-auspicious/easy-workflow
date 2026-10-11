@@ -57,6 +57,10 @@ export interface Store {
   focus: { x: number; y: number; k?: number; area?: { w: number; h: number }; at: number } | null;
   draft: string;
   boardFocus: string | null;
+  /** 你自己在对话里用哪张头像（ui/public/avatars 里的名字）。 */
+  userAvatar: string;
+  /** 发过的消息，供输入框用 ↑/↓ 回溯。 */
+  history: string[];
 }
 
 const LS = (k: string, v?: unknown) => {
@@ -76,6 +80,7 @@ let state: Store = {
   live: emptyLive(), dispatcher: idleDispatcher(),
   browser: emptyBrowser(),
   inspectors: [], selected: [], follow: false, trail: null, flashes: {}, settings: {}, model: "", keyPresent: false, replay: null, focus: null, draft: "", boardFocus: null,
+  userAvatar: (LS("userAvatar") as string) ?? "ada", history: (LS("history") as string[]) ?? [],
 };
 
 const listeners = new Set<() => void>();
@@ -86,6 +91,8 @@ export function setState(patch: Partial<Store> | ((s: Store) => Partial<Store>))
   if ("view" in p) LS("view", state.view);
   if ("chatOpen" in p) LS("chatOpen", state.chatOpen);
   if ("chatWidth" in p) LS("chatWidth", state.chatWidth);
+  if ("userAvatar" in p) LS("userAvatar", state.userAvatar);
+  if ("history" in p) LS("history", state.history);
   for (const l of listeners) l();
 }
 export const subscribe = (l: () => void) => { listeners.add(l); return () => { listeners.delete(l); }; };
