@@ -1,0 +1,4 @@
+.chat-activity{padding:0 20px;border-bottom:1px solid #f0f2f5;flex:none}
+.activity-toggle{display:flex;align-items:center;gap:7px;background:none;border:0;padding:9px 0;color:#929cab;font-size:11px;cursor:pointer}.activity-toggle span{font-variant-numeric:tabular-nums;color:#b0b7c1}.activity-log{max-height:220px;overflow:auto;padding-bottom:6px}.activity-log .note{margin:0 0 6px;padding:8px;font-size:11px;border:0;background:#f8f9fb;border-radius:6px}
+.chat-attention{display:flex;align-items:center;gap:6px;padding:9px 0;color:#ad7750;font-size:12px}.chat-attention button{background:none;border:0;color:inherit;cursor:pointer;text-align:left;font:inherit}.chat-attention button:first-of-type{flex:1;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.pi-waiting{display:flex;gap:8px;align-items:center;font-size:12px;color:#99a2af;margin:18px 0}.composer .send--stop{color:#687992;background:#edf1f7}

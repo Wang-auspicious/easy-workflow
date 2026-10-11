@@ -1,0 +1,14 @@
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { build as viteBuild } from 'vite';
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+await viteBuild({ configFile: path.join(root, 'ui', 'vite.config.ts') });
+const require = createRequire(import.meta.url);
+const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
+const child = spawn(require('electron'), [root], { cwd: root, env, stdio: 'inherit', windowsHide: true });
+child.on('error', (error) => { console.error(error); process.exit(1); });
+child.on('exit', (code) => process.exit(code ?? 0));
+process.on('SIGINT', () => child.kill());
+process.on('SIGTERM', () => child.kill());

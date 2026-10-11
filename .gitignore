@@ -1,3 +1,10 @@
-__pycache__/
+node_modules/
+ui/dist/
+var/
+layout/
+.env
+legacy/__pycache__/
 *.pyc
-run.json
+dist/
+release/
+artifacts/
