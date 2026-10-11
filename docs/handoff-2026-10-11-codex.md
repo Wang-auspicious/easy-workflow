@@ -86,22 +86,22 @@
 
 ### P2 规范里还没做的
 
-6. **复盘员与 LESSONS.md 自进化（§31）：**
+7. **复盘员与 LESSONS.md 自进化（§31）：**
    - 一轮结束后，按"工位 × 失败类型 × 站点框架"归类 `candidate.disposition`、`token.returned`、`consult.*`；
    - 起草待批准经验，写进 LESSONS.md 和对应 CONTEXT 的"待批准的经验"；
    - 站长批准后追加到 ROLE.md 的"已知坑"；
    - 批准前先重跑失败样本，再加一组已发布站点做回归。
-7. **闭源 Agent 适配（§31）：** envelope 作为第一条消息；能力箱与 `submit` 通过 MCP 暴露（stdio 或 HTTP）。目前只有 pi。控制面的 MCP 传输也还没有（`/api/capabilities` 是 HTTP JSON）。
-8. **主调度"学写 ROLE.md"：** 在 h2_help / bootstrap 里加一项指引，新增节点时按现有 ROLE.md 的结构起草，交站长批准。站长要求先审风格，风格已确认。
-9. **`read_report` 汇总 metrics：** 把 tokens 分项与耗时分项汇总进报告，给 Agent 用。UI 面板由 Claude 直接从 `state.attempts[].metrics` 计算，不依赖这一项。
-10. **其余 6 条休眠线的 ROLE.md** 仍是脚本生成的旧格式，接线时按新写法重写。
+8. **闭源 Agent 适配（§31）：** envelope 作为第一条消息；能力箱与 `submit` 通过 MCP 暴露（stdio 或 HTTP）。目前只有 pi。控制面的 MCP 传输也还没有（`/api/capabilities` 是 HTTP JSON）。
+9. **主调度"学写 ROLE.md"：** 在 h2_help / bootstrap 里加一项指引，新增节点时按现有 ROLE.md 的结构起草，交站长批准。站长要求先审风格，风格已确认。
+10. **`read_report` 汇总 metrics：** 把 tokens 分项与耗时分项汇总进报告，给 Agent 用。UI 面板由 Claude 直接从 `state.attempts[].metrics` 计算，不依赖这一项。
+11. **其余 6 条休眠线的 ROLE.md** 仍是脚本生成的旧格式，接线时按新写法重写。
 
 ### P3 桌面与数据
 
-11. **桌面实测"项目"菜单：** 新建 / 打开 / 最近 / 切换，确认数据隔离；重新打包 release。
-12. **迁移旧数据（只复制，不移动）：** 站长之前的运行数据被放在 Codex 应用的沙盒目录 `C:\Users\zjz65\AppData\Local\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Roaming\Pi Factory\workspace`（5 条发布、9 件失败恢复记录）。复制到默认项目文件夹 `文档\Pi Factory\Projects\vislexicon-curation`。旧记录里的 `curation/fetch` 重试时会映射到 `curation/scout`。
-13. **桌面模式下的 page_text / page_find：** 走 WebContentsView 租用的页，需要实测；独立服务模式已在试跑中通过。
-14. **端口 4317 上有一个旧版 H2 服务**（node PID 16528，代码是旧的）。确认是谁启动的再决定是否关闭，不要直接杀。
+12. **桌面实测"项目"菜单：** 新建 / 打开 / 最近 / 切换，确认数据隔离；重新打包 release。
+13. **迁移旧数据（只复制，不移动）：** 站长之前的运行数据被放在 Codex 应用的沙盒目录 `C:\Users\zjz65\AppData\Local\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Roaming\Pi Factory\workspace`（5 条发布、9 件失败恢复记录）。复制到默认项目文件夹 `文档\Pi Factory\Projects\vislexicon-curation`。旧记录里的 `curation/fetch` 重试时会映射到 `curation/scout`。
+14. **桌面模式下的 page_text / page_find：** 走 WebContentsView 租用的页，需要实测；独立服务模式已在试跑中通过。
+15. **端口 4317 上有一个旧版 H2 服务**（node PID 16528，代码是旧的）。确认是谁启动的再决定是否关闭，不要直接杀。
 
 ## 3. 约束（不变）
 
