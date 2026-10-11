@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Workflow, Images, Library, History, Globe, Settings2, ListRestart, ShieldAlert, ArrowUpRight, RefreshCw } from "lucide-react";
 import type { Alert } from "../../../shared/types.ts";
-import { api } from "../api.ts";
+import { actions, api } from "../api.ts";
 import { getState, setState, useStore, type View } from "../store.ts";
 import { toast } from "./Toasts.tsx";
+import { alertPresentation } from "./alert-presentation.ts";
 
 const ITEMS: { view: View; icon: typeof Workflow; label: string; key?: string }[] = [
   { view: "canvas", icon: Workflow, label: "画布 · 流水线", key: "Alt 1" },
@@ -45,20 +46,24 @@ export function Rail() {
   );
 }
 
-const ALERT_ZH: Record<Alert["kind"], string> = { tls: "证书", auth: "登录", model: "模型额度", preflight: "开跑体检", browser: "浏览器" };
-
-/** Red light (Spec §30.7): certificate, login, model-quota or failed-preflight problems only the
- *  user can fix. Blinks in the rail and marks the window title until cleared. */
+/** Red only for an identified user action; recovery diagnostics remain inspectable. */
 function AlertLight() {
-  const alerts = Object.values(useStore((s) => s.fs.alerts) ?? {}).sort((a, b) => b.at - a.at);
+  useStore(s => s.version);
+  const browser = useStore(s => s.browser);
+  const replay = useStore(s => s.replay);
+  const connected = useStore(s => s.connected);
+  const fs = getState().fs;
+  const alerts = Object.values(fs.alerts ?? {}).sort((a, b) => b.at - a.at).map(alert => ({ alert, view: alertPresentation(alert, fs.recoveries ?? {}, browser) }));
+  const userCount = alerts.filter(a => a.view.requiresUser).length;
+  const badgeCount = userCount || alerts.length;
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState("");
   const btn = useRef<HTMLButtonElement>(null), pop = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const base = document.title.replace(/^● /, "");
-    document.title = alerts.length ? `● ${base}` : base;
+    document.title = userCount ? `● ${base}` : base;
     if (!alerts.length) setOpen(false);
-  }, [alerts.length]);
+  }, [alerts.length, userCount]);
   useEffect(() => {
     if (!open) return;
     const down = (e: PointerEvent) => { if (!pop.current?.contains(e.target as Node) && !btn.current?.contains(e.target as Node)) setOpen(false); };
@@ -68,31 +73,39 @@ function AlertLight() {
   if (!alerts.length) return null;
   const tool = async (key: string, body: Record<string, unknown>, done: string) => {
     setBusy(key);
-    try { await api.post("/api/tools/alerts", body); toast(done); } catch (e) { toast(`没有成功：${(e as Error).message}`); } finally { setBusy(""); }
+    try { const result = await api.post<{ result?: { message?: string } }>("/api/tools/alerts", body); toast(result.result?.message || done); } catch { /* API displays the reason; keep the alert visible. */ } finally { setBusy(""); }
   };
-  const go = (a: Alert) => {
-    setOpen(false);
-    if (a.tab || a.kind === "auth" || a.kind === "tls") setState({ view: "browser" });
-    else if (a.token) setState({ view: "canvas", inspectors: [...getState().inspectors.filter((i) => i.pinned), { key: a.token, kind: "token", x: 0, y: 0, pinned: false }] });
+  const go = async (a: Alert, view: ReturnType<typeof alertPresentation>) => {
+    setBusy(a.id);
+    try {
+      if (view.tab || view.url) {
+        await actions.browser(view.tab ? { action: "activate", id: view.tab } : { action: "open", url: view.url });
+        setState({ view: "browser" });
+      } else if (a.kind === "model" || a.kind === "preflight") setState({ view: "settings" });
+      else if (a.token) setState({ view: "canvas", inspectors: [...getState().inspectors.filter((i) => i.pinned), { key: a.token, kind: "token", x: 0, y: 0, pinned: false }] });
+      setOpen(false);
+    } catch { /* Keep diagnostics open when the target could not be opened. */ } finally { setBusy(""); }
   };
   const r = btn.current?.getBoundingClientRect();
   return (
     <>
-      <button ref={btn} className="rail-item rail-alert" onClick={() => setOpen(!open)} data-tip={`${alerts.length} 个问题需要你处理`} data-tip-side="right" aria-label={`${alerts.length} 个红灯`}>
+      <button ref={btn} className={`rail-item rail-alert ${userCount ? "" : "is-recovery"}`} onClick={() => setOpen(!open)} data-tip={userCount ? `${userCount} 件需要你操作 · ${alerts.length - userCount} 件待系统检查` : `${alerts.length} 件待系统检查`} data-tip-side="right" aria-label={userCount ? `${userCount} 件需要你操作` : `${alerts.length} 件待系统检查`} aria-expanded={open}>
         <i className="rail-alert-dot" />
-        {alerts.length > 1 && <span className="rail-badge num">{alerts.length}</span>}
+        {badgeCount > 1 && <span className="rail-badge num">{badgeCount}</span>}
       </button>
       {open && (
         <div ref={pop} className="alert-pop" style={{ left: (r?.right ?? 64) + 10, bottom: Math.max(12, window.innerHeight - (r?.bottom ?? 0)) }}>
-          <header><ShieldAlert size={15} /><b>需要你处理</b><span className="grow" /><button className="btn btn--sm btn--ghost" disabled={busy === "pf"} onClick={() => void tool("pf", { action: "preflight" }, "已重新体检")}><RefreshCw size={12} />重新体检</button></header>
-          {alerts.map((a) => (
-            <div key={a.id} className="alert-item">
-              <div className="alert-kind"><i className="rail-alert-dot" />{ALERT_ZH[a.kind] ?? a.kind}{a.item && <span className="muted"> · {a.item}</span>}</div>
-              <p>{a.message}</p>
-              {a.nextAction && <p className="alert-next">{a.nextAction}</p>}
+          <header><ShieldAlert size={15} /><b>恢复与访问检查</b><span className="grow" /><button className="btn btn--sm btn--ghost" disabled={Boolean(busy || replay) || !connected} onClick={() => void tool("pf", { action: "preflight" }, "环境检查结果已更新")}><RefreshCw size={12} />环境检查</button></header>
+          <p className="alert-summary">{userCount ? `${userCount} 件需要你操作` : "当前没有已确认的登录操作"}{alerts.length > userCount ? ` · ${alerts.length - userCount} 件待系统检查` : ""}</p>
+          {alerts.sort((a, b) => Number(b.view.requiresUser) - Number(a.view.requiresUser)).map(({ alert: a, view }) => (
+            <div key={a.id} className={`alert-item ${view.requiresUser ? "" : "is-recovery"}`}>
+              <div className="alert-kind"><i className="rail-alert-dot" />{view.label}{view.title && <span className="muted"> · {view.title}</span>}</div>
+              <p>{view.message}</p>
+              {view.nextAction && <p className="alert-next">{view.nextAction}</p>}
+              {view.details !== view.message && <details className="alert-diagnostics"><summary>诊断详情</summary><pre>{view.details}</pre></details>}
               <div className="alert-actions">
-                {(a.tab || a.token || a.kind === "auth" || a.kind === "tls") && <button className="btn btn--sm" onClick={() => go(a)}>去处理<ArrowUpRight size={12} /></button>}
-                <button className="btn btn--sm btn--ghost" disabled={busy === a.id} onClick={() => void tool(a.id, { action: "clear", id: a.id, reason: "站长已处理" }, "红灯已熄灭")}>我已处理</button>
+                {(view.tab || view.url || a.token || a.kind === "model" || a.kind === "preflight") && <button className="btn btn--sm" disabled={Boolean(busy || replay) || !connected} onClick={() => void go(a, view)}>{view.tab || view.url ? "打开对应页面" : a.kind === "model" || a.kind === "preflight" ? "打开设置" : "查看记录"}<ArrowUpRight size={12} /></button>}
+                <button className="btn btn--sm btn--ghost" disabled={Boolean(busy || replay) || !connected} onClick={() => void tool(a.id, { action: "recheck", id: a.id }, "访问检查结果已更新")}>{busy === a.id ? "正在检查…" : "重新检查"}</button>
               </div>
             </div>
           ))}

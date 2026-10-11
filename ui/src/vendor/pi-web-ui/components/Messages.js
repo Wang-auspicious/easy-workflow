@@ -103,14 +103,15 @@ let AssistantMessage = class AssistantMessage extends LitElement {
                 ? html ` <div class="px-4 mt-2 text-xs text-muted-foreground cursor-pointer hover:text-foreground transition-colors" @click=${this.onCostClick}>${formatUsage(this.message.usage)}</div> `
                 : html ` <div class="px-4 mt-2 text-xs text-muted-foreground">${formatUsage(this.message.usage)}</div> `
             : ""}
-				${this.message.stopReason === "error" && this.message.errorMessage
+				${this.message.h2Failure ? html`<div class="pi-turn-notice" role="status"><span>${this.message.h2Failure.label}</span>${this.message.h2Failure.detail ? html`<details><summary>技术详情</summary><pre>${this.message.h2Failure.detail}</pre></details>` : ""}</div>` : ""}
+				${this.message.h2Failure === undefined && this.message.stopReason === "error" && this.message.errorMessage
             ? html `
 							<div class="mx-4 mt-3 p-3 bg-destructive/10 text-destructive rounded-lg text-sm overflow-hidden">
 								<strong>${i18n("Error:")}</strong> ${this.message.errorMessage}
 							</div>
 						`
             : ""}
-				${this.message.stopReason === "aborted"
+				${this.message.h2Failure === undefined && this.message.stopReason === "aborted"
             ? html `<span class="text-sm text-destructive italic">${i18n("Request aborted")}</span>`
             : ""}
 			</div>

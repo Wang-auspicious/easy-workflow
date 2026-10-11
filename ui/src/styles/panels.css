@@ -375,3 +375,4 @@
 .alert-item p { margin: 5px 0 0; font-size: 12.5px; color: var(--ink-2); line-height: 1.5; }
 .alert-item .alert-next { color: var(--ink-3); }
 .alert-actions { display: flex; gap: 6px; margin-top: 8px; }
+.is-recovery>.rail-alert-dot,.is-recovery .alert-kind>.rail-alert-dot{background:var(--ink-3);animation:none}.alert-summary{font-size:11.5px;color:var(--ink-3);margin:0 0 7px}.alert-kind .muted{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.alert-diagnostics{font-size:11px;color:var(--ink-3);margin-top:7px}.alert-diagnostics summary{cursor:pointer}.alert-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 var(--mono);max-height:160px;overflow:auto}.alert-pop{max-width:calc(100vw - 88px)}
