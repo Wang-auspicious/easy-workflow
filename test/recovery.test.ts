@@ -214,6 +214,20 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       assert.equal(f.runtime.correct({token:previous.id,node:"curation/facts"},"Verify the source again").ok,true);
       await f.runtime.settle();const report=await endRun(f);assert.equal(report?.totals.created,1,"historical corrections still appear in the current report");
     });
+    await t.test("choosing a concrete preview page validates the URL and resumes the selected checkpoint",async()=>{
+      const f=factory!;f.broker.memoryFloorMB=0;f.runtime.start("page choice");
+      f.runtime.executors=()=>async()=>({ok:false,summary:"没有合格的特写",error:"needsPick"});
+      const old=f.runtime.create("curation/proof",{item:"page-choice",url:base,source:"candidates/pool",data:{canonical:base,kind:"component-source",keptEvidence:true}});
+      for(let i=0;i<100&&f.state.tokens[old.id].status==="active";i++)await delay(10);
+      const control=new FactoryControl(f),url=`${base}/demo?path=/docs/button`;
+      await assert.rejects(control.execute("choose_preview_page",{item:old.item,role:"proof",url:"https://unrelated.test/demo"}),/该站点/);
+      await assert.rejects(control.execute("choose_preview_page",{item:old.item,role:"proof",url:`${base}/llms.txt`}),/可视页面/);
+      f.runtime.executors=n=>async ctx=>{assert.equal(n.key,"curation/proof");assert.equal((ctx.token.data.previewChoices as any).proof,url);assert.equal(ctx.token.data.keptEvidence,true);return {ok:true,summary:"fixture pass",finish:{status:"published",reason:"fixture"}};};
+      const response=await control.execute("choose_preview_page",{item:old.item,role:"proof",url});
+      await f.runtime.settle();assert.equal(f.state.tokens[response.result.token].status,"published");
+      await assert.rejects(control.execute("choose_preview_page",{item:old.item,role:"proof",url}),/不在待处理/);
+      await endRun(f);
+    });
   } finally {
     if(factory){await factory.runtime.close();factory.journal.close();}
     fixture.closeAllConnections();await new Promise<void>(resolve=>fixture.close(()=>resolve()));

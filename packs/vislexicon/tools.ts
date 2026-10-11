@@ -259,6 +259,8 @@ const breadth: Tool = async (ctx, svc) => {
   const shots = shotsOf(ctx);
   const exclude = new Set<string>((ctx.token.data.rejectedPages as string[]) ?? []);
   const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string}>|undefined)?.breadth;
+  const explicit=(ctx.token.data.previewChoices as Record<string,string>|undefined)?.breadth;
+  if(explicit)exclude.delete(pageKey(explicit));
   if (ctx.redo && shots.breadth?.href && (!repair||repair.action==="replace-page")) exclude.add(pageKey(shots.breadth.href));
   // The home page itself never counts as the catalogue.
   for (const h of [shots.identity?.href, String(ctx.token.data.canonical), (ctx.token.data.home as { finalUrl?: string })?.finalUrl]) if (h) exclude.add(pageKey(h));
@@ -268,6 +270,7 @@ const breadth: Tool = async (ctx, svc) => {
   }
   const ranked: { href: string; score: number; reasons: string[]; text: string }[] = scoreLinks(pool, role).filter((c) => !exclude.has(c.href)).slice(0, 4);
   if(repair&&repair.action!=="replace-page"&&repair.url&&!exclude.has(pageKey(repair.url)))ranked.unshift({href:repair.url,text:"按复审重新取景",score:10,reasons:['review-reframe']});
+  if(explicit)ranked.splice(0,ranked.length,{href:explicit,text:"已指定目录页",score:100,reasons:['explicit-choice']});
   for(const link of pool.filter(l=>new URL(l.href).searchParams.get('path')?.startsWith('/docs/')).slice(0,4))if(!exclude.has(pageKey(link.href))&&!ranked.some(r=>pageKey(r.href)===pageKey(link.href)))ranked.push({href:link.href,text:link.text,score:8,reasons:['storybook-docs']});
   ctx.progress(`目录候选 ${ranked.length} 个：${ranked.map((r) => new URL(r.href).pathname).join("  ") || "无"}`, { tool: "rules", text: "path +3 · text +2 · nav +1" });
   let usage: Usage | undefined;
@@ -302,7 +305,7 @@ const breadth: Tool = async (ctx, svc) => {
         ctx.progress(`拒收 ${new URL(c.href).pathname}：${issues.join("、")}`, { tool: "reject", text: issues.join(", "), ok: false });
         // Rules ran out: one needsPick round over the links not tried yet.
         tried.add(pageKey(page.url()));
-        if (i === ranked.length - 1 && selectionCalls<2) {
+        if (i === ranked.length - 1 && selectionCalls<2 && !explicit) {
           const rest = options.filter((l) => !tried.has(pageKey(l.href))&&!exclude.has(pageKey(l.href)));
           selectionCalls++;
           const pick = await pickOne(ctx, `Website ${ctx.token.data.title} is a ${KIND_ZH[kind] ?? kind}. Previous choice ${c.href} led to ${page.url()} and was rejected: ${issues.join(', ')}. Choose a DIFFERENT remaining catalogue, module overview or usage page that adds information beyond the home page. Return no choice if none exists.`, rest.map((l) => `${l.text} → ${l.href}`));
@@ -355,9 +358,11 @@ const proof: Tool = async (ctx, svc) => {
   const norm = pageKey;
   if(usesStage){const extra=scoreLinks([...breadthLinks,...homeLinks],{pathPatterns:['iframe[.]html','demo|example|playground','/components/'],linkText:['playground','examples','preview','demo','button','grid','dialog','table']}).map(l=>l.href);candidates=[...new Set([...extra,...candidates])];}
   const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string}>|undefined)?.proof;
+  const explicit=(ctx.token.data.previewChoices as Record<string,string>|undefined)?.proof;
   const taken = new Set([norm(String(ctx.token.data.canonical)), norm(shots.breadth?.href ?? ""), norm(shots.identity?.href ?? ""), ...(((ctx.token.data.rejectedPages as string[]) ?? []).map(norm))]);
   if(repair&&repair.action!=="replace-page"&&repair.url)candidates=[repair.url];
   else if (ctx.redo && shots.proof?.href) taken.add(norm(shots.proof.href));
+  if(explicit){candidates=[explicit];taken.delete(norm(explicit));}
   candidates = [...new Set(candidates.map(norm))].filter((h) => !taken.has(h)).slice(0, 6);
   let usage: Usage | undefined;
   if (!candidates.length) {

@@ -148,17 +148,33 @@ export class Factory {
     return Object.values(this.state.recoveries).filter(c=>(!filter.tag||c.failure?.tag===filter.tag)&&(!filter.disposition||c.disposition===filter.disposition)).sort((a,b)=>b.at-a.at);
   }
 
-  retryCandidates(filter:{tag?:string;items?:string[];count:number}) {
+  choosePreview(item:string,role:"breadth"|"proof",url:string) {
+    const c=this.state.recoveries[item];
+    if(!c||c.disposition!=="retry")throw new ControlError(409,"candidate_not_waiting","该候选当前不在待处理队列");
+    let selected:URL,entry:URL;
+    try{selected=new URL(url);entry=new URL(c.url);}catch{throw new ControlError(400,"invalid_url","请输入完整网页地址");}
+    const host=entry.hostname.replace(/^www\./,"");
+    if(!["http:","https:"].includes(selected.protocol)||selected.username||selected.password||!(selected.hostname.replace(/^www\./,"")===host||selected.hostname.endsWith('.'+host)))throw new ControlError(400,"invalid_preview_page","采集页必须是该站点或其子域的 HTTP(S) 网页");
+    if(/\.(txt|md|json|xml|zip|pdf|png|jpe?g|svg|mp4)$/i.test(selected.pathname))throw new ControlError(400,"not_visual_page","请选择可视页面，不能用数据文件或下载文件代替截图");
+    if(!this.state.tokens[c.token]?.data.canonical)throw new ControlError(409,"missing_classification","请先完成首页抓取与分类，再指定采集页");
+    return this.retryCandidates({items:[item],count:1,preview:{role,url:selected.href}})[0];
+  }
+
+  retryCandidates(filter:{tag?:string;items?:string[];count:number;preview?:{role:"breadth"|"proof";url:string}}) {
     if(this.runtime.paused&&this.runtime.running)throw new ControlError(409,"run_paused","请先继续或结束当前暂停的轮次");
     const selected=this.candidateFailures({tag:filter.tag,disposition:"retry"}).filter(c=>!filter.items||filter.items.includes(c.item)).slice(0,filter.count);
     if(!selected.length)return [];
     if(!this.runtime.running)this.runtime.start(`失败重试 × ${selected.length}`);
     return selected.map(c=>{
       const previous=this.state.tokens[c.token];
-      const failedAt=previous?.finishedAtNode;
+      const failedAt=filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode;
       const checkpoint=previous?.data.canonical&&failedAt&&this.compiled.nodes.some(n=>n.key===failedAt&&this.runtime.runnable(n))?failedAt:"candidates/tidy";
       const data:Record<string,unknown>=checkpoint==="candidates/tidy"?{}:structuredClone(previous.data);
       delete data.failure;delete data.gate;delete data.digest;
+      if(filter.preview){
+        data.previewChoices={...(data.previewChoices as object??{}),[filter.preview.role]:filter.preview.url};
+        const repairs={...(data.shotRepairs as Record<string,unknown>??{})};delete repairs[filter.preview.role];data.shotRepairs=repairs;
+      }
       const recoveryRoot=String(previous?.data.recoveryRoot??(previous&&this.state.attempts[previous.attempts[0]]?.node)??checkpoint);
       const completed=new Map((previous?.attempts??[]).map(id=>this.state.attempts[id]).filter(Boolean).map(a=>[a.node,a.ok]));
       const t=this.runtime.create(checkpoint,{item:c.item,url:c.url,title:c.title,source:"candidates/pool",category:c.category,data:{...data,express:true,retryOf:c.token,retryTag:c.failure?.tag,recoveryStation:checkpoint,recoveryRoot}});

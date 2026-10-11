@@ -108,6 +108,11 @@ function definitions(f: Factory): Tool[] {
         execute:async(_id,p)=>{const tasks=f.retryCandidates(p);return ok({count:tasks.length,tokens:tasks.map(t=>({id:t.id,item:t.item})),runId:f.state.run.id},`已取出 ${tasks.length} 件重试`);},
       },
       {
+        name:"choose_preview_page",label:"指定采集页并继续",description:"Resolve a needs_selection candidate by supplying a concrete same-site breadth (catalogue/overview) or proof (demo/example) page. Resumes at that station, retains prior evidence, and still runs quality checks.",
+        parameters:object({item:name(),role:choice("breadth","proof"),url:name()}),
+        execute:async(_id,p)=>{const t=f.choosePreview(p.item,p.role,p.url);return ok({token:t.id,item:t.item,station:`curation/${p.role}`,url:p.url},"已指定采集页，从对应工位继续");},
+      },
+      {
         name: "workers", label: "加人 / 撤人 / 锁定", description: "fork | retire | lock | unlock workers at a station (key like 'curation/proof').",
         parameters: Type.Object({ station: Type.String(), action: Type.Union(["fork", "retire", "lock", "unlock"].map((x) => Type.Literal(x))), reason: Type.String() }),
         execute: async (_id, p) => {
