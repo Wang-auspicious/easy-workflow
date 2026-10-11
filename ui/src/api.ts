@@ -4,6 +4,7 @@ import type { FactoryState } from "../../shared/project.ts";
 import { getState, ingest, setState, type LayoutFile } from "./store.ts";
 import { toast } from "./shell/Toasts.tsx";
 import { legacyReply } from "../../shared/conversation.ts";
+import { idleDispatcher, reconcileChatLive, reduceChatLive, type ChatEvent, type DispatcherStatus } from "./chat/live.ts";
 
 export const api = {
   async get<T>(path: string): Promise<T> { const r = await fetch(path); if (!r.ok) throw new Error(`${path} ${r.status}`); return r.json(); },
@@ -21,7 +22,7 @@ let es: EventSource | null = null;
 
 export async function boot() {
   const f = await api.get<{ factory: any; layout: Partial<LayoutFile>; defaultLayout: any; settings: Record<string, number>; model: string; keyPresent: boolean }>("/api/factory");
-  const fs = await api.get<FactoryState>("/api/state");
+  const fs = await api.get<FactoryState & { dispatcher?: DispatcherStatus }>("/api/state");
   // A window can reload while an older desktop backend is still shutting down.
   fs.activity ??= fs.chat.filter(m=>m.role==="note");
   fs.recoveries ??= {};
@@ -38,6 +39,8 @@ export async function boot() {
     factory: f.factory, defaultLayout: f.defaultLayout,
     layout,
     fs, version: getState().version + 1, settings: f.settings, model: f.model, keyPresent: f.keyPresent, ready: true,
+    dispatcher: fs.dispatcher ?? idleDispatcher(),
+    live: reconcileChatLive(getState().live, fs.dispatcher ?? idleDispatcher()),
   });
   connect(fs.seq);
   void api.get<import("../../shared/browser.ts").BrowserState>("/api/browser").then(browser => setState({browser})).catch(() => {});
@@ -55,16 +58,14 @@ export function connect(since: number) {
     if (event.kind === "factory.loaded" || event.kind === "spec.patched") void refreshSpec();
   };
   es.addEventListener("live", (m) => {
-    const e = JSON.parse((m as MessageEvent).data) as { kind: string; delta?: string; name?: string; status?: string; summary?: string; id?: string; turn?:string; message?: import("../../shared/conversation.ts").PiMessage | null; state?: import("../../shared/browser.ts").BrowserState };
+    const e = JSON.parse((m as MessageEvent).data) as ChatEvent & { state?: import("../../shared/browser.ts").BrowserState };
     if (e.kind === "browser.state" && e.state) { setState({browser:e.state}); return; }
+    if (getState().replay) return;
     const live = getState().live;
-    if (e.kind === "chat.start") setState({ live: { id: e.id ?? "x", text: "", tools: [] } });
-    else if (e.kind === "chat.pi") setState({ live: { ...live, id:e.turn??live.id, messageId: e.id, message: e.message } });
-    else if (e.kind === "chat.delta") setState({ live: { ...live, text: live.text + (e.delta ?? "") } });
-    else if (e.kind === "chat.tool") {
-      const tools = e.status === "start" ? [...live.tools, { name: e.name!, status: "start" }] : live.tools.map((t, i) => (i === live.tools.map((x) => x.name).lastIndexOf(e.name!) ? { ...t, status: "end", summary: e.summary } : t));
-      setState({ live: { ...live, tools } });
-    } else if (e.kind === "chat.end") setState({ live: { id: null, text: "", tools: [] } });
+    if (e.kind === "chat.status") {
+      const dispatcher = JSON.parse((m as MessageEvent).data) as DispatcherStatus;
+      setState({ dispatcher, live: reconcileChatLive(live, dispatcher) });
+    } else setState({ live: reduceChatLive(live, e) });
   });
 }
 
@@ -87,8 +88,9 @@ export function saveLayout(next: LayoutFile) {
 }
 
 export const actions = {
-  chat: (text: string, attachments: Attachment[]) => api.post("/api/chat", { text, attachments }),
+  chat: (text: string, attachments: Attachment[], options?: { requestId: string; mode: "steer" | "followUp" }) => api.post("/api/chat", { text, attachments, ...options }),
   abortChat: () => api.post("/api/chat/abort", {}),
+  continueChat: () => api.post("/api/chat/continue", {}),
   browser: async (args: Record<string,unknown>) => { const browser = await api.post<import("../../shared/browser.ts").BrowserState>("/api/browser",args); setState({browser}); return browser; },
   run: (action: "start" | "pause" | "resume" | "end", title?: string) => api.post("/api/run", { action, title }),
   pull: (count: number, category?: string) => api.post("/api/pull", { count, category }),

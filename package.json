@@ -19,7 +19,8 @@
     "pi:install": "node scripts/install-pi.mjs",
     "check:canvas": "node scripts/check-canvas.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test \"test/**/*.test.ts\""
+    "test": "node --test \"test/**/*.test.ts\"",
+    "test:ui": "node --test \"ui/test/*.test.ts\""
   },
   "engines": {
     "node": ">=24"

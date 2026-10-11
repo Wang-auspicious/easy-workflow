@@ -1,0 +1,53 @@
+/* 小人的动作。状态类由 Avatar.tsx 加在 <svg> 上，动画只改 transform / opacity，
+   不动布局，也不变形状数据。所有动作在 prefers-reduced-motion 下关闭。 */
+.gavatar { display: block; flex: none; overflow: visible; }
+.gavatar-body { transform-origin: 114.3px 114.3px; animation: gv-breathe 4.4s ease-in-out infinite; }
+.gavatar-eye { animation: gv-blink 5.6s ease-in-out infinite; }
+.gavatar-shadow { transform-origin: 114.3px 238px; }
+
+@keyframes gv-breathe { 0%, 100% { transform: translateY(0) } 50% { transform: translateY(-5px) } }
+@keyframes gv-blink { 0%, 92%, 100% { transform: scaleY(1) } 95% { transform: scaleY(.08) } }
+
+/* thinking：上浮 + 眼珠往上看，三点依次亮 */
+.gavatar--thinking .gavatar-body { animation: gv-float 2.8s ease-in-out infinite; }
+.gavatar--thinking .gavatar-eyes { animation: gv-look 4.2s ease-in-out infinite; }
+.gavatar-think .gavatar-dot { fill: oklch(0.72 0.1 var(--gv-hue)); animation: gv-dot 1.3s ease-in-out infinite; }
+@keyframes gv-float { 0%, 100% { transform: translateY(0) rotate(-1.5deg) } 50% { transform: translateY(-9px) rotate(1.5deg) } }
+@keyframes gv-look { 0%, 45%, 100% { transform: translate(0, 0) } 65% { transform: translate(-7px, -8px) } 85% { transform: translate(6px, -5px) } }
+@keyframes gv-dot { 0%, 100% { opacity: .25; transform: translateY(0) } 40% { opacity: 1; transform: translateY(-6px) } }
+
+/* speaking：说话的节奏，眨眼变快，声波环一圈圈散开 */
+.gavatar--speaking .gavatar-body { animation: gv-talk .92s ease-in-out infinite; }
+.gavatar--speaking .gavatar-eye { animation-duration: 2.4s; }
+.gavatar-ring { transform-origin: 114.3px 114.3px; animation: gv-ring 1.6s ease-out infinite; }
+@keyframes gv-talk { 0%, 100% { transform: translateY(0) scale(1) } 35% { transform: translateY(-6px) scale(1.025) } 70% { transform: translateY(-2px) scale(1.01) } }
+@keyframes gv-ring { 0% { opacity: .5; transform: scale(.86) } 100% { opacity: 0; transform: scale(1.06) } }
+
+/* work：前倾快节奏 */
+.gavatar--work .gavatar-body { animation: gv-work .78s ease-in-out infinite; transform: rotate(6deg); }
+.gavatar--work .gavatar-eye { animation-duration: 3.4s; }
+@keyframes gv-work { 0%, 100% { transform: translateY(0) rotate(6deg) } 50% { transform: translateY(-7px) rotate(3deg) } }
+
+/* wait：左右张望，慢 */
+.gavatar--wait .gavatar-body { animation: gv-breathe 6s ease-in-out infinite; }
+.gavatar--wait .gavatar-eyes { animation: gv-lookaround 5.2s ease-in-out infinite; }
+@keyframes gv-lookaround { 0%, 100% { transform: translateX(0) } 25% { transform: translateX(-9px) } 60% { transform: translateX(8px) } }
+
+/* returned：弹两下 + 星 */
+.gavatar--returned .gavatar-body { animation: gv-hop .62s ease-out 2; }
+.gavatar-spark { animation: gv-spark 1.4s ease-out 2; transform-origin: 210px 60px; }
+@keyframes gv-hop { 0% { transform: translateY(0) } 40% { transform: translateY(-16px) rotate(-3deg) } 100% { transform: translateY(0) } }
+@keyframes gv-spark { 0% { opacity: 0; transform: scale(.4) } 40% { opacity: 1; transform: scale(1.15) } 100% { opacity: 0; transform: scale(.6) } }
+
+/* fail：抖两下 */
+.gavatar--fail .gavatar-body { animation: gv-shake .34s ease-in-out 3; }
+@keyframes gv-shake { 0%, 100% { transform: translateX(0) } 25% { transform: translateX(-6px) rotate(-2deg) } 75% { transform: translateX(6px) rotate(2deg) } }
+
+/* sleep：更慢的呼吸 + z 一闪一闪 */
+.gavatar--sleep .gavatar-body { animation: gv-breathe 6.8s ease-in-out infinite; }
+.gavatar-z { animation: gv-z 3.2s ease-in-out infinite; }
+@keyframes gv-z { 0%, 100% { opacity: .25 } 50% { opacity: .85 } }
+
+@media (prefers-reduced-motion: reduce) {
+  .gavatar * { animation: none !important; }
+}

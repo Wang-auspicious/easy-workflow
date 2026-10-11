@@ -6,6 +6,8 @@ import { emptyBrowser, type BrowserState } from "../../shared/browser.ts";
 import type { Attachment, CompiledFactory, Stamped } from "../../shared/types.ts";
 import { apply, initialState, type FactoryState } from "../../shared/project.ts";
 import type { LayoutResult } from "../../shared/layout.ts";
+import { emptyLive, idleDispatcher, type DispatcherStatus, type LiveChat } from "./chat/live.ts";
+export type { LiveChat } from "./chat/live.ts";
 
 export type View = "canvas" | "board" | "candidates" | "library" | "runs" | "browser" | "settings" | "report";
 export type Layer = "pipeline" | "gantt" | "spec" | "channels";
@@ -22,8 +24,6 @@ export interface LayoutFile {
 }
 
 export interface Inspector { key: string; kind: "node" | "token" | "part"; x: number; y: number; pinned: boolean; pinScale?: number; worker?: string }
-
-export interface LiveChat { id: string | null; text: string; messageId?: string; message?: import("../../shared/conversation.ts").PiMessage | null; tools: { name: string; status: string; summary?: string }[] }
 
 export interface Store {
   ready: boolean;
@@ -42,6 +42,7 @@ export interface Store {
   chatWidth: number;
   unread: number;
   live: LiveChat;
+  dispatcher: DispatcherStatus;
   browser: BrowserState;
   inspectors: Inspector[];
   selected: string[];
@@ -72,7 +73,7 @@ let state: Store = {
   fs: initialState(), version: 0, nodeRev: {},
   view: (LS("view") as View) ?? "canvas", layer: "pipeline", reportRun: null,
   attachments: [], chatOpen: (LS("chatOpen") as boolean) ?? false, chatWidth: (LS("chatWidth") as number) ?? 320, unread: 0,
-  live: { id: null, text: "", tools: [] },
+  live: emptyLive(), dispatcher: idleDispatcher(),
   browser: emptyBrowser(),
   inspectors: [], selected: [], follow: false, trail: null, flashes: {}, settings: {}, model: "", keyPresent: false, replay: null, focus: null, draft: "", boardFocus: null,
 };

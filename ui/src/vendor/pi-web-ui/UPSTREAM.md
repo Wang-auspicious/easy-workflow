@@ -9,7 +9,8 @@ message-renderer-registry.js, utils/format.js. Keep LICENSE with distributions.
 
 Easy Workflow adaptations: streaming message identity in MessageList; lightweight attachment
 labels in UserMessage; accessible, localized thinking toggle; local i18n and
-collapsed Easy Workflow tool renderer. PiBlocks supplies sanitized Markdown and plain code
+collapsed Easy Workflow tool renderer; a view-only failure notice consolidates interrupted
+Pi responses without changing the journal, with technical details kept expandable. PiBlocks supplies sanitized Markdown and plain code
 blocks. A ShadowRoot scopes the sidebar stylesheet. The actual Pi 1.1 message
 events are recorded and replayed in order; the older UI package does not bring an
 older agent runtime, provider settings, session server, or Office parsers into Easy Workflow.

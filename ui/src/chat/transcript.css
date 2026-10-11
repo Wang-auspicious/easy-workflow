@@ -1,0 +1,64 @@
+/* 转录样式，参考 Grok Bot 的行结构：小人在左，右边是名字 / 时间 / 状态，正文依次排开。
+   颜色沿用应用的设计变量（:root 的自定义属性会穿过 shadow 边界）。 */
+:host { color: var(--ink-2); font: 13px/1.65 var(--font); }
+.tr { display: flex; flex-direction: column; gap: 18px; padding: 14px 0 22px; }
+.tr-row { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; align-items: start; }
+.tr-av { position: sticky; top: 0; padding-top: 1px; }
+/* 你自己的消息用人物头像，小人是给工位和主调度的。 */
+.tr-av-user { display: grid; place-items: center; width: 30px; height: 30px; margin-top: 2px; border-radius: 50%; background: var(--panel-3); border: 1px solid var(--line-2); color: var(--ink-3); }
+.tr-main { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+
+.tr-head { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
+.tr-who { font-size: 12px; font-weight: 600; color: var(--ink); }
+.tr-who--link { font: inherit; color: var(--ink); font-weight: 600; }
+.tr-who--link:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.tr-time { font-size: 10px; color: var(--ink-4); }
+.tr-tone { color: var(--ink-4); }
+.tr-state { font-size: 10px; padding: 0 6px; border-radius: 999px; background: var(--panel-3); color: var(--ink-3); }
+.tr-state--thinking, .tr-state--work { background: var(--accent-soft); color: var(--accent); }
+.tr-state--speaking { background: color-mix(in oklab, var(--accent) 12%, #fff); color: var(--accent); }
+.tr-state--fail { background: color-mix(in oklab, var(--bad) 12%, #fff); color: var(--bad); }
+.tr-state--wait { background: color-mix(in oklab, var(--warn) 18%, #fff); color: color-mix(in oklab, var(--warn) 65%, #553c00); }
+.tr-state--returned { background: color-mix(in oklab, var(--ok) 14%, #fff); color: color-mix(in oklab, var(--ok) 75%, #123); }
+
+/* 用户消息：一个浅底盒子，仍然在同一列里，不单独换边。 */
+.tr-row--user .tr-text markdown-block, .tr-row--user .tr-text .markdown { display: block; background: var(--panel-3); border: 1px solid var(--line); border-radius: 12px; padding: 9px 12px; }
+
+.tr-notice { margin: 0; font-size: 12px; color: var(--ink-3); }
+.tr-row--warn .tr-notice { color: color-mix(in oklab, var(--bad) 80%, #333); }
+.tr-row--fork .tr-notice { color: var(--ink-2); }
+
+.tr-think > summary { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); cursor: pointer; list-style: none; }
+.tr-think > summary::-webkit-details-marker { display: none; }
+.tr-think > summary:hover { color: var(--ink-2); }
+.tr-arrow { font-size: 15px; line-height: 1; transition: transform 160ms var(--ease); }
+.tr-think[open] .tr-arrow { transform: rotate(90deg); }
+.tr-think > markdown-block, .tr-think > .markdown { color: var(--ink-3); font-size: 12.5px; margin-top: 6px; padding-left: 2px; }
+.is-live { background: linear-gradient(90deg, var(--ink-4), var(--ink) 45%, var(--ink-4)); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: tr-shimmer 1.8s linear infinite; }
+@keyframes tr-shimmer { 0% { background-position: 120% 0 } 100% { background-position: -20% 0 } }
+
+.tr-tool { border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
+.tr-tool > summary { display: flex; align-items: center; gap: 7px; padding: 7px 10px; font-size: 12px; cursor: pointer; list-style: none; color: var(--ink-2); }
+.tr-tool > summary::-webkit-details-marker { display: none; }
+.tr-tool > summary:hover { color: var(--ink); }
+.tr-tool-status { display: inline-flex; color: var(--ok); }
+.tr-tool--pending .tr-tool-status { color: var(--accent); }
+.tr-tool--error .tr-tool-status, .tr-tool--error .tr-tool-state { color: var(--bad); }
+.tr-tool-wrench { color: var(--ink-4); }
+.tr-tool-name { font-weight: 500; }
+.tr-tool-state { margin-left: auto; font-size: 10px; color: var(--ink-4); }
+.tr-tool-body { padding: 0 10px 10px; display: flex; flex-direction: column; gap: 5px; }
+.tr-label { font-size: 10px; color: var(--ink-4); }
+.tr-tool-note { margin: 2px 0 0; font-size: 11px; color: var(--ink-3); }
+
+.tr-atts { display: flex; gap: 5px; flex-wrap: wrap; }
+.tr-att { font-size: 10px; border: 1px solid var(--line-2); padding: 1px 6px; border-radius: 4px; color: var(--ink-3); }
+
+/* 流式回答末尾的光标 */
+.tr-text.is-streaming::after { content: ""; display: inline-block; width: 7px; height: 13px; margin-left: 3px; vertical-align: -2px; background: var(--accent); border-radius: 1px; animation: tr-caret 1s step-end infinite; }
+@keyframes tr-caret { 50% { opacity: 0 } }
+
+@media (prefers-reduced-motion: reduce) {
+  .is-live { animation: none; background: none; color: inherit; -webkit-text-fill-color: currentColor; }
+  .tr-text.is-streaming::after { animation: none; }
+}
