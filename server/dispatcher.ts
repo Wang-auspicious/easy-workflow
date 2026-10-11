@@ -105,7 +105,7 @@ export class Dispatcher {
         .map((e) => this.f.store.resolve(e!.card!)).filter((p): p is string => Boolean(p && fs.existsSync(p)));
       const { EvidenceStore } = await import("./evidence.ts");
       const current=(await this.control.execute("status",{},"dispatcher")).result;
-      const content = `${text}${attachments.length?`\n\n附件：\n${attachments.map((a) => this.describe(a)).join("\n")}`:""}\n\n<H2_CURRENT_STATE at="${new Date().toISOString()}">${JSON.stringify(current)}</H2_CURRENT_STATE>\n以上为本次对话开始时的实时快照，历史回答中的数字可能已过期。若后续操作改变状态，回答前再次核对。`;
+      const content = `${text}${attachments.length?`\n\n附件：\n${attachments.map((a) => this.describe(a)).join("\n")}`:""}\n\n<EASY_WORKFLOW_CURRENT_STATE at="${new Date().toISOString()}">${JSON.stringify(current)}</EASY_WORKFLOW_CURRENT_STATE>\n以上为本次对话开始时的实时快照，历史回答中的数字可能已过期。若后续操作改变状态，回答前再次核对。`;
       await promptAgent(agent, content, images.length ? images.map((p) => ({ type: "image" as const, data: EvidenceStore.jpeg(p).toString("base64"), mimeType: "image/jpeg" })) : undefined);
       const last = [...agent.state.messages].reverse().find((m) => m.role === "assistant") as { content?: { type: string; text?: string }[]; usage?: { input: number; output: number; cost?: { total: number } } } | undefined;
       const reply = (last?.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("").trim() || (agent.state.errorMessage ? `（模型出错：${agent.state.errorMessage.slice(0, 160)}）` : "（已处理）");

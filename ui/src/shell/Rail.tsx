@@ -22,7 +22,7 @@ export function Rail() {
   const evidenceCount = useStore((s) => s.fs.evidenceOrder.length);
   return (
     <nav className="rail">
-      <div className="rail-mark" data-tip="Pi Factory">
+      <div className="rail-mark" data-tip="Easy Workflow">
         <Workflow size={24} strokeWidth={1.8} />
       </div>
       <div className="rail-items">

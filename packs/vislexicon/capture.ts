@@ -213,9 +213,32 @@ export async function motionFirst(page: Page) {
 }
 
 export async function previewsInViewport(page: Page) {
-  return page.evaluate((selectors) => selectors.reduce((n, sel) => {
-    try { return n + [...document.querySelectorAll(sel)].filter((el) => { const r = el.getBoundingClientRect(); return r.top < innerHeight && r.width > 80 && r.height > 60; }).length; } catch { return n; }
-  }, 0) + [...document.querySelectorAll("main img, main canvas, main video")].filter((el) => el.getBoundingClientRect().top < innerHeight).length, STAGE_SELECTORS).catch(() => 0);
+  return page.evaluate((selectors) => {
+    const visible = (el: Element) => {
+      if (el.closest("nav, header, footer, aside, pre, code")) return false;
+      const r = el.getBoundingClientRect(), css = getComputedStyle(el);
+      const w = Math.min(r.right, innerWidth) - Math.max(r.left, 0);
+      const h = Math.min(r.bottom, innerHeight) - Math.max(r.top, 0);
+      if (w <= 80 || h <= 60 || css.visibility === "hidden" || css.display === "none" || Number(css.opacity) === 0) return false;
+      if (el instanceof HTMLImageElement && (!el.complete || !el.naturalWidth)) return false;
+      if (/^\s*(loading|加载中)[.…]*\s*$/i.test((el as HTMLElement).innerText ?? "")) return false;
+      return true;
+    };
+    const stages = new Set<Element>();
+    for (const sel of selectors) try { for (const el of document.querySelectorAll(sel)) if (visible(el)) stages.add(el); } catch { /* Invalid optional selector. */ }
+    // One stage can match data-preview, preview and demo at once. Nested wrappers
+    // and images inside that same stage are still one preview, not four.
+    const leaves = [...stages].filter(el => ![...stages].some(other => other !== el && el.contains(other)));
+    const media = [...document.querySelectorAll("main img, main canvas, main video")].filter(el => visible(el) && ![...stages].some(stage => stage.contains(el)));
+    return leaves.length + media.length;
+  }, STAGE_SELECTORS).catch(() => 0);
+}
+
+/** The numeric gate is independent of a model's visual approval. */
+export function breadthPreviewIssues(kind: string, previews: unknown): string[] {
+  if (kind !== "component-source") return [];
+  if (typeof previews !== "number" || !Number.isInteger(previews) || previews < 0) return ["breadth-previews-missing（没有可核验的首屏预览计数）"];
+  return previews < 4 ? [`breadth-previews-below-minimum（首屏渲染预览 ${previews} 个，至少需要 4 个）`] : [];
 }
 
 /* ------------------------------------------------------------------ stage (component close-up) */

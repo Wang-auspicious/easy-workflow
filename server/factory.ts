@@ -22,6 +22,7 @@ import { readRole } from "./roles.ts";
 import { ensureProject, projectPaths, type ProjectInfo } from "./workspace.ts";
 import { configureNetwork } from "./network.ts";
 import { Docs } from "./docs.ts";
+import { Lessons } from "./lessons.ts";
 import { Toolbox } from "./toolbox.ts";
 import { configureAgentStations } from "./agent-station.ts";
 import { preflight } from "./preflight.ts";
@@ -46,15 +47,16 @@ export class Factory {
   ephemeral = new Set<(e: Record<string, unknown>) => void>();
   project: ProjectInfo;
   docs!: Docs;
+  lessons!: Lessons;
   toolbox!: Toolbox;
 
   constructor() {
-    fs.mkdirSync(VAR, { recursive: true });
     const readOnly = process.env.FACTORY_READONLY === "1";
+    if (!readOnly) fs.mkdirSync(VAR, { recursive: true });
     this.project = readOnly ? { name: path.basename(VAR), dir: VAR, pack: "vislexicon", createdAt: "" } : ensureProject(VAR, process.env.FACTORY_PROJECT_NAME ?? path.basename(VAR));
     if (!readOnly && process.env.FACTORY_HTTP_CACHE !== "0") configureNetwork({ cacheDir: projectPaths(VAR).cache });
     this.journal = new Journal(path.join(VAR, "journal.db"), readOnly);
-    this.store = new EvidenceStore(path.join(VAR, "evidence"));
+    this.store = new EvidenceStore(path.join(VAR, "evidence"), readOnly);
     const saved = this.readJson<Partial<Settings> & { browserCapV2?: boolean }>(path.join(VAR, "settings.json"), {});
     // Browser pages were capped at three before Spec §30.6; lift old saved caps once to the new default.
     if (!saved.browserCapV2 && (saved.browser ?? 0) <= 3) delete saved.browser;
@@ -73,6 +75,7 @@ export class Factory {
     if (process.env.FACTORY_READONLY !== "1" && this.state.digest !== this.compiled.digest) this.journal.append({ kind: "factory.loaded", digest: this.compiled.digest, specVersion: this.compiled.specVersion });
     this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
     this.docs = new Docs(this, VAR, this.project.name);
+    this.lessons = new Lessons(this, VAR);
     this.toolbox = new Toolbox({ journal: this.journal, broker: this.broker, docs: () => this.docs });
     configureAgentStations({ docs: () => this.docs, toolbox: () => this.toolbox });
     const defs = agentDefs(this.store);
@@ -90,6 +93,10 @@ export class Factory {
     this.wireRecovery();
     if (process.env.FACTORY_READONLY === "1") { this.catalog = loadCatalog(); return; }
     this.wireDocs();
+    try { this.lessons.recoverApproved(); } catch (error) { this.lessonIssue(error); }
+    const completedRuns = [...new Set([...this.journal.read()].filter(e => e.kind === "run.ended").map(e => e.runId))];
+    for (const run of completedRuns) { try { this.lessons.draftRun(run); } catch (error) { this.lessonIssue(error); } }
+    try { this.lessons.write(); } catch (error) { this.lessonIssue(error); }
     void warmStyleLib();
     this.loadStock();
     this.recoverLegacyFailures();
@@ -129,9 +136,38 @@ export class Factory {
       if (a) { this.docs.schedule("context", a.node); const t = this.state.tokens[a.token]; if (t) this.docs.schedule("case", t.item); }
       else if (e.kind === "case.noted") this.docs.schedule("case", e.caseId);
       else if (e.kind === "context.noted") this.docs.schedule("context", e.node);
+      else if (e.kind === "report.ready") queueMicrotask(() => { try { this.lessons.draftRun(e.runId); } catch (error) { this.lessonIssue(error); } });
       else if (e.kind === "token.finished" || e.kind === "consult.opened" || e.kind === "consult.replied" || e.kind === "consult.closed") { const t = this.state.tokens[e.token]; if (t) this.docs.schedule("case", t.item); }
     });
     try { this.docs.writeAllContexts(); } catch (err) { console.warn("contexts", (err as Error).message); }
+  }
+
+  /** Bind the whole rerun before Runtime's queued microtask may start a worker. */
+  async startLessonValidation(id: string, options: { digest: string; regressionItems: string[] }) {
+    if (this.runtime.running || this.runtime.ending) throw new ControlError(409, "run_active", "先结束当前轮次，再启动经验验证");
+    const intake = this.compiled.nodes.find(node => node.key === "candidates/tidy");
+    if (!intake || !this.runtime.runnable(intake)) throw new ControlError(409, "intake_unavailable", "候选准备工位当前不可执行，无法开始经验验证");
+    const trial = this.lessons.beginValidation(id, options);
+    this.runtime.start(`经验验证 ${id}`);
+    const samples = [...trial.failures, ...trial.regressions];
+    try {
+      const tokens = samples.map(sample => this.runtime.create("candidates/tidy", {
+        item: sample.item, url: sample.url, source: "manual",
+        data: { express: true, rerunPublished: true },
+      }));
+      this.lessons.bindValidation(trial.id, tokens.map(token => token.id));
+      return { trial, runId: this.state.run.id, tokens: tokens.map(token => ({ id: token.id, item: token.item })) };
+    } catch (error) {
+      // Stop synchronously, before the queued worker microtask can see unbound tasks.
+      this.runtime.pause();
+      const { endRun } = await import("./report.ts");
+      await endRun(this);
+      throw error;
+    }
+  }
+
+  private lessonIssue(error: unknown) {
+    this.journal.append({ kind: "context.noted", node: "dispatcher", note: { kind: "issue", by: "system", text: `复盘文档需要修复，原文已保留：${String((error as Error)?.message ?? error).slice(0, 500)}` } });
   }
 
   raiseAlert(alert: Alert) {
@@ -240,7 +276,7 @@ export class Factory {
       const legacy:Record<string,string>={"curation/fetch":"curation/scout"};
       const failedAt=filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode&&(legacy[previous.finishedAtNode]??previous.finishedAtNode);
       const checkpoint=previous?.data.canonical&&failedAt&&this.compiled.nodes.some(n=>n.key===failedAt&&this.runtime.runnable(n))?failedAt:"candidates/tidy";
-      const data:Record<string,unknown>=checkpoint==="candidates/tidy"?{}:structuredClone(previous.data);
+      const data:Record<string,unknown>=checkpoint==="candidates/tidy"?(previous?.data.rerunPublished === true ? { rerunPublished: true } : {}):structuredClone(previous.data);
       delete data.failure;delete data.gate;delete data.digest;
       if(filter.preview){
         data.previewChoices={...(data.previewChoices as object??{}),[filter.preview.role]:filter.preview.url};

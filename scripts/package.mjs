@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { buildDesktop, output, root, safeRemove } from './build.mjs';
 
 const zipOnly = process.argv.includes('--zip-only');
-const target = path.join(root, 'release', `PiFactory-${process.platform}-${process.arch}`);
+const target = path.join(root, 'release', `EasyWorkflow-${process.platform}-${process.arch}`);
 if (!zipOnly) {
 if (!process.argv.includes('--no-build')) await buildDesktop();
 const require = createRequire(import.meta.url);
@@ -20,7 +20,7 @@ fs.cpSync(runtime, target, { recursive: true, filter: (file) => {
   return true;
 } });
 fs.cpSync(output, path.join(target, 'resources', 'app'), { recursive: true });
-if (process.platform === 'win32') fs.renameSync(path.join(target, 'electron.exe'), path.join(target, 'PiFactory.exe'));
+if (process.platform === 'win32') fs.renameSync(path.join(target, 'electron.exe'), path.join(target, 'EasyWorkflow.exe'));
 function inventory(dir) {
   const files = fs.readdirSync(dir, { withFileTypes: true }).flatMap((item) => item.isDirectory() ? inventory(path.join(dir, item.name)) : [path.join(dir, item.name)]);
   return files;

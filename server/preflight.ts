@@ -46,7 +46,7 @@ export async function preflight(dir: string, broker: Broker): Promise<{ ok: bool
       try {
         const { page, close } = await within(25000, openPage({ width: 640, height: 400 }, "en-US"));
         try {
-          await page.goto("data:text/html,<body style='margin:0;background:%23fff'><div style='font:bold 64px sans-serif;padding:40px;color:%23123'>H2 preflight ■■■</div></body>");
+          await page.goto("data:text/html,<body style='margin:0;background:%23fff'><div style='font:bold 64px sans-serif;padding:40px;color:%23123'>Easy Workflow preflight ■■■</div></body>");
           const { withBrowserFrames } = await import("./browser.ts");
           const png = await within(15000, withBrowserFrames(page, () => page.screenshot()));
           const stats = imageStats(png);
@@ -83,7 +83,7 @@ export function writeEnv(dir: string, checks: PreflightCheck[], broker: Broker) 
   const rows = checks.map((c) => `| ${c.ok ? "✓" : "✗"} ${c.label} | ${c.detail.replace(/\|/g, "/")} | ${c.fix ?? ""} | ${c.ms}ms |`).join("\n");
   fs.writeFileSync(file, `# 环境（ENV）
 
-> 上半部分由 H2 在每次开跑前自动重写；分隔线以下是人工补充，程序不会改动。Agent 遇到环境问题先看这里。
+> 上半部分由 Easy Workflow 在每次开跑前自动重写；分隔线以下是人工补充，程序不会改动。Agent 遇到环境问题先看这里。
 
 ## 最近一次体检 · ${new Date().toLocaleString("zh-CN", { hour12: false })}
 

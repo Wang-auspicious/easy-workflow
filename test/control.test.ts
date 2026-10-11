@@ -13,7 +13,7 @@ const secret = "factory-test-only";
 async function start(dir: string, readOnly = false) {
   const child = fork(path.join(root, "server/main.ts"), [], {
     cwd: root, execArgv: [], stdio: ["ignore", "pipe", "pipe", "ipc"],
-    env: { ...process.env, FACTORY_DISCOVERY: "0", FACTORY_PREFLIGHT: "0", FACTORY_HTTP_CACHE: "0", FACTORY_ROOT: root, FACTORY_PORT: "0", FACTORY_TOKEN: secret,
+    env: { ...process.env, VISLEXICON_ROOT: path.join(dir, "unconnected"), FACTORY_DISCOVERY: "0", FACTORY_PREFLIGHT: "0", FACTORY_HTTP_CACHE: "0", FACTORY_ROOT: root, FACTORY_PORT: "0", FACTORY_TOKEN: secret,
       FACTORY_VAR: dir, FACTORY_LAYOUT: path.join(dir, "layout.json"), FACTORY_START_PAUSED: "1", FACTORY_READONLY: readOnly ? "1" : "0" },
   });
   let output = "";
@@ -88,15 +88,18 @@ test("headless service: real HTTP capability discovery, control, validation, act
       try {
         const registered = new Map<string, any>(), handlers = new Map<string, any>();
         h2Extension({ registerTool: (tool) => registered.set(tool.name, tool), on: (name, fn) => handlers.set(name, fn) });
-        assert.deepEqual([...registered.keys()], ["h2_help", "h2_call"]);
+        assert.deepEqual([...registered.keys()], ["easy_workflow_help", "easy_workflow_call", "h2_help", "h2_call"]);
         const hook = handlers.get("before_agent_start");
         const first = await hook({ systemPrompt: "base" });
         const second = await hook({ systemPrompt: first.systemPrompt });
-        assert.equal((second.systemPrompt.match(/<h2-agent>/g) ?? []).length, 1);
+        assert.equal((second.systemPrompt.match(/<easy-workflow-agent>/g) ?? []).length, 1);
+        assert.ok(!second.systemPrompt.includes("<h2-agent>"));
         assert.ok(!second.systemPrompt.includes(secret));
         assert.ok(second.systemPrompt.includes(bootstrap.body.revision));
-        const reply = await registered.get("h2_call").execute("test", { name: "status", arguments: {} });
+        const reply = await registered.get("easy_workflow_call").execute("test", { name: "status", arguments: {} });
         assert.equal(JSON.parse(reply.content[0].text).ok, true);
+        const legacy = await registered.get("h2_call").execute("test", { name: "status", arguments: {} });
+        assert.equal(JSON.parse(legacy.content[0].text).ok, true);
       } finally {
         if (previous === undefined) delete process.env.FACTORY_AGENT_CONNECTION; else process.env.FACTORY_AGENT_CONNECTION = previous;
       }

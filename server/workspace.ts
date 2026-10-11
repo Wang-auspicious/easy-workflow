@@ -36,7 +36,7 @@ const PROJECT_TEMPLATE = (name: string) => `# ${name}
 
 - VisLexicon \`Spec.md\`（分类 §2、风格 §2.6.1、预览 §4.8）
 - VisLexicon \`proposal/策展内容生产手册-给AI员工.md\`（条目结构、语气、自检清单）
-- H2 \`Spec.md\` §30–§38
+- Easy Workflow \`Spec.md\` §30–§38
 
 ## 文件夹约定
 

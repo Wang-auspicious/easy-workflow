@@ -8,3 +8,8 @@ legacy/__pycache__/
 dist/
 release/
 artifacts/
+.claude/
+legacy/run.json
+# Full local acceptance comparisons contain project paths and captured source records.
+docs/acceptance-*-run-*.json
+docs/acceptance-*-run-*.md

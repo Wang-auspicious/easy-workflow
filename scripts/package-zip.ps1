@@ -36,13 +36,13 @@ try {
     $packageEntry = $packageArchive.GetEntry($packagePrefix + $packageRelative)
     if ($null -eq $packageEntry -or $packageEntry.Length -ne $packageFile.Length) { throw "Zip length mismatch: $packageRelative" }
   }
-  $packageExe = $packageArchive.GetEntry($packagePrefix + 'PiFactory.exe')
-  if ($null -eq $packageExe) { throw 'PiFactory.exe is absent from the zip.' }
+  $packageExe = $packageArchive.GetEntry($packagePrefix + 'EasyWorkflow.exe')
+  if ($null -eq $packageExe) { throw 'EasyWorkflow.exe is absent from the zip.' }
   $packageHasher = [System.Security.Cryptography.SHA256]::Create()
   $packageStream = $packageExe.Open()
   try { $packageZipExeHash = [System.BitConverter]::ToString($packageHasher.ComputeHash($packageStream)).Replace('-', '') }
   finally { $packageStream.Dispose(); $packageHasher.Dispose() }
-  $packageSourceHash = Get-PackageSha256 (Join-Path $packageSource 'PiFactory.exe')
+  $packageSourceHash = Get-PackageSha256 (Join-Path $packageSource 'EasyWorkflow.exe')
   if ($packageZipExeHash -ne $packageSourceHash) { throw 'The executable changed while compressing.' }
 } finally { $packageArchive.Dispose() }
 $packageZip = Get-Item -LiteralPath $packageDestination

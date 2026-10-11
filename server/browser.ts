@@ -9,11 +9,12 @@ import { emptyBrowser, type BrowserState } from "../shared/browser.ts";
 
 const desktop = process.env.FACTORY_BROWSER_BRIDGE === "1" && Boolean(process.send);
 const { BrowserData, webURL } = createRequire(import.meta.url)("../app/browser-data.cjs");
+const { browserAttentionProbe, noteBrowserResponse, applyBrowserAttention } = createRequire(import.meta.url)("../app/browser-manager.cjs");
 const profile = path.resolve(process.env.FACTORY_VAR || "var", "browser");
 const data = desktop ? null : new BrowserData(path.join(profile, "browser.json"));
 const pending = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
 const pageIds = new WeakMap<Page, string>();
-const tabs = new Map<string, { page: Page; owner: "user" | "agent"; attention?: string }>();
+const tabs = new Map<string, { page: Page; owner: "user" | "agent"; attention?: string; checkSerial?: number; attentionCheck?: Promise<void>; documentUrl?: string; documentStatus?: number; denied?: Set<string>; manualAttention?: boolean }>();
 let state: BrowserState = { ...emptyBrowser(), ...(data ? { bookmarks: data.bookmarks, history: data.history, retentionDays: data.retentionDays } : {}) };
 let context: Promise<BrowserContext> | null = null;
 let connection: Promise<Browser> | null = null;
@@ -47,14 +48,30 @@ async function createHeadless(owner: "user" | "agent") {
   const c = await persistent(), page = await c.newPage(), id = crypto.randomUUID();
   tabs.set(id,{page,owner}); pageIds.set(page,id); state.active = id;
   page.on("close", () => { tabs.delete(id); titles.delete(id); update(); });
-  page.on("domcontentloaded", async () => { const title = await page.title().catch(() => ""); titles.set(id,title); data.visit(page.url(),title); await checkHeadless(id); update(); });
+  page.on("response", response => {
+    const tab = tabs.get(id); if (!tab) return;
+    try {
+      const request = response.request(); if (request.frame() !== page.mainFrame()) return;
+      if (noteBrowserResponse(tab, { url: response.url(), status: response.status(), mainFrame: request.isNavigationRequest(), resourceType: request.resourceType() })) { update(); void checkHeadless(id); }
+    } catch { /* The response may outlive a detached frame. */ }
+  });
+  page.on("framenavigated", frame => { const tab = tabs.get(id); if (tab && frame === page.mainFrame()) tab.checkSerial = (tab.checkSerial ?? 0) + 1; });
+  page.on("domcontentloaded", async () => { const url = page.url(), title = await page.title().catch(() => ""); if (page.isClosed() || page.url() !== url) return; titles.set(id,title); data.visit(url,title); await checkHeadless(id); update(); });
   page.on("crash", () => { const t = tabs.get(id); if (t) { t.attention = "页面进程退出"; update(); } });
   update(); return { page, context:c, id };
 }
-async function checkHeadless(id:string) {
+async function checkHeadless(id:string, manualCheck = false) {
   const tab=tabs.get(id);if(!tab)return;
-  const blocked=await tab.page.evaluate(()=>Boolean(document.querySelector('input[type="password"]')) || /sign in to continue|log in to view|登录后查看|captcha|人机验证/i.test((document.body?.innerText||"").slice(0,6000))).catch(()=>false);
-  tab.attention=blocked?"登录或验证状态需要检查":undefined;
+  const check = (tab.attentionCheck ?? Promise.resolve()).catch(() => {}).then(async () => {
+    if (!tabs.has(id) || tab.page.isClosed()) return;
+    const serial = tab.checkSerial = (tab.checkSerial ?? 0) + 1, url = tab.page.url();
+    const probe = await tab.page.evaluate(browserAttentionProbe).catch(() => null);
+    if (!tabs.has(id) || serial !== tab.checkSerial || tab.page.isClosed() || tab.page.url() !== url) return;
+    applyBrowserAttention(tab, probe, url, false, manualCheck);
+    update();
+  });
+  tab.attentionCheck = check;
+  await check;
 }
 
 export async function browserCommand(args: Record<string, any>): Promise<any> {
@@ -82,8 +99,8 @@ export async function browserCommand(args: Record<string, any>): Promise<any> {
     else if (action === "navigate") await tab.page.goto(args.url,{waitUntil:"domcontentloaded"});
     else if (action === "back") await tab.page.goBack();
     else if (action === "forward") await tab.page.goForward();
-    else if (action === "reload") { tab.attention = undefined; await tab.page.reload(); }
-    else if (action === "attention.check") await checkHeadless(args.id);
+    else if (action === "reload") await tab.page.reload();
+    else if (action === "attention.check") await checkHeadless(args.id, true);
     else if (action === "tab.move") {const entries=[...tabs];const i=entries.findIndex(([id])=>id===args.id);const [item]=entries.splice(i,1);const j=entries.findIndex(([id])=>id===args.before);if(j<0)throw new Error("目标标签不存在");entries.splice(j,0,item);tabs.clear();for(const [id,t] of entries)tabs.set(id,t);}
   }
   update(); return state;
@@ -97,7 +114,7 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
   };
   if (!desktop) {
     const t = await createHeadless("agent"); await t.page.setViewportSize(viewport);
-    return withCancellation(t.page,t.context,async () => { if (!tabs.get(t.id)?.attention) await t.page.close().catch(() => {}); });
+    return withCancellation(t.page,t.context,async () => { await checkHeadless(t.id); if (!tabs.get(t.id)?.attention) await t.page.close().catch(() => {}); });
   }
   const lease = await rpc({ action:"lease" });
   try {
@@ -114,7 +131,7 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
 export async function browserAttention(page: Page, message: string) {
   const id = pageIds.get(page); if (!id) return;
   if (desktop) await rpc({action:"attention",id,message});
-  else { const t = tabs.get(id); if (t) { t.attention = message; update(); } }
+  else { const t = tabs.get(id); if (t) { t.attention = message; t.manualAttention = true; update(); } }
 }
 /** Hold real compositor frames while capturing an occluded native task page. */
 export async function withBrowserFrames<T>(page:Page, capture:()=>Promise<T>):Promise<T> {

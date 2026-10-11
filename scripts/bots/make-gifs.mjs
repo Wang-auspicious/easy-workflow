@@ -6,7 +6,8 @@
 // BloubBot.vue, rasterised on a canvas in headless Chrome and packed with bloub's own
 // GIF encoder (src/ui/anime.ts). Output: ui/public/bots/*.gif + manifest.json.
 //
-// Usage: node scripts/bots/make-gifs.mjs [--bloub=D:/AI_Agents/refs/bloub] [--size=128]
+// Usage: node scripts/bots/make-gifs.mjs --bloub=/path/to/bloub [--size=128]
+// Alternatively provide the source checkout through BLOUB_ROOT.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,7 +16,10 @@ import { chromium } from "playwright-core";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const arg = (k, d) => process.argv.find((a) => a.startsWith(`--${k}=`))?.split("=").slice(1).join("=") ?? d;
-const BLOUB = arg("bloub", "D:/AI_Agents/refs/bloub");
+const sourceRoot = arg("bloub", process.env.BLOUB_ROOT ?? "");
+if (!sourceRoot.trim()) throw new Error("Provide --bloub=<source-checkout> or BLOUB_ROOT before regenerating avatars.");
+const BLOUB = path.resolve(sourceRoot);
+if (!fs.existsSync(path.join(BLOUB, "src")) || !fs.existsSync(path.join(BLOUB, "LICENSE"))) throw new Error("The configured bloub checkout must contain src and LICENSE.");
 const SIZE = Number(arg("size", 96));
 const OUT = path.join(ROOT, "ui/public/bots");
 const FPS = 20, SECONDS = 3;

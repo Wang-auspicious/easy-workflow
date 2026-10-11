@@ -15,7 +15,7 @@ const digest = async () => crypto.createHash('sha256').update(await fs.readFile(
 const beforeJournal = await digest();
 const env = { ...process.env, FACTORY_PROFILE: profile, FACTORY_VIEW_VAR: path.join(root, 'var'), FACTORY_DESKTOP_TEST: '1' };
 delete env.ELECTRON_RUN_AS_NODE;
-const app = await _electron.launch({ executablePath: path.join(root, 'release', 'PiFactory-win32-x64', 'PiFactory.exe'), args: [], env, timeout: 45000 });
+const app = await _electron.launch({ executablePath: path.join(root, 'release', 'EasyWorkflow-win32-x64', 'EasyWorkflow.exe'), args: [], env, timeout: 45000 });
 const checks = [];
 try {
   const page = await app.firstWindow();

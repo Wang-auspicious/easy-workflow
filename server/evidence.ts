@@ -8,10 +8,12 @@ import { execFileSync } from "node:child_process";
 
 export class EvidenceStore {
   root: string;
-  constructor(root: string) { this.root = root; fs.mkdirSync(root, { recursive: true }); }
+  readOnly: boolean;
+  constructor(root: string, readOnly = false) { this.root = root; this.readOnly = readOnly; if (!readOnly) fs.mkdirSync(root, { recursive: true }); }
 
   /** Writes bytes once; returns the sha256 and the served path. */
   put(buf: Buffer, ext: string): { sha: string; src: string; file: string } {
+    if (this.readOnly) throw new Error("Evidence store is read-only");
     const sha = crypto.createHash("sha256").update(buf).digest("hex");
     const dir = path.join(this.root, sha.slice(0, 2));
     const file = path.join(dir, `${sha}.${ext}`);

@@ -1,4 +1,4 @@
-// Spec §30–§36: the environment H2 builds for agents — adaptive browser pool, advice-bearing
+// Spec §30–§36: the environment Easy Workflow builds for agents — adaptive browser pool, advice-bearing
 // failures, rendered CONTEXT / CASE documents, the station toolbox, direct reviewer
 // consultation with bounded rounds, candidate normalization and v3 assembly.
 import assert from "node:assert/strict";
@@ -19,6 +19,8 @@ const { CONTEXT_HEADER, CASE_HEADER } = await import("../server/docs.ts");
 const { Factory } = await import("../server/factory.ts");
 const { closeNetwork } = await import("../server/network.ts");
 const { EvidenceStore } = await import("../server/evidence.ts");
+const { FRONTEND } = await import("../packs/vislexicon/env.ts");
+const taxonomyAvailable = [FRONTEND, process.env.VISLEXICON_BUNDLED].filter(Boolean).some(root => fs.existsSync(path.join(root!, "src", "data", "curation-taxonomy.js")));
 
 test("browser pages default to 8 and shrink with free memory, then recover", () => {
   const b = new Broker({ browser: 8, model: 8, cpu: 4, http: 6 }, 1024);
@@ -78,7 +80,7 @@ test("WebP headers give real widths and heights", async () => {
   assert.deepEqual(webpSize(webp.file), { width: 4, height: 6 });
 });
 
-test("v3 assembly passes VisLexicon's own validators and reports field-addressed problems", { skip: !fs.existsSync("D:/Desktop/VisLexicon  视元/VisLexicon-browser-design-kit/frontend/src/data/curation-taxonomy.js") && "VisLexicon taxonomy not on this machine" }, async () => {
+test("v3 assembly passes VisLexicon's own validators and reports field-addressed problems", { skip: !taxonomyAvailable && "VisLexicon is not connected; set VISLEXICON_ROOT or VISLEXICON_BUNDLED to run the real validator" }, async () => {
   const tax = await loadTaxonomy();
   const good = {
     schemaVersion: 3, entryId: "fixture-ui", entityId: "entity-fixture-ui", status: "APPROVED",

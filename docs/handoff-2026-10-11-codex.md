@@ -1,6 +1,8 @@
-# 交接：H2 后端任务（交给 Codex）
+# 交接：Easy Workflow 后端任务（交给 Codex）
 
 2026-10-11 · 交出：Claude · 接手：Codex（后端）· Claude 此后只做用户体验与视觉（UI 层）
+
+本文保留交接时的状态、日期与提交标识；产品名称和目录说明按当前公开约定表示。后续结果见 `backend-handoff-results-2026-10-10.md`，本地原始数据不随本文公开。
 
 > 分工从这一刻起明确：`server/`、`shared/`（除纯展示用的派生函数外）、`packs/`、`app/`（Electron 主进程）、`test/` 归 Codex；`ui/` 归 Claude。两边改同一个文件前先在对话里说一声。权威规范是 `Spec.md` §30–§38（本轮新增），与前文冲突时以它为准。
 
@@ -16,7 +18,7 @@
 
 - **项目文件夹（§30.1）**：
   - `server/workspace.ts` 建目录与 PROJECT.md / LESSONS.md；
-  - `app/main.cjs` 有"项目"菜单（新建 / 打开 / 最近 / 在资源管理器中显示），默认 `文档/Pi Factory/Projects/vislexicon-curation`。
+  - `app/main.cjs` 有"项目"菜单（新建 / 打开 / 最近 / 在资源管理器中显示），默认 `文档/Easy Workflow/Projects/vislexicon-curation`。
 - **环境层（§30）**：
   - `server/network.ts`：统一出口，代理、按主机限速、重试一次、项目内缓存 6 小时、`rememberRead`；
   - `shared/failures.ts`：每个失败带 `nextAction` / `owner`，新增 `model_unavailable`；
@@ -55,8 +57,8 @@
 
 **试跑数据：**
 
-- 项目文件夹：`C:\Users\zjz65\AppData\Local\Temp\claude\D--Desktop-VisLexicon----\c7be4bca-448a-482d-b002-b803aebc32a3\scratchpad\projects\curation-v2-trial`
-- 启动脚本：同目录上一级的 `trial-server.mjs`（设好 `FACTORY_VAR`、端口 4399 或 `PORT`、`NODE_USE_ENV_PROXY=1`）。
+- 项目文件夹：当时使用本机临时目录中的独立 `curation-v2-trial` 项目。实际位置由本地交接记录保存；继续试跑时把 `FACTORY_VAR` 指向该目录，确认其中有 `journal.db`、`evidence/` 和检查点。
+- 历史启动脚本 `trial-server.mjs` 只保存在本地临时区，不是仓库依赖。仓库入口为 `server/main.ts`；通过 `FACTORY_VAR` 选项目、`FACTORY_PORT` 选隔离端口，按需要设置 `NODE_USE_ENV_PROXY=1`。
 
 ## 2. 待办（按优先级）
 
@@ -92,16 +94,16 @@
    - 站长批准后追加到 ROLE.md 的"已知坑"；
    - 批准前先重跑失败样本，再加一组已发布站点做回归。
 8. **闭源 Agent 适配（§31）：** envelope 作为第一条消息；能力箱与 `submit` 通过 MCP 暴露（stdio 或 HTTP）。目前只有 pi。控制面的 MCP 传输也还没有（`/api/capabilities` 是 HTTP JSON）。
-9. **主调度"学写 ROLE.md"：** 在 h2_help / bootstrap 里加一项指引，新增节点时按现有 ROLE.md 的结构起草，交站长批准。站长要求先审风格，风格已确认。
+9. **主调度"学写 ROLE.md"：** 在 easy_workflow_help / bootstrap 里加一项指引，新增节点时按现有 ROLE.md 的结构起草，交站长批准。站长要求先审风格，风格已确认。
 10. **`read_report` 汇总 metrics：** 把 tokens 分项与耗时分项汇总进报告，给 Agent 用。UI 面板由 Claude 直接从 `state.attempts[].metrics` 计算，不依赖这一项。
 11. **其余 6 条休眠线的 ROLE.md** 仍是脚本生成的旧格式，接线时按新写法重写。
 
 ### P3 桌面与数据
 
 12. **桌面实测"项目"菜单：** 新建 / 打开 / 最近 / 切换，确认数据隔离；重新打包 release。
-13. **迁移旧数据（只复制，不移动）：** 站长之前的运行数据被放在 Codex 应用的沙盒目录 `C:\Users\zjz65\AppData\Local\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Roaming\Pi Factory\workspace`（5 条发布、9 件失败恢复记录）。复制到默认项目文件夹 `文档\Pi Factory\Projects\vislexicon-curation`。旧记录里的 `curation/fetch` 重试时会映射到 `curation/scout`。
+13. **迁移旧数据（只复制，不移动）：** 历史运行数据位于旧应用数据目录的 `workspace/`（交接时为 5 条发布、9 件失败恢复记录）。来源位置只在本地保存，使用 `scripts/migrate-project.mjs` 指定实际源目录与目标目录；目标为用户文档目录下的 `Easy Workflow/Projects/vislexicon-curation`。旧记录里的 `curation/fetch` 重试时会映射到 `curation/scout`。
 14. **桌面模式下的 page_text / page_find：** 走 WebContentsView 租用的页，需要实测；独立服务模式已在试跑中通过。
-15. **端口 4317 上有一个旧版 H2 服务**（node PID 16528，代码是旧的）。确认是谁启动的再决定是否关闭，不要直接杀。
+15. **端口 4317 上有一个旧版 Easy Workflow 服务**（node PID 16528，代码是旧的）。确认是谁启动的再决定是否关闭，不要直接杀。
 
 ## 3. 约束（不变）
 

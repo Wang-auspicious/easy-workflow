@@ -33,5 +33,5 @@ export function PiConversation({ entries, live, onResize }: { entries: Conversat
     list.current.messages = messages;
     list.current.requestUpdate();
   }, [entries, entries.length, live]);
-  return <div className="pi-conversation" ref={host} aria-label="与 Pi 的对话" />;
+  return <div className="pi-conversation" ref={host} aria-label="与 Easy Workflow 主调度的对话" />;
 }

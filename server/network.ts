@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { EnvHttpProxyAgent, fetch as proxyFetch } from "undici";
+import { isTlsFailure } from "../shared/failures.ts";
 
 let transport: EnvHttpProxyAgent | undefined;
 export const networkFetch: typeof globalThis.fetch = (input, init) => {
@@ -38,8 +39,7 @@ export interface WebResult { status: number; finalUrl: string; body: string; con
 
 const transient = (status: number) => status === 429 || status >= 500;
 const errorText = (e: unknown) => `${String((e as Error)?.message ?? e)} ${String((e as { cause?: { code?: string; message?: string } })?.cause?.code ?? "")} ${String((e as { cause?: { message?: string } })?.cause?.message ?? "")}`;
-const isTls = (e: unknown) => /certificate|CERT_|TLS|SSL/i.test(errorText(e));
-const transientError = (e: unknown) => !isTls(e) && /timeout|ECONNRESET|ECONNREFUSED|socket|fetch failed|UND_ERR/i.test(errorText(e));
+export const transientNetworkError = (e: unknown) => !isTlsFailure(e) && /timeout|ECONNRESET|ECONNREFUSED|socket|fetch failed|UND_ERR/i.test(errorText(e));
 
 /** GET a URL as text. Throws the underlying error (classified by callers) after one retry. */
 export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?: number; ttlMs?: number; cache?: boolean; accept?: string; headers?: Record<string, string> } = {}): Promise<WebResult> {
@@ -76,7 +76,7 @@ export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?
       if (retry) { release(); await new Promise((r) => setTimeout(r, res.status === 429 ? 3000 : 800)); continue; }
     } catch (err) {
       opts.signal?.throwIfAborted();
-      if (round === 0 && transientError(err)) { retry = true; }
+      if (round === 0 && transientNetworkError(err)) { retry = true; }
       else { (err as { tried?: string[] }).tried = tried; throw err; }
     } finally { if (!retry) release(); }
     release();

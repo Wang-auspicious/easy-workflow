@@ -34,7 +34,19 @@ export interface TokenRun {
   finishedStore?:string;
   notes: Map<string, { reason: string; note?: string; byHuman: boolean }>;
   /** Open direct consultation between a reviewer and field owners (Spec §34). */
-  consult?: { reviewer: string; queue: (Fix & { id: string })[]; current?: Fix & { id: string }; chain: string[]; replies: string[]; open: string[] };
+  consult?: Consultation;
+  pendingConsults?: { reviewer: string; fixes: Fix[]; reason: string }[];
+}
+
+interface Consultation {
+  reviewer: string;
+  queue: (Fix & { id: string })[];
+  current?: Fix & { id: string };
+  chain: string[];
+  replies: string[];
+  open: string[];
+  /** An intermediate reviewer must approve its own repair before this chain resumes. */
+  parent?: Consultation;
 }
 
 export interface Worker { id: string; label: string; node: string; busy: string | null; idleSince: number }
@@ -387,7 +399,8 @@ export class Runtime {
       });
     } catch (err) {
       const failure=(err as {failure?:Failure})?.failure ?? classifyFailure(err,{url:t.url});
-      res = { ok: false, summary: "工具出错", error: failure.message, failure };
+      const observed = err as { usage?: Usage; metrics?: AttemptMetrics };
+      res = { ok: false, summary: "工具出错", error: failure.message, failure, usage: observed?.usage, metrics: observed?.metrics };
     } finally {
       lease.release();
       this.aborts.delete(attempt);
@@ -396,7 +409,7 @@ export class Runtime {
     }
     const ms = Date.now() - t0;
     if (ctrl.signal.aborted || (t.nodeEpochs?.get(n.key)??0) !== epoch || t.finished) {
-      this.journal.append({ kind: "attempt.finished", attempt, ok: false, cancelled:true, summary: "已取消：任务已退回或本轮已结束", ms, queuedMs, usage: res.usage, error: "stale" });
+      this.journal.append({ kind: "attempt.finished", attempt, ok: false, cancelled:true, summary: "已取消：任务已退回或本轮已结束", ms, queuedMs, usage: res.usage, metrics: res.metrics, error: "stale" });
       if((t.nodeEpochs?.get(n.key)??0)===epoch)t.inflight.delete(n.key);
       this.schedule();
       return;
@@ -411,6 +424,7 @@ export class Runtime {
     if (res.ok) (this.durations.get(n.key) ?? this.durations.set(n.key, []).get(n.key)!).push(ms);
 
     if (!res.ok) {
+      this.closeConsult(t, "manual", res.error ?? res.summary);
       const failure=candidateFailure(res.failure ?? classifyFailure(res.error??res.summary,{url:t.url,stage:n.kind==="agent"||n.kind==="review"?"model":undefined}),String(t.data.canonical??t.url));
       if(failure.owner==="user")this.onAlert?.(t,n,failure);
       t.finished=true;t.data.failure=failure;
@@ -422,11 +436,12 @@ export class Runtime {
       this.onRecovery?.(t,failure);
       this.journal.append({kind:"dispatch.note",node:n.key,tone:"warn",text:`[${n.name}] ${t.title||t.item}：${failureLabels[failure.tag]}，${failure.retryable?"已退回候选库，可按原因重试":"已移除无效网址"}`});
     } else if (res.finish) {
+      this.closeConsult(t, "manual", res.finish.reason);
       t.finished = true;
       for (const q of this.queues.values()) { const i = q.indexOf(t.id); if (i >= 0) q.splice(i, 1); }
       this.journal.append({ kind: "token.finished", token: t.id, status: res.finish.status, node: n.key, reason: res.finish.reason });
-    } else if (t.consult && t.consult.chain[0] === n.key && t.consult.reviewer !== n.key) {
-      this.consultStep(t, n, res);
+    } else if (t.consult && (t.consult.chain[0] === n.key || t.consult.reviewer === n.key)) {
+      this.consultResult(t, n, res);
     } else if (res.verdict) {
       const v = res.verdict.verdict === "fix" ? "return" : res.verdict.verdict;
       this.journal.append({ kind: "review.verdict", token: t.id, node: n.key, verdict: v, returnTo: res.verdict.returnTo ?? res.verdict.fixes?.[0]?.station, reason: res.verdict.reason });
@@ -490,6 +505,7 @@ export class Runtime {
   }
 
   toManual(t: TokenRun, at: CompiledNode, reason: string) {
+    this.closeConsult(t, "manual", reason);
     t.data.manualReason = reason;
     this.journal.append({ kind: "token.data", token: t.id, patch: { manualReason: reason } });
     const manual = `${at.line}/manual`;
@@ -539,7 +555,18 @@ export class Runtime {
 
   /** A reviewer names fields and their owners; owners re-run in repair mode and reply straight back. */
   openConsult(t: TokenRun, reviewer: CompiledNode, fixes: Fix[], reason: string) {
-    const usable = fixes.filter((f) => { const o = this.nodes.get(f.station); return o && this.runnable(o) && t.closure.has(f.station) && f.station !== reviewer.key; });
+    const existing = t.consult;
+    // Parallel branches may request repairs together. Keep the second request pending;
+    // it must not overwrite a chain whose owner is still running.
+    if (existing && existing.reviewer !== reviewer.key && existing.chain[0] !== reviewer.key) {
+      (t.pendingConsults ??= []).push({ reviewer: reviewer.key, fixes, reason });
+      return;
+    }
+    const parent = existing?.reviewer === reviewer.key ? existing.parent : existing;
+    const reviewers = new Set([reviewer.key]);
+    for (let c = parent; c; c = c.parent) reviewers.add(c.reviewer);
+    const runnable = (key: string) => { const n = this.nodes.get(key); return !!n && this.runnable(n) && t.closure.has(key) && !reviewers.has(key); };
+    const usable = fixes.filter((f) => runnable(f.station) && (f.via ?? []).every(v => runnable(v) && v !== f.station) && new Set(f.via ?? []).size === (f.via ?? []).length);
     const unroutable = fixes.filter((f) => !usable.includes(f));
     if (!usable.length || unroutable.length) { this.closeConsult(t, "manual", "需要站长处理"); this.toManual(t, reviewer, `${reviewer.name}发现需要站长处理的问题：${(unroutable.length ? unroutable : fixes).map((f) => f.problem).join("；") || reason}`); return; }
     const queue: (Fix & { id: string })[] = [];
@@ -557,7 +584,8 @@ export class Runtime {
       this.journal.append({ kind: "consult.opened", consult: id, token: t.id, reviewer: reviewer.key, owner: f.station, fields: f.fields, problem: f.problem, round });
       queue.push({ ...f, id });
     }
-    t.consult = { reviewer: reviewer.key, queue, chain: [], replies: [], open: [...(t.consult?.open ?? []), ...queue.map((q) => q.id)] };
+    const previous = existing?.reviewer === reviewer.key ? existing : undefined;
+    t.consult = { reviewer: reviewer.key, queue, chain: [], replies: [...(previous?.replies ?? [])], open: [...(previous?.open ?? []), ...queue.map((q) => q.id)], parent };
     this.nextConsult(t);
   }
 
@@ -573,7 +601,7 @@ export class Runtime {
       return;
     }
     c.current = fix;
-    c.chain = [fix.station, ...(fix.via ?? []).filter((v) => this.nodes.has(v) && this.runnable(this.nodes.get(v)!))];
+    c.chain = [fix.station, ...(fix.via ?? [])];
     this.redoAt(t, fix.station, `${this.nodes.get(c.reviewer)?.name} 要求修改字段 ${fix.fields.join("、")}：${fix.problem}`);
     this.enqueue(t, fix.station, c.reviewer, true);
   }
@@ -598,9 +626,49 @@ export class Runtime {
     this.nextConsult(t);
   }
 
+  private consultResult(t: TokenRun, n: CompiledNode, res: StationResult) {
+    const c = t.consult!;
+    const verdict = res.verdict;
+    if (verdict) this.journal.append({ kind: "review.verdict", token: t.id, node: n.key, verdict: verdict.verdict === "fix" ? "return" : verdict.verdict, returnTo: verdict.returnTo ?? verdict.fixes?.[0]?.station, reason: verdict.reason });
+    if (verdict?.verdict === "fix") { this.openConsult(t, n, verdict.fixes ?? [], verdict.reason); return; }
+    if (verdict?.verdict === "escalate") { this.toManual(t, n, verdict.reason); return; }
+    if (verdict?.verdict === "return") {
+      const to = verdict.returnTo;
+      const edge = (this.returns.get(n.key) ?? []).find(e => e.to === to);
+      if (!to || !edge) { this.toManual(t, n, `退回目标 ${to ?? "未指定"} 不在规格的退回边里：${verdict.reason}`); return; }
+      const round = (t.rounds[to] ?? 0) + 1;
+      if (round > (edge.maxRounds ?? 0)) { this.toManual(t, n, `退回 ${this.nodes.get(to)?.name} 已满 ${edge.maxRounds ?? 0} 轮：${verdict.reason}`); return; }
+      // Re-run only the route leading back to this reviewer. A normal pipeline return
+      // would reset the original reviewer and lose its outstanding consultation.
+      const paths = [[to]], seen = new Set<string>();
+      let route: string[] | undefined;
+      while (paths.length) {
+        const p = paths.shift()!, key = p.at(-1)!;
+        if (key === n.key) { route = p; break; }
+        if (seen.has(key)) continue;
+        seen.add(key);
+        for (const e of this.outFlow.get(key) ?? []) if (t.closure.has(e.to) && (!e.when || this.conditions[e.when]?.(t.data))) paths.push([...p, e.to]);
+      }
+      if (!route) { this.toManual(t, n, `退回 ${to} 后没有回到 ${n.key} 的有效审查路径：${verdict.reason}`); return; }
+      t.rounds[to] = round;
+      this.openConsult(t, n, [{ station: to, fields: c.current?.fields ?? [], problem: verdict.reason, via: route.slice(1, -1) }], verdict.reason);
+      return;
+    }
+    if (c.reviewer !== n.key) { this.consultStep(t, n, res); return; }
+    this.closeConsult(t, "resolved", verdict?.reason ?? "复查通过");
+    if (t.consult) { this.consultStep(t, n, res); return; }
+    const pending = t.pendingConsults?.shift();
+    if (pending) this.openConsult(t, this.nodes.get(pending.reviewer)!, pending.fixes, pending.reason);
+    this.complete(t, n.key);
+  }
+
   private closeConsult(t: TokenRun, outcome: "resolved" | "manual", reason: string) {
-    for (const id of t.consult?.open ?? []) this.journal.append({ kind: "consult.closed", consult: id, token: t.id, outcome, reason });
-    t.consult = undefined;
+    do {
+      const c = t.consult;
+      for (const id of c?.open ?? []) this.journal.append({ kind: "consult.closed", consult: id, token: t.id, outcome, reason });
+      t.consult = c?.parent;
+    } while (outcome === "manual" && t.consult);
+    if (outcome === "manual") t.pendingConsults = [];
   }
 
   correct(target: { token: string; node: string; evidence?: string }, reason: string, note?: string) {

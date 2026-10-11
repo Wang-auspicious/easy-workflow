@@ -8,7 +8,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
-const profile=fs.mkdtempSync(path.join(os.tmpdir(),'h2-live-capture-'));
+const profile=fs.mkdtempSync(path.join(os.tmpdir(),'easy-workflow-live-capture-'));
 const out=path.join(root,'artifacts','failure-audit');fs.mkdirSync(out,{recursive:true});
 const env={...process.env,FACTORY_PROFILE:profile,FACTORY_DESKTOP_TEST:'1',VISLEXICON_ROOT:path.join(profile,'no-catalogue')};
 delete env.ELECTRON_RUN_AS_NODE;delete env.FACTORY_VIEW_VAR;

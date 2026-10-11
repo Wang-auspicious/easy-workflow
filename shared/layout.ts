@@ -1,5 +1,5 @@
 // Initial auto-layout (Spec §10.7) and edge geometry, drawn as a factory floor plan.
-// The graph stays a layered DAG read left to right (the H1 viewer's algorithm: ranks,
+// The graph stays a layered DAG read left to right (ranks,
 // dummy waypoints, barycentre sweeps, isotonic placement). Every line is a hall; inside
 // a hall the stations sit in work bays (收货 · 判定 · 采集 …), which are only tinted
 // zones behind the DAG. A long hall wraps between bays, never inside one, like lines of
@@ -125,7 +125,7 @@ function crossings(cols: Item[][]): number {
   return c;
 }
 
-/** Weighted isotonic regression: the closest non-decreasing sequence (H1 viewer). */
+/** Weighted isotonic regression: the closest non-decreasing sequence. */
 function pav(s: number[], w: number[]): number[] {
   const blocks: { v: number; wt: number; n: number }[] = [];
   for (let i = 0; i < s.length; i++) {
@@ -505,7 +505,7 @@ class Path {
   get end(): Pt { return this.segs.length ? this.segs[this.segs.length - 1].to : this.start; }
   curve(c1: Pt, c2: Pt, to: Pt) { this.segs.push({ c1, c2, to }); return this; }
   line(to: Pt) { const e = this.end; if (Math.abs(e.x - to.x) > 0.01 || Math.abs(e.y - to.y) > 0.01) this.segs.push({ to }); return this; }
-  /** Horizontal-tangent cubic (H1 viewer's mid-point curve, turned sideways). */
+  /** Horizontal-tangent cubic (mid-point curve, turned sideways). */
   ease(to: Pt, outDir = 1, inDir = 1) {
     const p = this.end;
     const k = Math.max(36, Math.abs(to.x - p.x) / 2, Math.min(110, Math.abs(to.y - p.y) * 0.35));

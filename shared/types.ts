@@ -145,6 +145,11 @@ export type StepDetail = { tool: string; text: string; ok?: boolean; evidence?: 
 
 /** Token and time breakdown of one attempt (Spec §37). Estimated parts are char-based. */
 export interface AttemptMetrics {
+  usageReported?: boolean;
+  modelTimeReported?: boolean;
+  usageComplete?: boolean;
+  cacheUsageComplete?: boolean;
+  execution?: { adapter: string; model: string };
   tokens?: { system: number; context: number; caseFile: number; input: number; images: number; toolDefs: number; toolResults: number; output: number; actualInput: number; actualOutput: number; cacheRead: number; cacheWrite: number };
   time?: { firstTokenMs: number; outputMs: number; toolMs: number; programMs: number; modelCalls: number; toolCalls: number };
 }
@@ -154,6 +159,7 @@ export interface PreflightCheck { id: string; label: string; ok: boolean; detail
 export interface CaseNote { station: string; section: string; text: string; by: string }
 
 export type JournalEvent =
+  | import("./lessons.ts").LessonEvent
   | { kind: "factory.loaded"; digest: string; specVersion: string }
   | { kind: "run.started"; runId: string; title: string }
   | { kind: "run.paused"; runId: string }

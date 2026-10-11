@@ -3,8 +3,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export const VIS_ROOT = process.env.VISLEXICON_ROOT ?? "D:/Desktop/VisLexicon  视元";
-export const FRONTEND = path.join(VIS_ROOT, "VisLexicon-browser-design-kit", "frontend");
+// An unset root means no connected catalogue. Never infer a developer's checkout.
+export const VIS_ROOT = process.env.VISLEXICON_ROOT?.trim() ? path.resolve(process.env.VISLEXICON_ROOT) : "";
+export const FRONTEND = VIS_ROOT ? path.join(VIS_ROOT, "VisLexicon-browser-design-kit", "frontend") : "";
 const BUNDLED = process.env.VISLEXICON_BUNDLED;
 
 const readJson = <T>(rel: string, fallback: T): T => {

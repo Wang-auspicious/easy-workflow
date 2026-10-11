@@ -1,4 +1,4 @@
-"""Declarative software-engineering workflow for the H2 runtime."""
+"""Declarative software-engineering workflow for the workflow runtime."""
 
 from __future__ import annotations
 

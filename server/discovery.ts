@@ -1,18 +1,26 @@
 // Private connection rendezvous for local Pi sessions; no credentials enter prompts.
 import fs from "node:fs";
 import path from "node:path";
-import { piDirectory } from "./pi.ts";
+import crypto from "node:crypto";
+import { controlConnectionPaths, CONTROL_PROTOCOL } from "./agent-connection.ts";
 
 export function publishConnection(url: string, token?: string) {
   if (process.env.FACTORY_DISCOVERY === "0" || process.env.FACTORY_DESKTOP_TEST === "1") return () => {};
-  const file = process.env.FACTORY_AGENT_CONNECTION ?? path.join(piDirectory(), "h2", "connection.json");
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ protocol: "h2-agent/1", url, token, pid: process.pid, startedAt: new Date().toISOString() }), { mode: 0o600 });
-  fs.renameSync(tmp, file);
-  return () => {
-    try {
-      if (JSON.parse(fs.readFileSync(file, "utf8")).pid === process.pid) fs.unlinkSync(file);
+  const files = controlConnectionPaths(), instanceId = crypto.randomUUID();
+  const payload = JSON.stringify({ protocol: CONTROL_PROTOCOL, product: "Easy Workflow", url, token, pid: process.pid, instanceId, startedAt: new Date().toISOString() });
+  const cleanup = () => {
+    for (const file of files) try {
+      if (JSON.parse(fs.readFileSync(file, "utf8")).instanceId === instanceId) fs.unlinkSync(file);
     } catch { /* already replaced or removed */ }
   };
+  try {
+    // Publishing the legacy path keeps already installed clients connected after a rename.
+    for (const file of files) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.${instanceId}.tmp`;
+      try { fs.writeFileSync(tmp, payload, { mode: 0o600 }); fs.renameSync(tmp, file); }
+      finally { fs.rmSync(tmp, { force: true }); }
+    }
+  } catch (error) { cleanup(); throw error; }
+  return cleanup;
 }
