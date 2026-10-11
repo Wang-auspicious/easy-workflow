@@ -3,7 +3,7 @@
 // but everybody wants once they see them — each with a number, a sparkline and a link.
 import fs from "node:fs";
 import path from "node:path";
-import type { Stamped } from "../shared/types.ts";
+import type { AttemptMetrics, Stamped, Usage } from "../shared/types.ts";
 import { apply, initialState, median, quantile, type FactoryState } from "../shared/project.ts";
 import { VAR, type Factory } from "./factory.ts";
 
@@ -19,13 +19,15 @@ export interface RunReport {
   workers: WorkerRow[];
   insights: Insight[];
   suggestions: Suggestion[];
-  attempts: { id:string; node:string; token:string; item:string; startedAt:number; endedAt?:number; ms:number; queuedMs:number; input:number; output:number; cost:number; ok?:boolean; cancelled?:boolean; summary:string; steps:{at:number;text:string}[] }[];
+  metrics?: ReportMetrics;
+  attempts: { id:string; node:string; token:string; item:string; startedAt:number; endedAt?:number; ms:number; queuedMs:number; input:number; output:number; cost:number; cacheRead?:number; cacheWrite?:number; metrics?:AttemptMetrics; ok?:boolean; cancelled?:boolean; summary:string; steps:{at:number;text:string}[] }[];
   items: { published: ItemRow[]; manual: ItemRow[]; corrected: ItemRow[]; merged: ItemRow[]; rejected: ItemRow[]; parked:ItemRow[] };
 }
 interface NodeRow {
   key: string; name: string; role: string; layer: number; line: string; stockStart: number; stock: number; plus: number; sent: number; merged: number; rejected: number; failed: number;
   returned: number; inRun: number; processed: number; medianMs: number; p90Ms: number; waitShare: number; tokens: number; cost: number; timeShare: number; workers: number; forks: number; retires: number;
   topReasons: { reason: string; n: number }[]; slowest: { item: string; ms: number }[];
+  metrics: ReportMetrics;
 }
 interface WorkerRow { id: string; label: string; node: string; nodeName: string; done: number; busyMs: number; idleShare: number; spawnedAt: number; retiredAt?: number; forked: boolean; spans: [number, number, string][]; items: string[] }
 interface ItemRow { token: string; item: string; title?: string; reason?: string; thumbs: string[]; node?: string; ms?: number; cost?: number }
@@ -33,6 +35,64 @@ interface ItemRow { token: string; item: string; title?: string; reason?: string
 const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
 const pct = (x: number) => `${Math.round(x * 100)}%`;
 const secs = (ms: number) => (ms >= 60000 ? `${(ms / 60000).toFixed(1)} 分` : `${(ms / 1000).toFixed(1)} 秒`);
+
+const ESTIMATED = ["system", "context", "caseFile", "input", "images", "toolDefs", "toolResults"] as const;
+type EstimatedTokens = Record<typeof ESTIMATED[number], number>;
+export interface ReportMetrics {
+  source: "run-journal";
+  coverage: { attempts: number; finished: number; tokenBreakdowns: number; usageReported: number; usageComplete: number; cacheUsageComplete: number; timeBreakdowns: number; modelTimeReported: number };
+  tokens: {
+    estimated: EstimatedTokens | null;
+    estimatedFields: readonly string[];
+    estimateBasis: string;
+    actual: { input: number; output: number; cacheRead: number | null; cacheWrite: number | null; cost: number } | null;
+    cacheHitRate: number | null;
+    cacheHitRateBasis: string;
+  };
+  time: { aggregation: "sum-of-attempts"; attemptMs: number; queuedMs: number; firstTokenMs: number | null; outputMs: number | null; toolMs: number | null; programMs: number | null; otherMs: number; modelCalls: number | null; toolCalls: number | null; outputTokensPerSecond: number | null };
+}
+
+/** Only finished journal events certify usage; projection defaults are not observations. */
+export function aggregateMetrics(attempts: FactoryState["attempts"][string][], events: Stamped[]): ReportMetrics {
+  const finishes = new Map(events.filter(e => e.kind === "attempt.finished").map(e => [e.attempt, e]));
+  const finished = attempts.filter(a => a.endedAt !== undefined);
+  const tokenParts = attempts.flatMap(a => a.metrics?.tokens ? [a.metrics.tokens] : []);
+  const reported = attempts.flatMap(a => {
+    const e = finishes.get(a.id);
+    if (e?.usage && a.metrics?.usageReported !== false) return [{ attempt: a, usage: e.usage }];
+    return [];
+  });
+  const timed = attempts.filter(a => a.metrics?.time);
+  const modelTimed = timed.filter(a => a.metrics?.modelTimeReported !== false);
+  const estimated = tokenParts.length ? Object.fromEntries(ESTIMATED.map(k => [k, sum(tokenParts.map(t => t[k]))])) as EstimatedTokens : null;
+  const actual = reported.length ? {
+    input: sum(reported.map(x => x.usage.input)), output: sum(reported.map(x => x.usage.output)), cost: sum(reported.map(x => x.usage.cost)),
+    cacheRead: reported.some(x => x.usage.cacheRead !== undefined) ? sum(reported.map(x => x.usage.cacheRead ?? 0)) : null,
+    cacheWrite: reported.some(x => x.usage.cacheWrite !== undefined) ? sum(reported.map(x => x.usage.cacheWrite ?? 0)) : null,
+  } : null;
+  const completeUsage = reported.filter(x => x.attempt.metrics?.usageComplete !== false);
+  const completeCache = reported.filter(x => x.attempt.metrics?.usageComplete !== false && x.attempt.metrics?.cacheUsageComplete !== false && x.usage.cacheRead !== undefined && x.usage.cacheWrite !== undefined);
+  const cacheKnown = reported.length > 0 && completeCache.length === reported.length;
+  const cacheTotal = actual ? actual.input + (actual.cacheRead ?? 0) + (actual.cacheWrite ?? 0) : 0;
+  const speedSamples = completeUsage.filter(x => x.attempt.metrics?.time && x.attempt.metrics.modelTimeReported !== false && x.attempt.metrics.time.outputMs > 0);
+  const outputMs = sum(speedSamples.map(x => x.attempt.metrics!.time!.outputMs));
+  return {
+    source: "run-journal",
+    coverage: { attempts: attempts.length, finished: finished.length, tokenBreakdowns: tokenParts.length, usageReported: reported.length, usageComplete: completeUsage.length, cacheUsageComplete: completeCache.length, timeBreakdowns: timed.length, modelTimeReported: modelTimed.length },
+    tokens: { estimated, estimatedFields: ESTIMATED, estimateBasis: "Character/image-budget estimates of the initial payload plus accumulated tool results, not an allocation of billable totals or repeated model contexts.", actual, cacheHitRate: cacheKnown && cacheTotal > 0 ? (actual!.cacheRead ?? 0) / cacheTotal : null, cacheHitRateBasis: "cacheRead / (uncached input + cacheRead + cacheWrite); null if cache reporting is incomplete" },
+    time: {
+      aggregation: "sum-of-attempts", attemptMs: sum(finished.map(a => a.ms ?? 0)), queuedMs: sum(finished.map(a => a.queuedMs ?? 0)),
+      firstTokenMs: modelTimed.length ? sum(modelTimed.map(a => a.metrics!.time!.firstTokenMs)) : null,
+      outputMs: modelTimed.length ? sum(modelTimed.map(a => a.metrics!.time!.outputMs)) : null,
+      toolMs: timed.length ? sum(timed.map(a => a.metrics!.time!.toolMs)) : null,
+      programMs: timed.length ? sum(timed.map(a => a.metrics!.time!.programMs)) : null,
+      otherMs: sum(finished.map(a => { const t = a.metrics?.time; return Math.max(0, (a.ms ?? 0) - (t ? t.toolMs + t.programMs + (a.metrics?.modelTimeReported === false ? 0 : t.firstTokenMs + t.outputMs) : 0)); })),
+      modelCalls: modelTimed.length ? sum(modelTimed.map(a => a.metrics!.time!.modelCalls)) : null,
+      toolCalls: timed.length ? sum(timed.map(a => a.metrics!.time!.toolCalls)) : null,
+      outputTokensPerSecond: outputMs > 0 ? sum(speedSamples.map(x => x.usage.output)) * 1000 / outputMs : null,
+    },
+  };
+}
 
 export function buildReport(f: Factory, runId: string): RunReport {
   const events: Stamped[] = [...f.journal.read(0, runId)];
@@ -52,7 +112,10 @@ export function buildReport(f: Factory, runId: string): RunReport {
   const tokenIds = new Set(events.flatMap(e=>e.kind==="token.created"||e.kind==="token.queued"?[e.token]:[]));
   const attemptIds = new Set(events.flatMap(e=>e.kind==="attempt.started"?[e.attempt]:[]));
   const tokens = [...new Map(Object.values(s.tokens).filter((t) => tokenIds.has(t.id)).map(t=>[t.item,t])).values()];
-  const attempts = Object.values(s.attempts).filter((a) => attemptIds.has(a.id));
+  const recordedUsage = new Map(events.filter(e => e.kind === "attempt.finished").map(e => [e.attempt, e.usage]));
+  // A duplicated terminal receipt must not double bill the same attempt through projection counters.
+  const attempts = Object.values(s.attempts).filter((a) => attemptIds.has(a.id)).map(a => ({ ...a, usage: recordedUsage.get(a.id) ?? { input: 0, output: 0, cost: 0 } }));
+  const runMetrics = aggregateMetrics(attempts, events);
 
   /* per-node reasons and slowest items */
   const reasons = new Map<string, Map<string, number>>();
@@ -85,6 +148,7 @@ export function buildReport(f: Factory, runId: string): RunReport {
       returned: st.returned, inRun: st.inRun, processed: st.processed, medianMs: median(okMs), p90Ms: quantile(okMs, 0.9), waitShare: wait / Math.max(1, wait + work),
       tokens: sum(mine.map((a) => a.usage.input + a.usage.output)), cost: sum(mine.map((a) => a.usage.cost)), timeShare: work / totalWork,
       workers: st.workers.length, forks: st.forks, retires: st.retires, topReasons: top, slowest: slow,
+      metrics: aggregateMetrics(mine, events),
     });
   }
   const layers = [1, 2, 3].map((layer) => ({ layer, nodes: rows.filter((r) => r.layer === layer) })).filter((l) => l.nodes.length);
@@ -99,7 +163,7 @@ export function buildReport(f: Factory, runId: string): RunReport {
 
   /* items */
   const thumbs = (tid: string) => (s.tokens[tid]?.evidence ?? []).map((id) => s.evidence[id]).filter((e) => e && (e.kind === "image" || e.kind === "video")).slice(-3).map((e) => e!.poster ?? e!.card ?? e!.src ?? "");
-  const tokenCost = (tid: string) => sum((s.tokens[tid]?.attempts ?? []).map((a) => s.attempts[a]?.usage.cost ?? 0));
+  const tokenCost = (tid: string) => sum(attempts.filter(a => a.token === tid).map(a => a.usage.cost));
   const row = (t: (typeof tokens)[number]): ItemRow => ({ token: t.id, item: t.item, title: t.title, reason: t.reason, thumbs: thumbs(t.id), node: t.finishedAtNode, ms: (t.finishedAt ?? endedAt) - t.createdAt, cost: tokenCost(t.id) });
   const items = {
     published: tokens.filter((t) => t.status === "published").map(row),
@@ -109,7 +173,8 @@ export function buildReport(f: Factory, runId: string): RunReport {
     rejected: tokens.filter((t) => t.status === "rejected").map(row),
     parked: tokens.filter(t=>t.status==="parked").map(row),
   };
-  const usage = { input: sum(attempts.map((a) => a.usage.input)), output: sum(attempts.map((a) => a.usage.output)), cost: sum(attempts.map((a) => a.usage.cost)) };
+  const usage: Usage = { input: sum(attempts.map((a) => a.usage.input)), output: sum(attempts.map((a) => a.usage.output)), cost: sum(attempts.map((a) => a.usage.cost)) };
+  for (const key of ["cacheRead", "cacheWrite"] as const) if (runMetrics.tokens.actual?.[key] != null) usage[key] = runMetrics.tokens.actual[key];
   const pub = Math.max(1, items.published.length);
   const totals = {
     ...s.totals, usage, created: tokens.length, published:items.published.length,manual:items.manual.length,merged:items.merged.length,rejected:items.rejected.length,parked:items.parked.length, failedAttempts:attempts.filter(a=>a.ok===false&&!a.cancelled).length,
@@ -119,8 +184,8 @@ export function buildReport(f: Factory, runId: string): RunReport {
 
   const insights = mine({ ...f, state:s } as Factory, events, rows, workers, tokens, attempts, startedAt, endedAt);
   const suggestions = suggest(rows, insights, f);
-  return { version:3, status:s.run.status, runId, title: start?.kind === "run.started" ? start.title : s.run.title, startedAt, endedAt, netMs, totals, layers, flows: [...flows.values()], workers, insights, suggestions, items,
-    attempts: attempts.map(a=>({id:a.id,node:a.node,token:a.token,item:s.tokens[a.token]?.title || s.tokens[a.token]?.item || a.token,startedAt:a.startedAt,endedAt:a.endedAt,ms:a.ms ?? Math.max(0,endedAt-a.startedAt),queuedMs:a.queuedMs ?? 0,input:a.usage.input,output:a.usage.output,cost:a.usage.cost,ok:a.ok,cancelled:a.cancelled,summary:a.summary || a.error || "进行中",steps:a.steps.map(st=>({at:st.at,text:st.text}))})) };
+  return { version:3, status:s.run.status, runId, title: start?.kind === "run.started" ? start.title : s.run.title, startedAt, endedAt, netMs, totals, layers, flows: [...flows.values()], workers, insights, suggestions, items, metrics: runMetrics,
+    attempts: attempts.map(a=>({id:a.id,node:a.node,token:a.token,item:s.tokens[a.token]?.title || s.tokens[a.token]?.item || a.token,startedAt:a.startedAt,endedAt:a.endedAt,ms:a.ms ?? Math.max(0,endedAt-a.startedAt),queuedMs:a.queuedMs ?? 0,input:a.usage.input,output:a.usage.output,cost:a.usage.cost,cacheRead:recordedUsage.get(a.id)?.cacheRead,cacheWrite:recordedUsage.get(a.id)?.cacheWrite,metrics:a.metrics,ok:a.ok,cancelled:a.cancelled,summary:a.summary || a.error || "进行中",steps:a.steps.map(st=>({at:st.at,text:st.text}))})) };
 }
 
 /* ------------------------------------------------------------------ insight mining */

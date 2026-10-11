@@ -1,0 +1,103 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
+
+test("curation comparison isolates run calls, marks inherited drafts and keeps missing current baselines explicit", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "h2-comparison-"));
+  const project = path.join(root, "project");
+  const sourceRoot = path.join(root, "vislexicon");
+  const baseline = path.join(sourceRoot, "frontend", "public", "data", "site");
+  fs.mkdirSync(path.join(project, "published"), { recursive: true });
+  fs.mkdirSync(baseline, { recursive: true });
+  const record = (id: string, token: string, name: string, host: string) => ({ schemaVersion: 3, entryId: id, status: "APPROVED", official: { finalUrl: `https://${host}` }, editorial: { name }, h2: { token } });
+  const old = record("magic-ui", "historical-token", "Historical title", "magicui.design");
+  fs.writeFileSync(path.join(baseline, "magic-ui.json"), JSON.stringify({ ...old, editorial: { name: "Published baseline" } }));
+  for (const [id, host] of [["uiverse", "uiverse.io"], ["laws-of-ux", "lawsofux.com"], ["carbon", "carbondesignsystem.com"]]) fs.writeFileSync(path.join(baseline, `${id}.json`), JSON.stringify(record(id, "baseline", "Baseline", host)));
+  const samples = path.join(sourceRoot, "content-samples", "approved-v3");
+  fs.mkdirSync(samples, { recursive: true });
+  fs.writeFileSync(path.join(samples, "lucide.json"), JSON.stringify(record("lucide", "sample", "Lucide", "lucide.dev")));
+  const db = new DatabaseSync(path.join(project, "journal.db"));
+  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE events(seq INTEGER PRIMARY KEY, at INTEGER, run TEXT, kind TEXT, body TEXT)");
+  let seq = 0;
+  const emit = (run: string, at: number, event: Record<string, unknown>) => db.prepare("INSERT INTO events VALUES (?, ?, ?, ?, ?)").run(++seq, at, run, String(event.kind), JSON.stringify(event));
+  const metrics = (calls: number) => ({ time: { firstTokenMs: 10, outputMs: 20, toolMs: 0, programMs: 0, modelCalls: calls, toolCalls: 0 } });
+  try {
+    emit("historical", 1000, { kind: "run.started", runId: "historical", title: "old Magic trial" });
+    emit("historical", 1100, { kind: "token.created", token: "historical-token", item: "magicui.design", url: "https://magicui.design" });
+    emit("historical", 1200, { kind: "attempt.started", attempt: "historical-call", token: "historical-token", node: "curation/copy", worker: "w" });
+    emit("historical", 1800, { kind: "attempt.finished", attempt: "historical-call", ok: true, ms: 600, queuedMs: 0, metrics: metrics(99) });
+    emit("historical", 1900, { kind: "token.data", token: "historical-token", patch: { draftV3: old, digest: "old-digest" } });
+    emit("historical", 2000, { kind: "token.returned", token: "historical-token", from: "curation/shot-review", to: "curation/proof", round: 1, reason: "old reshoot" });
+    emit("historical", 2200, { kind: "token.finished", token: "historical-token", status: "parked", node: "curation/audit", reason: "old failure" });
+    emit("historical", 2500, { kind: "run.ended", runId: "historical", manual: true });
+
+    emit("retry", 5000, { kind: "run.started", runId: "retry", title: "Magic retry only" });
+    emit("retry", 5100, { kind: "token.created", token: "retry-token", item: "magicui.design", url: "https://magicui.design" });
+    emit("retry", 5150, { kind: "token.data", token: "retry-token", patch: { draftV3: old, retryOf: "historical-token", checkpointDone: ["curation/copy", "curation/assemble"] } });
+    emit("retry", 5160, { kind: "token.data", token: "historical-token", patch: { retriedBy: "retry-token" } });
+    emit("retry", 5200, { kind: "attempt.started", attempt: "retry-call", token: "retry-token", node: "curation/audit", worker: "w" });
+    emit("retry", 5500, { kind: "attempt.finished", attempt: "retry-call", ok: true, ms: 300, queuedMs: 5, metrics: metrics(3) });
+    // A duplicated historical finish cannot turn into a fresh call in the retry run.
+    emit("retry", 5550, { kind: "attempt.finished", attempt: "historical-call", ok: true, ms: 600, queuedMs: 0, metrics: metrics(99) });
+    emit("retry", 5600, { kind: "consult.opened", consult: "k", token: "retry-token", reviewer: "curation/audit", owner: "curation/copy", fields: ["editorial.name"], problem: "fix name", round: 1 });
+    emit("retry", 5700, { kind: "consult.closed", consult: "k", token: "retry-token", outcome: "manual", reason: "pending owner" });
+    emit("retry", 5800, { kind: "candidate.disposition", candidate: { token: "retry-token", item: "magicui.design", disposition: "retry", failure: { tag: "tool_error", message: "fixture failure" } } });
+    emit("retry", 5900, { kind: "token.finished", token: "retry-token", status: "parked", node: "curation/audit", reason: "fixture failure" });
+    emit("retry", 6000, { kind: "run.ended", runId: "retry", manual: true });
+
+    emit("five-sites", 10000, { kind: "run.started", runId: "five-sites", title: "new acceptance" });
+    emit("five-sites", 10100, { kind: "token.created", token: "fresh-token", item: "magicui.design", url: "https://magicui.design" });
+    const fresh = record("magic-ui", "fresh-token", "New accepted output", "magicui.design");
+    emit("five-sites", 10200, { kind: "token.data", token: "fresh-token", patch: { draftV3: fresh } });
+    emit("five-sites", 10300, { kind: "attempt.started", attempt: "fresh-call", token: "fresh-token", node: "curation/audit", worker: "w" });
+    emit("five-sites", 10700, { kind: "attempt.finished", attempt: "fresh-call", ok: true, ms: 400, queuedMs: 0, metrics: metrics(2) });
+    emit("five-sites", 10800, { kind: "token.data", token: "fresh-token", patch: { digest: "fresh-digest", gate: "pass" } });
+    emit("five-sites", 10900, { kind: "token.finished", token: "fresh-token", status: "published", node: "curation/published", reason: "gate passed" });
+    fs.writeFileSync(path.join(project, "published", "magicui.design.json"), JSON.stringify({ ...fresh, h2: { token: "fresh-token", digest: "fresh-digest" } }));
+    emit("five-sites", 11000, { kind: "token.created", token: "lucide-token", item: "lucide.dev", url: "https://lucide.dev" });
+    emit("five-sites", 11100, { kind: "attempt.started", attempt: "lucide-assemble", token: "lucide-token", node: "curation/assemble", worker: "w" });
+    emit("five-sites", 11200, { kind: "token.data", token: "lucide-token", patch: { draftV3: record("lucide", "lucide-token", "Lucide draft", "lucide.dev") } });
+    emit("five-sites", 11300, { kind: "attempt.finished", attempt: "lucide-assemble", ok: true, ms: 200, queuedMs: 0, metrics: metrics(0) });
+    emit("five-sites", 11400, { kind: "attempt.started", attempt: "lucide-audit", token: "lucide-token", node: "curation/audit", worker: "w" });
+    emit("five-sites", 11500, { kind: "attempt.finished", attempt: "lucide-audit", ok: false, ms: 100, queuedMs: 0, metrics: { modelTimeReported: false } });
+    emit("five-sites", 11600, { kind: "token.finished", token: "lucide-token", status: "manual", node: "curation/audit", reason: "not approved" });
+    emit("five-sites", 12000, { kind: "run.ended", runId: "five-sites", manual: true });
+
+    const run = (runId: string) => {
+      const output = path.join(root, `${runId}.json`);
+      execFileSync(process.execPath, [path.resolve("scripts/curation-compare.mjs"), "--project", project, "--runId", runId, "--baseline", baseline, "--output", output], { cwd: path.resolve("."), encoding: "utf8", stdio: "pipe" });
+      return JSON.parse(fs.readFileSync(output, "utf8"));
+    };
+    const retry = run("retry");
+    const magic = retry.sites.find((site: any) => site.id === "magic-ui");
+    assert.equal(retry.coverage.observedSites, 1);
+    assert.equal(magic.counts.agentAndReviewAttempts, 1);
+    assert.equal(magic.counts.modelCallsRecorded, 3);
+    assert.equal(magic.counts.returned, 0);
+    assert.equal(magic.counts.consultOpened, 1);
+    assert.deepEqual(magic.tokens.map((token: any) => token.id), ["retry-token"]);
+    assert.equal(magic.artifact.kind, "inherited-draft-not-approved");
+    assert.equal(magic.artifact.value.editorial.name, "Historical title", "later-run data cannot leak into the selected snapshot");
+    assert.equal(magic.publicationVerified, false, "a later published file is not this run's result");
+    assert.equal(magic.dispositions.length, 1);
+    assert.equal(magic.timing.wallMs, 800);
+    assert.ok(magic.comparison.differences.some((diff: any) => diff.path === "/editorial/name"));
+    const latest = run("five-sites");
+    assert.equal(latest.coverage.verifiedPublications, 1);
+    assert.equal(latest.sites[0].counts.modelCallsRecorded, 2);
+    assert.equal(latest.sites[0].artifact.kind, "published-this-run");
+    const lucide = latest.sites.find((site: any) => site.id === "lucide");
+    assert.equal(lucide.artifact.kind, "assembled-draft-not-approved");
+    assert.equal(lucide.publicationVerified, false);
+    assert.equal(lucide.baseline.status, "missing-current-published-baseline");
+    assert.equal(lucide.comparison.status, "not-comparable-current-baseline-missing");
+    assert.equal(lucide.comparison.alternativeComparisons.length, 1);
+    assert.ok(lucide.comparison.alternativeComparisons[0].differences.length);
+    assert.equal(lucide.counts.modelCallsComplete, false, "unreported model calls stay unknown");
+    assert.deepEqual(lucide.counts.modelMetricsCoverage.missingAgentReviewAttemptIds, ["lucide-audit"]);
+  } finally { db.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});

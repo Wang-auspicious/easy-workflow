@@ -1,4 +1,4 @@
-"""Runnable ZCode-style software-engineering workflow."""
+"""Runnable staged agent workflow."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from threading import Lock
 from workflow_spec import PHASES, actor_map, all_actors, graph_template
 
 
-# Compatibility aliases keep the first H2 demo's public surface usable.
+# Compatibility aliases keep the first workflow demo's public surface usable.
 ACTORS = actor_map()
 WORKERS = tuple((actor.name, actor.task) for actor in PHASES[1].actors)
 PHASE_NAMES = tuple(phase.name for phase in PHASES)
@@ -122,7 +122,7 @@ def ask(run: Run, phase_id: str, actor_id: str) -> dict:
         "artifact": {
             "kind": "workflow-finding",
             "summary": f"{actor.task}完成",
-            "source": "H2 demo actor",
+            "source": "Workflow demo actor",
         },
     }
     run.save_result(actor_id, result)
@@ -235,7 +235,7 @@ def run_workflow(fail: str | None = None, delay: float = 0.05) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the H2 software-engineering agent workflow.")
+    parser = argparse.ArgumentParser(description="Run the Easy Workflow prototype.")
     choices = [actor.name for actor in all_actors()] + [actor.id for actor in all_actors()]
     parser.add_argument("--fail", choices=choices, help="inject one actor failure")
     parser.add_argument("--delay", type=float, default=0.05, help="actor delay in seconds")

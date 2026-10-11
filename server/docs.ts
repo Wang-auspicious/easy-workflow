@@ -17,7 +17,7 @@ const time = (ms: number) => new Date(ms).toLocaleString("zh-CN", { hour12: fals
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 const safe = (s: string) => s.replace(/[\\/:*?"<>|]+/g, "~");
 
-export const CONTEXT_HEADER = "> 这份 CONTEXT.md 由 H2 程序维护，每完成一次处理自动重写，段名和顺序固定。你不能直接改写它；要留笔记或报告问题，调用 env_call(\"context_note\", {kind, text})。版本信息只看这里，ROLE.md 不记版本。最新的条目在每段最上面。";
+export const CONTEXT_HEADER = "> 这份 CONTEXT.md 由 Easy Workflow 程序维护，每完成一次处理自动重写，段名和顺序固定。你不能直接改写它；要留笔记或报告问题，调用 env_call(\"context_note\", {kind, text})。版本信息只看这里，ROLE.md 不记版本。最新的条目在每段最上面。";
 export const CASE_HEADER = "> 这份案卷随这件货走，所有工位共用。开始工作前读完它，完成后调用 env_call(\"case_note\", {section, text}) 给后面的人留一段交接笔记：你确认了什么、拿不准什么、提醒谁注意什么。案卷由程序按时间渲染，不要直接改写，也不要复述别人已经写过的内容。";
 
 export class Docs {
@@ -25,7 +25,10 @@ export class Docs {
   name: string;
   private timers = new Map<string, NodeJS.Timeout>();
   private f: { state: FactoryState; compiled: CompiledFactory };
+  private lessons?: { pendingContext(station: string): string; validationContext(station: string, item: string): string };
   constructor(f: { state: FactoryState; compiled: CompiledFactory }, dir: string, name: string) { this.f = f; this.dir = dir; this.name = name; }
+
+  setLessons(source: { pendingContext(station: string): string; validationContext(station: string, item: string): string }) { this.lessons = source; }
 
   private node(key: string) { return this.f.compiled.nodes.find((n) => n.key === key); }
 
@@ -56,7 +59,7 @@ export class Docs {
       "## 最近交接", handoffs, "",
       "## 待解决问题", issues, "",
       "## 工作笔记", list("note", 8), "",
-      "## 待批准的经验", list("lesson", 6), "",
+      "## 待批准的经验", [list("lesson", 6), this.lessons?.pendingContext(key)].filter((text) => text && text !== "- （无）").join("\n") || "- （无）", "",
     ].join("\n");
   }
 
@@ -137,6 +140,8 @@ export class Docs {
       `---\n# 你的 CONTEXT（节选，完整版 env_call("context_read", {station:"${key}"})）\n${this.contextBrief(key)}`,
     ];
     if (caseId) parts.push(`---\n${this.caseBrief(caseId)}`);
+    const trial = caseId ? this.lessons?.validationContext(key, caseId) : "";
+    if (trial) parts.push(trial);
     if (tools?.length) parts.push(`---\n# 能力箱\n你可以调用 env_help 查看工具说明（带 name 看参数），用 env_call({name, arguments}) 执行。本工位可用：${tools.join("、")}。工具返回 ok:false 时读 failure.nextAction 和 failure.owner：owner=agent 按建议换方法，owner=user 或 system 就在提交里如实写明卡在哪，不要重复同一个调用。`);
     return { text: parts.join("\n\n"), role: role.revision, sizes: { role: role.content.length, project: project.length, context: parts[2].length, caseFile: caseId ? parts[3].length : 0 } };
   }

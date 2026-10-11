@@ -14,7 +14,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-factory-desktop-'));
 const artifacts = path.join(root, 'artifacts', 'desktop'); fs.mkdirSync(artifacts, { recursive: true });
-const env = { ...process.env, FACTORY_PROFILE: profile, FACTORY_DESKTOP_TEST: '1' };
+const env = { ...process.env, FACTORY_PROFILE: profile, FACTORY_DESKTOP_TEST: '1', FACTORY_PREFLIGHT: '0', FACTORY_DISCOVERY: '0' };
 delete env.ELECTRON_RUN_AS_NODE;
 delete env.OPENCODE_API_KEY;
 delete env.FACTORY_VIEW_VAR;
@@ -78,9 +78,10 @@ try {
   await checkNativeLayers(app);
   const desktop = await page.evaluate(() => window.desktop.info());
   assert.equal(desktop.readOnly, false);
-  assert.equal(desktop.workspace, path.join(profile, 'workspace'));
+  assert.equal(desktop.workspace, path.join(profile, 'projects', 'vislexicon-curation'));
   const boot = await page.evaluate(async () => ({ factory: await (await fetch('/api/factory')).json(), state: await (await fetch('/api/state')).json() }));
-  assert.equal(boot.factory.factory.nodes.length, 66);
+  assert.ok(boot.factory.factory.nodes.some(node => node.key === 'curation/scout'));
+  assert.equal(Object.keys(boot.state.nodes).length, boot.factory.factory.nodes.length);
   assert.equal(Object.keys(boot.state.tokens).length, 0);
   assert.equal(boot.state.run.status, 'idle');
   const role = await page.evaluate(async()=>{
@@ -88,7 +89,7 @@ try {
     if(!r.ok)throw new Error(`read_role: ${r.status}`);return r.json();
   });
   assert.match(JSON.stringify(role),/组件特写摄影/);
-  assert.match(JSON.stringify(role),/情况判断与处理/);
+  for (const repair of ['reframe', 'wait-for-render', 'replace-page']) assert.ok(role.result.content.includes(repair));
   results.checks.push('bundled node ROLE.md accessible through the Agent interface');
   if (process.argv.includes('--standalone')) {
     assert.equal(boot.factory.keyPresent, false, 'standalone smoke must not discover an API key');
@@ -100,7 +101,7 @@ try {
   assert.equal(prefs.contextIsolation, true); assert.equal(prefs.nodeIntegration, false); assert.equal(prefs.sandbox, true);
   const { url } = await app.evaluate(() => globalThis.__factoryDesktop());
   assert.equal((await fetch(`${url}/api/state`)).status, 401);
-  results.checks.push('66-node graph renders without running work', 'isolated writable workspace', 'sandbox and context isolation', 'unauthenticated local request rejected');
+  results.checks.push('current compiled graph renders without running work', 'isolated writable workspace', 'sandbox and context isolation', 'unauthenticated local request rejected');
   await page.evaluate((url) => new Promise((resolve, reject) => {
     const w = document.createElement('webview'); w.id = 'desktop-smoke-webview';
     w.setAttribute('partition', 'persist:social-x'); w.src = url;
@@ -230,9 +231,9 @@ try {
   assert.equal(restored.bookmarks[0].id,'bilibili');assert.ok(restored.bookmarks.some(b=>b.title==='本地验证 · 已编辑'));assert.ok(restored.history.some(h=>h.title==='Local webview check'));
   results.checks.push('bookmarks and history survive restart');
   await closeAndVerify(app); app = null;
-  const journal = path.join(profile, 'workspace', 'journal.db');
+  const journal = path.join(profile, 'projects', 'vislexicon-curation', 'journal.db');
   const before = crypto.createHash('sha256').update(fs.readFileSync(journal)).digest('hex');
-  app = await launch({ FACTORY_VIEW_VAR: path.join(profile, 'workspace') });
+  app = await launch({ FACTORY_VIEW_VAR: path.dirname(journal) });
   const readPage = await app.firstWindow();
   await readPage.locator('.node').first().waitFor({ timeout: 30000 });
   assert.equal((await readPage.evaluate(() => window.desktop.info())).readOnly, true);

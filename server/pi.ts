@@ -35,7 +35,7 @@ function configuredKey(value: unknown): string | undefined {
   if (typeof value !== "string" || !value) return undefined;
   // Pi's shell-command credentials require its CLI auth lifecycle; never execute
   // an arbitrary configuration string inside the factory service.
-  if (value.startsWith("!")) throw new Error("Pi 的命令式凭据暂不支持；请为 H2 提供对应 API key 环境变量。");
+  if (value.startsWith("!")) throw new Error("Pi 的命令式凭据暂不支持；请为 Easy Workflow 提供对应 API key 环境变量。");
   return process.env[value] ?? value;
 }
 
@@ -43,7 +43,7 @@ function credential(provider: string) {
   if (provider === "opencode-go" && process.env.OPENCODE_API_KEY) return { type: "api_key" as const, key: process.env.OPENCODE_API_KEY };
   const entry = json(path.join(piDirectory(), "auth.json"))[provider];
   if (entry?.type === "api_key" && entry.key) return { type: "api_key" as const, key: configuredKey(entry.key) };
-  if (entry?.type === "oauth") throw new Error(`Pi 的 ${provider} 使用 OAuth；当前 H2 仅支持 API key 凭据。`);
+  if (entry?.type === "oauth") throw new Error(`Pi 的 ${provider} 使用 OAuth；当前 Easy Workflow 仅支持 API key 凭据。`);
   const custom = json(path.join(piDirectory(), "models.json")).providers?.[provider];
   if (custom?.apiKey) return { type: "api_key" as const, key: configuredKey(custom.apiKey) };
   if (provider === "opencode-go") {
@@ -57,8 +57,8 @@ function credential(provider: string) {
 const credentials: CredentialStore = {
   read: async (id) => credential(id),
   list: async () => Object.keys(json(path.join(piDirectory(), "auth.json"))).map((providerId) => ({ providerId, type: "api_key" as const })),
-  modify: async () => { throw new Error("H2 does not write Pi credentials"); },
-  delete: async () => { throw new Error("H2 does not write Pi credentials"); },
+  modify: async () => { throw new Error("Easy Workflow does not write Pi credentials"); },
+  delete: async () => { throw new Error("Easy Workflow does not write Pi credentials"); },
 };
 
 export function models() {

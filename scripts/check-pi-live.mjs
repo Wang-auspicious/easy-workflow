@@ -7,7 +7,7 @@ import { fork, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'h2-pi-live-'));
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-pi-live-'));
 const connection = path.join(dir, 'connection.json');
 const token = 'isolated-live-pi-check';
 const out = path.join(root, 'artifacts', 'pi-integration');
@@ -18,8 +18,8 @@ let logs = '', cli;
 child.stdout.on('data', b => { logs += b; }); child.stderr.on('data', b => { logs += b; });
 try {
   const url = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('H2 startup timeout')), 20000);
-    child.once('exit', () => { clearTimeout(timer); reject(new Error('H2 exited before ready')); });
+    const timer = setTimeout(() => reject(new Error('Easy Workflow startup timeout')), 20000);
+    child.once('exit', () => { clearTimeout(timer); reject(new Error('Easy Workflow exited before ready')); });
     child.on('message', m => { if (m.type === 'ready') { clearTimeout(timer); resolve(m.url); } });
   });
   const request = async (route, input) => {
@@ -29,7 +29,7 @@ try {
   const bootstrap = await request('/api/agent/bootstrap');
   assert.ok(bootstrap.model.ready, bootstrap.model.error ?? 'Pi credentials missing');
   console.log(JSON.stringify({ phase: 'connected', model: bootstrap.model, bootstrapCharacters: bootstrap.instructions.length }));
-  const prompt = '检查 H2 当前是否有任务在运行。只读查询，不要投料或启动任务。用一句中文告诉我真实状态。';
+  const prompt = '检查 Easy Workflow 当前是否有任务在运行。只读查询，不要投料或启动任务。用一句中文告诉我真实状态。';
   await request('/api/chat', { text: prompt });
   const deadline = Date.now() + 120000;
   let reply;
@@ -40,13 +40,13 @@ try {
     await new Promise(r => setTimeout(r, 750));
   }
   assert.ok(reply, 'dispatcher did not finish');
-  const dispatcherOK = reply.tools?.some(t => t.name === 'h2_call') && !/出错|调用失败/.test(reply.text);
+  const dispatcherOK = reply.tools?.some(t => t.name === 'easy_workflow_call') && !/出错|调用失败/.test(reply.text);
   console.log(JSON.stringify({ phase: 'dispatcher', text: reply.text, tools: reply.tools }));
   fs.writeFileSync(connection, JSON.stringify({ protocol: 'h2-agent/1', url, token }), { mode: 0o600 });
   const cliPath = process.env.PI_CLI ?? path.join(process.env.APPDATA, 'npm/node_modules/@earendil-works/pi-coding-agent/dist/cli.js');
   assert.ok(fs.existsSync(cliPath), 'installed Pi CLI not found');
   let output = '', errors = '';
-  cli = spawn(process.execPath, [cliPath, '--no-session', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '-e', path.join(root, 'integrations/pi/h2-factory.ts'), '--tools', 'h2_help,h2_call', '--thinking', 'off', '--mode', 'json', '--system-prompt', '你是用户的助手，优先使用当前提供的工具获取真实信息。', '-p', prompt], {
+  cli = spawn(process.execPath, [cliPath, '--no-session', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '-e', path.join(root, 'integrations/pi/easy-workflow.ts'), '--tools', 'easy_workflow_help,easy_workflow_call', '--thinking', 'off', '--mode', 'json', '--system-prompt', '你是用户的助手，优先使用当前提供的工具获取真实信息。', '-p', prompt], {
     cwd: dir, windowsHide: true, env: { ...process.env, FACTORY_AGENT_CONNECTION: connection }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   cli.stdout.on('data', b => { output += b; }); cli.stderr.on('data', b => { errors += b; });
@@ -57,7 +57,7 @@ try {
   assert.equal(code, 0, errors.slice(-600));
   const events = output.split('\n').flatMap(line => { try { return [JSON.parse(line)]; } catch { return []; } });
   const calls = events.filter(e => e.type === 'tool_execution_end').map(e => ({ name: e.toolName, isError: e.isError }));
-  assert.ok(calls.some(c => c.name === 'h2_call' && !c.isError), 'Pi did not discover and call H2');
+  assert.ok(calls.some(c => c.name === 'easy_workflow_call' && !c.isError), 'Pi did not discover and call Easy Workflow');
   const answer = events.filter(e => e.type === 'message_end' && e.message?.role === 'assistant').at(-1)?.message?.content?.filter(c => c.type === 'text').map(c => c.text).join('');
   const state = await request('/api/state');
   const native = state.conversation;
@@ -78,6 +78,6 @@ try {
     child.once('exit', () => { clearTimeout(timer); resolve(); });
     if (child.connected) child.send({ type: 'shutdown' }); else child.kill();
   });
-  assert.ok(path.resolve(dir).startsWith(path.join(path.resolve(os.tmpdir()), 'h2-pi-live-')));
+  assert.ok(path.resolve(dir).startsWith(path.join(path.resolve(os.tmpdir()), 'easy-workflow-pi-live-')));
   fs.rmSync(dir, { recursive: true, force: true });
 }

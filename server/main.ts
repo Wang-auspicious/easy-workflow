@@ -164,6 +164,7 @@ const server = http.createServer(async (req, res) => {
         case "/api/layout": factory.writeLayout(b); return send(res, 200, { ok: true });
         case "/api/settings": { const r = await control.execute("settings", { values: b }, "user"); return send(res, 200, { ...r, settings: r.result }); }
         case "/api/patch": return send(res, 200, await control.execute("decide_patch", b, "user"));
+        case "/api/lessons/decision": return send(res, 200, await control.execute("decide_lesson", b, "user"));
       }
     }
     if (p.startsWith("/api/") || p.startsWith("/.well-known/") || req.method !== "GET") throw new ControlError(404, "not_found", "接口不存在");
@@ -187,7 +188,7 @@ server.listen(PORT, "127.0.0.1", () => {
   const port = typeof address === "object" && address ? address.port : PORT;
   const url = `http://127.0.0.1:${port}`;
   removeConnection = publishConnection(url, TOKEN);
-  console.log(`factory server on ${url}  (var: ${VAR})`);
+  console.log(`Easy Workflow server on ${url}  (var: ${VAR})`);
   process.send?.({ type: "ready", url });
 });
 
@@ -201,7 +202,7 @@ const shutdown = async () => {
   for (const c of clients) c.end();
   server.close(); server.closeAllConnections();
   await Promise.all([factory.runtime.close(), chatTask]);
-  await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]); factory.journal.close(); process.exit(0);
+  await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]); factory.docs.flush(); factory.lessons.close(); factory.journal.close(); process.exit(0);
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

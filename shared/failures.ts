@@ -47,10 +47,19 @@ export function classifyFailure(error:unknown, context:{url?:string;status?:numb
   else if(status===429){tag="http_rate_limit";category="network";}
   else if((status??0)>=500){tag="http_server";category="network";}
   else if(/ENOTFOUND|EAI_AGAIN|ERR_NAME|DNS/i.test(text)){tag="network_dns";category="network";}
-  else if(/certificate|CERT_|TLS|SSL/i.test(text)){tag="network_tls";category="network";}
+  else if(isTlsFailure(error)){tag="network_tls";category="network";}
   else if(/timeout|timed? ?out|ETIMEDOUT|超时/i.test(text)){tag="network_timeout";category="network";}
   else if(/fetch failed|ECONN|ERR_CONNECTION|socket|network|导航|navigation/i.test(text)){tag="network_connection";category="network";}
   return withAdvice({tag,category,message,url:context.url,code,status,retryable:category!=="invalid"});
+}
+
+/** A reset before a TLS connection exists is a connection error, not a bad certificate. */
+export function isTlsFailure(error: unknown): boolean {
+  const e = error as { message?: string; code?: string; cause?: { code?: string; message?: string } };
+  const text = `${e?.code ?? ""} ${e?.cause?.code ?? ""} ${e?.message ?? error ?? ""} ${e?.cause?.message ?? ""}`;
+  if (/certificate|CERT_|ERR_(?:SSL|TLS)_|SSL_ERROR|证书/i.test(text)) return true;
+  if (/ECONN|ERR_CONNECTION|socket disconnected|timeout|timed? ?out|ETIMEDOUT/i.test(text)) return false;
+  return /\b(?:TLS|SSL)\b/i.test(text);
 }
 
 const OWNER:Record<FailureTag,"agent"|"user"|"system">={invalid_url:"agent",http_not_found:"agent",page_unavailable:"agent",network_timeout:"system",network_dns:"system",network_connection:"system",network_tls:"user",http_rate_limit:"system",http_server:"system",auth_required:"user",browser_capture:"system",tool_error:"system",run_ended:"system",needs_selection:"agent",missing_artifact:"system",quality_rejected:"agent",model_unavailable:"user"};

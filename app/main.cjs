@@ -4,10 +4,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { BrowserManager } = require('./browser-manager.cjs');
+const { copyProjectSnapshot } = require('./project-data.cjs');
+const { PRODUCT_NAME, userDataDirectory, projectLocations, activeProjectDirectory, recentProjectDirectories } = require('./branding.cjs');
 
 const root = path.resolve(__dirname, '..');
-if (process.env.FACTORY_PROFILE) app.setPath('userData', path.resolve(process.env.FACTORY_PROFILE));
-app.setName('Pi Factory');
+const profileDirectory = userDataDirectory({ appData: app.getPath('appData'), explicitProfile: process.env.FACTORY_PROFILE });
+app.setName(PRODUCT_NAME);
+fs.mkdirSync(profileDirectory, { recursive: true });
+app.setPath('userData', profileDirectory);
 app.commandLine.appendSwitch('disable-background-networking');
 app.commandLine.appendSwitch('remote-debugging-port', '0');
 app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
@@ -20,27 +24,15 @@ const config = () => { try { return JSON.parse(fs.readFileSync(configFile(), 'ut
 const isWeb = (url) => { try { return ['http:', 'https:'].includes(new URL(url).protocol); } catch { return false; } };
 const saveConfig = (patch) => fs.writeFileSync(configFile(), JSON.stringify({ ...config(), ...patch }, null, 2));
 
-/* Projects (Spec §30.1): one folder per project holds all of its data. Test profiles keep
- * their projects inside the profile; real profiles default to Documents/Pi Factory/Projects. */
-function defaultProject() {
-  const base = process.env.FACTORY_PROFILE ? path.join(app.getPath('userData'), 'projects') : path.join(app.getPath('documents'), 'Pi Factory', 'Projects');
-  return path.join(base, 'vislexicon-curation');
-}
+/* Existing projects keep their exact folder and configuration. New projects default to
+ * Documents/Easy Workflow/Projects; isolated test profiles retain their own projects. */
+const projectPaths = () => projectLocations({ documents: app.getPath('documents'), userData: app.getPath('userData'), explicitProfile: process.env.FACTORY_PROFILE });
+const defaultProject = () => projectPaths().defaultProject;
 function activeProject() {
-  if (process.env.FACTORY_PROJECT) return path.resolve(process.env.FACTORY_PROJECT);
-  const saved = config().activeProject;
-  if (saved) return saved;
-  const dir = defaultProject();
-  // Copy (never move) data from the old single workspace the first time.
-  const legacy = path.join(app.getPath('userData'), 'workspace');
-  if (!fs.existsSync(path.join(dir, 'journal.db')) && fs.existsSync(path.join(legacy, 'journal.db'))) {
-    fs.mkdirSync(path.dirname(dir), { recursive: true });
-    fs.cpSync(legacy, dir, { recursive: true, errorOnExist: false, force: false });
-  }
-  return dir;
+  return activeProjectDirectory(projectPaths(), config(), process.env.FACTORY_PROJECT);
 }
 function rememberProject(dir) {
-  const recent = [dir, ...(config().recentProjects ?? []).filter((d) => d !== dir)].slice(0, 8);
+  const recent = recentProjectDirectories(projectPaths(), config(), dir);
   saveConfig({ activeProject: dir, recentProjects: recent });
 }
 if (!app.requestSingleInstanceLock()) app.quit();
@@ -59,6 +51,11 @@ async function stopBackend() {
 
 async function startBackend() {
   const saved = config();
+  const legacy = path.join(app.getPath('userData'), 'workspace');
+  const project = viewDir || activeProject();
+  if (!viewDir && project === defaultProject() && !fs.existsSync(project) && fs.existsSync(path.join(legacy, 'journal.db'))) {
+    await copyProjectSnapshot(legacy, project);
+  }
   const token = crypto.randomBytes(32).toString('hex');
   const profile = app.getPath('userData');
   const env = {
@@ -99,7 +96,7 @@ async function startBackend() {
   baseURL = ready.url;
   await session.defaultSession.cookies.set({ url: baseURL, name: 'pf_auth', value: token, httpOnly: true, sameSite: 'strict', path: '/' });
   child.on('exit', (code) => {
-    if (backend === child && !closing) dialog.showErrorBox('Pi Factory 后台已退出', `退出码：${code}。重新打开应用可从日志恢复。`);
+    if (backend === child && !closing) dialog.showErrorBox(`${PRODUCT_NAME} 后台已退出`, `退出码：${code}。重新打开应用可从日志恢复。`);
   });
 }
 
@@ -108,7 +105,7 @@ function secureSession(s) {
   s.setPermissionCheckHandler(() => false);
 }
 
-const windowTitle = () => viewDir ? 'Pi Factory · 只读查看已有运行' : `Pi Factory · ${path.basename(activeProject())}`;
+const windowTitle = () => viewDir ? `${PRODUCT_NAME} · 只读查看已有运行` : `${PRODUCT_NAME} · ${path.basename(activeProject())}`;
 async function changeWorkspace(dir) {
   viewDir = dir;
   await stopBackend();
@@ -127,7 +124,7 @@ function menu() {
   return Menu.buildFromTemplate([
     { label: '项目', submenu: [
       { label: '新建项目…', click: async () => {
-        const chosen = await dialog.showSaveDialog(window, { title: '新建项目文件夹（项目的全部数据都会存在这里）', defaultPath: path.join(path.dirname(activeProject()), 'new-project'), buttonLabel: '创建项目' });
+        const chosen = await dialog.showSaveDialog(window, { title: '新建项目文件夹（项目的全部数据都会存在这里）', defaultPath: path.join(projectPaths().newProjectBase, 'new-project'), buttonLabel: '创建项目' });
         if (chosen.canceled || !chosen.filePath) return;
         await openProject(chosen.filePath).catch(showError);
       } },
@@ -136,7 +133,7 @@ function menu() {
         if (chosen.canceled) return;
         await openProject(chosen.filePaths[0]).catch(showError);
       } },
-      { label: '最近项目', submenu: (config().recentProjects ?? [activeProject()]).map((dir) => ({ label: `${path.basename(dir)}  —  ${dir}`, type: 'radio', checked: !viewDir && dir === activeProject(), click: () => openProject(dir).catch(showError) })) },
+      { label: '最近项目', submenu: recentProjectDirectories(projectPaths(), config(), activeProject()).map((dir) => ({ label: `${path.basename(dir)}  —  ${dir}`, type: 'radio', checked: !viewDir && dir === activeProject(), click: () => openProject(dir).catch(showError) })) },
       { label: '在资源管理器中显示', click: () => shell.openPath(viewDir || activeProject()) },
       { type: 'separator' },
       { label: '回到当前项目', click: () => changeWorkspace(null).catch(showError) },
@@ -162,7 +159,7 @@ function menu() {
   ]);
 }
 
-const showError = (error) => dialog.showErrorBox('Pi Factory', String(error?.stack || error));
+const showError = (error) => dialog.showErrorBox(PRODUCT_NAME, String(error?.stack || error));
 if (process.env.FACTORY_DESKTOP_TEST === '1') {
   globalThis.__factoryDesktop = () => ({ backendPid: backend?.pid, url: baseURL, readOnly: Boolean(viewDir) });
   globalThis.__factoryBrowser = args => browserManager.command(args);

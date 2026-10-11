@@ -28,7 +28,7 @@ const candidates = line({
   blurb: "所有原始货先落到这里：整理、提取、索引，再分流到各条线。本地待处理清单都在这一层。",
   stations: [
     station({
-      id: "tidy", name: "候选准备", role: "candidate", kind: "program", resource: "none", estimateSeconds: 0.1, input: "RawItem", output: "TidyItem",
+      id: "tidy", name: "候选准备", role: "candidate", kind: "program", resource: "http", estimateSeconds: 6.6, input: "RawItem", output: "TidyItem",
       tool: "candidates.tidy", accept: ["merges keep a disposition record"], blurb: "规范化网址 · 拆一帖多链 · 合并重复",
       pseudo: "url = lower(host) - www - tracking params\nif seen(url): record merge disposition (never drop silently)",
     }),

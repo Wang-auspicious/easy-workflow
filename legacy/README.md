@@ -1,31 +1,19 @@
-# H2 · Software Engineering Agent Workflow
+# 早期工作流原型
 
-H2 把 ZCode 的多 agent 运行模型放进软件工程流程：需求、设计、构建、测试、维护。它不是把三个聊天窗口并排摆出来，而是用一个声明式阶段图约束谁先做、哪些任务可以并行、结果怎样交接，以及失败后停在哪里。
+这里保留 Easy Workflow 早期的确定性流程原型，用于检查阶段调度、结构化交接、事件顺序和失败恢复。它与当前桌面应用分开运行，不调用外部模型，也不作为生产验收数据。
 
-## 后端做什么
+## 目录
 
-- `workflow_spec.py` 声明阶段、软件工程知识域、具名 actor 和稳定的 handoff 拓扑。
-- `workflow_demo.py` 执行阶段，阶段内独立 actor 用 `ThreadPoolExecutor` 并行，阶段之间由协调者汇总后再放行。
-- 每个 actor 必须返回结构化结果；协调者只读取结果，不从自然语言猜测隐含状态。
-- `Run.events` 是追加式运行日志，包含序号、相对时间、阶段、actor、状态和产物。
-- `graph` 是静态拓扑叠加运行状态，节点和边在运行中保持稳定，适合后续 ZCode 风格 Web UI 实时消费。
-- 哨兵检查事件序号、actor 终态和图拓扑；失败时保留已经完成的产物，并把后续阶段留在 `pending`，记录 `blocked_by`。
-- `index.html` 是 ZCode 风格的运行面板：顶部阶段轨道、中间具名 agent 时间线、彩色小人状态、右侧结构化结算和底部后续输入区。
-- 每个角色使用原创的轻量 SVG blob 形象，分别对应需求、架构、证据、测试、构建和维护职责；形状、颜色和眼睛表情彼此独立，并参考了 [bloub](https://bloub.vercel.app/) 的极简 bot 语言，没有复制第三方图片资产。
+- `workflow_spec.py`：声明阶段、角色职责和固定的交接拓扑。
+- `workflow_demo.py`：按阶段执行；设计阶段的独立角色通过 `ThreadPoolExecutor` 并行，全部结束后再交给下一阶段。
+- `test_workflow.py`：验证成功结果、稳定拓扑、连续事件序号，以及失败后的结果保留和下游阻断。
+- `index.html`：读取运行记录，显示阶段、角色状态与结构化结果；也可回放内置演示数据。
 
-## 软件工程流程映射
-
-| H2 阶段 | 软件工程知识域 | 主要 actor |
-| --- | --- | --- |
-| 需求与范围 | Software Requirements | 需求协调者 |
-| 设计与依赖审查 | Software Design | 架构审查员、证据审查员、测试规划员 |
-| 实现与变更检查 | Software Construction | 实现检验员 |
-| 测试与质量验证 | Software Testing | 测试验证员 |
-| 维护与交付反馈 | Software Maintenance | 维护记录员 |
-
-设计阶段的三个 actor 是独立读任务，会并行 fan-out；只有它们全部结算后，构建阶段才会开始。这就是 H2 相比“多次调用同一个 prompt”的新增内容：调度、门禁、结构化交接和可复盘证据都由运行时负责。
+流程包含需求、设计、实现检查、测试验证和维护记录五个阶段。所有角色返回结构化结果；协调者汇总结果，检查程序核对事件序号、角色终态与图拓扑。失败时保留已完成产物，后续阶段保持 `pending` 并记录 `blocked_by`。
 
 ## 运行
+
+以下命令在 `legacy/` 目录内执行：
 
 ```powershell
 python workflow_demo.py --delay 0
@@ -33,39 +21,15 @@ python workflow_demo.py --fail 证据审查员 --delay 0
 python -m unittest -v
 ```
 
-默认写入 `run.json`。也可以指定路径：
+默认输出到当前目录的 `run.json`；可通过 `--output` 指定其他位置。成功返回退出码 `0`，注入失败返回 `1`。生成的记录只用于本地检查，不随产品发布。
 
-```powershell
-python workflow_demo.py --output artifacts/run.json
-```
-
-失败注入会返回退出码 `1`，但已完成的 actor 结果仍会保留；后续阶段不会假装执行。成功运行返回退出码 `0`。
-
-## 打开前端
-
-先生成一份后端运行记录，再用静态服务器打开页面：
+## 查看结果
 
 ```powershell
 python workflow_demo.py --delay 0
 python -m http.server 8802
 ```
 
-打开 `http://127.0.0.1:8802/index.html`。页面会优先读取同目录的 `run.json`，按后端事件顺序回放；直接双击 HTML 时无法读取本地 JSON，会使用同一协议的内置演示数据。点击阶段节点可以展开 agent，点击“开始运行”可以重播，底部输入区会记录后续修改意图。
+打开 `http://127.0.0.1:8802/index.html`。页面优先读取同目录 `run.json` 并按事件顺序回放；直接打开 HTML 无法读取该文件时，使用内置协议样本。点击阶段可展开角色，“开始运行”用于重播，底部输入区仅记录后续修改意图。
 
-## 与 H1 的关系
-
-H1 是单 agent 的代码证据层：文件、符号、调用、导入、源码和测试结果。H2 是多 agent 的执行层：阶段、角色、并行、汇总、失败和维护反馈。下一步接入时，H2 actor 可以把 H1 的图谱查询、源码读取和测试执行注册成工具；workflow graph 负责展示过程，code graph 负责提供证据。
-
-## 与 ZCode 的对应
-
-| H2 | ZCode |
-| --- | --- |
-| `PhaseSpec` | `phase("...")` |
-| `ActorSpec` / `ask()` | `agent(name).ask(...)` |
-| `ThreadPoolExecutor` | 阶段内 Promise fan-out |
-| `coordinator` 事件 | join / collect 门禁 |
-| `Run.events` | log / report journal |
-| `project_graph()` | 静态图 + live status overlay |
-| `audit()` | settlement / sentinel 检查 |
-
-当前版本故意使用本地确定性 actor，先把协议、状态和证据边界做实；后续只需替换 `ask()` 内部的模型驱动器，不需要重写调度器或前端数据协议。
+这个原型只验证调度与数据协议。当前可运行能力、模型接入和项目数据约定以仓库根目录的 [README](../README.md) 与 [Spec](../Spec.md) 为准。

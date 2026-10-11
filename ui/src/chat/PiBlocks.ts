@@ -1,4 +1,4 @@
-// Small H2 adapters for Pi Web UI's markdown-block / code-block contracts.
+// Easy Workflow adapters for Pi Web UI's markdown-block / code-block contracts.
 // Keep model text untrusted; no HTML, event handlers or unsafe URLs reach the DOM.
 import { html, LitElement } from "lit";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";

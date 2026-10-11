@@ -59,6 +59,17 @@ function copyRuntimeDependencies(destination) {
 }
 
 export async function buildDesktop() {
+  const configuredRoot = process.env.VISLEXICON_ROOT?.trim();
+  if (!configuredRoot) throw new Error('Set VISLEXICON_ROOT to the connected VisLexicon repository before building; no personal-directory fallback is used.');
+  const visRoot = path.resolve(configuredRoot);
+  const ruleSources = [
+    [path.join(visRoot, 'Spec.md'), 'Spec.md'],
+    ...['vocab.json', 'preview-rules.json'].map((name) => [path.join(visRoot, 'VisLexicon-browser-design-kit', 'frontend', 'public', 'spec', 'v1', name), path.join('public', 'spec', 'v1', name)]),
+    ...['style/site-style.mjs', 'ingest-v5/common.mjs'].map((name) => [path.join(visRoot, 'VisLexicon-browser-design-kit', 'frontend', 'scripts', name), path.join('scripts', name)]),
+    [path.join(visRoot, 'VisLexicon-browser-design-kit', 'frontend', 'src', 'data', 'curation-taxonomy.js'), path.join('src', 'data', 'curation-taxonomy.js')],
+  ];
+  // Check source availability before rebuilding UI or replacing a previous distribution.
+  for (const [source, relative] of ruleSources) if (!fs.existsSync(source)) throw new Error(`Required rule source is missing under VISLEXICON_ROOT: ${relative}`);
   await viteBuild({ configFile: path.join(root, 'ui', 'vite.config.ts') });
   safeRemove(output, root);
   fs.mkdirSync(output, { recursive: true });
@@ -89,14 +100,8 @@ export async function buildDesktop() {
   fs.cpSync(path.join(root, 'ui', 'dist'), path.join(output, 'ui', 'dist'), { recursive: true });
   const sourcePackage = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   fs.writeFileSync(path.join(output, 'package.json'), JSON.stringify({ name: sourcePackage.name, version: sourcePackage.version, type: 'module', main: 'app/main.cjs', description: sourcePackage.description }, null, 2));
-  const visRoot = process.env.VISLEXICON_ROOT || 'D:/Desktop/VisLexicon  视元';
   const bundle = path.join(output, 'resources', 'vislexicon');
-  for (const [source, rel] of [
-    [path.join(visRoot, 'Spec.md'), 'Spec.md'],
-    ...['vocab.json', 'preview-rules.json'].map((name) => [path.join(visRoot, 'VisLexicon-browser-design-kit', 'frontend', 'public', 'spec', 'v1', name), path.join('public', 'spec', 'v1', name)]),
-    ...['style/site-style.mjs', 'ingest-v5/common.mjs'].map((name) => [path.join(visRoot, 'VisLexicon-browser-design-kit', 'frontend', 'scripts', name), path.join('scripts', name)]),
-  ]) {
-    if (!fs.existsSync(source)) throw new Error(`Required rule source is missing: ${source}`);
+  for (const [source, rel] of ruleSources) {
     const target = path.join(bundle, rel); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.copyFileSync(source, target);
   }
   const packages = copyRuntimeDependencies(output);

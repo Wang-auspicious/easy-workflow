@@ -13,6 +13,7 @@ import { readText } from "../../server/network.ts";
 import { repoSources, type RepoMeta } from "../../server/repo.ts";
 import { FRONTEND, KINDS, KIND_ZH, VOCAB, ruleExcerpt } from "./env.ts";
 import { dossierText, type Dossier } from "./scout.ts";
+import { breadthPreviewIssues } from "./capture.ts";
 import { CHOSEN_AXES, KIND_CATEGORIES, loadTaxonomy, ownerOf, taxonomyLoaded } from "./v3.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -214,6 +215,10 @@ function imagesOf(ctx: StationContext, store: EvidenceStore) {
 
 export const shotReview = (store: EvidenceStore): AgentStationDef<ShotReviewOut> => ({
   system: withRules(prompt("shot-review.md"), "vislexicon:Spec.md#4.8"),
+  skip: (ctx) => {
+    const veto = enforceBreadth({ perImage: [], verdict: "pass", reason: "" }, ctx);
+    return veto.verdict === "return" ? shotReviewResult(veto, ctx) : null;
+  },
   schema: Type.Object({
     perImage: Type.Array(Type.Object({ role: lit("identity", "breadth", "proof", "poster"), ok: Type.Boolean(), reason: Type.String() })),
     verdict: lit("pass", "return"), returnTo: Type.Optional(lit("identity", "breadth", "proof")), repair: Type.Optional(lit("reframe", "replace-page", "wait-for-render")), reason: Type.String(),
@@ -228,7 +233,16 @@ export const shotReview = (store: EvidenceStore): AgentStationDef<ShotReviewOut>
   },
   check: (o) => (o.verdict === "return" && (!o.returnTo || !o.repair || o.reason.trim().length < 6) ? ["a return must name returnTo, repair (reframe | replace-page | wait-for-render), and a concrete reason"] : []),
   describe: (o) => (o.verdict === "pass" ? `通过：${o.perImage.map((p) => `${p.role} ${p.ok ? "✓" : "✗"}`).join(" ")}` : `退回 ${o.returnTo}：${o.reason.slice(0, 70)}`),
-  after: (out, ctx) => {
+  after: (out, ctx) => shotReviewResult(enforceBreadth(out, ctx), ctx),
+});
+
+function enforceBreadth(out: ShotReviewOut, ctx: StationContext): ShotReviewOut {
+  const d = data(ctx);
+  const issues = d.mode === "video" ? [] : breadthPreviewIssues(d.kind, d.shots?.breadth?.previews);
+  return issues.length ? { ...out, verdict: "return", returnTo: "breadth", repair: "replace-page", reason: issues.join("；"), perImage: [...out.perImage.filter(p => p.role !== "breadth"), { role: "breadth", ok: false, reason: issues.join("；") }] } : out;
+}
+
+function shotReviewResult(out: ShotReviewOut, ctx: StationContext): StationResult {
     const d = data(ctx);
     const rejected = out.verdict === "return" && out.repair === "replace-page" && out.returnTo ? [...((d.rejectedPages as string[]) ?? []), d.shots?.[out.returnTo]?.href].filter(Boolean) : d.rejectedPages;
     const shotRepairs = { ...d.shotRepairs };
@@ -240,8 +254,7 @@ export const shotReview = (store: EvidenceStore): AgentStationDef<ShotReviewOut>
       data: { shotReview: out.verdict, shotRepairs, rejectedPages: rejected, reviews: reviewsWith(ctx, { station: "shot-review", verdict: out.verdict, reason: out.reason }) },
       verdict: { verdict: out.verdict, returnTo: out.returnTo ? `curation/${out.returnTo}` : undefined, reason: out.reason },
     };
-  },
-});
+}
 
 /* ------------------------------------------------------------------ ⑫ style (VisLexicon §2.6.1 prompt kept verbatim) */
 
@@ -291,6 +304,13 @@ export const style = (store: EvidenceStore): AgentStationDef<StyleOut> => ({
   after: (out, ctx, meta) => {
     const words = out.styles.map((s) => VOCAB.styles.find((v) => v.id === s.id)?.zh ?? s.id);
     ctx.addEvidence({ id: `st-${ctx.attempt}`, kind: "verdict", label: "风格", verdict: out.subjectVisible ? (words.join(" · ") || "无合适的词") : "看不到组件", tone: out.subjectVisible ? "ok" : "warn", meta: { ...out, rounds: meta.rounds } });
+    if (!out.subjectVisible) {
+      const d = data(ctx), problem = "截图里看不到渲染出来的主体，只有文档文字、名称列表、代码或空预览。请按阅读员拍摄单重新定位到真实预览，再送图像处理与截图审查。";
+      const roles = ["breadth", "proof"] as const;
+      const shotRepairs = { ...d.shotRepairs };
+      for (const role of roles) shotRepairs[role] = { action: "reframe", url: d.shots?.[role]?.href, reason: problem };
+      return { ok: true, summary: "看不到主体：请求目录与特写重拍", data: { style: { applicable: true, ...out }, shotRepairs }, verdict: { verdict: "fix", reason: problem, fixes: roles.map(role => ({ station: `curation/${role}`, fields: [`shots.${role}`], problem, via: ["curation/process", "curation/shot-review"] })) } };
+    }
     return { ok: true, summary: out.subjectVisible ? `${words.join(" · ") || "无合适的词"}${meta.rounds > 1 ? "（重答 1 次）" : ""}` : "看不到组件：截图需要重拍", data: { style: { applicable: true, ...out } } };
   },
 });

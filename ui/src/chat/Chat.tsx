@@ -74,7 +74,7 @@ function ChatHead() {
         <i className="chat-online-dot" />
       </div>
       <div className="who">
-        <b>主调度 · Pi <i className="light light--green" /></b>
+        <b>主调度 · Easy Workflow <i className="light light--green" /></b>
         <span>{replay ? "回放中 · 只读" : live ? "正在回答…" : model || "当前工作区 · 网站入库"}</span>
       </div>
       <span className="grow" />
@@ -100,7 +100,7 @@ function Log() {
     <div className="chat-log" ref={ref} onScroll={onScroll}>
       {!entries.length && !live.id && <Empty />}
       <PiConversation entries={entries} live={live} onResize={followBottom} />
-      {live.id && !live.message && <div className="pi-waiting"><Loader2 size={12} className="spin-i" />Pi 正在处理…</div>}
+      {live.id && !live.message && <div className="pi-waiting"><Loader2 size={12} className="spin-i" />主调度正在处理…</div>}
       {patches.filter((p) => p.status === "proposed").map((p) => (
         <div key={p.id} className="patch-card">
           <div><b>规格补丁 {p.id}</b> <span className="muted">待你确认</span></div>

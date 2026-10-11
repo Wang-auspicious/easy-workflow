@@ -16,7 +16,7 @@ import { scout } from "./scout.ts";
 import { repoOf } from "../../server/repo.ts";
 import { ALL_AXES, CHOSEN_AXES, derivedFacets, loadTaxonomy, validateV3, webpSize } from "./v3.ts";
 import {
-  VIEW, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, recordScroll, sameSite,
+  VIEW, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, breadthPreviewIssues, recordScroll, sameSite,
   scoreLinks, shoot, stageClip, visit, pageKey, type Link,
 } from "./capture.ts";
 
@@ -232,7 +232,7 @@ function shotEvidence(ctx: StationContext, svc: Services, png: Buffer, role: str
   return ctx.addEvidence({ id: `img-${card.sha.slice(0, 12)}-${ctx.attempt.slice(2, 8)}`, kind: "image", src: card.src, card: card.src, label: ROLE_ZH[role] ?? role, meta: { role, ...meta } });
 }
 const ROLE_ZH: Record<string, string> = { identity: "首屏", breadth: "目录", proof: "组件特写" };
-type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number; title?: string };
+type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number; title?: string; previews?: number };
 type ReaderPlan = { identity?: { url: string }; breadth?: { url: string; alternatives?: { url: string }[] }; proof?: { url: string; locate?: string; alternatives?: { url: string; locate?: string }[] } };
 const readerPlanOf = (ctx: StationContext) => ctx.token.data.readerPlan as ReaderPlan | undefined;
 const shotsOf = (ctx: StationContext) => ({ ...((ctx.token.data.shots as Record<string, ShotData>) ?? {}) });
@@ -348,7 +348,8 @@ const breadth: Tool = async (ctx, svc) => {
       }
       const png = await shoot(page);
       const check = checkImage(png, hashes);
-      const issues = [...v.issues, ...check.issues];
+      let previews = await previewsInViewport(page);
+      const issues = [...v.issues, ...check.issues, ...breadthPreviewIssues(kind, previews)];
       if (issues.length) {
         ctx.progress(`拒收 ${new URL(c.href).pathname}：${issues.join("、")}`, { tool: "reject", text: issues.join(", "), ok: false });
         // Rules ran out: one needsPick round over the links not tried yet.
@@ -363,21 +364,24 @@ const breadth: Tool = async (ctx, svc) => {
       }
       let chosen = { png, hash: check.hash, href: page.url(), reason: c.reasons.includes("reader-plan") ? "阅读员拍摄单" : c.reasons.includes("needsPick") ? "模型从编号列表选的（needsPick）" : `score ${c.score}（${c.reasons.join("+")}）` };
       const deeper = (await links(page)).filter((l) => sameSite(l.href, host));
-      let breadthLinks=deeper,previews=await previewsInViewport(page);
+      let breadthLinks=deeper;
       const better = scoreLinks(deeper, role).find((x) => x.score > c.score + 0.3 && x.href.replace(/\/+$/, "") !== c.href.replace(/\/+$/, "") && !exclude.has(x.href));
       if (better) {
         ctx.progress(`第二跳：${new URL(better.href).pathname} 分数 ${better.score} 高于 ${c.score}`, { tool: "rules", text: "second hop" });
         const hop = await visitCandidate(page,better.href,host,ctx,accessFailures);
         if(!hop.issues.length){const hopPng = await shoot(page);
           const hopCheck = checkImage(hopPng, hashes);
-          if (!hopCheck.issues.length) {chosen = { png: hopPng, hash: hopCheck.hash, href: page.url(), reason: `第二跳 ${better.score} > ${c.score}` };breadthLinks=(await links(page)).filter(l=>sameSite(l.href,host));previews=await previewsInViewport(page);}
+          const hopPreviews = await previewsInViewport(page);
+          const hopIssues = [...hopCheck.issues, ...breadthPreviewIssues(kind, hopPreviews)];
+          if (!hopIssues.length) {chosen = { png: hopPng, hash: hopCheck.hash, href: page.url(), reason: `第二跳 ${better.score} > ${c.score}` };breadthLinks=(await links(page)).filter(l=>sameSite(l.href,host));previews=hopPreviews;}
+          else ctx.progress(`第二跳拒收：${hopIssues.join("、")}`, { tool: "reject", text: hopIssues.join(", "), ok: false });
         }
       }
       const file = path.join(workDir(svc, ctx), "breadth.png");
       fs.writeFileSync(file, chosen.png);
       const ev = shotEvidence(ctx, svc, chosen.png, "breadth", { href: chosen.href, reason: chosen.reason, previews });
       ctx.progress(`截目录 ✓ ${new URL(chosen.href).pathname}（${chosen.reason}）`, { tool: "shot", text: `首屏内预览 ${previews} 个`, ok: true, evidence: [ev.id] });
-      shots.breadth = { file, href: chosen.href, hash: chosen.hash, evidence: ev.id, title: await page.title().catch(() => "") };
+      shots.breadth = { file, href: chosen.href, hash: chosen.hash, evidence: ev.id, title: await page.title().catch(() => ""), previews };
       return { ok: true, summary: `目录 ✓ ${new URL(chosen.href).pathname}`, data: { shots, breadthLinks: breadthLinks.slice(0, 200) }, usage };
     }
     return { ok: false, summary: "没有合格的目录页", error: ranked.length ? "所有候选都被拒收" : "规则和模型都没找到目录页（needsPick 交人）", failure:accessFailures.length===tried.size?accessFailures.at(-1):undefined,usage, data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) },candidateAccessFailures:accessFailures } };
@@ -552,7 +556,7 @@ export function buildV3(d: Record<string, any>, token: { id: string; url: string
     editorial: { name: copy.name || d.title, descriptionZh: copy.descriptionZh, descriptionEn: copy.descriptionEn, takeawayZh: copy.takeawayZh, noteZh: copy.noteZh, recommendation: null, pricing: d.pricingNote || facts.pricing?.value || "unknown", pricingNote: null },
     classification: {
       recordLevel: "entry", primaryCategory: cat.primaryCategory, subcategory: cat.subcategory, status: "confirmed", alternatives: [],
-      reasons: copy.reasons ?? [], curatorId: "h2:curation/classify", reviewerId: d.kindAgreed ? "h2:curation/classify-review" : "h2:curation/arbiter", confirmedAt: now,
+      reasons: copy.reasons ?? [], curatorId: "easy-workflow:curation/classify", reviewerId: d.kindAgreed ? "easy-workflow:curation/classify-review" : "easy-workflow:curation/arbiter", confirmedAt: now,
     },
     facets: Object.fromEntries(ALL_AXES.map((a) => [a, a === "access" ? derived.access : a === "licenses" ? derived.licenses : (cat.facets?.[a] ?? [])])),
     pages, facts: factList,
@@ -560,7 +564,7 @@ export function buildV3(d: Record<string, any>, token: { id: string; url: string
     style: d.style ?? null,
     preview: d.mode === "video" ? { mode: "video", video: d.video } : { mode: "shots" },
     editorialVoice: { status: "written", writtenAt: now.slice(0, 10) },
-    h2: { token: token.id, kindV1: d.kind, reviews: d.reviews ?? [], note: "H2 工厂产出；写入 VisLexicon 正式目录前需站长确认（Spec R4）" },
+    h2: { token: token.id, kindV1: d.kind, reviews: d.reviews ?? [], note: "Easy Workflow 产出；写入正式资料目录前需站长确认（Spec R4）" },
   };
 }
 
@@ -574,6 +578,20 @@ const assemble: Tool = async (ctx, svc) => {
 
 const gate: Tool = async (ctx, svc) => {
   const d = ctx.token.data as Record<string, any>;
+  // A retry can resume at audit/gate with an old shotReview=pass. Certify the current
+  // capture evidence again here; legacy approval never substitutes for a missing count.
+  const breadthIssues = d.mode === "video" ? [] : breadthPreviewIssues(String(d.kind), d.shots?.breadth?.previews);
+  if (breadthIssues.length) {
+    const reason = `${breadthIssues.join("；")}。历史截图审查通过不能覆盖当前目录证据，请重拍并复查受影响的风格、导览与终审。`;
+    const shotRepairs = { ...d.shotRepairs, breadth: { action: typeof d.shots?.breadth?.previews === "number" ? "replace-page" : "reframe", url: d.shots?.breadth?.href, reason } };
+    ctx.progress(`发布前拒收目录截图：${breadthIssues.join("；")}`, { tool: "gate", text: reason, ok: false });
+    ctx.addEvidence({ id: `gate-breadth-${ctx.attempt}`, kind: "verdict", label: "发布闸门", verdict: "目录截图需重新验收", tone: "warn", meta: { previews: d.shots?.breadth?.previews ?? null, issues: breadthIssues } });
+    return {
+      ok: true, summary: "暂不发布：目录预览未通过当前门禁，直接退回摄影修复",
+      data: { gate: "repair", digest: null, shotReview: "pending", "copy-reviewVerdict": "pending", auditVerdict: "pending", shotRepairs },
+      verdict: { verdict: "fix", reason, fixes: [{ station: "curation/breadth", fields: ["shots.breadth", "images"], problem: reason, via: ["curation/process", "curation/shot-review", "curation/style", "curation/copy", "curation/copy-review", "curation/assemble", "curation/audit"] }] },
+    };
+  }
   const missing: string[] = [];
   if (!d.kind) missing.push("分类");
   if (!(d.kindAgreed || d.arbiterDecided)) missing.push("分类复核");

@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark" />
-  <title>H2 · Agent Team</title>
+  <title>Easy Workflow · Prototype</title>
   <style>
     :root {
       color-scheme: dark;
@@ -512,7 +512,7 @@
     $("stop").onclick=()=>{state.running=false;if(state.timer)clearTimeout(state.timer);render();showToast("已停止当前回放");};
     $("config").onclick=()=>showToast("当前：本地确定性 actor · 事件日志模式");
     $("send").onclick=()=>{const input=$("composer-input"); if(!input.value.trim()){showToast("先输入要排队的修改");return;} state.feed.push(input.value.trim()); input.value=""; $("composer-state").textContent=`已排队 ${state.feed.length} 条后续修改`; showToast("已加入后续修改队列");};
-    $("attach").onclick=()=>showToast("H2 当前使用 run.json 作为运行证据");
+    $("attach").onclick=()=>showToast("当前原型使用 run.json 作为运行证据");
     $("access").onclick=()=>showToast("本地工作流：工具访问由运行时控制");
     $("fanout").onclick=()=>showToast("设计阶段包含 3 个并行 actor");
     loadRun();

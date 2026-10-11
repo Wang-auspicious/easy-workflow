@@ -11,7 +11,7 @@ import { legacyReply } from '../shared/conversation.ts';
 import { buildReport } from '../server/report.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'h2-control-ui-'));
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-control-ui-'));
 const out = path.join(root, 'artifacts', 'parts-workspace');
 fs.mkdirSync(out, { recursive: true });
 const token = 'isolated-ui-test';
@@ -152,14 +152,14 @@ try {
   await fixturePage.route('**/api/state',async route=>{
     const state=structuredClone(baseline), now=Date.now();state.seq=100000;
     state.run={id:'run-ui-fixture',title:'界面验证样本',startedAt:now-120000,pausedMs:0,status:'running'};
-    const help=legacyReply('',now-2000);help.content=[{type:'toolCall',id:'fixture-help',name:'h2_help',arguments:{name:'status'}}];
-    const inspect=legacyReply('',now-1000);inspect.content=[{type:'toolCall',id:'fixture-status',name:'h2_call',arguments:{name:'status',arguments:{}}}];
+    const help=legacyReply('',now-2000);help.content=[{type:'toolCall',id:'fixture-help',name:'easy_workflow_help',arguments:{name:'status'}}];
+    const inspect=legacyReply('',now-1000);inspect.content=[{type:'toolCall',id:'fixture-status',name:'easy_workflow_call',arguments:{name:'status',arguments:{}}}];
     state.conversation=[
       {id:'fixture-user',turn:'fixture-turn',message:{role:'user',content:'检查当前运行状态，不要投料。',timestamp:now-3000}},
       {id:'fixture-help-call',turn:'fixture-turn',message:help},
-      {id:'fixture-help-result',turn:'fixture-turn',message:{role:'toolResult',toolCallId:'fixture-help',toolName:'h2_help',content:[{type:'text',text:'{"name":"status","inputSchema":{"type":"object","properties":{}}}'}],isError:false,timestamp:now-1900}},
+      {id:'fixture-help-result',turn:'fixture-turn',message:{role:'toolResult',toolCallId:'fixture-help',toolName:'easy_workflow_help',content:[{type:'text',text:'{"name":"status","inputSchema":{"type":"object","properties":{}}}'}],isError:false,timestamp:now-1900}},
       {id:'fixture-status-call',turn:'fixture-turn',message:inspect},
-      {id:'fixture-status-result',turn:'fixture-turn',message:{role:'toolResult',toolCallId:'fixture-status',toolName:'h2_call',content:[{type:'text',text:'{"run":{"status":"idle"},"tokensActive":0}'}],isError:false,timestamp:now-900}},
+      {id:'fixture-status-result',turn:'fixture-turn',message:{role:'toolResult',toolCallId:'fixture-status',toolName:'easy_workflow_call',content:[{type:'text',text:'{"run":{"status":"idle"},"tokensActive":0}'}],isError:false,timestamp:now-900}},
       {id:'fixture-answer',turn:'fixture-turn',message:legacyReply('当前没有正在运行的任务。\n\n- 队列为空\n- 没有正在执行的工位\n\n可以选择候选条目开始新一轮。',now-500)},
     ];
     const unsafe=legacyReply('安全渲染检查 <img src=x onerror="window.fixtureUnsafe=true"> [链接](javascript:alert(1))',now);
@@ -226,6 +226,6 @@ try {
     child.once('exit', () => { clearTimeout(timer); resolve(); });
     if (child.connected) child.send({ type: 'shutdown' }); else child.kill();
   });
-  assert.ok(path.resolve(dir).startsWith(path.join(path.resolve(os.tmpdir()), 'h2-control-ui-')));
+  assert.ok(path.resolve(dir).startsWith(path.join(path.resolve(os.tmpdir()), 'easy-workflow-control-ui-')));
   fs.rmSync(dir, { recursive: true, force: true });
 }
