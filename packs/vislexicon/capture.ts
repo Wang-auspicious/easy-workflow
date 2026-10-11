@@ -300,14 +300,50 @@ export async function bestScrollFrame(page: Page, { skipFirst = false } = {}) {
 
 /* ------------------------------------------------------------------ stage (component close-up) */
 
+export interface CaptureLocation { matched?: string; anchors: string[]; y?: number; scrollY?: number }
+
+/** Reader/reviewer prose contains quoted visible text, not a literal DOM text
+ * node. Match the complete rendered heading (including nested spans and breaks)
+ * and verify that scrolling actually brought it into the viewport. */
+export async function locateCaptureTarget(page: Page, hints: string[]): Promise<CaptureLocation> {
+  const quoted = (text: string) => [...text.matchAll(/[「『“\"]([^」』”\"]{2,240})[」』”\"]/g)].map(match => match[1].trim());
+  const anchors = [...new Set(hints.flatMap(text => {
+    const directed = [...text.matchAll(/(?:滚到|滚动到|滚动至|定位到|scroll(?:ing)? to|(?:L[1-6]|H[1-6])\s*(?:标题|heading))[^，。；\n「『“\"]{0,60}[「『“\"]([^」』”\"]{2,240})[」』”\"]/gi)].map(match => match[1].trim());
+    return [...directed, ...quoted(text)];
+  }))];
+  const candidates = [...new Set([...anchors, ...hints.flatMap(text => text.split(/[，,；;（）()]/).map(part => part.trim()).filter(part => part.length >= 2 && part.length <= 240))])];
+  return page.evaluate(async ({ anchors, candidates }) => {
+    const normalize = (text: string) => text.normalize('NFKC').toLowerCase().replace(/[\s\u200b]+/g, ' ').replace(/[.。…]+$/g, '').trim();
+    const eligible = (el: Element) => {
+      if (el.closest('nav,header,footer,aside,script,style,noscript,pre,code')) return false;
+      const box = el.getBoundingClientRect(), style = getComputedStyle(el);
+      return box.width > 0 && box.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
+    };
+    const elements = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role=heading],p,label,span,strong,a,div,section')].filter(eligible);
+    for (const candidate of candidates) {
+      const wanted = normalize(candidate); if (wanted.length < 2) continue;
+      const matches = elements.map(element => ({ element, text: normalize((element as HTMLElement).innerText || '') }))
+        .filter(({ text }) => text.length <= 1000 && text.includes(wanted))
+        .sort((a, b) => Number(!a.element.matches('h1,h2,h3,h4,h5,h6,[role=heading]')) - Number(!b.element.matches('h1,h2,h3,h4,h5,h6,[role=heading]')) || a.text.length - b.text.length);
+      const target = matches[0]?.element; if (!target) continue;
+      target.scrollIntoView({ block: 'start', behavior: 'instant' });
+      window.scrollBy({ top: -Math.min(96, innerHeight / 6), behavior: 'instant' });
+      await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      const box = target.getBoundingClientRect();
+      if (box.bottom > 0 && box.top < innerHeight) return { matched: candidate, anchors, y: box.top + scrollY, scrollY };
+    }
+    return { anchors };
+  }, { anchors, candidates });
+}
+
 export interface Stage { sel: string; x: number; y: number; w: number; h: number; painted: number; media: number; locked: boolean }
-export interface CaptureWait { timeoutMs?: number; deadline?: number; signal?: AbortSignal }
+export interface CaptureWait { timeoutMs?: number; deadline?: number; signal?: AbortSignal; anchorY?: number }
 // Selectors are descriptive (and can match several examples). Retain the exact
 // chosen DOM node for frame checks without adding attributes to the source page.
 const stageElements = new WeakMap<Stage, ElementHandle<Element>>();
 
-async function findStageOnce(page: Page): Promise<Stage | null> {
-  const selection = await page.evaluateHandle((selectors) => {
+async function findStageOnce(page: Page, anchorY?: number): Promise<Stage | null> {
+  const selection = await page.evaluateHandle(({ selectors, anchorY }) => {
     const seen = new Set<Element>();
     const boxes: { stage: Stage; element: Element }[] = [];
     const roots:(Document|ShadowRoot)[]=[document];
@@ -358,6 +394,7 @@ async function findStageOnce(page: Page): Promise<Stage | null> {
         seen.add(el);
         const r = el.getBoundingClientRect();
         if (r.width < 80 || r.height < 24 || r.height > innerHeight * 1.5 || getComputedStyle(el).visibility==="hidden") continue;
+        if (anchorY !== undefined && (r.bottom <= 0 || r.top >= innerHeight)) continue;
         const painted = el.querySelectorAll("*").length;
         const media = el.querySelectorAll("canvas, img, svg, video").length + (el.matches("iframe,canvas,img,svg,video") ? 1 : 0);
         if (painted < 1 && !media && !el.matches("button,input,[role=button]")) continue;
@@ -366,9 +403,9 @@ async function findStageOnce(page: Page): Promise<Stage | null> {
         boxes.push({ stage: { sel, x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height, painted, media, locked }, element: el });
       }
     }
-    boxes.sort((a, b) => (a.stage.y<innerHeight?0:1)-(b.stage.y<innerHeight?0:1) || b.stage.w*b.stage.h-a.stage.w*a.stage.h);
+    boxes.sort((a, b) => (anchorY === undefined ? (a.stage.y<innerHeight?0:1)-(b.stage.y<innerHeight?0:1) : Math.abs(a.stage.y-anchorY)-Math.abs(b.stage.y-anchorY)) || b.stage.w*b.stage.h-a.stage.w*a.stage.h);
     return boxes.find((b) => !b.stage.locked) || { stage: null, element: null };
-  }, STAGE_SELECTORS).catch(() => null);
+  }, { selectors: STAGE_SELECTORS, anchorY }).catch(() => null);
   if (!selection) return null;
   try {
     const info = await selection.getProperty("stage");
@@ -387,7 +424,7 @@ export async function findStage(page: Page, opts: CaptureWait = {}): Promise<Sta
   const deadline = opts.deadline ?? Date.now() + Math.max(0, opts.timeoutMs ?? 0);
   while (true) {
     opts.signal?.throwIfAborted();
-    const stage = await boundedFrameRead(() => findStageOnce(page).catch(() => null), opts.signal, bounded ? deadline - Date.now() : undefined);
+    const stage = await boundedFrameRead(() => findStageOnce(page, opts.anchorY).catch(() => null), opts.signal, bounded ? deadline - Date.now() : undefined);
     opts.signal?.throwIfAborted();
     if (stage || !bounded) return stage;
     const remaining = deadline - Date.now();

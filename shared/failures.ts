@@ -61,7 +61,7 @@ export function classifyFailure(error:unknown, context:{url?:string;requestedUrl
   else if(status===401||/loginWall|(?:需要|要求|完成|必须|请先).{0,8}登录|登录(?:墙|状态需要检查)|(?:sign|log)[ -]?in (?:to (?:continue|view|access)|required)|captcha|human verification|verify you are human|checking your browser|人机验证|页面需要完成验证/i.test(text)){tag="auth_required";category="auth";}
   else if(status===403){tag="http_forbidden";category="network";}
   else if(/原图丢失|[.](png|webp).*missing/i.test(text)){tag="missing_artifact";}
-  else if(/没找到.*(舞台|目录|特写)|没有合格|所有候选|试了 \d+ 页|needsPick/i.test(text)){tag="needs_selection";}
+  else if(/需要重新选页|没找到.*(舞台|目录|特写)|没有合格|所有候选|试了 \d+ 页|needsPick/i.test(text)){tag="needs_selection";}
   else if(/duplicate images|图片重复|blank\(|stage-nearly-empty|iframe-empty/i.test(text)){tag="quality_rejected";}
   else if(/screenshot|captureScreenshot|screencast|截图|出帧/i.test(text)||context.stage==="capture"){tag="browser_capture";}
   else if(status===429){tag="http_rate_limit";category="network";}
@@ -96,7 +96,7 @@ const NEXT:Record<FailureTag,string>={
   browser_capture:"截图异常：环境问题，页面池会自动重建；本次作废重排，不计站点失败。",
   tool_error:"工具异常：记录完整错误交给系统修复，不要反复尝试同一方法。",
   run_ended:"本轮已结束：下轮从失败工位继续，复用已有成果。",
-  needs_selection:"没有合格页面：列出试过的页和拒收原因，交阅读员或站长指定页面。",
+  needs_selection:"需要重新选页：列出试过的页和拒收原因，交阅读员重新查找公开页面。",
   missing_artifact:"产物引用失效：先从持久证据恢复，只补做确实丢失的部分。",
   quality_rejected:"图像不合格：按拒收原因在原页重新取景或换备选页。",
   model_unavailable:"模型不可用：已暂停领取模型任务并亮红灯；站长检查额度、凭据或代理后按原因重试。",

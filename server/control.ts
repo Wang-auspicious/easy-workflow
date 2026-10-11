@@ -36,6 +36,25 @@ const patchOp = Type.Union([
 type Tool = { name: string; label: string; description: string; parameters: ReturnType<typeof Type.Object>; execute: (id: string, p: any, actor?: "agent" | "dispatcher" | "user") => Promise<{ content: { type: "text"; text: string }[]; details: Record<string, unknown> }> };
 const ok = (v: unknown, summary: string) => ({ content: [{ type: "text" as const, text: typeof v === "string" ? v : JSON.stringify(v) }], details: { summary, result: v } });
 
+/** IDs are exact historical queries; item/host aliases describe current work. */
+function resolveToken(state: Factory["state"], query: string) {
+  if (Object.hasOwn(state.tokens, query)) return state.tokens[query];
+  const ordered = state.tokenOrder.map(id => state.tokens[id]).filter(Boolean);
+  // A host may belong to several distinct entries. An exact item name wins;
+  // otherwise retain those entry identities instead of merging by host.
+  const items = new Set(ordered.some(token => token.item === query) ? [query]
+    : ordered.filter(token => typeof token.data.host === "string" && token.data.host === query).map(token => token.item));
+  if (!items.size) return undefined;
+  let candidates = latestRunTokens(state).filter(token => items.has(token.item));
+  if (!candidates.length) candidates = latestRunTokens({ ...state, run: { ...state.run, startedAt: 0 } }).filter(token => items.has(token.item));
+  const ids = new Set(candidates.map(token => token.id));
+  let latest: typeof candidates[number] | undefined;
+  // Match latestRunTokens' timestamp rule and later tokenOrder tie break,
+  // including resumed older tokens and exclusion of valid retriedBy ancestors.
+  for (const token of ordered) if (ids.has(token.id) && (!latest || (token.touchedAt ?? token.createdAt) >= (latest.touchedAt ?? latest.createdAt))) latest = token;
+  return latest;
+}
+
 export const ROLE_AUTHORING = {
   guide: "新增节点时先 read_role 读相近岗位，按已确认的手写结构起草完整 ROLE.md，与规格补丁一并交站长批准。批准前不改现有职责、不把新节点接成可执行。",
   examples: ["curation/reader", "curation/facts", "curation/scout"],
@@ -166,7 +185,7 @@ function definitions(f: Factory): Tool[] {
         },
       },
       {
-        name: "inspect", label: "查看货 / 工位 / 证据", description: "Details of a token (by id or item/host), a station (key), or an evidence id.",
+        name: "inspect", label: "查看货 / 工位 / 证据", description: "Details of a token, station, or evidence. An exact token id reads that historical token; item/host resolves current-run work or its latest historical token, excluding superseded retries.",
         parameters: Type.Object({ token: Type.Optional(name()), station: Type.Optional(name()), evidence: Type.Optional(name()), worker: Type.Optional(name()), part: Type.Optional(name()) }),
         execute: async (_id, p) => {
           const s = f.state;
@@ -192,7 +211,7 @@ function definitions(f: Factory): Tool[] {
             const atts = Object.values(s.attempts).filter((a) => a.node === p.station).slice(-12).map((a) => ({ token: s.tokens[a.token]?.item, ok: a.ok, ms: a.ms, summary: a.summary, error: a.error }));
             return ok({ ...st, spec: f.compiled.nodes.find((n) => n.key === p.station), locked: s.lockedStations.includes(p.station), medianMs: median(st.durations), p90Ms: quantile(st.durations, 0.9), recent: atts }, `查看 ${nodeName(p.station)}`);
           }
-          const t = s.tokens[p.token ?? ""] ?? Object.values(s.tokens).find((x) => x.item === p.token || String(x.data.host) === p.token);
+          const t = resolveToken(s, p.token ?? "");
           if (!t) throw new ControlError(404, "token_not_found", "找不到这件货");
           const d = t.data as Record<string, any>;
           return ok({
@@ -255,10 +274,10 @@ function definitions(f: Factory): Tool[] {
         },
       },
       {
-        name: "read_case", label: "读取案卷", description: "The CASE.md of one item (candidate id or host): every station's handoff notes, results and reviewer conversations in time order.",
+        name: "read_case", label: "读取案卷", description: "The shared CASE.md of one item: all handoffs, results and reviews in time order. Exact token IDs retain their item; item/host aliases resolve current/latest work like inspect.",
         parameters: object({ item: name() }),
         execute: async (_id, p) => {
-          const t = Object.values(f.state.tokens).find((x) => x.item === p.item || String(x.data.host) === p.item || x.id === p.item);
+          const t = resolveToken(f.state, p.item);
           if (!t) throw new ControlError(404, "case_not_found", "没有这件货的案卷");
           return ok({ item: t.item, markdown: f.docs.renderCase(t.item), file: f.docs.caseFile(t.item) }, `读取 ${t.title || t.item} 的案卷`);
         },
