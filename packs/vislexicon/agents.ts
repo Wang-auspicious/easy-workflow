@@ -227,7 +227,7 @@ export const shotReview = (store: EvidenceStore): AgentStationDef<ShotReviewOut>
     const imgs = imagesOf(ctx, store);
     const plan = data(ctx).readerPlan as ReaderOut["plan"] | undefined;
     return {
-      text: `Site: ${data(ctx).title} (${data(ctx).canonical}). Kind: ${data(ctx).kind} (${KIND_ZH[data(ctx).kind]}). Mode: ${data(ctx).mode}.${plan ? `\nReader's shot plan: breadth ${plan.breadth.url}; proof ${plan.proof.url} (locate: ${plan.proof.locate ?? "-"}).` : ""}\n${imgs.map((im, i) => `image ${i + 1}: ${im.label}`).join("\n")}`,
+      text: `Site: ${data(ctx).title} (${data(ctx).canonical}). Kind: ${data(ctx).kind} (${KIND_ZH[data(ctx).kind]}). Mode: ${data(ctx).mode}.${plan ? `\nReader's shot plan: breadth ${plan.breadth.url}; proof ${plan.proof.url} (locate: ${plan.proof.locate ?? "-"}).` : ""}${breadthNote(ctx)}\n${imgs.map((im, i) => `image ${i + 1}: ${im.label}`).join("\n")}`,
       images: imgs,
     };
   },
@@ -236,9 +236,19 @@ export const shotReview = (store: EvidenceStore): AgentStationDef<ShotReviewOut>
   after: (out, ctx) => shotReviewResult(enforceBreadth(out, ctx), ctx),
 });
 
+/** Tell later eyes how the catalogue page was chosen, so a names-only catalogue on a site
+ *  without any preview wall is judged as that, not as a failed preview grid. */
+function breadthNote(ctx: StationContext) {
+  const v = data(ctx).shots?.breadth?.visual as { basis?: string; reason?: string; compared?: number } | undefined;
+  if (!v?.basis) return "";
+  if (v.basis === "name-list") return `\nBreadth note: the photographer compared ${v.compared ?? "several"} candidate pages side by side; none renders the site's items in a grid, so the breadth image is the catalogue of item names (${v.reason ?? ""}). Accept a names catalogue for this site if it visibly lists many items; still return it if it is a customer showcase, a single item or marketing copy.`;
+  if (v.basis === "owner-choice") return "\nBreadth note: the site owner chose this breadth page explicitly.";
+  return `\nBreadth note: chosen by comparing ${v.compared ?? "several"} candidate pages side by side (${v.reason ?? ""}).`;
+}
+
 function enforceBreadth(out: ShotReviewOut, ctx: StationContext): ShotReviewOut {
   const d = data(ctx);
-  const issues = d.mode === "video" ? [] : breadthPreviewIssues(d.kind, d.shots?.breadth?.previews);
+  const issues = d.mode === "video" ? [] : breadthPreviewIssues(d.kind, d.shots?.breadth?.previews, d.shots?.breadth?.visual);
   return issues.length ? { ...out, verdict: "return", returnTo: "breadth", repair: "replace-page", reason: issues.join("；"), perImage: [...out.perImage.filter(p => p.role !== "breadth"), { role: "breadth", ok: false, reason: issues.join("；") }] } : out;
 }
 
@@ -288,7 +298,8 @@ export const style = (store: EvidenceStore): AgentStationDef<StyleOut> => ({
   input: (ctx) => {
     const subject = subjectOf(data(ctx).kind)!;
     const imgs = ((data(ctx).images ?? []) as { role: string; card: string; href: string }[]).map((im) => ({ file: store.resolve(im.card)!, label: `${im.role}: ${new URL(im.href).pathname}` }));
-    return { text: `${SUBJECT_RULE[subject]}\nSite: ${data(ctx).title} (${data(ctx).host}). Subject kind: ${subject}. Mixed allowed: no.\n${imgs.map((im, i) => `image ${i + 1}: ${im.label}`).join("\n")}`, images: imgs };
+    const names = data(ctx).shots?.breadth?.visual?.basis === "name-list" ? "\nImage 2 is a catalogue of item NAMES (this site has no preview wall); do not expect rendered items there. Judge from the rendered item in image 3 and any items visible in image 1." : "";
+    return { text: `${SUBJECT_RULE[subject]}${names}\nSite: ${data(ctx).title} (${data(ctx).host}). Subject kind: ${subject}. Mixed allowed: no.\n${imgs.map((im, i) => `image ${i + 1}: ${im.label}`).join("\n")}`, images: imgs };
   },
   check: (out, ctx) => {
     const stats = ((data(ctx).images ?? []) as { card: string }[]).map((im) => pixelStats(store.resolve(im.card)!));
@@ -306,7 +317,7 @@ export const style = (store: EvidenceStore): AgentStationDef<StyleOut> => ({
     ctx.addEvidence({ id: `st-${ctx.attempt}`, kind: "verdict", label: "风格", verdict: out.subjectVisible ? (words.join(" · ") || "无合适的词") : "看不到组件", tone: out.subjectVisible ? "ok" : "warn", meta: { ...out, rounds: meta.rounds } });
     if (!out.subjectVisible) {
       const d = data(ctx), problem = "截图里看不到渲染出来的主体，只有文档文字、名称列表、代码或空预览。请按阅读员拍摄单重新定位到真实预览，再送图像处理与截图审查。";
-      const roles = ["breadth", "proof"] as const;
+      const roles = d.shots?.breadth?.visual?.basis === "name-list" ? ["proof"] as const : ["breadth", "proof"] as const;
       const shotRepairs = { ...d.shotRepairs };
       for (const role of roles) shotRepairs[role] = { action: "reframe", url: d.shots?.[role]?.href, reason: problem };
       return { ok: true, summary: "看不到主体：请求目录与特写重拍", data: { style: { applicable: true, ...out }, shotRepairs }, verdict: { verdict: "fix", reason: problem, fixes: roles.map(role => ({ station: `curation/${role}`, fields: [`shots.${role}`], problem, via: ["curation/process", "curation/shot-review"] })) } };

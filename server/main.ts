@@ -24,7 +24,7 @@ const factory = new Factory();
 await factory.boot();
 const control = new FactoryControl(factory);
 const dispatcher = new Dispatcher(factory, control);
-browserEvents.add(state => factory.emit({ kind: "browser.state", state }));
+browserEvents.add(state => { factory.emit({ kind: "browser.state", state }); void factory.resumeVerified(state); });
 let chatTask: Promise<unknown> | null = null;
 
 const MIME: Record<string, string> = { ".webp": "image/webp", ".mp4": "video/mp4", ".json": "application/json", ".js": "text/javascript", ".css": "text/css", ".html": "text/html; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8" };

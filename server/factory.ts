@@ -27,6 +27,7 @@ import { Toolbox } from "./toolbox.ts";
 import { configureAgentStations } from "./agent-station.ts";
 import { preflight } from "./preflight.ts";
 import type { Alert } from "../shared/types.ts";
+import type { BrowserState } from "../shared/browser.ts";
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -191,6 +192,30 @@ export class Factory {
     this.journal.append({ kind: "alert.cleared", id, reason });
     if (a.kind === "model" && !Object.values(this.state.alerts ?? {}).some((x) => x.kind === "model")) { this.broker.modelHold = null; this.runtime.schedule(); }
     return true;
+  }
+
+  /** Verification walls go to the owner: red light, page kept in the built-in browser.
+   *  Once that page loads normally again (the owner passed the check), continue the
+   *  candidate from its failed station instead of waiting for a manual retry. */
+  private walled = new Set<string>();
+  private resuming = false;
+  async resumeVerified(browser: BrowserState) {
+    const alerts = Object.values(this.state.alerts ?? {}).filter((a) => a.kind === "auth" && a.item && (a.url || a.tab));
+    if (!alerts.length) { this.walled.clear(); return; }
+    if (this.resuming) return;
+    const hostOf = (u: string) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } };
+    for (const a of alerts) {
+      const tabs = browser.tabs.filter((t) => (a.tab && t.id === a.tab) || (a.url && hostOf(t.url) === hostOf(a.url)));
+      if (tabs.some((t) => t.attention)) { this.walled.add(a.id); continue; }
+      if (!this.walled.has(a.id) || !tabs.some((t) => !t.loading)) continue;
+      this.walled.delete(a.id);
+      this.resuming = true;
+      try {
+        if (!this.runtime.running) await this.ensureReady();
+        if (this.retryCandidates({ items: [a.item!], count: 1 }).length) this.journal.append({ kind: "dispatch.note", node: a.node, tone: "info", text: `${a.item}：内置浏览器里的验证已通过，自动从失败工位继续` });
+      } catch { /* Paused, preflight failed or no longer waiting: the red light and manual retry remain. */ }
+      finally { this.resuming = false; }
+    }
   }
 
   private lastPreflight = 0;

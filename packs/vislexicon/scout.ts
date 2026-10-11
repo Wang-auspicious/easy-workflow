@@ -4,7 +4,7 @@
 // over the shared network exit.
 import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { openPage } from "../../server/browser.ts";
-import { rememberRead, webGet } from "../../server/network.ts";
+import { diagnoseReach, rememberRead, webGet } from "../../server/network.ts";
 import { fetchRepoMeta, repoOf, repoSources, type RepoMeta } from "../../server/repo.ts";
 import { classifyFailure, type Failure } from "../../shared/failures.ts";
 import { VIEW, links as pageLinks, sameSite, visit, type Link } from "./capture.ts";
@@ -63,6 +63,20 @@ const FRAMEWORK_PROBE = () => {
   return out;
 };
 
+/** "连接中断" alone does not tell the owner what to fix. Probe the direct path once and
+ *  name the broken side: the proxy node for this host, or the host itself. */
+async function explainUnreachable(f: Failure, url: string, ctx: StationContext): Promise<Failure> {
+  if (!["network_connection", "network_timeout"].includes(f.tag)) return f;
+  const probe = await diagnoseReach(url, ctx.signal).catch(() => null);
+  if (!probe) return f;
+  const host = hostOf(url);
+  const nextAction = probe.directOk
+    ? `经代理 ${probe.proxy} 连不上 ${host}，但${probe.direct}：在代理软件里把 ${host} 设为直连或换一个节点，然后按原因重试。`
+    : `经代理 ${probe.proxy} 和直连都连不上 ${host}（${probe.direct}）。其他站点正常时，多半是当前代理节点访问不到这个站：在代理软件里给 ${host} 换节点或分流规则，然后按原因重试。`;
+  ctx.progress(`网络诊断：${nextAction}`, { tool: "network", text: f.message.slice(0, 160), ok: false });
+  return { ...f, message: `${host} 连不上（${probe.directOk ? "代理线路的问题" : "代理与直连都失败"}）：${f.message.slice(0, 160)}`, owner: "user", nextAction, tried: [...(f.tried ?? []), "经代理访问", probe.direct] };
+}
+
 export async function scout(ctx: StationContext, svc: {
   tryBrowser?: () => { release: () => void } | null;
   acquireBrowser?: (signal: AbortSignal, timeoutMs: number) => Promise<{ release: () => void } | null>;
@@ -117,11 +131,11 @@ export async function scout(ctx: StationContext, svc: {
       ctx.signal.throwIfAborted();
       const f = (err as { failure?: Failure }).failure ?? classifyFailure(err, { url: finalUrl });
       if (f.tag === "auth_required" || f.tag === "network_tls" || f.category === "invalid") return { ok: false, summary: f.message, error: f.message, failure: f };
-      if (!http) return { ok: false, summary: f.message, error: f.message, failure: f };
+      if (!http) { const g = await explainUnreachable(f, finalUrl, ctx); return { ok: false, summary: g.message, error: g.message, failure: g }; }
       ctx.progress(`浏览器渲染失败，改用 HTTP 正文继续：${f.message.slice(0, 80)}`, { tool: "recover", text: f.tag, ok: false });
     } finally { lease.release(); }
   } else if (http) ctx.progress("浏览器名额已满：先用已取得的 HTTP 正文建卷宗", { tool: "recover", text: "no browser lease" });
-  if (!rendered && !http) { const f = failure ?? classifyFailure("首页没有响应", { url }); return { ok: false, summary: f.message, error: f.message, failure: f }; }
+  if (!rendered && !http) { const f = await explainUnreachable(failure ?? classifyFailure("首页没有响应", { url }), url, ctx); return { ok: false, summary: f.message, error: f.message, failure: f }; }
 
   const text = rendered?.text || http!.text;
   const allLinks = rendered?.links ?? http!.links.map((l) => ({ text: l.text, href: l.href, region: l.inNav ? "nav" : "main" }));
