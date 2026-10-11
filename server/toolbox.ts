@@ -65,13 +65,7 @@ export class Toolbox {
   /* ---------------------------------------------------------------- browser lease with a short wait */
 
   private async lease(signal: AbortSignal): Promise<Lease | null> {
-    for (let i = 0; i < 40; i++) {
-      const l = this.deps.broker.tryAcquire("browser");
-      if (l) return l;
-      signal.throwIfAborted();
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    return null;
+    return this.deps.broker.acquire("browser", { signal, timeoutMs: 20000 });
   }
 
   private async fetchText(url: string, max: number, signal: AbortSignal) {
@@ -99,9 +93,11 @@ ${p.text}`);
           const max = a.max ?? 12000;
           const lease = await this.lease(c.signal);
           if (!lease) return { ...(await this.fetchText(a.url, max, c.signal)), via: "http（浏览器名额已满）" };
-          c.progress?.(`渲染 ${a.url.replace(/^https?:\/\//, "")}`, { tool: "page_text", text: a.url });
-          const { page, close } = await openPage(VIEW, "en-US", c.signal);
+          let close: (() => Promise<void>) | undefined;
           try {
+            c.progress?.(`渲染 ${a.url.replace(/^https?:\/\//, "")}`, { tool: "page_text", text: a.url });
+            const browser = await openPage(VIEW, "en-US", c.signal); close = browser.close;
+            const { page } = browser;
             let issues: string[] = [];
             try { issues = (await visit(page, a.url, hostOf(a.url))).issues; } catch (err) { throw fail(err, a.url, ["browser"]); }
             const data = await page.evaluate((max) => {
@@ -121,7 +117,7 @@ ${p.text}`);
 ${data.text}`); rememberRead(page.url(), `${data.title}
 ${data.text}`);
             return { url: a.url, finalUrl: page.url(), via: "browser", issues, ...data };
-          } finally { await close(); lease.release(); }
+          } finally { try { await close?.(); } finally { lease.release(); } }
         },
       },
       {
@@ -131,8 +127,10 @@ ${data.text}`);
         run: async (a: { url: string; query: string }, c) => {
           const lease = await this.lease(c.signal);
           if (!lease) throw new ToolError({ tag: "tool_error", category: "system", message: "浏览器名额已满", retryable: true, owner: "agent", nextAction: "改用 fetch_text 读正文后自己查找，或稍后再试" });
-          const { page, close } = await openPage(VIEW, "en-US", c.signal);
+          let close: (() => Promise<void>) | undefined;
           try {
+            const browser = await openPage(VIEW, "en-US", c.signal); close = browser.close;
+            const { page } = browser;
             try { await visit(page, a.url, hostOf(a.url)); } catch (err) { throw fail(err, a.url, ["browser"]); }
             const hits = await page.evaluate((q) => {
               const out: { snippet: string; heading: string; tag: string; y: number; inCode: boolean }[] = [];
@@ -152,7 +150,7 @@ ${data.text}`);
               return out;
             }, a.query);
             return { url: a.url, finalUrl: page.url(), query: a.query, hits };
-          } finally { await close(); lease.release(); }
+          } finally { try { await close?.(); } finally { lease.release(); } }
         },
       },
       {

@@ -5,6 +5,7 @@ import type {
   Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, PreflightCheck, Stamped, StepDetail, TokenStatus, Usage,
 } from "./types.ts";
 import { legacyReply, type ConversationEntry } from "./conversation.ts";
+import { mergeActivity } from "./activity.ts";
 
 export interface WorkerState {
   id: string;
@@ -262,12 +263,18 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       if (n && n.active.includes(a.id)) { n.summary = e.text; n.lastAt = e.at; }
       break;
     }
+    case "attempt.activity": {
+      const a = s.attempts[e.attempt];
+      if (a) a.metrics = { ...a.metrics, activity: mergeActivity(a.metrics?.activity, { version: 1, modelTiming: e.activity.source === "model-stream" ? "observed" : "unavailable", spans: [e.activity] }) };
+      break;
+    }
     case "attempt.finished": {
       const a = s.attempts[e.attempt];
       if (!a) break;
       const ok = e.ok && !/^(打不开[：:]|HTTP [45]\d\d|网址无法解析)/.test(e.summary);
       a.cancelled = e.cancelled || e.error === "stale";
-      a.endedAt = e.at; a.ok = ok; a.summary = e.summary; a.error = e.error; a.ms = e.ms; a.queuedMs = e.queuedMs; a.output = e.output; a.metrics = e.metrics;
+      const activity = mergeActivity(a.metrics?.activity, e.metrics?.activity);
+      a.endedAt = e.at; a.ok = ok; a.summary = e.summary; a.error = e.error; a.ms = e.ms; a.queuedMs = e.queuedMs; a.output = e.output; a.metrics = activity ? { ...e.metrics, activity } : e.metrics;
       addUsage(a.usage, e.usage);
       const n = node(a.node);
       remove(n.active, a.id);

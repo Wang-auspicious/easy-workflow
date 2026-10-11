@@ -49,7 +49,7 @@ export function classifyFailure(error:unknown, context:{url?:string;status?:numb
   else if(/ENOTFOUND|EAI_AGAIN|ERR_NAME|DNS/i.test(text)){tag="network_dns";category="network";}
   else if(isTlsFailure(error)){tag="network_tls";category="network";}
   else if(/timeout|timed? ?out|ETIMEDOUT|超时/i.test(text)){tag="network_timeout";category="network";}
-  else if(/fetch failed|ECONN|ERR_CONNECTION|socket|network|导航|navigation/i.test(text)){tag="network_connection";category="network";}
+  else if(/fetch failed|connection error|ECONN|ERR_CONNECTION|socket|network|导航|navigation/i.test(text)){tag="network_connection";category="network";}
   return withAdvice({tag,category,message,url:context.url,code,status,retryable:category!=="invalid"});
 }
 

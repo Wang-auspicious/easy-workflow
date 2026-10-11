@@ -10,7 +10,7 @@ import type { FactoryState, TokenState } from "../shared/project.ts";
 import { apply, initialState } from "../shared/project.ts";
 import { classifyFailure, failureLabels } from "../shared/failures.ts";
 import type { LessonArtifact, LessonDraft, LessonEvent, LessonObservation, LessonSample, LessonTrial, LessonValidation, LessonView } from "../shared/lessons.ts";
-import type { Docs } from "./docs.ts";
+import type { CaseScope, Docs } from "./docs.ts";
 import { Journal } from "./journal.ts";
 import { EvidenceStore } from "./evidence.ts";
 import { ControlError } from "./errors.ts";
@@ -300,11 +300,11 @@ export class Lessons {
   }
 
   /** Only bound trial attempts receive a candidate rule; production roles stay intact. */
-  validationContext(station: string, item: string) {
+  validationContext(station: string, item: string, scope: CaseScope) {
+    if (process.env.FACTORY_READONLY === "1") return "";
     const events = this.events();
-    const active = Object.values(this.host.state.attempts).filter((a) => a.node === station && !a.endedAt && this.host.state.tokens[a.token]?.item === item);
-    if (active.length !== 1) return "";
-    const attempt = active[0];
+    const attempt = this.host.state.attempts[scope.attempt];
+    if (!attempt || attempt.token !== scope.token || attempt.node !== station || attempt.endedAt || this.host.state.tokens[scope.token]?.item !== item) return "";
     const bound = events.find((e) => e.kind === "lesson.validation.bound" && e.token === attempt.token);
     if (bound?.kind !== "lesson.validation.bound") return "";
     const trial = this.trial(bound.trialId).trial, l = this.get(trial.lessonId);

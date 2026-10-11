@@ -121,7 +121,7 @@ function definitions(f: Factory): Tool[] {
       {
         name:"choose_preview_page",label:"指定采集页并继续",description:"Resolve a needs_selection candidate by supplying a concrete same-site breadth (catalogue/overview) or proof (demo/example) page. Resumes at that station, retains prior evidence, and still runs quality checks.",
         parameters:object({item:name(),role:choice("breadth","proof"),url:name()}),
-        execute:async(_id,p)=>{const t=f.choosePreview(p.item,p.role,p.url);return ok({token:t.id,item:t.item,station:`curation/${p.role}`,url:p.url},"已指定采集页，从对应工位继续");},
+        execute:async(_id,p)=>{if(!f.runtime.running)await f.ensureReady();const t=f.choosePreview(p.item,p.role,p.url);return ok({token:t.id,item:t.item,station:`curation/${p.role}`,url:p.url},"已指定采集页，从对应工位继续");},
       },
       {
         name: "workers", label: "加人 / 撤人 / 锁定", description: "fork | retire | lock | unlock workers at a station (key like 'curation/proof').",
@@ -143,6 +143,9 @@ function definitions(f: Factory): Tool[] {
           const token = ev?.token ?? p.token;
           const station = p.station ?? ev?.station;
           if (!token || !station) throw new ControlError(400, "missing_target", "需要证据 id，或 token + station");
+          const target = f.runtime.tokens.get(token), node = f.runtime.nodes.get(station);
+          // Let Runtime preserve its target rejection; invalid commands must not probe a model.
+          if (!f.runtime.running && target && node && f.runtime.runnable(node) && target.closure.has(station)) await f.ensureReady();
           const r = f.runtime.correct({ token, node: station, evidence: p.evidence }, p.reason, p.note);
           return ok(r, `${f.state.tokens[token]?.item ?? token} → ${nodeName(station)}：${r.message}`);
         },
@@ -245,16 +248,19 @@ function definitions(f: Factory): Tool[] {
         },
       },
       {
-        name: "read_report", label: "读取本轮报告", description: "Read a completed report or compute the current run report without ending the run.",
-        parameters: object({ runId: Type.Optional(Type.String({ pattern: "^run-[a-zA-Z0-9-]+$" })) }),
+        name: "read_report", label: "读取本轮报告", description: "Read a historical or current run report, including observed activity intervals. Optional station returns only that station's attempts, metrics and timeline; missing interval boundaries remain unknown.",
+        parameters: object({ runId: Type.Optional(Type.String({ pattern: "^run-[a-zA-Z0-9-]+$" })), station: Type.Optional(name()) }),
         execute: async (_id, p) => {
-          const { readReport, buildReport } = await import("./report.ts");
+          const { readReport, buildReport, stationReport } = await import("./report.ts");
           const id = p.runId ?? f.state.run.id;
           const cached = readReport(id);
-          // Older v3 caches predate metrics. Reconstruct their own run, never the current run.
-          const report = cached?.metrics ? cached : id && f.journal.runs().some(r=>r.run===id) ? buildReport(f, id) : cached;
+          // Older caches lack activity. Reconstruct only their own journal, including
+          // open spans, rather than using the current run's state or duration ratios.
+          const fresh = !cached?.metrics || !cached?.activity || p.station || (id === f.state.run.id && f.state.run.status !== "ended");
+          const report = fresh && id && f.journal.runs().some(r=>r.run===id) ? buildReport(f, id) : cached;
           if (!report) throw new ControlError(404, "report_not_found", "没有这轮报告");
-          return ok(report, "读取工作报告");
+          if (p.station && !f.compiled.nodes.some(n => n.key === p.station) && !report.attempts.some(a => a.node === p.station)) throw new ControlError(404, "station_not_found", "没有这个工位");
+          return ok(p.station ? stationReport(report, p.station) : report, p.station ? `读取 ${p.station} 的工作报告` : "读取工作报告");
         },
       },
       {

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { emptyBrowser, type BrowserState } from "../shared/browser.ts";
 
@@ -22,12 +23,64 @@ const titles = new Map<string,string>();
 export const browserEvents = new Set<(state: BrowserState) => void>();
 function publish(next: BrowserState) { state = next; for (const listener of browserEvents) listener(next); }
 
+export class BrowserPoolFault extends Error {
+  code: string;
+  mode: "desktop" | "headless";
+  nextAction: string;
+  constructor(code: string, message: string, options?: ErrorOptions) {
+    super(message, options); this.name = "BrowserPoolFault"; this.code = code;
+    this.mode = desktop ? "desktop" : "headless";
+    this.nextAction = desktop
+      ? "当前浏览器处理已作废；运行时会重新连接桌面浏览器并领取新页。若两次自动恢复仍失败，请重启桌面应用后从当前工位继续；不会自动登录或绕过访问限制。"
+      : "当前浏览器处理已作废；运行时会重建共享页面并从当前工位继续。若两次自动恢复仍失败，请检查浏览器安装、进程与内存后重试，保留已有成果。";
+  }
+}
+export interface BrowserAttemptScope {
+  signal: AbortSignal;
+  usedBrowser: boolean;
+  closed: boolean;
+  fault?: BrowserPoolFault;
+  invalidate(fault: BrowserPoolFault): void;
+}
+const attemptScopes = new AsyncLocalStorage<BrowserAttemptScope>();
+const signalScopes = new WeakMap<AbortSignal, BrowserAttemptScope>();
+const activeScopes = new Set<BrowserAttemptScope>();
+export function browserAttemptScope(signal: AbortSignal, cancel: (fault: BrowserPoolFault) => void): BrowserAttemptScope {
+  const scope: BrowserAttemptScope = { signal, usedBrowser: false, closed: false, invalidate(fault) {
+    if (scope.closed || scope.fault || signal.aborted) return;
+    scope.fault = fault; cancel(fault);
+  } };
+  signalScopes.set(signal, scope);
+  return scope;
+}
+export async function withBrowserAttempt<T>(scope: BrowserAttemptScope, run: () => Promise<T>): Promise<T> {
+  activeScopes.add(scope);
+  try { return await attemptScopes.run(scope, run); }
+  finally { scope.closed = true; activeScopes.delete(scope); signalScopes.delete(scope.signal); }
+}
+function poolFault(error: unknown, stage: "start" | "lease"): BrowserPoolFault | undefined {
+  if (error instanceof BrowserPoolFault) return error;
+  const text = String((error as Error)?.message ?? error);
+  if (stage === "start") return new BrowserPoolFault("BROWSER_START_FAILED", "共享浏览器实例未能启动；请检查浏览器安装、进程或内存。", { cause: error });
+  if (/BROWSER_[A-Z_]+|Target (?:page, context or browser has been closed|closed)|page (?:has )?crashed|browser (?:has )?(?:disconnected|closed)|Connection closed|无法挂载后台标签页|内置浏览器(?:响应超时|调试连接尚未就绪)|IPC channel|EPIPE|ECONNREFUSED|ECONNRESET|connectOverCDP|websocket/i.test(text)) {
+    return new BrowserPoolFault(desktop ? "BROWSER_BRIDGE_UNAVAILABLE" : "BROWSER_POOL_CLOSED", desktop ? "桌面浏览器连接或租用页面已失效；需要重新建立连接。" : "共享浏览器连接或租用页面已失效；需要重新领取页面。", { cause: error });
+  }
+  return undefined;
+}
+
 if (desktop) process.on("message", (message: any) => {
   if (message?.type === "browser:state") publish(message.state);
   if (message?.type === "browser:reply") { const p = pending.get(message.id); if (!p) return; clearTimeout(p.timer); pending.delete(message.id); message.error ? p.reject(new Error(message.error)) : p.resolve(message.result); }
 });
+if (desktop) process.on("disconnect", () => {
+  const fault = new BrowserPoolFault("BROWSER_BRIDGE_UNAVAILABLE", "桌面主进程的浏览器通道已断开；请重新打开桌面应用后继续当前工位。");
+  for (const scope of activeScopes) if (scope.usedBrowser) scope.invalidate(fault);
+  for (const p of pending.values()) { clearTimeout(p.timer); p.reject(fault); }
+  pending.clear(); connection = null;
+});
 function rpc(args: Record<string, unknown>): Promise<any> {
   return new Promise((resolve, reject) => {
+    if (!process.connected) { reject(new BrowserPoolFault("BROWSER_BRIDGE_UNAVAILABLE", "桌面浏览器通道未连接；请重新打开桌面应用后继续当前工位。")); return; }
     const id = crypto.randomUUID();
     const timer = setTimeout(() => { pending.delete(id); reject(new Error("内置浏览器响应超时")); }, 25000);
     pending.set(id, { resolve, reject, timer });
@@ -36,7 +89,18 @@ function rpc(args: Record<string, unknown>): Promise<any> {
 }
 function executable() { return [process.env.CHROME_PATH, "C:/Program Files/Google/Chrome/Application/chrome.exe", "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", "/usr/bin/google-chrome"].find(p => p && fs.existsSync(p)); }
 async function persistent(): Promise<BrowserContext> {
-  if (!context) context = chromium.launchPersistentContext(path.join(profile, "profile"), { headless: true, executablePath: executable(), viewport: { width: 1280, height: 800 }, args: ["--hide-scrollbars", "--mute-audio"] }).then(async c => { for(const p of c.pages())if(p.url()==="about:blank")await p.close();c.on("close", () => { context = null; tabs.clear(); update(); }); return c; }).catch(error => { context = null; throw error; });
+  if (!context) {
+    const startup = chromium.launchPersistentContext(path.join(profile, "profile"), { headless: true, executablePath: executable(), viewport: { width: 1280, height: 800 }, args: ["--hide-scrollbars", "--mute-audio"] }).then(async c => {
+      c.on("close", () => {
+        if (context === startup) context = null;
+        for (const [id, tab] of tabs) if (tab.page.context() === c) { tabs.delete(id); titles.delete(id); }
+        update();
+      });
+      for (const p of c.pages()) if (p.url() === "about:blank") await p.close();
+      return c;
+    }).catch(error => { if (context === startup) context = null; throw poolFault(error, "start"); });
+    context = startup;
+  }
   return context;
 }
 function update() {
@@ -108,11 +172,22 @@ export async function browserCommand(args: Record<string, any>): Promise<any> {
 
 export async function openPage(viewport = { width: 1280, height: 800 }, _locale = "en-US", signal?:AbortSignal): Promise<{ page: Page; context: BrowserContext; close: () => Promise<void> }> {
   signal?.throwIfAborted();
+  const scope = attemptScopes.getStore() ?? (signal ? signalScopes.get(signal) : undefined);
+  if (scope) { scope.usedBrowser = true; scope.signal.throwIfAborted(); }
   const withCancellation=(page:Page, context:BrowserContext, release:()=>Promise<void>)=>{
-    const abort=()=>{void page.close().catch(()=>{});};signal?.addEventListener("abort",abort,{once:true});if(signal?.aborted)abort();
-    return {page,context,close:async()=>{signal?.removeEventListener("abort",abort);await release();}};
+    let released = false;
+    const browser = context.browser();
+    const failed = (code: string, message: string) => { if (!released && !signal?.aborted) scope?.invalidate(new BrowserPoolFault(code, message)); };
+    const crash = () => failed("BROWSER_PAGE_CRASHED", "共享浏览器标签进程崩溃，当前处理已作废。");
+    const closed = () => failed("BROWSER_POOL_CLOSED", "共享浏览器页面或连接意外关闭，当前处理已作废。");
+    const disconnected = () => { if (desktop) connection = null; failed("BROWSER_POOL_CLOSED", "共享浏览器进程或调试连接断开，当前处理已作废。"); };
+    const unwatch = () => { released = true; page.off("crash", crash); page.off("close", closed); context.off("close", closed); browser?.off("disconnected", disconnected); signal?.removeEventListener("abort", abort); };
+    const abort=()=>{unwatch();void page.close().catch(()=>{});};
+    page.on("crash", crash); page.on("close", closed); context.on("close", closed); browser?.on("disconnected", disconnected);
+    signal?.addEventListener("abort",abort,{once:true});if(signal?.aborted)abort();
+    return {page,context,close:async()=>{unwatch();await release();}};
   };
-  if (!desktop) {
+  try { if (!desktop) {
     const t = await createHeadless("agent"); await t.page.setViewportSize(viewport);
     return withCancellation(t.page,t.context,async () => { await checkHeadless(t.id); if (!tabs.get(t.id)?.attention) await t.page.close().catch(() => {}); });
   }
@@ -124,8 +199,14 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
     for (let i=0;i<40 && !page;i++) { page = b.contexts().flatMap(c => c.pages()).find(p => p.url() === lease.marker); if (!page) await new Promise(r => setTimeout(r,50)); }
     if (!page) throw new Error("无法挂载后台标签页");
     pageIds.set(page,lease.id); await page.setViewportSize(viewport);
-    return withCancellation(page,page.context(),async () => { await rpc({action:"release",id:lease.id}).catch(() => {}); });
-  } catch (error) { await rpc({action:"release",id:lease.id}).catch(() => {}); throw error; }
+    return withCancellation(page,page.context(),async () => { await rpc({action:"release",id:lease.id,discard:Boolean(scope?.fault || signal?.aborted)}).catch(() => {}); });
+  } catch (error) { await rpc({action:"release",id:lease.id,discard:true}).catch(() => {}); throw error; }
+  } catch (error) {
+    if (signal?.aborted && !scope?.fault) throw error;
+    const fault = poolFault(error, "lease");
+    if (fault) { scope?.invalidate(fault); throw fault; }
+    throw error;
+  }
 }
 
 export async function browserAttention(page: Page, message: string) {

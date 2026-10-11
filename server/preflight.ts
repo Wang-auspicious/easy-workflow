@@ -7,17 +7,43 @@ import path from "node:path";
 import type { PreflightCheck } from "../shared/types.ts";
 import { networkFetch } from "./network.ts";
 import { openPage, browserCommand } from "./browser.ts";
-import { models, piStatus } from "./pi.ts";
+import { probeModelConnection } from "./pi.ts";
 import { imageStats } from "./evidence.ts";
 import type { Broker } from "./broker.ts";
 import { projectPaths } from "./workspace.ts";
 
-const within = <T>(ms: number, p: Promise<T>) => Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`超过 ${ms / 1000}s`)), ms))]);
+async function within<T>(ms: number, p: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  try { return await Promise.race([p, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`超过 ${ms / 1000}s`)), ms); })]); }
+  finally { clearTimeout(timer!); }
+}
 
 async function check(id: string, label: string, fn: () => Promise<{ ok: boolean; detail: string; fix?: string }>): Promise<PreflightCheck> {
   const t0 = Date.now();
   try { return { id, label, ...(await fn()), ms: Date.now() - t0 }; }
   catch (err) { return { id, label, ok: false, detail: String((err as Error).message ?? err).slice(0, 240), ms: Date.now() - t0 }; }
+}
+
+export async function checkModelEndpoint(timeoutMs = 20000): Promise<{ ok: boolean; detail: string; fix?: string }> {
+  return probeModelConnection(timeoutMs);
+}
+
+/** One unavailable third-party probe must not be mistaken for a total Internet outage. */
+export async function checkExternalAccess(urls = ["https://api.github.com/zen", "https://example.com/"], timeoutMs = 10000): Promise<{ ok: boolean; detail: string; fix?: string }> {
+  const tried: string[] = [];
+  for (const url of urls) {
+    const host = new URL(url).host;
+    try {
+      const response = await networkFetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+      await response.body?.cancel();
+      tried.push(`${host} HTTP ${response.status}`);
+      if (response.status < 500) return { ok: true, detail: tried.join("；") };
+    } catch (error) {
+      const cause = (error as { cause?: { code?: string } })?.cause?.code;
+      tried.push(`${host} ${cause ?? String((error as Error)?.message ?? "连接失败").slice(0, 100)}`);
+    }
+  }
+  return { ok: false, detail: tried.join("；") || "没有外网探测目标", fix: "外网探测均失败：检查系统代理和网络后重试" };
 }
 
 export async function preflight(dir: string, broker: Broker): Promise<{ ok: boolean; checks: PreflightCheck[] }> {
@@ -27,19 +53,8 @@ export async function preflight(dir: string, broker: Broker): Promise<{ ok: bool
       await within(6000, dns.lookup("github.com"));
       return { ok: true, detail: proxy ? `走代理 ${proxy.replace(/\/\/[^@]*@/, "//")}` : "直连（未设置代理环境变量）" };
     }),
-    check("web", "外网可达", async () => {
-      const once = () => within(12000, networkFetch("https://api.github.com/zen", { signal: AbortSignal.timeout(11000) }));
-      const r = await once().catch(async () => { await new Promise((x) => setTimeout(x, 1500)); return once(); });
-      return { ok: r.status < 500, detail: `api.github.com HTTP ${r.status}`, fix: r.status >= 500 ? "稍后再试，或检查代理" : undefined };
-    }),
-    check("model", "模型凭据与接口", async () => {
-      const st = piStatus();
-      if (!st.ready) return { ok: false, detail: st.error ?? `${st.provider}/${st.id} 没有可用凭据`, fix: "在 Pi 配置里补上 API key，或设置对应环境变量" };
-      const base = (models().model as { baseUrl?: string }).baseUrl;
-      if (!base) return { ok: true, detail: `${st.provider}/${st.id}（未声明接口地址，跳过连通检查）` };
-      const r = await within(12000, networkFetch(base, { signal: AbortSignal.timeout(11000) }));
-      return { ok: r.status < 500, detail: `${st.provider}/${st.id} · ${new URL(base).host} HTTP ${r.status}`, fix: r.status >= 500 ? "模型服务异常，稍后再试" : undefined };
-    }),
+    check("web", "外网可达", () => checkExternalAccess()),
+    check("model", "模型凭据与接口", () => checkModelEndpoint()),
     check("browser", "后台页能截出画面", async () => {
       const lease = broker.tryAcquire("browser");
       if (!lease) return { ok: true, detail: "浏览器名额都在使用中（已在工作，跳过）" };

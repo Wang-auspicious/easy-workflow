@@ -41,7 +41,7 @@ function fixture() {
   const attempt = (token: string, ok = true, exposed = false) => {
     const id = `${token}-attempt`;
     emit({ kind: "attempt.started", attempt: id, token, node: station, worker: "fixture-worker", input: "fixture" });
-    if (exposed) docs.envelope(compiled.nodes.find((n) => n.key === station)!, state.tokens[token].item);
+    if (exposed) docs.envelope(compiled.nodes.find((n) => n.key === station)!, state.tokens[token].item, undefined, { token, attempt: id });
     emit({ kind: "attempt.finished", attempt: id, ok, summary: ok ? "source verified" : "review feedback", ms: 1, queuedMs: 0, ...(!ok ? { error: "HTTP 503" } : {}) });
   };
   const publish = (item: string, token: string, options: { trial?: string; expose?: boolean; create?: boolean; text?: string } = {}) => {
@@ -167,6 +167,32 @@ test("trial bindings cannot be added after execution or selectively replace a sa
     f.lessons.bindValidation(trial.id, ["first-binding"]);
     f.create("known-a", "second-binding");
     assert.throws(() => f.lessons.bindValidation(trial.id, ["second-binding"]), /只能绑定一个任务/);
+  } finally { f.close(); }
+});
+
+test("candidate trial context follows the exact bound token and attempt when identical items run concurrently", () => {
+  const f = fixture();
+  try {
+    const draft = f.seed(), trial = f.trial(draft), node = f.f.compiled.nodes.find((n) => n.key === station)!;
+    f.start("concurrent-trial");
+    f.create("failed-site", "bound-token"); f.create("failed-site", "ordinary-token");
+    f.lessons.bindValidation(trial.id, ["bound-token"]);
+    for (const token of ["bound-token", "ordinary-token"]) f.emit({ kind: "attempt.started", attempt: `${token}-live`, token, node: station, worker: "fixture", input: "same item" });
+    const exposed = () => [...f.journal.read()].filter((e) => e.kind === "lesson.validation.exposed");
+    assert.doesNotMatch(f.docs.envelope(node, "failed-site").text, /仅本次验证使用的候选经验/);
+    assert.doesNotMatch(f.docs.envelope(node, "failed-site", undefined, { token: "ordinary-token", attempt: "ordinary-token-live" }).text, /仅本次验证使用的候选经验/);
+    assert.doesNotMatch(f.docs.envelope(node, "failed-site", undefined, { token: "ordinary-token", attempt: "bound-token-live" }).text, /仅本次验证使用的候选经验/);
+    assert.doesNotMatch(f.docs.envelope(node, "wrong-item", undefined, { token: "bound-token", attempt: "bound-token-live" }).text, /仅本次验证使用的候选经验/);
+    assert.equal(exposed().length, 0);
+    const context = f.docs.envelope(node, "failed-site", undefined, { token: "bound-token", attempt: "bound-token-live" }).text;
+    assert.match(context, /仅本次验证使用的候选经验/); assert.ok(context.includes(draft.suggestion));
+    assert.equal(exposed().length, 1);
+    assert.equal(exposed()[0].kind === "lesson.validation.exposed" && exposed()[0].token, "bound-token");
+    f.docs.envelope(node, "failed-site", undefined, { token: "bound-token", attempt: "bound-token-live" });
+    assert.equal(exposed().length, 1, "repeated envelope reads cannot inflate proof of exposure");
+    f.emit({ kind: "attempt.finished", attempt: "bound-token-live", ok: true, summary: "finished", ms: 1, queuedMs: 0 });
+    assert.doesNotMatch(f.docs.envelope(node, "failed-site", undefined, { token: "bound-token", attempt: "bound-token-live" }).text, /仅本次验证使用的候选经验/);
+    assert.equal(fs.readFileSync(f.roleFile, "utf8"), f.role);
   } finally { f.close(); }
 });
 

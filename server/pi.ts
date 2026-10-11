@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createModels, createProvider, envApiKeyAuth, type Model, type Api, type CredentialStore } from "@earendil-works/pi-ai";
+import { createModels, createProvider, envApiKeyAuth, normalizeContext, type Model, type Api, type CredentialStore } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
@@ -11,6 +11,8 @@ import { opencodeGoProvider } from "@earendil-works/pi-ai/providers/opencode-go"
 import { withOpenCodeSessionHeader } from "@earendil-works/pi-ai/providers/opencode-headers";
 import { EnvHttpProxyAgent, fetch as proxyFetch } from "undici";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
+import { classifyFailure } from "../shared/failures.ts";
+import { redactText } from "./mcp-security.ts";
 
 let transport: EnvHttpProxyAgent | undefined;
 const modelFetch: typeof globalThis.fetch = (input, init) => {
@@ -106,6 +108,28 @@ export function piStatus() {
     return { ...selection, name: model.name, ready: Boolean(credential(selection.provider)?.key), error: null };
   } catch (error) {
     return { ...selection, name: selection.id, ready: false, error: (error as Error).message };
+  }
+}
+
+/** A bounded authenticated request: a reachable provider homepage proves no model capability. */
+export async function probeModelConnection(timeoutMs = 20000): Promise<{ ok: boolean; detail: string; fix?: string }> {
+  const status = piStatus();
+  const label = `${status.provider}/${status.id}`;
+  if (!status.ready) return { ok: false, detail: status.error ?? `${label} 没有可用凭据`, fix: "在 Pi 配置里补上 API key，或设置对应环境变量" };
+  const secret = credential(status.provider)?.key;
+  const signal = AbortSignal.timeout(timeoutMs);
+  const redact = (text: string) => redactText(text, [secret]).replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [redacted]").slice(0, 400);
+  try {
+    const selection = models();
+    const request = await selection.stream(selection.model, normalizeContext({ messages: [{ role: "user", content: "Reply with OK.", timestamp: Date.now() }] }), { signal, maxTokens: 64, sessionId: `easy-workflow-preflight-${Date.now()}` });
+    const result = await request.result();
+    if (signal.aborted) throw new Error(`模型请求超时（${timeoutMs}ms）`);
+    if (result.stopReason === "error" || result.stopReason === "aborted") throw new Error(result.errorMessage || "模型请求失败");
+    return { ok: true, detail: `${label} · 已完成实际模型请求（输出上限 64 tokens）` };
+  } catch (error) {
+    const message = signal.aborted ? `模型请求超时（${timeoutMs}ms）` : redact(String((error as Error)?.message ?? error));
+    const failure = classifyFailure(new Error(message), { stage: "model" });
+    return { ok: false, detail: `${label} · ${message}`, fix: failure.nextAction };
   }
 }
 

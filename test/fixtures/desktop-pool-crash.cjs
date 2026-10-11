@@ -1,0 +1,38 @@
+const { app, BrowserWindow } = require('electron');
+const fs = require('node:fs');
+const assert = require('node:assert/strict');
+const { BrowserManager } = require('../../app/browser-manager.cjs');
+const profile = process.env.EASY_WORKFLOW_RECOVERY_PROFILE, url = process.env.EASY_WORKFLOW_RECOVERY_URL;
+fs.mkdirSync(profile, { recursive: true });
+app.setPath('userData', profile);
+app.commandLine.appendSwitch('remote-debugging-port', '0');
+app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
+let window, manager, closing = false;
+app.whenReady().then(() => {
+  window = new BrowserWindow({ show: false, width: 640, height: 480 });
+  void window.loadURL('about:blank');
+  manager = new BrowserManager(profile, () => {}, session => session.setPermissionRequestHandler((_wc, _permission, callback) => callback(false)));
+  manager.attach(window);
+  globalThis.runBrowserRecovery = async () => {
+  const user = manager.create(url, 'user'); await user.ready;
+  const lease = await manager.command({ action: 'lease' });
+  const agent = manager.tabs.get(lease.id), contents = agent.view.webContents;
+  await contents.loadURL(url);
+  const gone = new Promise(resolve => contents.once('render-process-gone', resolve));
+  contents.forcefullyCrashRenderer(); await gone;
+  for (let i = 0; i < 100 && manager.tabs.has(lease.id); i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(manager.tabs.has(lease.id), false);
+  const replacement = await manager.command({ action: 'lease' });
+  assert.notEqual(replacement.id, lease.id);
+  const next = manager.tabs.get(replacement.id);
+  await next.view.webContents.loadURL(url);
+  assert.match(await next.view.webContents.executeJavaScript('document.body.innerText'), /Rendered checkpoint/);
+  assert.equal(manager.tabs.has(user.id), true); assert.equal(user.view.webContents.isDestroyed(), false);
+    return { oldAgentRemoved: true, replacementWorks: true, userTabPreserved: true };
+  };
+});
+app.on('before-quit', event => {
+  if (closing) return;
+  event.preventDefault(); closing = true;
+  Promise.resolve(manager?.close()).finally(() => app.exit(0));
+});
