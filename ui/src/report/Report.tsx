@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArrowLeft, ArrowUpRight, Download, PlayCircle, X } from "lucide-react";
 import type { RunReport } from "../../../server/report.ts";
+import type { AttemptMetrics } from "../../../shared/types.ts";
 import { api } from "../api.ts";
 import { getState, setState, useStore } from "../store.ts";
 import { fmt, secs } from "../canvas/Node.tsx";
@@ -9,7 +10,11 @@ import { startReplay } from "../canvas/ReplayBar.tsx";
 import "./dashboard.css";
 
 type Attempt = RunReport["attempts"][number];
-const palette = ["#5798d4","#58b5a7","#aa8bd2","#d6ac63","#d77c81","#8593b1"];
+const palette = ["#5798d4","#58b5a7","#aa8bd2","#d6ac63","#d77c81","#8593b1","#7fae6b","#b98a62"];
+type TokenKey = keyof NonNullable<AttemptMetrics["tokens"]>;
+const TOKEN_PARTS: [TokenKey, string][] = [["system","角色与规则"],["context","上下文"],["caseFile","案卷"],["input","任务输入"],["images","图片"],["toolDefs","工具定义"],["toolResults","工具结果"],["output","输出"]];
+// Per-attempt breakdowns (Spec §37) come with the report when the server includes them, else from live state.
+const metricsOf = (a: Attempt): AttemptMetrics | undefined => (a as Attempt & { metrics?: AttemptMetrics }).metrics ?? getState().fs.attempts[a.id]?.metrics;
 const stamp = (at:number) => new Date(at).toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
 
 export function Report({ runId, embedded = false }: {runId?:string;embedded?:boolean}) {
@@ -67,6 +72,7 @@ function Dashboard({report:r,embedded}:{report:RunReport;embedded:boolean}) {
       <section className="dash-panel"><div className="dash-panel-head"><h2>{metric==="work"?"工位耗时":"工位用量"}</h2><span>点击下钻</span></div><div className="dash-ranks">{ranks.map((n,i)=>{const value=metric==="work"?n.medianMs:n.tokens,max=Math.max(1,...ranks.map(x=>metric==="work"?x.medianMs:x.tokens));return <button key={n.key} className={node===n.key?"is-selected":""} onClick={()=>setNode(node===n.key?null:n.key)}><span>{n.name}</span><b>{metric==="work"?secs(value):fmt(value)}</b><i style={{width:`${value/max*100}%`,background:palette[i%palette.length]}}/></button>;})}{!ranks.length&&<p className="dash-no-data">运行后显示各工位的实测数据</p>}</div></section>
       <section className="dash-panel dash-stations"><div className="dash-panel-head"><h2>工位表现</h2><span>{nodes.length} 个参与工位</span></div><div className="dash-table-scroll"><table><thead><tr><th>工位</th><th>完成</th><th>中位</th><th>P90</th><th>排队占比</th><th>Token</th></tr></thead><tbody>{nodes.map(n=><tr key={n.key} className={node===n.key?"is-selected":""}><td><button onClick={()=>setNode(node===n.key?null:n.key)}>{n.name}<ArrowUpRight size={11}/></button></td><td>{n.processed}</td><td>{n.medianMs?secs(n.medianMs):"—"}</td><td>{n.p90Ms?secs(n.p90Ms):"—"}</td><td><span className="mini-meter"><i style={{width:`${n.waitShare*100}%`}}/></span>{Math.round(n.waitShare*100)}%</td><td>{fmt(n.tokens)}</td></tr>)}</tbody></table></div></section>
     </div>
+    <Breakdown attempts={attempts.filter(a=>!node||a.node===node)} scope={activeNode?.name ?? (line==="all"?"全部工位":factory?.lines.find(x=>x.id===line)?.name ?? line)}/>
     <section className="dash-panel dash-process"><div className="dash-panel-head"><h2>{activeNode?`${activeNode.name} · 处理过程`:"处理过程"}</h2><span>{bucket!==null?`${stamp(r.startedAt+bucket*span/nBuckets)} – ${stamp(r.startedAt+(bucket+1)*span/nBuckets)}`:`${filtered.length} 条记录`}</span><select aria-label="筛选处理结果" value={outcome} onChange={e=>setOutcome(e.target.value)}><option value="all">全部结果</option><option value="ok">成功</option><option value="failed">失败</option><option value="cancelled">已取消</option></select></div>
       {activeNode&&<div className="node-summary"><span>完成 <b>{activeNode.processed}</b></span><span>退回 <b>{activeNode.returned}</b></span><span>失败 <b>{activeNode.failed}</b></span><span>模型费用 <b>${activeNode.cost.toFixed(4)}</b></span></div>}
       <div className="dash-attempts">{[...filtered].sort((a,b)=>b.startedAt-a.startedAt).slice(0,30).map(a=><button key={a.id} onClick={()=>setDetail(detail===a.id?null:a.id)} className={detail===a.id?"is-selected":""}><i className={a.cancelled?"cancelled":a.ok===false?"bad":a.ok===true?"ok":"working"}/><time>{stamp(a.startedAt)}</time><b>{a.item}</b><span>{allNodes.find(n=>n.key===a.node)?.name??a.node}</span><small>{secs(a.ms)}</small></button>)}{!filtered.length&&<p className="dash-no-data">这个范围内没有处理记录。</p>}</div>
@@ -75,8 +81,30 @@ function Dashboard({report:r,embedded}:{report:RunReport;embedded:boolean}) {
     </section>
   </div>;
 }
+/** Token composition and time composition of the attempts in scope (the clicked station, or all). */
+function Breakdown({attempts,scope}:{attempts:Attempt[];scope:string}) {
+  const withM=attempts.map(a=>({a,m:metricsOf(a)}));
+  const sum=(f:(x:typeof withM[number])=>number)=>withM.reduce((n,x)=>n+f(x),0);
+  const tok=TOKEN_PARTS.map(([k,label])=>[label,sum(x=>x.m?.tokens?.[k]??0)] as [string,number]).filter(([,v])=>v>0);
+  const actualIn=sum(x=>x.m?.tokens?.actualInput??0), cacheRead=sum(x=>x.m?.tokens?.cacheRead??0), actualOut=sum(x=>x.m?.tokens?.actualOutput??x.a.output);
+  const t=(k:"firstTokenMs"|"outputMs"|"toolMs"|"programMs")=>sum(x=>x.m?.time?.[k]??0);
+  const known=t("firstTokenMs")+t("outputMs")+t("toolMs")+t("programMs");
+  const time=([["首字等待",t("firstTokenMs")],["生成输出",t("outputMs")],["工具",t("toolMs")],["程序",t("programMs")],["其他",Math.max(0,sum(x=>x.a.ms)-known)],["排队",sum(x=>x.a.queuedMs)]] as [string,number][]).filter(([,v])=>v>=500);
+  const covered=withM.filter(x=>x.m?.tokens||x.m?.time).length, outMs=t("outputMs"), calls=sum(x=>x.m?.time?.modelCalls??0);
+  const tokTotal=tok.reduce((n,[,v])=>n+v,0), timeTotal=time.reduce((n,[,v])=>n+v,0);
+  return <div className="dash-grid dash-breakdown">
+    <section className="dash-panel"><div className="dash-panel-head"><h2>Token 构成</h2><span>{scope}</span></div>
+      <Donut values={tok.map(x=>x[1])} labels={tok.map(x=>x[0])} center={fmt(tokTotal)} suffix="Token" format={fmt}/>
+      <p className="dash-footnote">{covered?`${covered}/${attempts.length} 步有分项，分项按字符估算。`:"运行后显示每一步的 Token 分项。"}{actualIn>0&&` 缓存命中 ${Math.round(cacheRead/actualIn*100)}%。`}</p></section>
+    <section className="dash-panel"><div className="dash-panel-head"><h2>耗时构成</h2><span>{scope}</span></div>
+      <Donut values={time.map(x=>x[1])} labels={time.map(x=>x[0])} center={secs(timeTotal)} suffix="累计步骤时间" format={secs}/>
+      <p className="dash-footnote">{outMs>0?`输出速度 ${(actualOut/(outMs/1000)).toFixed(1)} tok/s。`:""}{calls>0&&`模型调用 ${calls} 次，工具调用 ${sum(x=>x.m?.time?.toolCalls??0)} 次。`}并行步骤按累计时间计。</p></section>
+  </div>;
+}
+
 function Kpi({label,value,sub,warn=false}:{label:string;value:string;sub:string;warn?:boolean}) { return <div className={`dash-kpi ${warn?"is-warn":""}`}><span>{label}</span><b>{value}</b><small>{sub}</small></div>; }
 function Donut({values,labels,center,suffix,format}:{values:number[];labels:string[];center:string;suffix:string;format:(n:number)=>string}) {
-  const total=values.reduce((s,n)=>s+n,0), p=total?values[0]/total*100:0;
-  return <div className="dash-donut"><div className="donut-ring" style={{background:total?`conic-gradient(${palette[0]} 0 ${p}%,${palette[1]} ${p}% 100%)`:"#edf0f4"}}><div><b>{total?center:"—"}</b><span>{suffix}</span></div></div><div className="donut-key">{values.map((v,i)=><div key={i}><span><i style={{background:palette[i]}}/>{labels[i]}</span><b>{format(v)}</b><small>{total?Math.round(v/total*100):0}%</small></div>)}</div></div>;
+  const total=values.reduce((s,n)=>s+n,0);
+  let at=0; const stops=values.map((v,i)=>{const a=at; at+=total?v/total*100:0; return `${palette[i%palette.length]} ${a}% ${at}%`;});
+  return <div className="dash-donut"><div className="donut-ring" style={{background:total?`conic-gradient(${stops.join(",")})`:"#edf0f4"}}><div><b>{total?center:"—"}</b><span>{suffix}</span></div></div><div className="donut-key">{values.map((v,i)=><div key={i}><span><i style={{background:palette[i%palette.length]}}/>{labels[i]}</span><b>{format(v)}</b><small>{total?Math.round(v/total*100):0}%</small></div>)}</div></div>;
 }

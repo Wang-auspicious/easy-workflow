@@ -1,5 +1,6 @@
 // Evidence board (Spec §10.9): replaces the canvas in the workspace. Dense rows (one item
-// per row, its preview images in order) or image-only tiles; filter, single / Ctrl / Shift /
+// per row: its three role images, then name, reviews and a wrapped line of station notes —
+// never a horizontal strip) or image-only tiles; filter, single / Ctrl / Shift /
 // box select — the selection *is* the chat's attachment strip — and one-click correction.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
@@ -15,7 +16,8 @@ const KIND_ZH: Record<string, string> = { gallery: "灵感合集", "component-so
 const ROLE_ZH: Record<string, string> = { identity: "首屏", breadth: "目录", proof: "特写" };
 const STATUS_ZH: Record<string, string> = { active: "在线上", published: "已发布", merged: "已合并", rejected: "已排除", manual: "待人工", failed: "失败", parked: "待重试" };
 
-interface Row { t: TokenState; images: EvidenceRef[]; suspicious: string[] }
+interface Row { t: TokenState; images: EvidenceRef[]; notes: EvidenceRef[]; suspicious: string[] }
+const isVisual = (e: EvidenceRef) => e.kind === "image" || e.kind === "video";
 
 const evAttachment = (ev: EvidenceRef, t?: TokenState): Attachment => ({ type: "evidence", id: ev.id, label: `${t?.item ?? ""} · ${ev.label}`, thumb: ev.poster ?? ev.card ?? ev.src });
 
@@ -45,10 +47,13 @@ export function EvidenceBoard() {
       const all = t.evidence.map((e) => s.fs.evidence[e]).filter((e): e is EvidenceRef => Boolean(e));
       // Latest image per role (a reshoot replaces the earlier one in the row).
       const byRole = new Map<string, EvidenceRef>();
-      for (const e of all) byRole.set(e.kind==="image"||e.kind==="video"?String(e.meta?.role??e.kind):e.id, e);
+      // Text evidence: the latest note per station, in the order the stations spoke.
+      const byStation = new Map<string, EvidenceRef>();
+      for (const e of all) if (isVisual(e)) byRole.set(String(e.meta?.role ?? e.kind), e); else { byStation.delete(e.station); byStation.set(e.station, e); }
       const order = ["identity", "breadth", "proof", "video"];
       const images = [...byRole.entries()].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0])).map(([, e]) => e);
-      if (!images.length && !f.status) continue;
+      const notes = [...byStation.values()];
+      if (!images.length && !notes.length && !f.status) continue;
       const d = t.data as Record<string, any>;
       const suspicious: string[] = [];
       if (d.kindAgreed === false) suspicious.push("分类有分歧");
@@ -60,7 +65,7 @@ export function EvidenceBoard() {
       if (q && !text.includes(q.toLowerCase())) continue;
       if (f.kind && d.kind !== f.kind) continue;
       if (f.status && t.status !== f.status) continue;
-      if (f.station && !images.some((e) => e.station === f.station)) continue;
+      if (f.station && ![...images, ...notes].some((e) => e.station === f.station)) continue;
       if (f.review === "returned" && !Object.keys(t.rounds).length) continue;
       if (f.review === "passed" && d.shotReview !== "pass") continue;
       if (f.review === "pending" && d.shotReview) continue;
@@ -68,13 +73,14 @@ export function EvidenceBoard() {
       if (f.source === "pool" && t.source !== "candidates/pool") continue;
       if (f.source === "manual" && t.source !== "manual") continue;
       if (f.suspicious && !suspicious.length) continue;
-      out.push({ t, images, suspicious });
+      out.push({ t, images, notes, suspicious });
     }
     if (f.suspicious) out.sort((a, b) => b.suspicious.length - a.suspicious.length);
     return out;
   }, [s.version, q, f]);
 
-  const flat = useMemo(() => rows.flatMap((r) => r.images.map((e) => ({ e, t: r.t }))), [rows]);
+  const flat = useMemo(() => rows.flatMap((r) => (mode === "tiles" ? r.images : [...r.images, ...r.notes]).map((e) => ({ e, t: r.t }))), [rows, mode]);
+  const nImages = rows.reduce((n, r) => n + r.images.length, 0), nNotes = rows.reduce((n, r) => n + r.notes.length, 0);
 
   const select = (ids: string[], how: "set" | "toggle" | "add") => {
     const s2 = getState();
@@ -125,7 +131,7 @@ export function EvidenceBoard() {
 
   // Box select (drag on empty space).
   const onDown = (e: React.PointerEvent) => {
-    if ((e.target as HTMLElement).closest(".ev, button, input, select, .bd-row-main")) return;
+    if ((e.target as HTMLElement).closest(".ev, .bd-note, button, input, select, .bd-row-main")) return;
     const sc = scroller.current!;
     const rect = sc.getBoundingClientRect();
     const x0 = e.clientX - rect.left + sc.scrollLeft, y0 = e.clientY - rect.top + sc.scrollTop;
@@ -166,7 +172,7 @@ export function EvidenceBoard() {
         <button className={`bd-toggle ${f.corrected ? "is-on" : ""}`} onClick={() => setF({ ...f, corrected: !f.corrected })}><Undo2 size={13} />纠错过</button>
         <button className={`bd-toggle ${f.suspicious ? "is-on" : ""}`} onClick={() => setF({ ...f, suspicious: !f.suspicious })}><AlertTriangle size={13} />只看可疑</button>
         <span className="grow" />
-        <span className="muted num">{rows.length} 件 · {flat.length} 条证据（{flat.filter(x=>x.e.kind==="image"||x.e.kind==="video").length} 张图像 / 视频）</span>
+        <span className="muted num">{rows.length} 件 · {nImages} 张图 · {nNotes} 条工位记录</span>
         <Seg value={mode} onChange={(v) => setMode(v as Mode)} options={[["rows", <Rows3 key="r" size={14} />], ["tiles", <LayoutGrid key="t" size={14} />]]} />
       </div>
       {selected.size > 0 && (
@@ -184,7 +190,7 @@ export function EvidenceBoard() {
           <div key={row.t.id} data-row={ri} className={`bd-row ${cursor.r === ri ? "is-cursor" : ""}`}>
             <div className="bd-imgs">
               {row.images.map((e, ci) => <Ev key={e.id} e={e} t={row.t} sel={selected.has(e.id)} cur={cursor.r === ri && cursor.c === ci} onClick={(ev) => { setCursor({ r: ri, c: ci }); click(ev, e.id); }} onZoom={() => setLight(e)} />)}
-              {Array.from({ length: Math.max(0, 3 - row.images.length) }).map((_, i) => <div key={i} className="ev ev--empty" />)}
+              {Array.from({ length: Math.max(0, 3 - row.images.length) }).map((_, i) => <div key={i} className="ev ev--empty"><span>{["首屏", "目录", "特写"][row.images.length + i] ?? ""}</span></div>)}
             </div>
             <div className="bd-row-main" onClick={(e) => { setCursor({ r: ri, c: 0 }); if (e.ctrlKey || e.metaKey) select(row.images.map((x) => x.id), "toggle"); else select(row.images.map((x) => x.id), "set"); }}>
               <div className="bd-name"><b>{(row.t.data as any).title || row.t.title || row.t.item}</b><span className="muted">{row.t.url.replace(/^https?:\/\//, "")}</span></div>
@@ -199,6 +205,7 @@ export function EvidenceBoard() {
                 {row.t.corrections > 0 && <span className="chip warn-chip">纠错 {row.t.corrections}</span>}
                 <button className="bd-go" onClick={(e) => { e.stopPropagation(); goCanvas(row.t); }} data-tip="在画布上看这件货的证据链  Enter"><ArrowRight size={14} /></button>
               </div>
+              {row.notes.length > 0 && <div className="bd-notes">{row.notes.map((e) => <Note key={e.id} e={e} sel={selected.has(e.id)} onClick={(ev) => click(ev, e.id)} onZoom={() => setLight(e)} />)}</div>}
             </div>
           </div>
         )) : (
@@ -225,14 +232,24 @@ function Ev({ e, t, sel, cur, tile, onClick, onZoom }: { e: EvidenceRef; t: Toke
   const hover = useHoverPreview(() => previewSet(e), onZoom);
   return (
     <div className={`ev ${sel ? "is-sel" : ""} ${cur ? "is-cur" : ""} ${tile ? "is-tile" : ""}`} data-ev={e.id} onClick={onClick} onDoubleClick={onZoom} {...(visual ? hover : {})}>
-      {e.kind==="image"||e.kind==="video"?<img src={e.poster ?? e.card ?? e.src} alt="" draggable={false} loading="lazy" />:<div className={`ev-document tone-${e.tone??"none"}`}><header>{e.kind==="verdict"?<ClipboardCheck size={17}/>:<FileText size={17}/>}<b>{e.label}</b></header><span>{e.verdict||"查看文字证据"}</span></div>}
-      {(e.kind==="image"||e.kind==="video")&&<span className="ev-role">{ROLE_ZH[String(e.meta?.role)] ?? (e.kind === "video" ? "录屏" : e.label)}</span>}
+      <img src={e.poster ?? e.card ?? e.src} alt="" draggable={false} loading="lazy" />
+      {visual && <span className="ev-role">{ROLE_ZH[String(e.meta?.role)] ?? (e.kind === "video" ? "录屏" : e.label)}</span>}
       {e.kind === "video" && <span className="play">▶</span>}
       {returning && <span className="ev-state">已退回 → 重做中</span>}
       {!returning && corrected && <span className="ev-state is-done">已纠错</span>}
       {tile && <span className="ev-host">{t.item}</span>}
       <button className="ev-wrong" onClick={(ev) => { ev.stopPropagation(); openCorrection([{ token: e.token, node: e.station, evidence: e.id, label: `${t.item} · ${e.label}` }], ev.currentTarget); }}>不对</button>
     </div>
+  );
+}
+
+/** One station's latest text evidence as a compact line: station · verdict. Same selection and zoom as images. */
+function Note({ e, sel, onClick, onZoom }: { e: EvidenceRef; sel: boolean; onClick: (ev: React.MouseEvent) => void; onZoom: () => void }) {
+  const Icon = e.kind === "verdict" ? ClipboardCheck : FileText;
+  return (
+    <span className={`bd-note tone-${e.tone ?? "none"} ${sel ? "is-sel" : ""}`} data-ev={e.id} onClick={(ev) => { ev.stopPropagation(); onClick(ev); }} onDoubleClick={(ev) => { ev.stopPropagation(); onZoom(); }} data-tip={`${e.label}：${e.verdict ?? ""}  双击看全文`}>
+      <Icon size={12} /><b>{e.label}</b>{e.verdict && <span>{e.verdict}</span>}
+    </span>
   );
 }
 
