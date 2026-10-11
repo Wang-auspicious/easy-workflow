@@ -82,6 +82,13 @@ try {
   assert.equal(boot.factory.factory.nodes.length, 66);
   assert.equal(Object.keys(boot.state.tokens).length, 0);
   assert.equal(boot.state.run.status, 'idle');
+  const role = await page.evaluate(async()=>{
+    const r=await fetch('/api/tools/read_role',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({station:'curation/proof'})});
+    if(!r.ok)throw new Error(`read_role: ${r.status}`);return r.json();
+  });
+  assert.match(JSON.stringify(role),/组件特写摄影/);
+  assert.match(JSON.stringify(role),/情况判断与处理/);
+  results.checks.push('bundled node ROLE.md accessible through the Agent interface');
   if (process.argv.includes('--standalone')) {
     assert.equal(boot.factory.keyPresent, false, 'standalone smoke must not discover an API key');
     assert.equal(boot.state.nodes['candidates/pool'].stock, 0, 'standalone smoke must not read the local candidate catalogue');

@@ -18,6 +18,7 @@ import { agentDefs, warmStyleLib } from "../packs/vislexicon/agents.ts";
 import { loadCatalog, loadPublished, type CatalogEntry } from "../packs/vislexicon/env.ts";
 import { ControlError } from "./errors.ts";
 import { classifyFailure, type Failure } from "../shared/failures.ts";
+import { readRole } from "./roles.ts";
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -291,6 +292,8 @@ export class Factory {
       if (trial.issues.length) throw new ControlError(422, "invalid_spec", "补丁校验未通过", trial.issues);
       const missing = trial.nodes.filter((n) => n.kind !== "source" && n.kind !== "store" && !n.dormant && trial!.lines.find((l) => l.id === n.line)?.wired && !this.runtime.executors(n));
       if (missing.length) throw new ControlError(422, "missing_executor", "新增工位缺少执行器，不能生效", missing.map((n) => n.key));
+      const missingRoles=trial.nodes.filter(n=>{try{readRole(n.key);return false;}catch{return true;}});
+      if(missingRoles.length)throw new ControlError(422,"missing_role","节点缺少 ROLE.md 职责契约，不能生效",missingRoles.map(n=>n.key));
       if (this.runtime.running || [...this.runtime.workers.values()].some((pool) => pool.some((w) => w.busy))) throw new ControlError(409, "run_active", "请先结束本轮并等待在途工人退出，再应用规格补丁");
     }
     p.status = accept ? "accepted" : "rejected";

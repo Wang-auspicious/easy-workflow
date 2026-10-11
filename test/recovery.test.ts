@@ -150,6 +150,44 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
       assert.equal(factory.candidateFailures({disposition:"retry"}).length,expected);
       assert.equal(factory.state.nodes["candidates/pool"].stock,expected);
     });
+    await t.test("checkpoint retry can return upstream, survive restart and count one logical item",async()=>{
+      let f=factory!;
+      // These executors are in-memory fixtures, not actual browser processes.
+      f.broker.memoryFloorMB=0;
+      const until=async(check:()=>boolean)=>{for(let i=0;i<200&&!check();i++)await delay(10);assert.ok(check(),"runtime must reach the expected checkpoint");};
+      f.runtime.start("checkpoint review recovery");
+      f.runtime.executors=n=>async()=>n.key==="curation/process"
+        ? {ok:false,summary:"missing artifact",error:"identity.png missing"}
+        : {ok:true,summary:"fixture evidence"};
+      const first=f.runtime.create("curation/identity",{item:"checkpoint-item",url:base,source:"candidates/pool",data:{canonical:base,kind:"tool",mode:"shots",needsProof:true}});
+      await until(()=>f.state.tokens[first.id].status==="parked");
+      f.runtime.executors=n=>async()=>{
+        if(n.key==="curation/shot-review"){
+          f.runtime.pause();
+          return {ok:true,summary:"reshoot identity",verdict:{verdict:"return",returnTo:"curation/identity",reason:"fixture review"}};
+        }
+        return {ok:true,summary:"reuse existing evidence"};
+      };
+      const [retry]=f.retryCandidates({items:["checkpoint-item"],count:1});
+      await until(()=>f.runtime.queues.get("curation/identity")!.includes(retry.id));
+      assert.equal(f.state.attempts[f.state.tokens[retry.id].attempts[0]].node,"curation/process");
+      await f.runtime.close();f.journal.close();factory=undefined;
+      factory=new Factory();await factory.boot();f=factory;
+      f.broker.memoryFloorMB=0;
+      const resumed=f.runtime.tokens.get(retry.id)!;
+      assert.ok(resumed.closure.has("curation/identity"));
+      assert.ok(!resumed.done.has("curation/identity"),"return invalidation must survive restart");
+      const executed:string[]=[];
+      f.runtime.executors=n=>async()=>{executed.push(n.key);return {ok:true,summary:"fixture complete",data:n.key==="curation/gate"?{gate:"pass"}:undefined};};
+      f.runtime.resume();await until(()=>f.state.tokens[retry.id].status!=="active");
+      assert.equal(f.state.tokens[retry.id].status,"published");
+      assert.equal(executed[0],"curation/identity");
+      assert.ok(executed.includes("curation/process"));
+      const report=await endRun(f);
+      assert.equal(report?.totals.created,1,"retry is not a second logical item");
+      assert.equal(report?.totals.parked,0,"superseded failure is no longer pending");
+      assert.ok(report?.attempts.some(a=>a.token===first.id&&!a.ok),"original failed work stays in the cost/audit record");
+    });
   } finally {
     if(factory){await factory.runtime.close();factory.journal.close();}
     fixture.closeAllConnections();await new Promise<void>(resolve=>fixture.close(()=>resolve()));

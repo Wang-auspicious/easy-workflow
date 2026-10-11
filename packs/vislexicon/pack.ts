@@ -56,7 +56,7 @@ const curation = line({
     station({
       id: "fetch", num: "②", name: "首页抓取", role: "sort", kind: "program", resource: "http", estimateSeconds: 2.5, input: "Site", output: "HomeFacts",
       tool: "curation.fetch", accept: ["2xx or leaves the line with a reason"],
-      pseudo: "GET canonical (20s) → {status, finalUrl, title, description, navLinks[], textSample}\nHTTP only, no browser",
+      pseudo: "GET canonical (20s) → {status, finalUrl, title, description, navLinks[], textSample}\nrecoverable access failure → one shared browser fallback if quota available; never bypass TLS/auth",
       workers: { min: 1, max: 4, initial: 2, policy: "auto" },
     }),
     station({
