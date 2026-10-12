@@ -9,7 +9,7 @@ import { Type } from "typebox";
 import type { AgentStationDef } from "../../server/agent-station.ts";
 import type { StationContext, StationResult, Fix } from "../../server/runtime.ts";
 import { EvidenceStore, pixelStats } from "../../server/evidence.ts";
-import { readText } from "../../server/network.ts";
+import { readText, readEvidence, evidenceURL } from "../../server/network.ts";
 import { repoSources, type RepoMeta } from "../../server/repo.ts";
 import { FRONTEND, KINDS, KIND_ZH, VOCAB, ruleExcerpt } from "./env.ts";
 import { dossierText, type Dossier } from "./scout.ts";
@@ -35,10 +35,10 @@ const sameSite = (u: string, host: string) => { const h = hostOf(u); return Bool
 /** Every text an agent may quote for this item: dossier, key pages, repo sources and pages it read. */
 function corpus(ctx: StationContext) {
   const d = dossier(ctx);
-  const parts = [d?.title ?? "", d?.description ?? "", d?.text ?? "", ...(d?.pages ?? []).map((p) => `${p.title}\n${p.text}`), d?.files.llms ?? "", ...(d?.repo ? repoSources(d.repo).map((s) => s.text) : []), String(data(ctx).home?.text ?? "")];
+  const parts = [dossierText(d), d?.title ?? "", d?.description ?? "", d?.text ?? "", ...(d?.pages ?? []).map((p) => `${p.title}\n${p.text}`), d?.files.llms ?? "", ...(d?.repo ? repoSources(d.repo).map((s) => s.text) : []), String(data(ctx).home?.text ?? ""), ...readEvidence().map(p => p.text)];
   return norm(parts.join("\n"));
 }
-const quoted = (quote: string, hay: string) => { const q = norm(quote); return q.length >= 3 && hay.includes(q.slice(0, Math.min(80, q.length))); };
+const quoted = (quote: string, hay: string) => { const q = norm(quote); return q.length >= 3 && hay.includes(q); };
 
 /* ------------------------------------------------------------------ ③ reader */
 
@@ -153,7 +153,7 @@ export const arbiter: AgentStationDef<ArbOut> = {
   check: (o, ctx) => {
     if (!o.kind) return [];
     const issues: string[] = [];
-    const hay = corpus(ctx) + norm(readText(o.sourceUrl) ?? "");
+    const hay = corpus(ctx);
     if (!quoted(o.quote, hay)) issues.push("裁定引用不在卷宗或你读过的页面里；引用原文并给出 sourceUrl，或者提交空 kind 交人");
     return issues;
   },
@@ -387,9 +387,9 @@ export const facts: AgentStationDef<FactsOut> = {
       if (!v) { issues.push(`${f}: 缺少`); continue; }
       if (v.value === "unknown" || !v.value) continue;
       if (!isHttp(v.sourceUrl)) { issues.push(`${f}: sourceUrl 不是完整网址`); continue; }
-      const text = pages.find((p) => p.url.replace(/\/+$/, "") === v.sourceUrl.replace(/\/+$/, ""))?.text ?? readText(v.sourceUrl);
-      if (!text) issues.push(`${f}: ${v.sourceUrl} 不在资料里，也没有被你用工具读过`);
-      else if (!quoted(v.quote, norm(text))) issues.push(`${f}: quote 不是 ${v.sourceUrl} 原文里的连续文字`);
+      const sources = [...pages, ...readEvidence(v.sourceUrl)].filter(p => evidenceURL(p.url) === evidenceURL(v.sourceUrl));
+      if (!sources.length) issues.push(`${f}: ${v.sourceUrl} 不在资料里，也没有被你用工具读过`);
+      else if (!sources.some(p => quoted(v.quote, norm(p.text)))) issues.push(`${f}: quote 不是 ${v.sourceUrl} 原文里的连续文字`);
     }
     if (out.pricing && !["free", "freemium", "paid", "unknown"].includes(out.pricing.value)) issues.push("pricing: value 只能是 free / freemium / paid / unknown");
     if (out.sourceCode && !["open", "closed", "unknown"].includes(out.sourceCode.value)) issues.push("sourceCode: value 只能是 open / closed / unknown");
@@ -406,7 +406,9 @@ export const facts: AgentStationDef<FactsOut> = {
   after: (out, ctx) => {
     const facts = Object.fromEntries(FACT_FIELDS.map((f) => [f, out[f]]));
     const pages = factCache.get(ctx.token) ?? [];
-    const read = FACT_FIELDS.map((f) => out[f]?.sourceUrl).filter((u) => u && !pages.some((p) => p.url === u)).map((u) => ({ url: u, text: (readText(u) ?? "").slice(0, 3500) })).filter((p) => p.text);
+    // Preserve the actual cited evidence for downstream review, even when it
+    // came from beyond the prefetched excerpt or a second read of the same URL.
+    const read = readEvidence().filter(p => FACT_FIELDS.some(f => evidenceURL(out[f]?.sourceUrl ?? "") === evidenceURL(p.url) && quoted(out[f]?.quote ?? "", norm(p.text))));
     ctx.addEvidence({ id: `fa-${ctx.attempt}`, kind: "verdict", label: "事实", verdict: `${out.pricing?.value} · ${out.license?.value}`, tone: FACT_FIELDS.some((f) => out[f]?.value !== "unknown") ? "ok" : "warn", meta: { ...facts, pricingNote: out.pricingNote, conflicts: out.conflicts } });
     return {
       ok: true, summary: `作者 ${out.author?.value} · 许可 ${out.license?.value} · 价格 ${out.pricing?.value} · 商用 ${out.commercial?.value}${out.reply ? `；${out.reply}` : ""}`,

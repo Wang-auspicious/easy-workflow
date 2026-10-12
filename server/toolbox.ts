@@ -149,6 +149,10 @@ ${data.text}`);
               }
               return out;
             }, a.query);
+            for (const hit of hits) {
+              rememberRead(a.url, hit.snippet);
+              rememberRead(page.url(), hit.snippet);
+            }
             return { url: a.url, finalUrl: page.url(), query: a.query, hits };
           } finally { try { await close?.(); } finally { lease.release(); } }
         },
@@ -168,6 +172,7 @@ ${data.text}`);
           const get = async (p: string, max: number) => { try { const r = await webGet(origin + p, { signal: c.signal, timeout: 12000 }); return r.status < 400 && !/<html/i.test(r.body.slice(0, 300)) ? r.body.slice(0, max) : null; } catch { return null; } };
           c.progress?.(`读取 ${origin} 的 llms / sitemap / robots`, { tool: "site_files", text: origin });
           const [llms, llmsFull, robots, sitemap] = await Promise.all([get("/llms.txt", 6000), get("/llms-full.txt", 15000), get("/robots.txt", 3000), get("/sitemap.xml", 400000)]);
+          for (const [file, text] of [['llms.txt', llms], ['llms-full.txt', llmsFull], ['robots.txt', robots]]) if (text) rememberRead(`${origin}/${file}`, text);
           let paths: string[] = [];
           const locs = (xml: string) => [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1]);
           if (sitemap) {

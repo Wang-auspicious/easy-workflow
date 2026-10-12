@@ -14,8 +14,58 @@ export class BatchSupervisor {
   constructor(factory: Factory) {
     this.factory = factory;
     factory.journal.subscribe(event => {
+      const circuit = factory.state.batch?.modelCircuit;
+      if (event.kind === 'attempt.finished' && event.ok && circuit?.state === 'trial') {
+        const attempt = factory.state.attempts[event.attempt];
+        if (attempt?.token === circuit.trialToken && attempt.node === circuit.station) this.modelRecovered();
+      }
+      if (event.kind === 'token.finished' && event.token === circuit?.trialToken && circuit.state === 'trial') {
+        // A transport-healthy answer may still fail a content check. Keep that
+        // item's failure; do not leave the entire provider locked to a dead token.
+        const token = factory.state.tokens[event.token];
+        if ((token?.data.failure as { tag?: string })?.tag !== 'model_transport') {
+          const attempt = token?.attempts.map(id=>factory.state.attempts[id]).reverse().find(a=>a?.node===circuit.station && !a.cancelled);
+          if (attempt?.metrics?.usageReported && (attempt.metrics.time?.modelCalls ?? 0) > 0) this.modelRecovered('真实工位已收到模型回答；该任务的业务检查仍未通过，保留单独的失败原因');
+          else { factory.broker.modelHold = '恢复验证尚未完成；等待另一个真实模型工位'; this.modelFailed(); }
+        }
+      }
       if (['batch.configured', 'run.resumed', 'token.finished', 'token.queued', 'candidate.disposition', 'alert.cleared'].includes(event.kind)) this.schedule();
     });
+  }
+
+  modelFailed() {
+    const f = this.factory, goal = f.state.batch;
+    if (!goal || goal.runId !== f.state.run.id) return;
+    const old = goal.modelCircuit;
+    // Several workers may finish their failing requests together. That is ONE
+    // dependency incident, not several more recovery attempts.
+    if (old?.state === 'open') return;
+    const failures = (old?.failures ?? 0) + 1;
+    f.broker.recoveryToken = null;
+    f.journal.append({ kind: 'batch.configured', batch: { ...goal, modelCircuit: {
+      state: 'open', failures, nextAt: failures <= 3 ? Date.now() + 30000 * 2 ** (failures - 1) : 0,
+    } } });
+  }
+
+  /** A tiny connectivity probe can permit a trial, never reopen bulk intake. */
+  permitModelTrial() {
+    const f = this.factory, goal = f.state.batch;
+    if (!goal?.modelCircuit || goal.runId !== f.state.run.id || !f.runtime.running) return false;
+    f.journal.append({ kind: 'batch.configured', batch: { ...goal, modelCircuit: {
+      ...goal.modelCircuit, state: 'open', failures: 0, nextAt: Date.now(), trialToken: undefined,
+    } } });
+    this.schedule();
+    return true;
+  }
+
+  private modelRecovered(reason = '真实工位已完成模型任务与提交校验，恢复已有检查点') {
+    const f = this.factory, goal = f.state.batch;
+    if (!goal?.modelCircuit) return;
+    f.journal.append({ kind: 'batch.configured', batch: { ...goal, modelCircuit: undefined } });
+    f.broker.recoveryToken = null;
+    f.clearAlert('model-transport', reason);
+    f.runtime.schedule();
+    this.schedule();
   }
 
   configure(options: { target: number; maxInFlight?: number; intakeWindow?: number; category?: string; query?: string }) {
@@ -27,6 +77,7 @@ export class BatchSupervisor {
     if (!f.runtime.running) f.runtime.start(`候选 × ${options.target}`);
     const goal: BatchGoal = { runId: f.state.run.id, target: options.target, maxInFlight: options.maxInFlight ?? 12,
       intakeWindow: options.intakeWindow ?? 6, maxRecoveries: 2, mode: 'running', startedAt: f.state.batch?.runId === f.state.run.id ? f.state.batch.startedAt : Date.now(),
+      modelCircuit: f.state.batch?.runId === f.state.run.id ? f.state.batch.modelCircuit : undefined,
       category: options.category, query: options.query };
     f.journal.append({ kind: 'batch.configured', batch: goal });
     f.runtime.resume();
@@ -62,14 +113,37 @@ export class BatchSupervisor {
       // with early reading attempts while downstream review stations sit idle.
       const recoveryOrder = [...items].sort((a, b) =>
         f.compiled.nodes.findIndex(node => node.key === b.finishedAtNode) - f.compiled.nodes.findIndex(node => node.key === a.finishedAtNode));
+      if (goal.modelCircuit) {
+        const circuit = goal.modelCircuit;
+        if (circuit.state === 'trial' || !circuit.nextAt || now < circuit.nextAt || f.broker.used.model > 0) return;
+        if (Object.values(f.state.alerts).some(a => a.kind === 'model' && a.id !== 'model-transport')) return;
+        const candidate = recoveryOrder.find(t => t.status === 'parked' && f.state.recoveries[t.item]?.failure?.tag === 'model_transport');
+        if (!candidate) return;
+        // Hold all newly scheduled tasks until retryCandidates returns the new
+        // token ID. Existing requests drain naturally and keep their results.
+        f.broker.recoveryToken = 'pending-model-trial';
+        f.broker.modelHold = null;
+        try {
+          const [trial] = f.retryCandidates({ items: [candidate.item], count: 1, automatic: true });
+          if (!trial) { f.broker.recoveryToken = null; f.broker.modelHold = '模型恢复样本尚未就绪'; return; }
+          f.broker.recoveryToken = trial.id;
+          f.journal.append({ kind: 'batch.configured', batch: { ...goal, modelCircuit: { ...circuit, state: 'trial', trialToken: trial.id, station: candidate.finishedAtNode } } });
+          f.runtime.schedule();
+        } catch (error) { f.broker.recoveryToken = null; f.broker.modelHold = '模型恢复样本尚未就绪'; throw error; }
+        return;
+      }
       for (const token of recoveryOrder) {
         if (token.status !== 'parked') continue;
         const candidate = f.state.recoveries[token.item];
         if (!candidate || candidate.disposition !== 'retry' || candidate.token !== token.id) continue;
         const failure = candidate.failure;
         if (!failure) continue;
+        if (failure.tag === 'model_transport') {
+          if (active < goal.maxInFlight && !f.broker.modelHold) active += f.retryCandidates({ items: [token.item], count: 1, automatic: true }).length;
+          continue;
+        }
         const replan = REPLAN.has(failure.tag);
-        if (!replan && !TRANSIENT.has(failure.tag)) continue;
+        if (!replan && !TRANSIENT.has(failure.tag) && failure.code !== 'RESTORED_FRONTIER_MISSING') continue;
         // Login/TLS/credentials and deterministic tool bugs never enter blind retries.
         const previous = token.data.batchRecovery as BatchRecovery | undefined;
         if (previous?.count && !previous.nextAt && previous.count >= goal.maxRecoveries) continue;
@@ -91,7 +165,7 @@ export class BatchSupervisor {
       active = latest.filter(t => t.status === 'active').length;
       const upstream = latest.filter(t => t.status === 'active' && !f.runtime.tokens.get(t.id)?.done.has('curation/plan')).length;
       const want = Math.max(0, Math.min(goal.target - latest.length, goal.maxInFlight - active, goal.intakeWindow - upstream));
-      if (want && !f.broker.modelHold) {
+      if (want && !f.broker.modelHold && !f.broker.blocked('browser')) {
         const got = f.pull(want, { category: goal.category, query: goal.query });
         if ((got.length < want) !== Boolean(goal.supplyExhausted)) f.journal.append({ kind: 'batch.configured', batch: { ...goal, supplyExhausted: got.length < want } });
       }

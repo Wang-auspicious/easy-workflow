@@ -3,6 +3,7 @@
 // spec; the balancer measures service times and forks or retires same-duty workers.
 // Everything that changes state is journaled first.
 import crypto from "node:crypto";
+import { withModelAdmission } from './model-requests.ts';
 import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
 import { median } from "../shared/project.ts";
 import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
@@ -288,6 +289,24 @@ export class Runtime {
     }
   }
 
+  /** A failed sibling cancels all in-flight work for its item. Reconstruct the
+   * WHOLE unfinished frontier, not only the station that reported the failure. */
+  resumeFrontier(t: TokenRun, from: string) {
+    if (t.finished) return;
+    for (const key of t.closure) {
+      const ins = (this.inFlow.get(key) ?? []).filter(e => t.closure.has(e.from));
+      if (ins.length) this.evaluate(t, key, from);
+    }
+  }
+
+  readyFrontier(t: TokenRun) {
+    return [...t.closure].filter(key => {
+      if (t.done.has(key) || t.dead.has(key)) return false;
+      const ins=(this.inFlow.get(key)??[]).filter(e=>t.closure.has(e.from));
+      return ins.length>0 && ins.every(e=>t.edgeLive.has(e.key)) && ins.some(e=>t.edgeLive.get(e.key));
+    });
+  }
+
   create(entry: string, item: { item: string; url: string; title?: string; source: string; category?: string; data?: Record<string, unknown> }): TokenRun {
     const t: TokenRun = {
       id: `t-${short()}`, item: item.item, url: item.url, title: item.title, source: item.source, entry,
@@ -360,10 +379,15 @@ export class Runtime {
       for (const w of this.workers.get(key)!) {
         if (!q.length) break;
         if (w.busy) continue;
+        const index = this.broker.recoveryToken ? q.indexOf(this.broker.recoveryToken) : 0;
+        if (index < 0) { waiting[key] = "模型恢复验证中，其他任务保留检查点等待"; continue; }
+        const queuedToken = this.tokens.get(q[index]);
+        const capacityWait = queuedToken?.data.capacityWait as Record<string, number> | undefined;
+        if ((capacityWait?.[key] ?? 0) > Date.now()) { waiting[key] = '等待共享浏览器释放容量；网站未记为失败'; continue; }
         const why = this.broker.blocked(n.resource, { review: n.kind === "review" });
         if (why) { waiting[key] = why; break; }
         const lease = this.broker.tryAcquire(n.resource, { review: n.kind === "review" })!;
-        const tid = q.shift()!;
+        const [tid] = q.splice(index, 1);
         const t = this.tokens.get(tid);
         if (!t || t.finished) { lease.release(); continue; }
         const job = this.run(w, t, n, lease);
@@ -399,7 +423,7 @@ export class Runtime {
       if (!exec) throw new Error(`工位 ${n.key} 没有执行器`);
       const role=readRole(n.key);
       this.journal.append({kind:"attempt.progress",attempt,text:`按 ${n.name} 的 ROLE.md 执行`,step:{tool:"role",text:`${role.path} @ ${role.revision}`}});
-      res = await withBrowserAttempt(browserScope, () => exec({
+      res = await withModelAdmission(() => this.broker.modelHold || (this.broker.recoveryToken && this.broker.recoveryToken !== t.id ? '正在用一个工位验证模型恢复' : null), () => withBrowserAttempt(browserScope, () => exec({
         token: t, node: n, attempt, worker: w, signal: ctrl.signal, redo: t.notes.get(n.key),
         progress: (text, step) => {
           if (!ctrl.signal.aborted && (t.nodeEpochs?.get(n.key)??0) === epoch && !t.finished) this.journal.append({ kind: "attempt.progress", attempt, text, step });
@@ -412,7 +436,7 @@ export class Runtime {
           this.journal.append({ kind: "evidence.added", evidence: full });
           return full;
         },
-      }));
+      })));
     } catch (err) {
       const failure=(err as {failure?:Failure})?.failure ?? classifyFailure(err,{url:t.url});
       const observed = err as { usage?: Usage; metrics?: AttemptMetrics };
@@ -424,6 +448,16 @@ export class Runtime {
       w.busy = null; w.idleSince = Date.now();
     }
     const ms = Date.now() - t0;
+    if (res.failure?.code === 'BROWSER_CAPACITY_TIMEOUT' && !ctrl.signal.aborted && !t.finished && this.running && !this.ending && (t.nodeEpochs?.get(n.key) ?? 0) === epoch) {
+      this.journal.append({kind:'attempt.finished',attempt,ok:false,cancelled:true,summary:'共享浏览器容量不足，保留本工位排队；网站未记为失败',ms,queuedMs,error:'resource_wait'});
+      t.inflight.delete(n.key);
+      const capacityWait = {...(t.data.capacityWait as Record<string,number> ?? {}),[n.key]:Date.now()+5000};
+      t.data.capacityWait=capacityWait;
+      this.journal.append({kind:'token.data',token:t.id,patch:{capacityWait}});
+      this.enqueue(t,n.key,n.key,true);
+      setTimeout(()=>{if(this.running&&!this.ending)this.schedule();},5000).unref();
+      return;
+    }
     if (browserScope.fault && this.running && !this.ending && !t.finished && (t.nodeEpochs?.get(n.key) ?? 0) === epoch) {
       this.recoverBrowserAttempt(t, n, attempt, browserScope.fault, res, ms, queuedMs);
       this.schedule();
@@ -447,7 +481,7 @@ export class Runtime {
     if (!res.ok) {
       this.closeConsult(t, "manual", res.error ?? res.summary);
       const failure=candidateFailure(res.failure ?? classifyFailure(res.error??res.summary,{url:t.url,stage:n.kind==="agent"||n.kind==="review"?"model":undefined}),String(t.data.canonical??t.url));
-      if(failure.owner==="user")this.onAlert?.(t,n,failure);
+      if(failure.owner==="user"||failure.tag==="model_transport")this.onAlert?.(t,n,failure);
       t.finished=true;t.data.failure=failure;
       for(const [id,controller] of this.aborts)if(this.attemptTokens.get(id)===t.id)controller.abort();
       for(const q of this.queues.values()){const i=q.indexOf(t.id);if(i>=0)q.splice(i,1);}
@@ -544,6 +578,9 @@ export class Runtime {
     if (t.finished || t.inflight.size) return;
     for (const q of this.queues.values()) if (q.includes(t.id)) return;
     const n = this.nodes.get([...t.done].pop() ?? t.entry)!;
+    this.resumeFrontier(t, n.key);
+    if (t.finished) return;
+    for (const q of this.queues.values()) if (q.includes(t.id)) return;
     this.toManual(t, n, "没有可走的下一步（分支条件都不成立）");
   }
 

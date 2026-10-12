@@ -13,7 +13,7 @@ import type { Docs } from "../server/docs.ts";
 import type { Toolbox } from "../server/toolbox.ts";
 import type { StationContext } from "../server/runtime.ts";
 
-test("station clocks: real Pi requests and tools may outlive the old whole-loop timeout", { timeout: 20000 }, async t => {
+test("station clocks: real Pi requests and tools may outlive the old whole-loop timeout", { timeout: 30000 }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easy-workflow-station-clocks-"));
   const saved = Object.fromEntries(["PI_CODING_AGENT_DIR", "FACTORY_MODEL", "FACTORY_PROVIDER", "FACTORY_STATION_COMMAND", "FACTORY_STATION_MODEL"].map(k => [k, process.env[k]]));
   process.env.PI_CODING_AGENT_DIR = dir;
@@ -25,7 +25,7 @@ test("station clocks: real Pi requests and tools may outlive the old whole-loop 
     const name = JSON.stringify(body).match(/clock-case:([a-z-]+)/)?.[1];
     const current = name ? scenarios.get(name) : undefined;
     const index = current ? current.requests.push(body) : 0;
-    if (current?.hold === index) return;
+    if (current?.hold === index || (name === 'tool-persist' && [2,3].includes(index))) return;
     res.writeHead(200, { "content-type": "text/event-stream" }); res.flushHeaders();
     if (current?.socket === index) { res.write(`data: ${JSON.stringify({ id: "clock", choices: [{ index: 0, delta: { role: "assistant", content: "partial before connection failure" }, finish_reason: null }] })}\n\n`); setTimeout(() => res.destroy(), 25); return; }
     if (current) await delay(400);
@@ -53,10 +53,10 @@ test("station clocks: real Pi requests and tools may outlive the old whole-loop 
     },
   } as unknown as Toolbox;
   configureAgentStations({ docs: () => docs, toolbox: () => toolbox });
-  const run = (name: string, signal = new AbortController().signal, extra = {}) => {
+  const run = (name: string, signal = new AbortController().signal, extra = {}, tokenData = {}) => {
     active = name;
     const current = scenarios.get(name)!;
-    const ctx = { node: { key: "curation/copy-review" }, token: { id: `t-${name}`, item: name }, worker: { id: `w-${name}` }, attempt: `a-${name}`, signal, progress: (message: string) => current.progress.push(message) } as unknown as StationContext;
+    const ctx = { node: { key: "curation/copy-review" }, token: { id: `t-${name}`, item: name, data:tokenData }, worker: { id: `w-${name}` }, attempt: `a-${name}`, signal, progress: (message: string) => current.progress.push(message) } as unknown as StationContext;
     return runAgentStation<{ value: number }>({ system: "Read the local fixture and submit.", schema: Type.Object({ value: Type.Number() }),
       input: () => ({ text: `clock-case:${name}` }), after: value => ({ ok: true, summary: "submitted", data: value }), ...extra }, ctx);
   };
@@ -86,6 +86,18 @@ test("station clocks: real Pi requests and tools may outlive the old whole-loop 
       assert.equal(continuation.at(-1).role, "tool"); assert.ok(JSON.stringify(continuation).includes("observed-1"));
       assert.equal(continuation.filter((m: any) => m.role === "user").length, 1);
       assert.ok(current.progress.some(p => p.includes("保留已完成的工具结果")));
+    });
+    await t.test('provider recovery resumes the saved tool receipt across station attempts', async () => {
+      const current={requests:[] as any[],tools:0,progress:[] as string[]}; scenarios.set('tool-persist',current);
+      const failed=await run('tool-persist');
+      assert.equal(failed.ok,false); assert.equal(failed.failure?.tag,'model_transport');
+      assert.ok(failed.data?.stationSessions);
+      assert.equal(current.tools,1);
+      const recovered=await run('tool-persist',new AbortController().signal,{},failed.data);
+      assert.equal(recovered.ok,true,recovered.error ?? 'checkpoint recovery failed');
+      assert.equal(current.tools,1,'a provider disconnect must not repeat a completed page read');
+      assert.match(JSON.stringify(current.requests.at(-1)),/long-tool-completed/);
+      assert.deepEqual(recovered.data?.stationSessions,{});
     });
     await t.test("an explicit work deadline stays absolute and is never extended for recovery", async () => {
       const current = { requests: [] as any[], tools: 0, progress: [] as string[], hold: 1 }; scenarios.set("work-limit", current);

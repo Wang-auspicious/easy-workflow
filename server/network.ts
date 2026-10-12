@@ -3,6 +3,7 @@
 // project-local cache of successful GETs. Certificates are always verified.
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import { Agent as DirectAgent, EnvHttpProxyAgent, fetch as proxyFetch } from "undici";
 import { isTlsFailure } from "../shared/failures.ts";
@@ -88,8 +89,16 @@ export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?
 /* Pages an agent actually read during recent work, so checks can verify quotes against
  * what was read through the toolbox, not only against pre-fetched excerpts. */
 const reads = new Map<string, string>();
+// Validation must use this attempt's evidence, not another worker's last read of
+// the same URL. Keep all versions: a short follow-up must not erase a full page.
+const evidenceReads = new AsyncLocalStorage<{ url: string; text: string }[]>();
+export const evidenceURL = (url: string) => url.replace(/[#].*$/, "").replace(/\/+$/, "");
+export const withEvidenceReads = <T>(run: () => Promise<T>) => evidenceReads.run([], run);
+export const readEvidence = (url?: string) => (evidenceReads.getStore() ?? []).filter(p => !url || evidenceURL(p.url) === evidenceURL(url));
 export function rememberRead(url: string, text: string) {
-  const key = url.replace(/[#].*$/, "").replace(/\/+$/, "");
+  const key = evidenceURL(url);
+  const local = evidenceReads.getStore();
+  if (local && !local.some(p => evidenceURL(p.url) === key && p.text === text)) local.push({ url, text });
   reads.delete(key); reads.set(key, text.slice(0, 60000));
   while (reads.size > 400) reads.delete(reads.keys().next().value!);
 }

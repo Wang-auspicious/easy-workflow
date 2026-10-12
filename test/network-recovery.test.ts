@@ -21,9 +21,9 @@ test('actual certificate and SSL protocol failures stay blocked', () => {
   }
 });
 
-test('a model SDK connection error remains a system-owned recoverable network failure', () => {
+test('a model SDK connection error stays recoverable without being mislabeled as a website failure', () => {
   const failure = classifyFailure(new Error('Connection error.（已自动重试一次）'), { stage: 'model' });
-  assert.equal(failure.tag, 'network_connection');
+  assert.equal(failure.tag, 'model_transport');
   assert.equal(failure.owner, 'system');
   assert.equal(failure.retryable, true);
   assert.equal(classifyFailure(new Error('Unknown submit property'), { stage: 'model' }).tag, 'tool_error');

@@ -48,6 +48,14 @@ test('shared browser holds actual access walls and releases recoverable system f
   const { pageVerdict, visit } = await import('../packs/vislexicon/capture.ts');
   const { BrowserManager, noteBrowserResponse } = createRequire(import.meta.url)('../app/browser-manager.cjs');
   try {
+    await t.test('background popups do not leave untracked pages behind', async () => {
+      const lease = await openPage(); await lease.page.goto(base);
+      assert.equal(await lease.page.evaluate(() => window.open('/login') === null), true);
+      assert.equal(lease.context.pages().length, 1);
+      await lease.close();
+      assert.equal(lease.context.pages().length, 0);
+      assert.equal((await browserCommand({action:'state'})).tabs.length, 0);
+    });
     await t.test('optional anonymous session checks cannot hold a public site hostage', async () => {
       const lease = await openPage(); await lease.page.goto(base);
       await lease.page.waitForFunction(() => (window as any).sessionChecked);

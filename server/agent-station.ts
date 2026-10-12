@@ -12,10 +12,13 @@ import type { AttemptMetrics, Usage } from "../shared/types.ts";
 import type { Docs } from "./docs.ts";
 import { BASE_TOOLS, type Toolbox } from "./toolbox.ts";
 import type { StationContext, StationResult } from "./runtime.ts";
-import { models } from "./pi.ts";
+import { models, MODEL_REQUEST_DEADLINE, redactModelError } from "./pi.ts";
 import { readRole } from "./roles.ts";
 import { ClosedStationAgent, closedAgentConfig } from "./mcp-station.ts";
 import { StationActivity } from "./activity.ts";
+import { withEvidenceReads, readEvidence, rememberRead } from "./network.ts";
+import { classifyFailure } from "../shared/failures.ts";
+import { loadStationSession, saveStationSession, sessionSignature, type SessionRef } from './station-session.ts';
 export { models, MODEL_ID, apiKeyPresent } from "./pi.ts";
 
 export async function promptAgent(agent: Pick<Agent, "prompt" | "abort"> | ClosedStationAgent, text: string, images?: { type: "image"; data: string; mimeType: string }[], signal?: AbortSignal, timeoutMs = 120_000) {
@@ -92,6 +95,10 @@ function throwStationAbort(signal: AbortSignal, partial: StationResult): never {
 
 /** Recover a Pi model turn in its existing transcript; completed tools are never replayed. */
 export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationContext): Promise<StationResult> {
+  return withEvidenceReads(() => executeAgentStation(def, ctx));
+}
+
+async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationContext): Promise<StationResult> {
   ctx.signal.throwIfAborted();
   const skipped = def.skip?.(ctx);
   if (skipped) return skipped;
@@ -112,18 +119,10 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
   const boundRequest = (stream: StreamFn): StreamFn => async (model, context, options) => {
     sessionSignal.throwIfAborted();
     requestTimedOut = false;
-    const timeout = AbortSignal.timeout(requestTimeoutMs);
-    const markTimeout = () => { requestTimedOut = true; };
-    timeout.addEventListener("abort", markTimeout, { once: true });
-    const cleanup = () => timeout.removeEventListener("abort", markTimeout);
-    const signal = AbortSignal.any([sessionSignal, timeout, ...(options?.signal ? [options.signal] : [])]);
-    try {
-      const response = await stream(model, context, { ...options, signal });
-      // Remove the observer when this request finishes. An old request timer
-      // firing during a long tool must not be mistaken for a new model failure.
-      void response.result().then(cleanup, cleanup);
-      return response;
-    } catch (error) { cleanup(); throw error; }
+    const signal = AbortSignal.any([sessionSignal, ...(options?.signal ? [options.signal] : [])]);
+    // The request clock starts after the global request queue grants capacity.
+    const bounded = { ...options, signal, [MODEL_REQUEST_DEADLINE]: { ms: requestTimeoutMs, expired: () => { requestTimedOut = true; } } };
+    return stream(model, context, bounded);
   };
   const external = closedAgentConfig(path.join(docs?.dir ?? process.env.FACTORY_VAR ?? process.cwd(), "work", ctx.token.id.replace(/[^a-zA-Z0-9_-]/g, "_")));
   const selection = external ? null : models();
@@ -154,8 +153,9 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
         const r = await toolbox.call(allowed, p.name, p.arguments ?? {}, { node: ctx.node.key, token: ctx.token.id, caseId, signal: signal ? AbortSignal.any([ctx.signal, signal]) : ctx.signal, progress: ctx.progress });
         const ok = (r as { ok?: boolean }).ok !== false;
         ctx.progress(`${p.name}${ok ? " ✓" : `：${String((r as { failure?: { message?: string } }).failure?.message ?? "失败").slice(0, 80)}`}`, { tool: p.name, text: JSON.stringify(p.arguments ?? {}).slice(0, 160), ok });
-        let text = JSON.stringify(r);
-        if (text.length > 24000) text = `${text.slice(0, 24000)}…（已截断）`;
+        // Tools already bound page text and collections. Cutting the serialized
+        // object corrupts JSON and can silently remove the evidence being cited.
+        const text = JSON.stringify(r);
         toolResultChars += text.length;
         return { content: [{ type: "text", text }], details: { ok } };
       },
@@ -215,6 +215,16 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
   const images = (input.images ?? []).filter((i) => fs.existsSync(i.file)).map((i) => ({ type: "image" as const, data: jpeg(i.file).toString("base64"), mimeType: "image/jpeg" }));
   ctx.progress(`读取身份、案卷与输入${images.length ? `：${images.length} 张图 + 文字` : ""}；调用 ${external ? "闭源 Agent / " : ""}${modelId}`, { tool: "model", text: input.text.slice(0, 160) });
   const redo = ctx.redo ? `\n\nTHIS IS A REDO. ${ctx.redo.byHuman ? "The human owner corrected" : "A reviewer sent back"} this work: ${ctx.redo.reason}${ctx.redo.note ? ` (${ctx.redo.note})` : ""}. Change only what is named; keep everything else as it was, and say in your submission what you changed.` : "";
+  const sessionRoot = docs?.dir;
+  const sessions = (ctx.token.data?.stationSessions ?? {}) as Record<string, SessionRef>;
+  const signature = sessionSignature({ node: ctx.node.key, model: modelId, role: readRole(ctx.node.key).revision, contract: def.system, schema: def.schema, input: input.text + redo, images: input.images });
+  const saved = sessionRoot && agent instanceof Agent ? loadStationSession(sessionRoot, sessions[ctx.node.key], signature) : undefined;
+  if (saved && agent instanceof Agent) {
+    agent.state.messages = saved.messages as typeof agent.state.messages;
+    envCalls = saved.calls;
+    for (const evidence of saved.evidence) rememberRead(evidence.url, evidence.text);
+    ctx.progress('恢复本工位已经完成的工具读取与对话，从中断的模型请求继续', {tool:'recover',text:'不重复打开页面或重做已完成的工具调用'});
+  }
   const metrics = (): AttemptMetrics => ({
     usageReported, modelTimeReported: modelTimeReported && (!external || externalReplies === promptCalls), execution: { adapter: external ? "closed-command" : "pi", model: external && !externalReplies ? "unreported" : modelId },
     usageComplete: usageReported && !usageMissing && usageResponses === (external ? promptCalls : activity.count("model_request")),
@@ -230,7 +240,20 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
       toolMs: activity.duration("tool"), programMs: 0, modelCalls: external ? modelCalls : activity.count("model_request"), toolCalls: activity.count("tool") },
   });
   let continued = false;
-  const modelError = () => requestTimedOut ? `模型单次请求超时（${requestTimeoutMs}ms）${continued ? "；本工位的原地续答次数已用完" : ""}` : agent.state.errorMessage;
+  const modelError = () => requestTimedOut ? `模型单次请求超时（${requestTimeoutMs}ms）${continued ? "；本工位的原地续答次数已用完" : ""}` : agent.state.errorMessage && redactModelError(agent.state.errorMessage);
+  const modelFailure = (error: string, summary: string): StationResult => {
+    let data: Record<string, unknown> | undefined;
+    if (sessionRoot && agent instanceof Agent) {
+      const messages = [...agent.state.messages];
+      const last = messages.at(-1);
+      if (last?.role === 'assistant' && ['error','aborted'].includes(last.stopReason)) messages.pop();
+      if (['user','toolResult'].includes(messages.at(-1)?.role ?? '')) {
+        const ref = saveStationSession(sessionRoot, signature, {messages,evidence:readEvidence(),calls:envCalls});
+        data = {stationSessions:{...sessions,[ctx.node.key]:ref}};
+      }
+    }
+    return {ok:false,summary,error:error.slice(0,240),failure:classifyFailure(error,{stage:'model'}),data,usage:usageReported?usage:undefined,metrics:metrics()};
+  };
   const invoke = async (run: () => Promise<void>) => {
     sessionSignal.throwIfAborted();
     const abort = () => agent.abort();
@@ -254,13 +277,14 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
     await invoke(() => agent.continue());
   };
   try {
-  await ask(input.text + redo, images.length ? images : undefined);
+  if (saved && agent instanceof Agent) await invoke(() => agent.continue());
+  else await ask(input.text + redo, images.length ? images : undefined);
   if (!submitted && !modelError()) {
     ctx.progress("模型没有调用 submit，提醒一次", { tool: "repair", text: "" });
     await ask("You did not call submit. Call submit now with your answer.");
   }
   const error = modelError();
-  if (error && !submitted) return { ok: false, summary: "模型调用失败", error: error.slice(0, 240), usage: usageReported ? usage : undefined, metrics: metrics() };
+  if (error && !submitted) return modelFailure(error, "模型调用失败");
   if (!submitted) return { ok: false, summary: "模型没有提交结果", error: "no submit", usage: usageReported ? usage : undefined, metrics: metrics() };
   let out = submitted as T;
   if (def.describe) ctx.progress(def.describe(out), { tool: "submit", text: "", ok: true });
@@ -271,7 +295,7 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
     submitted = null;
     await ask(`Your submission failed these program checks:\n- ${issues.join("\n- ")}\nFix them and call submit again.`);
     const repairError = modelError();
-    if (repairError && !submitted) return { ok: false, summary: "模型重答失败", error: repairError.slice(0, 240), usage: usageReported ? usage : undefined, metrics: metrics() };
+    if (repairError && !submitted) return modelFailure(repairError, "模型重答失败");
     rounds = 2;
     if (submitted) {
       out = submitted as T;
@@ -288,7 +312,8 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
   sessionSignal.throwIfAborted();
   const res = await def.after(out, { ...ctx, signal: sessionSignal }, { rounds, issues });
   sessionSignal.throwIfAborted();
-  return { ...res, usage: usageReported ? usage : undefined, metrics: metrics() };
+  const remainingSessions = {...sessions}; delete remainingSessions[ctx.node.key];
+  return { ...res, data: {...res.data,...(sessions[ctx.node.key] ? {stationSessions:remainingSessions} : {})}, usage: usageReported ? usage : undefined, metrics: metrics() };
   } catch (err) {
     activity.close(ctx.signal.aborted || ["AbortError", "TimeoutError"].includes((err as Error)?.name) ? "cancelled" : "failed");
     if (ctx.signal.aborted) throwStationAbort(ctx.signal, { ok: false, summary: "模型调用已取消", usage: usageReported ? usage : undefined, metrics: metrics() });

@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CompiledFactory, CompiledNode, Stamped } from "../shared/types.ts";
-import { apply, initialState, type FactoryState } from "../shared/project.ts";
+import { apply, initialState, latestRunTokens, type FactoryState } from "../shared/project.ts";
 import { compile, type Patch } from "./spec/compile.ts";
 import { Journal } from "./journal.ts";
 import { Broker } from "./broker.ts";
@@ -112,6 +112,11 @@ export class Factory {
       if(failure.tag!=="tool_error")this.journal.append({kind:"candidate.disposition",candidate:{...c,failure}});
     }
     this.reconcileFailureAlerts();
+    if (this.state.batch?.modelCircuit) {
+      const batch = this.state.batch;
+      this.journal.append({ kind: 'batch.configured', batch: { ...batch, modelCircuit: { ...batch.modelCircuit!, state: 'open', trialToken: undefined, nextAt: batch.modelCircuit!.nextAt ? Date.now() + 30000 : 0 } } });
+    }
+    this.broker.modelHold = Object.values(this.state.alerts).find(a => a.kind === 'model')?.message ?? null;
     this.restore();
     this.runtime.tick();
     this.batch.schedule();
@@ -190,6 +195,7 @@ export class Factory {
   }
 
   raiseAlert(alert: Alert) {
+    if (alert.kind === "model") this.broker.modelHold = alert.message;
     if (this.state.alerts?.[alert.id]) return;
     this.journal.append({ kind: "alert.raised", alert });
     if (alert.kind === "model") this.broker.modelHold = alert.message;
@@ -208,12 +214,21 @@ export class Factory {
   reconcileFailureAlerts() {
     for (const candidate of Object.values(this.state.recoveries)) {
       const old = candidate.failure;
-      if (!old || !['auth_required', 'network_connection'].includes(old.tag)) continue;
-      const classified = classifyFailure(old.message, { url: old.url ?? candidate.url, status: old.status });
+      if (!old || !['auth_required', 'network_connection', 'network_timeout', 'tool_error'].includes(old.tag)) continue;
+      const token = this.state.tokens[candidate.token];
+      const attempt = token?.attempts.map(id => this.state.attempts[id]).reverse().find(a => a && !a.ok && !a.cancelled);
+      // Use the operation recorded at the failing boundary. Being an Agent node
+      // alone is insufficient: its tools can also encounter real site failures.
+      const model = attempt && /模型(?:调用|重答)失败/.test(attempt.summary ?? '');
+      const classified = classifyFailure(old.message, { url: model ? undefined : old.url ?? candidate.url, status: old.status, stage: model ? 'model' : undefined });
       if (classified.tag !== old.tag || classified.owner !== old.owner) {
         const failure = { ...old, ...classified };
         this.journal.append({ kind: 'candidate.disposition', candidate: { ...candidate, failure } });
-        this.journal.append({ kind: 'token.data', token: candidate.token, patch: { failure } });
+        this.journal.append({ kind: 'token.data', token: candidate.token, patch: { failure, ...(failure.tag === 'model_transport' ? {batchRecovery:null} : {}) } });
+        if (failure.tag === 'model_transport' && latestRunTokens(this.state).some(t => t.id === candidate.token) && candidate.disposition === 'retry') {
+          this.raiseAlert({ id: 'model-transport', kind: 'model', level: 'red', message: '此前模型连接故障，已保留检查点；恢复前先验证一个真实工位', nextAction: failure.nextAction });
+          this.batch.modelFailed();
+        }
       }
     }
     for (const alert of Object.values(this.state.alerts)) {
@@ -247,6 +262,7 @@ export class Factory {
     if (alert.kind === 'model' || alert.kind === 'preflight') {
       try { await this.ensureReady(true); } catch { /* Preserve the concrete preflight result. */ }
       const cleared = !this.state.alerts[id];
+      if (id === 'model-transport' && !cleared && this.state.preflight?.ok && this.state.batch?.modelCircuit) return { cleared:false,resumed:false,message:this.runtime.paused ? '连接体检通过；本轮仍暂停，继续后用一个真实工位验证恢复' : '连接体检通过；只允许一个真实工位验证，完整提交通过后再恢复批量任务' };
       return { cleared, resumed: false, message: cleared ? '体检已通过，提醒已解除' : '体检仍未通过，请查看当前检测结果' };
     }
     return { cleared: false, resumed: false, message: alert.nextAction ?? '问题尚未有修复证据，提醒保持' };
@@ -304,16 +320,20 @@ export class Factory {
       throw new ControlError(412, "preflight_failed", `开跑体检未通过：${bad.map((c) => c.label).join("、")}`, bad);
     }
     this.clearAlert("preflight", "体检通过");
-    if (r.checks.find((c) => c.id === "model")?.ok) for (const a of Object.values(this.state.alerts ?? {})) if (a.kind === "model") this.clearAlert(a.id, "体检确认模型可用");
+    if (r.checks.find((c) => c.id === "model")?.ok) for (const a of Object.values(this.state.alerts ?? {})) if (a.kind === "model") {
+      if (a.id === 'model-transport' && this.batch.permitModelTrial()) continue;
+      this.clearAlert(a.id, "体检确认模型可用");
+    }
     return r;
   }
 
   private wireRecovery() {
     this.runtime.onRecovery = (token, failure) => this.recordRecovery(token, failure);
     this.runtime.onAlert = (token, node, failure) => {
-      const kind: Alert["kind"] | undefined = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" ? "model" : failure.tag === "auth_required" ? "auth" : undefined;
+      const kind: Alert["kind"] | undefined = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" || failure.tag === "model_transport" ? "model" : failure.tag === "auth_required" ? "auth" : undefined;
       if (!kind) return;
-      this.raiseAlert({ id: kind === "model" ? "model" : `${kind}:${token.item}`, level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: failure.url ?? token.url });
+      this.raiseAlert({ id: failure.tag === 'model_transport' ? 'model-transport' : kind === "model" ? "model" : `${kind}:${token.item}`, level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: kind === 'model' ? undefined : failure.url ?? token.url });
+      if (failure.tag === 'model_transport') this.batch.modelFailed();
     };
     this.runtime.onPark = token => this.recordRecovery(token, {tag:"run_ended",category:"system",message:"本轮结束，工作尚未完成",url:token.url,retryable:true});
   }
@@ -403,6 +423,7 @@ export class Factory {
         const invalidated=this.runtime.descendants(t,checkpoint);
         t.done=new Set([...(previous.data.checkpointDone as string[]??[]),...[...completed].filter(([,ok])=>ok).map(([key])=>key)].filter(key=>!invalidated.has(key)));
         this.runtime.restoreFlow(t);
+        this.runtime.resumeFrontier(t, checkpoint);
         t.data.checkpointDone=[...t.done];this.journal.append({kind:"token.data",token:t.id,patch:{checkpointDone:[...t.done]}});
       }
       if(previous&&checkpoint!=="candidates/tidy"){
@@ -487,6 +508,19 @@ export class Factory {
       };
       rt.restoreFlow(t);
       rt.tokens.set(t.id, t);
+      if (ts.status === 'manual' && ts.data.recoveryStation && !ts.data.retriedBy && ts.data.manualReason === '没有可走的下一步（分支条件都不成立）') {
+        const frontier = rt.readyFrontier(t).filter(key=>rt.runnable(rt.nodes.get(key)!));
+        if (frontier.length) {
+          const failure: Failure = {tag:'tool_error',category:'system',code:'RESTORED_FRONTIER_MISSING',retryable:true,owner:'system',message:`恢复时遗漏的并行分支已找回：${frontier.join('、')}`,nextAction:'从待执行分支继续，保留已经通过的截图、事实和审查；无需人工替系统补结果。'};
+          if (t.finishedStore) rt.stockDelta(t.finishedStore,-1,'修复恢复时遗漏的并行分支');
+          t.finishedStore=undefined; t.data.failure=failure;
+          this.journal.append({kind:'token.data',token:t.id,patch:{failure,manualReason:null}});
+          this.journal.append({kind:'token.finished',token:t.id,node:frontier[0],status:'parked',reason:failure.message});
+          const old=this.state.recoveries[t.item];
+          this.journal.append({kind:'candidate.disposition',candidate:{...old,item:t.item,token:t.id,url:t.url,title:t.title??t.item,source:t.source,disposition:'retry',failure,at:Date.now(),attempts:old?.attempts??1}});
+          rt.stockDelta('candidates/pool',1,'系统恢复缺失分支，重新进入可恢复候选');
+        }
+      }
       if(t.finished||!resumable)continue;
       for (const aid of ts.attempts) {
         const a = this.state.attempts[aid];

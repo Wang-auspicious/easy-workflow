@@ -36,6 +36,11 @@ function browserAttentionKind(message) {
   return 'http';
 }
 function retainBrowserAttention(tab) { return Boolean(tab.attention && ['auth', 'challenge', 'certificate'].includes(tab.attentionKind)); }
+function attentionKey(tab) { try { return `${new URL(tab.url).origin}:${tab.attentionKind}`; } catch { return tab.url; } }
+function boundedProbe(promise, ms = 5000) {
+  let timer;
+  return Promise.race([promise.catch(() => null), new Promise(resolve => { timer = setTimeout(() => resolve(null), ms); })]).finally(() => clearTimeout(timer));
+}
 
 function documentKey(url) { try { const parsed = new URL(url); parsed.hash = ''; return parsed.href; } catch { return url; } }
 function noteBrowserResponse(tab, { url, status, mainFrame, resourceType }) {
@@ -133,7 +138,7 @@ class BrowserManager {
     this.window?.contentView.addChildView(view,0);
     const wc = view.webContents;
     wc.setAudioMuted(true);
-    wc.setWindowOpenHandler(({url}) => { try { this.create(url, 'user'); } catch {} return {action:'deny'}; });
+    wc.setWindowOpenHandler(args => this.openWindow(t, args));
     wc.on('will-navigate', (event, url) => { try { webURL(url); } catch { event.preventDefault(); } });
     wc.on('did-start-loading', () => { t.loading = true; this.publish(); });
     wc.on('did-stop-loading', () => { t.loading = false; this.publish(); void this.check(t); });
@@ -149,23 +154,30 @@ class BrowserManager {
       if (t.owner === 'agent') this.discardAgent(t);
     });
     wc.on('did-finish-load', () => { t.crashed = false; });
-    wc.once('destroyed', () => { this.tabs.delete(id); if (this.active === id) this.active = this.tabs.keys().next().value ?? null; this.mount(); this.publish(); this.persistTabs(); });
+    wc.once('destroyed', () => { if (this.window && !this.window.isDestroyed()) this.window.contentView.removeChildView(view); this.tabs.delete(id); if (this.active === id) this.active = this.tabs.keys().next().value ?? null; this.mount(); this.publish(); this.persistTabs(); });
     if (owner === 'user' || !this.active) this.active = id;
     // The marker lets Playwright find precisely this page, never a user's other tab.
     t.ready = wc.loadURL(url === 'about:blank' ? `about:blank#easy-workflow-${id}` : url).catch(error => { t.readyError = error.message; t.attention = error.message; this.publish(); });
     this.mount(); this.publish(); return t;
   }
+  openWindow(parent, { url }) {
+    // A script popup from a task must never become a durable user tab or escape
+    // its resource lease. Agent navigation is explicit through the browser API.
+    if (parent.owner === 'user') { try { this.create(url, 'user'); } catch {} }
+    return { action: 'deny' };
+  }
   async check(t, manualCheck = false) {
+    if (t.attentionCheck) { await t.attentionCheck; if (!manualCheck) return; }
     const check = (t.attentionCheck || Promise.resolve()).catch(() => {}).then(async () => {
       const wc = t.view.webContents; if (!this.tabs.has(t.id) || t.crashed || wc.isDestroyed() || !/^https?:/.test(wc.getURL())) return;
       const serial=t.checkSerial=(t.checkSerial||0)+1, url=wc.getURL();
-      const probe = await wc.executeJavaScript(`(${browserAttentionProbe.toString()})()`).catch(() => null);
+      const probe = await boundedProbe(wc.executeJavaScript(`(${browserAttentionProbe.toString()})()`));
       if (!this.tabs.has(t.id)||serial!==t.checkSerial||wc.isDestroyed()||wc.getURL()!==url) return;
       applyBrowserAttention(t, probe, url, wc.isLoading(), manualCheck);
       this.publish();
     });
     t.attentionCheck = check;
-    await check;
+    try { await check; } finally { if (t.attentionCheck === check) t.attentionCheck = undefined; }
   }
   discardAgent(t) {
     if (t.owner !== 'agent') return false;
@@ -190,7 +202,8 @@ class BrowserManager {
     if (action === 'lease') {
       const t = this.create('about:blank','agent');
       try {
-        await t.ready;
+        const ready = await boundedProbe(t.ready.then(() => true));
+        if (!ready) throw new Error('BROWSER_LEASE_FAILED: 创建页面超时');
         if (t.readyError || t.crashed || t.view.webContents.isDestroyed()) throw new Error('BROWSER_LEASE_FAILED: 内置浏览器未能创建可用页面');
         return { id:t.id, marker:`about:blank#easy-workflow-${t.id}`, endpoint:await this.endpoint() };
       } catch (error) { this.discardAgent(t); throw error; }
@@ -223,7 +236,7 @@ class BrowserManager {
       if(t.captureDepth){wc.endFrameSubscription();t.captureDepth=0;}
       await this.check(t);
       if (t.owner === 'agent') {
-        const duplicate = [...this.tabs.values()].some(other => other !== t && other.owner === 'agent' && other.leased === false && other.url === t.url && retainBrowserAttention(other));
+        const duplicate = [...this.tabs.values()].some(other => other !== t && other.owner === 'agent' && other.leased === false && attentionKey(other) === attentionKey(t) && retainBrowserAttention(other));
         t.leased = false;
         if (!retainBrowserAttention(t) || duplicate) wc.close();
       }
@@ -234,4 +247,4 @@ class BrowserManager {
   }
   async close() { clearInterval(this.timer);clearInterval(this.authTimer); this.persistTabs(); for (const t of [...this.tabs.values()]) { t.view.webContents.removeAllListeners('destroyed'); t.view.webContents.close(); } this.tabs.clear(); await session.fromPartition(this.partition).cookies.flushStore(); }
 }
-module.exports = { BrowserManager, browserAttentionProbe, browserAttentionKind, retainBrowserAttention, noteBrowserResponse, applyBrowserAttention };
+module.exports = { BrowserManager, browserAttentionProbe, browserAttentionKind, retainBrowserAttention, noteBrowserResponse, applyBrowserAttention, attentionKey, boundedProbe };

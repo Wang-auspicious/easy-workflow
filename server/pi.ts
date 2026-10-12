@@ -13,6 +13,10 @@ import { EnvHttpProxyAgent, fetch as proxyFetch } from "undici";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { classifyFailure } from "../shared/failures.ts";
 import { redactText } from "./mcp-security.ts";
+import { ModelRequests, checkModelAdmission } from './model-requests.ts';
+
+export const MODEL_REQUEST_DEADLINE = Symbol('model-request-deadline');
+const requests = new ModelRequests(Math.max(1, Math.min(8, Number(process.env.FACTORY_MODEL_REQUESTS) || 2)));
 
 let transport: EnvHttpProxyAgent | undefined;
 const modelFetch: typeof globalThis.fetch = (input, init) => {
@@ -97,7 +101,37 @@ export function models() {
   }
   const model = m.getModel(selection.provider, selection.id);
   if (!model) throw new Error(`Pi 模型未配置：${selection.provider}/${selection.id}；请检查 Pi settings.json / models.json。`);
-  const stream: StreamFn = (model, context, options) => m.streamSimple(model, context, { ...options, fetch: modelFetch });
+  const stream: StreamFn = async (model, context, options) => {
+    checkModelAdmission();
+    const release = await requests.acquire(options?.signal);
+    const deadline = (options as typeof options & { [MODEL_REQUEST_DEADLINE]?: { ms: number; expired: () => void } })?.[MODEL_REQUEST_DEADLINE];
+    const timeout = deadline ? AbortSignal.timeout(deadline.ms) : undefined;
+    if (timeout) timeout.addEventListener('abort', deadline!.expired, { once: true });
+    const cleanup = () => { if (timeout) timeout.removeEventListener('abort', deadline!.expired); release(); };
+    try {
+      checkModelAdmission();
+      const signal = timeout ? AbortSignal.any([timeout, ...(options?.signal ? [options.signal] : [])]) : options?.signal;
+      // Recovery belongs to the station transcript/circuit, not three nested SDK
+      // attempts multiplied by station continuation and per-site batch retries.
+      let transportDetail = '';
+      const observedFetch: typeof fetch = async (input, init) => {
+        try { return await modelFetch(input, init); }
+        catch (error) {
+          const e = error as {message?:string;code?:string;cause?:{code?:string;message?:string}};
+          let endpoint = model.provider;
+          try { endpoint = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url).host; } catch {}
+          transportDetail = redactModelError([endpoint,e.cause?.code??e.code,e.cause?.message??e.message].filter(Boolean).join(' · ')).slice(0,400);
+          throw error;
+        }
+      };
+      const response = m.streamSimple(model, context, { ...options, signal, maxRetries: 0, fetch: observedFetch });
+      void response.result().then(result => {
+        if (result.stopReason === 'error' && transportDetail) result.errorMessage = `${redactModelError(result.errorMessage ?? '模型连接失败')}（模型出口：${transportDetail}）`;
+        cleanup();
+      }, cleanup);
+      return response;
+    } catch (error) { cleanup(); throw error; }
+  };
   return { models: m, model: model as Model<Api>, stream };
 }
 
@@ -128,11 +162,13 @@ export async function probeModelConnection(timeoutMs = 20000): Promise<{ ok: boo
   const redact = (text: string) => redactText(text, [secret]).replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [redacted]").slice(0, 400);
   try {
     const selection = models();
-    const request = await selection.stream(selection.model, normalizeContext({ messages: [{ role: "user", content: "Reply with OK.", timestamp: Date.now() }] }), { signal, maxTokens: 64, sessionId: `easy-workflow-preflight-${Date.now()}` });
+    const request = await selection.stream(selection.model, normalizeContext({ messages: [{ role: "user", content: "Reply with exactly OK. No explanation.", timestamp: Date.now() }] }), { signal, maxTokens: 1024, reasoning: 'minimal', sessionId: `easy-workflow-preflight-${Date.now()}` });
     const result = await request.result();
     if (signal.aborted) throw new Error(`模型请求超时（${timeoutMs}ms）`);
     if (result.stopReason === "error" || result.stopReason === "aborted") throw new Error(result.errorMessage || "模型请求失败");
-    return { ok: true, detail: `${label} · 已完成实际模型请求（输出上限 64 tokens）` };
+    const answer = result.content.filter(c => c.type === 'text').map(c => c.text).join('').trim();
+    if (result.stopReason === 'length' || !/^OK[.!。！]?$/i.test(answer)) throw new Error('模型未完成体检回答（空答、截断或未遵循指令）；不能据此恢复批量任务');
+    return { ok: true, detail: `${label} · 已收到完整体检回答；批量恢复仍需真实工位验证` };
   } catch (error) {
     const message = signal.aborted ? `模型请求超时（${timeoutMs}ms）` : redact(String((error as Error)?.message ?? error));
     const failure = classifyFailure(new Error(message), { stage: "model" });

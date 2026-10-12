@@ -23,6 +23,7 @@ test('model preflight tests authenticated inference, not a healthy public base U
     if (mode === 'unauthorized') { res.writeHead(401, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: `Invalid API key: ${activeKey}`, type: 'authentication_error' } })); return; }
     if (mode === 'hang') return;
     res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (mode === 'empty') { res.end('data: '+JSON.stringify({id:'probe',model:'fixture',choices:[{index:0,delta:{},finish_reason:'length'}]})+'\n\ndata: [DONE]\n\n'); return; }
     for (const delta of [{ choices: [{ index: 0, delta: { role: 'assistant', content: 'OK' }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } }]) res.write(`data: ${JSON.stringify({ id: 'probe', model: 'fixture', ...delta })}\n\n`);
     res.end('data: [DONE]\n\n');
   });
@@ -43,15 +44,20 @@ test('model preflight tests authenticated inference, not a healthy public base U
       const result = await checkModelEndpoint(5000);
       assert.equal(result.ok, true, result.detail);
       const outputLimit = requests.at(-1).max_tokens ?? requests.at(-1).max_completion_tokens;
-      assert.ok(outputLimit > 0 && outputLimit <= 128);
+      assert.ok(outputLimit > 0 && outputLimit <= 1024);
       assert.equal(inferenceCalls, 2); assert.equal(getCalls, 0);
+    });
+    await t.test('an empty truncated response never means the provider is healthy', async () => {
+      mode = 'empty';
+      const result = await checkModelEndpoint(5000);
+      assert.equal(result.ok, false); assert.match(result.detail, /未完成体检回答/);
     });
     await t.test('a stalled model is aborted within the check deadline', async () => {
       mode = 'hang'; const start = Date.now();
       const result = await checkModelEndpoint(500);
       assert.equal(result.ok, false);
       assert.ok(Date.now() - start < 4000);
-      assert.equal(inferenceCalls, 3);
+      assert.equal(inferenceCalls, 4);
     });
     await t.test('provider errors cannot leak a credential through JSON escaping', async () => {
       mode = 'unauthorized'; activeKey = 'fixture"escaped\\key';

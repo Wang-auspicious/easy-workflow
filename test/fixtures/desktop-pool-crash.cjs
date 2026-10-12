@@ -18,6 +18,8 @@ app.whenReady().then(() => {
   const lease = await manager.command({ action: 'lease' });
   const agent = manager.tabs.get(lease.id), contents = agent.view.webContents;
   await contents.loadURL(url);
+  await contents.executeJavaScript('window.open(location.href); null');
+  assert.equal(manager.tabs.size, 2, 'agent popup must not create a persistent user tab');
   const gone = new Promise(resolve => contents.once('render-process-gone', resolve));
   contents.forcefullyCrashRenderer(); await gone;
   for (let i = 0; i < 100 && manager.tabs.has(lease.id); i++) await new Promise(resolve => setTimeout(resolve, 10));

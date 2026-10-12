@@ -10,7 +10,7 @@ import { emptyBrowser, type BrowserState, type BrowserAttentionKind } from "../s
 
 const desktop = process.env.FACTORY_BROWSER_BRIDGE === "1" && Boolean(process.send);
 const { BrowserData, webURL } = createRequire(import.meta.url)("../app/browser-data.cjs");
-const { browserAttentionProbe, browserAttentionKind, retainBrowserAttention, noteBrowserResponse, applyBrowserAttention } = createRequire(import.meta.url)("../app/browser-manager.cjs");
+const { browserAttentionProbe, browserAttentionKind, retainBrowserAttention, noteBrowserResponse, applyBrowserAttention, attentionKey, boundedProbe } = createRequire(import.meta.url)("../app/browser-manager.cjs");
 const profile = path.resolve(process.env.FACTORY_VAR || "var", "browser");
 const data = desktop ? null : new BrowserData(path.join(profile, "browser.json"));
 const pending = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
@@ -70,7 +70,11 @@ function poolFault(error: unknown, stage: "start" | "lease"): BrowserPoolFault |
 
 if (desktop) process.on("message", (message: any) => {
   if (message?.type === "browser:state") publish(message.state);
-  if (message?.type === "browser:reply") { const p = pending.get(message.id); if (!p) return; clearTimeout(p.timer); pending.delete(message.id); message.error ? p.reject(new Error(message.error)) : p.resolve(message.result); }
+  if (message?.type === "browser:reply") { const p = pending.get(message.id); if (!p) {
+    // A lease that arrived after timeout/cancellation still owns a native page.
+    if (message.result?.id && message.result?.marker) void rpc({action:'release',id:message.result.id,discard:true}).catch(() => {});
+    return;
+  } clearTimeout(p.timer); pending.delete(message.id); message.error ? p.reject(new Error(message.error)) : p.resolve(message.result); }
 });
 if (desktop) process.on("disconnect", () => {
   const fault = new BrowserPoolFault("BROWSER_BRIDGE_UNAVAILABLE", "桌面主进程的浏览器通道已断开；请重新打开桌面应用后继续当前工位。");
@@ -78,13 +82,22 @@ if (desktop) process.on("disconnect", () => {
   for (const p of pending.values()) { clearTimeout(p.timer); p.reject(fault); }
   pending.clear(); connection = null;
 });
-function rpc(args: Record<string, unknown>): Promise<any> {
+function rpc(args: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(signal.reason); return; }
     if (!process.connected) { reject(new BrowserPoolFault("BROWSER_BRIDGE_UNAVAILABLE", "桌面浏览器通道未连接；请重新打开桌面应用后继续当前工位。")); return; }
     const id = crypto.randomUUID();
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error("内置浏览器响应超时")); }, 25000);
-    pending.set(id, { resolve, reject, timer });
-    process.send!({ type: "browser:request", id, args }, error => { if (error) { clearTimeout(timer); pending.delete(id); reject(error); } });
+    let done = false;
+    const finish = (value: unknown, error = false) => {
+      if (done) return; done = true;
+      clearTimeout(timer); pending.delete(id); signal?.removeEventListener('abort', abort);
+      error ? reject(value) : resolve(value);
+    };
+    const abort = () => finish(signal!.reason, true);
+    const timer = setTimeout(() => finish(new Error("内置浏览器响应超时"),true), 25000);
+    pending.set(id, { resolve:v=>finish(v), reject:e=>finish(e,true), timer });
+    signal?.addEventListener('abort',abort,{once:true});
+    process.send!({ type: "browser:request", id, args }, error => { if (error) finish(error,true); });
   });
 }
 function executable() { return [process.env.CHROME_PATH, "C:/Program Files/Google/Chrome/Application/chrome.exe", "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", "/usr/bin/google-chrome"].find(p => p && fs.existsSync(p)); }
@@ -111,6 +124,13 @@ async function createHeadless(owner: "user" | "agent") {
   if (tabs.size >= 30) throw new Error("已有 30 个标签页，请先关闭不需要的页面");
   const c = await persistent(), page = await c.newPage(), id = crypto.randomUUID();
   tabs.set(id,{page,owner,leased:owner==="agent"}); pageIds.set(page,id); state.active = id;
+  // BrowserContext does not automatically release popup pages with their opener.
+  // Background scripts cannot allocate untracked pages outside the quota.
+  if (owner === 'agent') {
+    try { await page.addInitScript(() => { window.open = () => null; }); }
+    catch (error) { tabs.delete(id); await page.close().catch(() => {}); update(); throw error; }
+    page.on('popup', popup => { void popup.close().catch(() => {}); });
+  }
   page.on("close", () => { tabs.delete(id); titles.delete(id); update(); });
   page.on("response", response => {
     const tab = tabs.get(id); if (!tab) return;
@@ -126,16 +146,17 @@ async function createHeadless(owner: "user" | "agent") {
 }
 async function checkHeadless(id:string, manualCheck = false) {
   const tab=tabs.get(id);if(!tab)return;
+  if (tab.attentionCheck) { await tab.attentionCheck; if (!manualCheck) return; }
   const check = (tab.attentionCheck ?? Promise.resolve()).catch(() => {}).then(async () => {
     if (!tabs.has(id) || tab.page.isClosed()) return;
     const serial = tab.checkSerial = (tab.checkSerial ?? 0) + 1, url = tab.page.url();
-    const probe = await tab.page.evaluate(browserAttentionProbe).catch(() => null);
+    const probe = await boundedProbe(tab.page.evaluate(browserAttentionProbe));
     if (!tabs.has(id) || serial !== tab.checkSerial || tab.page.isClosed() || tab.page.url() !== url) return;
     applyBrowserAttention(tab, probe, url, false, manualCheck);
     update();
   });
   tab.attentionCheck = check;
-  await check;
+  try { await check; } finally { if (tab.attentionCheck === check) tab.attentionCheck = undefined; }
 }
 
 export async function browserCommand(args: Record<string, any>): Promise<any> {
@@ -185,19 +206,22 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
     const abort=()=>{unwatch();void page.close().catch(()=>{});};
     page.on("crash", crash); page.on("close", closed); context.on("close", closed); browser?.on("disconnected", disconnected);
     signal?.addEventListener("abort",abort,{once:true});if(signal?.aborted)abort();
-    return {page,context,close:async()=>{unwatch();await release();}};
+    let closing: Promise<void> | undefined;
+    return {page,context,close:()=>{unwatch();return closing ??= release();}};
   };
   try { if (!desktop) {
-    const t = await createHeadless("agent"); await t.page.setViewportSize(viewport);
+    const t = await createHeadless("agent");
+    try { signal?.throwIfAborted(); await t.page.setViewportSize(viewport); }
+    catch (error) { await t.page.close().catch(() => {}); throw error; }
     return withCancellation(t.page,t.context,async () => {
       await checkHeadless(t.id);
       const tab = tabs.get(t.id); if (!tab) return;
-      const duplicate = [...tabs.values()].some(other => other !== tab && other.owner === "agent" && !other.leased && other.page.url() === tab.page.url() && retainBrowserAttention(other));
+      const duplicate = [...tabs.values()].some(other => other !== tab && other.owner === "agent" && !other.leased && attentionKey({...other,url:other.page.url()}) === attentionKey({...tab,url:tab.page.url()}) && retainBrowserAttention(other));
       tab.leased = false;
       if (!retainBrowserAttention(tab) || duplicate) await t.page.close().catch(() => {});
     });
   }
-  const lease = await rpc({ action:"lease" });
+  const lease = await rpc({ action:"lease" }, signal);
   try {
     if (!connection || !(await connection.catch(() => null))?.isConnected()) connection = chromium.connectOverCDP(lease.endpoint);
     const b = await connection;

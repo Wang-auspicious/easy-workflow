@@ -17,6 +17,119 @@ const close = async (factory: InstanceType<typeof Factory>) => {
 };
 const catalog = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `site-${i}`, name: `Site ${i}`, canonicalUrl: `https://site-${i}.example/` }));
 
+test('legacy system-created manual stops with a missing sibling become resumable without overriding real human review', async () => {
+  let factory=new Factory();
+  try {
+    await factory.boot();factory.broker.memoryFloorMB=0;factory.runtime.start('legacy frontier');
+    factory.runtime.executors=()=>async()=>({ok:true,summary:'fixture'});
+    const token=factory.runtime.create('curation/shot-review',{item:'legacy-frontier',url:'https://site.example/',source:'candidates/pool',data:{canonical:'https://site.example/',recoveryRoot:'curation/plan',recoveryStation:'curation/shot-review'}});
+    token.entry='curation/plan';token.closure=factory.runtime.closureOf(token.entry);
+    token.done=new Set(['curation/plan','curation/identity','curation/breadth','curation/proof','curation/process','curation/facts']);
+    factory.journal.append({kind:'token.data',token:token.id,patch:{checkpointDone:[...token.done]}});
+    factory.runtime.restoreFlow(token);
+    factory.runtime.resumeFrontier=()=>{}; // Reproduce the previous scheduler.
+    await factory.runtime.settle();
+    assert.equal(factory.state.tokens[token.id].status,'manual');factory.runtime.pause();
+    await close(factory);factory=new Factory();await factory.boot();
+    assert.equal(factory.state.tokens[token.id].status,'parked');
+    assert.equal(factory.state.recoveries[token.item].failure?.code,'RESTORED_FRONTIER_MISSING');
+    assert.equal(factory.state.tokens[token.id].finishedAtNode,'curation/fact-review');
+    factory.runtime.executors=node=>async()=>({ok:true,summary:'fixture',data:node.key==='curation/gate'?{gate:'pass'}:undefined});
+    factory.runtime.resume();const [retry]=factory.retryCandidates({items:[token.item],count:1});await factory.runtime.settle();
+    assert.equal(factory.state.tokens[retry.id].status,'published');
+  } finally {await close(factory);fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('retrying a failed screenshot review also restores the cancelled facts-review sibling', async () => {
+  const factory=new Factory();let siblingStarted=false;
+  try {
+    await factory.boot();factory.broker.memoryFloorMB=0;
+    factory.runtime.start('interrupted parallel reviews');
+    factory.runtime.executors=node=>async ctx=>{
+      if(node.key==='curation/fact-review') {siblingStarted=true; await new Promise((resolve,reject)=>ctx.signal.addEventListener('abort',()=>reject(ctx.signal.reason),{once:true}));}
+      if(node.key==='curation/shot-review') {for(let i=0;i<100&&!siblingStarted;i++)await new Promise(r=>setTimeout(r,5));return {ok:false,summary:'fixture interruption',failure:{tag:'tool_error',category:'system',message:'interrupted review',retryable:true}};}
+      return {ok:true,summary:'fixture complete'};
+    };
+    const old=factory.runtime.create('curation/plan',{item:'parallel-item',url:'https://site.example/',source:'candidates/pool',data:{canonical:'https://site.example/'}});
+    await factory.runtime.settle();assert.equal(siblingStarted,true);
+    assert.equal(factory.state.tokens[old.id].status,'parked');
+    const nodes:string[]=[];
+    factory.runtime.executors=node=>async()=>{nodes.push(node.key);return {ok:true,summary:'fixture recovered',data:node.key==='curation/gate'?{gate:'pass'}:undefined};};
+    const [retry]=factory.retryCandidates({items:[old.item],count:1});await factory.runtime.settle();
+    assert.equal(factory.state.tokens[retry.id].status,'published');
+    assert.ok(nodes.includes('curation/fact-review'),'cancelled sibling must rejoin the live frontier');
+    assert.ok(!nodes.includes('curation/facts'),'completed facts are not recomputed');
+    assert.equal(nodes.filter(n=>n==='curation/shot-review').length,1);
+  } finally {await close(factory);fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('waiting for browser capacity stays queued and never consumes a website recovery', async () => {
+  const factory=new Factory();let calls=0;
+  try {
+    await factory.boot();factory.catalog=catalog(1);
+    factory.runtime.executors=()=>async()=> ++calls===1
+      ? {ok:false,summary:'capacity wait',failure:{tag:'tool_error',category:'system',code:'BROWSER_CAPACITY_TIMEOUT',message:'pool full',retryable:true,owner:'system'}}
+      : {ok:true,summary:'fixture',finish:{status:'published',reason:'fixture'}};
+    const [token]=factory.pull(1);await factory.runtime.settle();
+    assert.equal(factory.state.tokens[token.id].status,'active');
+    assert.equal(factory.state.recoveries[token.item],undefined);
+    await new Promise(r=>setTimeout(r,5100));await factory.runtime.settle();
+    assert.equal(factory.state.tokens[token.id].status,'published');
+    assert.equal(factory.runtime.tokens.size,1);assert.equal(calls,2);
+    assert.equal(Object.values(factory.state.attempts).filter(a=>!a.ok&&!a.cancelled).length,0);
+  } finally {await close(factory);fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('provider circuit and checkpoints survive restart without treating a paused run as authorization to retry', async () => {
+  let factory=new Factory();
+  try {
+    await factory.boot();factory.catalog=catalog(1);
+    factory.runtime.executors=()=>async()=>({ok:false,summary:'模型调用失败',failure:{tag:'model_transport',category:'system',message:'Connection error.',retryable:true,owner:'system'}});
+    factory.batch.configure({target:1});await factory.runtime.settle();factory.runtime.pause();
+    await close(factory);factory=new Factory();await factory.boot();
+    const count=factory.runtime.tokens.size;
+    assert.equal(factory.state.batch?.modelCircuit?.state,'open');assert.ok(factory.broker.modelHold);
+    factory.batch.pump(Date.now()+3600000);await factory.runtime.settle();
+    assert.equal(factory.runtime.tokens.size,count);assert.equal(factory.runtime.paused,true);
+  } finally {await close(factory);fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('a shared provider outage stops intake and recovers one real checkpoint before reopening the batch', async () => {
+  const factory=new Factory(); let broken=true;
+  try {
+    await factory.boot(); factory.catalog=catalog(10);
+    factory.runtime.executors=()=>async()=>broken
+      ? {ok:false,summary:'模型调用失败',failure:{tag:'model_transport',category:'system',message:'Connection error.',retryable:true,owner:'system'}}
+      : {ok:true,summary:'real checkpoint fixture',finish:{status:'published',reason:'fixture'}};
+    factory.batch.configure({target:6,maxInFlight:4,intakeWindow:2});
+    await factory.runtime.settle();
+    assert.ok(batchSummary(factory.state)!.admitted<=2,'an outage must not feed the remaining catalog');
+    assert.equal(factory.state.batch!.modelCircuit?.state,'open');
+    assert.ok(factory.broker.modelHold);
+    assert.ok(Object.values(factory.state.tokens).every(t=>!t.data.batchRecovery),'provider downtime is not a website retry');
+    broken=false;
+    factory.batch.pump(Date.now()+60000); await factory.runtime.settle();
+    assert.equal(factory.state.batch!.modelCircuit,undefined);
+    assert.equal(factory.broker.modelHold,null); assert.equal(factory.broker.recoveryToken,null);
+    assert.equal(batchSummary(factory.state)!.published,6);
+  } finally {await close(factory);fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('persistent provider failures stop after three real trials without exhausting site repair budgets', async () => {
+  const factory=new Factory();
+  try {
+    await factory.boot(); factory.catalog=catalog(10);
+    factory.runtime.executors=()=>async()=>({ok:false,summary:'模型调用失败',failure:{tag:'model_transport',category:'system',message:'Request timed out.',retryable:true,owner:'system'}});
+    factory.batch.configure({target:10,maxInFlight:4,intakeWindow:1}); await factory.runtime.settle();
+    for(let i=0;i<6;i++){factory.batch.pump(Date.now()+3600000);await factory.runtime.settle();}
+    assert.equal(batchSummary(factory.state)!.admitted,1);
+    assert.equal(factory.runtime.tokens.size,4);
+    assert.equal(factory.state.batch!.modelCircuit?.nextAt,0);
+    assert.ok(Object.values(factory.state.tokens).every(t=>!t.data.batchRecovery));
+    assert.ok(factory.broker.modelHold);
+  } finally {await close(factory);fs.rmSync(dir,{recursive:true,force:true});}
+});
+
 test('a durable 100-site goal replenishes a bounded pipeline without a chat polling loop', async () => {
   const factory = new Factory();
   try {

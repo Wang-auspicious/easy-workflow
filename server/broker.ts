@@ -16,6 +16,8 @@ export class Broker {
   memoryFloorMB: number;
   /** Model leases are refused while a quota/credential alert is open. */
   modelHold: string | null = null;
+  /** A recovering provider gets one real task before normal scheduling resumes. */
+  recoveryToken: string | null = null;
   private next = 1;
   private waiters = new Set<() => void>();
   onRelease: () => void = () => {};

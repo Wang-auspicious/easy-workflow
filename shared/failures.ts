@@ -1,4 +1,4 @@
-export type FailureTag = "invalid_url" | "http_not_found" | "page_unavailable" | "network_timeout" | "network_dns" | "network_connection" | "network_tls" | "http_rate_limit" | "http_server" | "http_forbidden" | "auth_required" | "browser_capture" | "tool_error" | "run_ended" | "needs_selection" | "missing_artifact" | "quality_rejected" | "model_unavailable";
+export type FailureTag = "invalid_url" | "http_not_found" | "page_unavailable" | "network_timeout" | "network_dns" | "network_connection" | "network_tls" | "http_rate_limit" | "http_server" | "http_forbidden" | "auth_required" | "browser_capture" | "tool_error" | "run_ended" | "needs_selection" | "missing_artifact" | "quality_rejected" | "model_unavailable" | "model_transport";
 export interface Failure { tag:FailureTag; category:"invalid"|"network"|"auth"|"system"; message:string; url?:string; requestedUrl?:string; code?:string; status?:number; retryable:boolean;
   /** What to do next, written for the agent or person who owns the fix (Spec §30.4). */
   nextAction?:string;
@@ -7,10 +7,11 @@ export interface Failure { tag:FailureTag; category:"invalid"|"network"|"auth"|"
   /** Methods already tried, so nobody repeats them. */
   tried?:string[] }
 export interface CandidateRecovery { item:string; token:string; url:string; title:string; source:string; category?:string; disposition:"retry"|"removed"|"claimed"|"resolved"; failure?:Failure; at:number; attempts:number }
-export const failureLabels:Record<FailureTag,string>={invalid_url:"网址格式错误",http_not_found:"页面不存在",page_unavailable:"采集子页面失效",network_timeout:"网络超时",network_dns:"DNS 解析失败",network_connection:"连接中断",network_tls:"TLS / 证书问题",http_rate_limit:"访问限流",http_server:"站点暂时异常",http_forbidden:"服务器拒绝请求",auth_required:"登录 / 人机验证",browser_capture:"浏览器截图异常",tool_error:"工具执行异常",run_ended:"本轮中止，尚未完成",needs_selection:"需要重新选页",missing_artifact:"产物引用失效",quality_rejected:"图像质量不合格",model_unavailable:"模型不可用（额度 / 凭据 / 限流）"};
+export const failureLabels:Record<FailureTag,string>={invalid_url:"网址格式错误",http_not_found:"页面不存在",page_unavailable:"采集子页面失效",network_timeout:"网络超时",network_dns:"DNS 解析失败",network_connection:"连接中断",network_tls:"TLS / 证书问题",http_rate_limit:"访问限流",http_server:"站点暂时异常",http_forbidden:"服务器拒绝请求",auth_required:"登录 / 人机验证",browser_capture:"浏览器截图异常",tool_error:"工具执行异常",run_ended:"本轮中止，尚未完成",needs_selection:"需要重新选页",missing_artifact:"产物引用失效",quality_rejected:"图像质量不合格",model_unavailable:"模型凭据 / 额度不可用",model_transport:"模型服务连接 / 超时"};
 
 export function recoveryAdvice(f:Failure|undefined) {
   const tag=f?.tag;
+  if(tag==="model_transport"||tag==="model_unavailable")return f?.nextAction ?? NEXT[tag];
   if(tag==="auth_required")return "到内置浏览器完成登录或验证，再从失败工位继续。";
   if(tag==="http_forbidden")return "系统检查公开入口与共享浏览器的实际响应；403 本身不能证明需要登录。";
   if(tag==="network_tls")return "等待站点证书修复，或提供正确入口；不能忽略 TLS 校验。";
@@ -49,7 +50,8 @@ export function classifyFailure(error:unknown, context:{url?:string;requestedUrl
   const text=`${code??""} ${message} ${e?.cause?.message??""}`;
   const status=context.status??(Number(text.match(/(?:HTTP|httpError:)[ :]*(\d{3})/i)?.[1]??0)||undefined);
   let tag:FailureTag="tool_error",category:Failure["category"]="system";
-  if(context.stage==="model"&&/401|403|429|quota|insufficient|credit|balance|rate.?limit|unauthori[sz]ed|api key|余额|额度/i.test(text)){tag="model_unavailable";category="auth";}
+  if(context.stage==="model"&&/401|403|quota|insufficient|credit|balance|unauthori[sz]ed|api key|余额|额度/i.test(text)){tag="model_unavailable";category="auth";}
+  else if(context.stage==="model"&&/MODEL_CIRCUIT_OPEN|timeout|timed?[ _]?out|超时|ECONN|ENOTFOUND|EAI_AGAIN|CERT_|ERR_(?:SSL|TLS)_|fetch failed|connection error|socket|terminated|overloaded|temporarily|rate.?limit|\b429\b|\b50[0-9]\b/i.test(text)){tag="model_transport";category="system";}
   else if(context.stage==="url"||/invalid url|无法解析.*网址/i.test(text)){tag="invalid_url";category="invalid";}
   else if(status===404||status===410){tag="http_not_found";category="invalid";}
   // Error codes identify the failed operation before words in its URL or context.
@@ -66,7 +68,7 @@ export function classifyFailure(error:unknown, context:{url?:string;requestedUrl
   else if(/screenshot|captureScreenshot|screencast|截图|出帧/i.test(text)||context.stage==="capture"){tag="browser_capture";}
   else if(status===429){tag="http_rate_limit";category="network";}
   else if((status??0)>=500){tag="http_server";category="network";}
-  else if(/timeout|timed? ?out|ETIMEDOUT|超时/i.test(text)){tag="network_timeout";category="network";}
+  else if(/timeout|timed?[ _]?out|ETIMEDOUT|超时/i.test(text)){tag="network_timeout";category="network";}
   else if(/fetch failed|connection error|ECONN|ERR_CONNECTION|socket|network|导航|navigation/i.test(text)){tag="network_connection";category="network";}
   return withAdvice({tag,category,message,url:context.url,requestedUrl:context.requestedUrl,code,status,retryable:category!=="invalid"});
 }
@@ -80,8 +82,9 @@ export function isTlsFailure(error: unknown): boolean {
   return /\b(?:TLS|SSL)\b/i.test(text);
 }
 
-const OWNER:Record<FailureTag,"agent"|"user"|"system">={invalid_url:"agent",http_not_found:"agent",page_unavailable:"agent",network_timeout:"system",network_dns:"system",network_connection:"system",network_tls:"user",http_rate_limit:"system",http_server:"system",http_forbidden:"system",auth_required:"user",browser_capture:"system",tool_error:"system",run_ended:"system",needs_selection:"agent",missing_artifact:"system",quality_rejected:"agent",model_unavailable:"user"};
+const OWNER:Record<FailureTag,"agent"|"user"|"system">={invalid_url:"agent",http_not_found:"agent",page_unavailable:"agent",network_timeout:"system",network_dns:"system",network_connection:"system",network_tls:"user",http_rate_limit:"system",http_server:"system",http_forbidden:"system",auth_required:"user",browser_capture:"system",tool_error:"system",run_ended:"system",needs_selection:"agent",missing_artifact:"system",quality_rejected:"agent",model_unavailable:"user",model_transport:"system"};
 const NEXT:Record<FailureTag,string>={
+  model_transport:"模型服务连接中断、超时或限流：停止补新料并冷却，只允许一个真实工位试恢复；成功后继续已有检查点。不是网站打不开，不删除站点、不消耗选页重试额度。",
   invalid_url:"网址无法使用：检查是否为仓库写法或拼写错误；确实无效就排除并保留出处。",
   http_not_found:"入口 404/410：换一个同站入口（首页、文档首页），确实不存在才排除。",
   page_unavailable:"子页面失效：从拍摄单的备选页或站点目录里换一页，不要删除整站。",
