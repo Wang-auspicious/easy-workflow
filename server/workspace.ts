@@ -18,7 +18,7 @@ export const projectPaths = (dir: string) => ({
   work: path.join(dir, "work"),
 });
 
-const PROJECT_TEMPLATE = (name: string) => `# ${name}
+const LEGACY_PROJECT_TEMPLATE = (name: string) => `# ${name}
 
 > 项目说明。站长维护；主调度可以起草修改，站长确认后生效。各 Agent 每次工作前都会读到这一页的摘要。
 
@@ -51,6 +51,30 @@ const PROJECT_TEMPLATE = (name: string) => `# ${name}
 | \`cache/http/\` | 网页缓存（默认 6 小时） |
 `;
 
+const PROJECT_TEMPLATE = (name: string) => `# ${name}
+
+> 项目说明。站长维护目标与验收要求，流水线包提供各节点职责、输入输出契约和执行器。
+
+## 目标
+
+按已安装工作流的入口契约接收任务，完成真实处理与独立审查，保留可核对的过程、证据和产物。具体业务要求写在这里或随任务输入提供。
+
+## 工作约定
+
+- 只执行本项目已接线且具有职责、schema 和执行器的工位。
+- 取消、工具失败与待人工保持真实状态，不将未处理数据标为成功。
+- 证书、身份验证及凭据由用户处理，不自动绕过或重登。
+- 安装与修改结构必须在轮次结束且无在途任务时生效。
+
+## 项目文件
+
+- \`packs/installed.json\`：启用的包与不可变版本。
+- \`journal.db\`：运行事件与恢复检查点。
+- \`outputs/\`、\`published/\`、\`evidence/\`：工作流实际生成的产物与证据。
+- \`cases/\`、\`context/\`：任务案卷与节点上下文。
+- \`work/\`、\`cache/\`：任务工作目录和项目缓存。
+`;
+
 const LESSONS_TEMPLATE = `# 经验（LESSONS）
 
 > 每轮结束后由复盘员起草，站长批准后写入对应节点 ROLE.md 的"已知坑"。未批准的条目只作参考，不约束 Agent。
@@ -69,6 +93,23 @@ export function ensureProject(dir: string, name = path.basename(dir), pack = "vi
   try { info = JSON.parse(fs.readFileSync(p.manifest, "utf8")); }
   catch { info = { name, dir, pack, createdAt: new Date().toISOString() }; fs.writeFileSync(p.manifest, JSON.stringify(info, null, 2)); }
   return { ...info, dir };
+}
+
+/** Installed packs define the project domain. Only an exact old automatic
+ * document is migrated; any human edit, even a short note, remains untouched. */
+export function synchronizeProjectPacks(dir: string, packIds: string[]): ProjectInfo {
+  const paths = projectPaths(dir);
+  const previous = JSON.parse(fs.readFileSync(paths.manifest, 'utf8')) as ProjectInfo;
+  const pack = packIds.length ? [...new Set(packIds)].join(',') : 'generic';
+  if (!packIds.includes('vislexicon') && fs.existsSync(paths.project)) {
+    const current = fs.readFileSync(paths.project, 'utf8').replace(/\r\n/g, '\n');
+    if (current === LEGACY_PROJECT_TEMPLATE(previous.name).replace(/\r\n/g, '\n')) fs.writeFileSync(paths.project, PROJECT_TEMPLATE(previous.name));
+  }
+  if (previous.pack !== pack) {
+    const temporary = `${paths.manifest}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify({ ...previous, pack }, null, 2)); fs.renameSync(temporary, paths.manifest);
+  }
+  return { ...previous, dir, pack };
 }
 
 /** First lines of a markdown file without its title, for prompt envelopes. */

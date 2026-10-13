@@ -77,6 +77,19 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
   const lines: LineSpec[] = clone(packs.flatMap((p) => p.lines));
   const links: EdgeSpec[] = clone(packs.flatMap((p) => p.links));
   const conditions = Object.assign({}, ...packs.map((p) => p.conditions)) as Pack["conditions"];
+  const seenPacks = new Set<string>(), seenLines = new Set<string>(), seenConditions = new Set<string>();
+  for (const pack of packs) {
+    if (seenPacks.has(pack.id)) issues.push({ at: pack.id, message: 'duplicate pack id' });
+    seenPacks.add(pack.id);
+    for (const line of pack.lines) {
+      if (seenLines.has(line.id)) issues.push({ at: line.id, message: 'duplicate line id across packs' });
+      seenLines.add(line.id);
+    }
+    for (const name of Object.keys(pack.conditions)) {
+      if (seenConditions.has(name)) issues.push({ at: name, message: 'duplicate condition id across packs' });
+      seenConditions.add(name);
+    }
+  }
   for (const patch of patches.filter((p) => p.status === "accepted")) applyPatch(lines, links, patch, issues);
 
   const nodes: CompiledNode[] = [];
@@ -137,11 +150,13 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
     if (![n.workers.min, n.workers.max, n.workers.initial].every((v) => Number.isInteger(v) && v >= 0)) issues.push({ at: n.key, message: "worker counts must be non-negative integers" });
     if (n.workers.initial < n.workers.min || n.workers.initial > n.workers.max) issues.push({ at: n.key, message: "workers.initial must be within min/max" });
     if (runnable && !n.dormant && lines.find((l) => l.id === n.line)?.wired && n.workers.max < 1) issues.push({ at: n.key, message: "runnable station needs at least one worker" });
+    const owner = packs.find(pack => pack.lines.some(line => line.id === n.line));
+    if (runnable && !n.dormant && lines.find(line => line.id === n.line)?.wired && owner?.contracts && !owner.contracts[n.key]) issues.push({ at: n.key, message: 'installed runnable station requires role, schemas and executor binding' });
   }
 
   const runtimeGraph = {
     nodes: nodes.map(({ bot, ...rest }) => ({ ...rest, bot: { shape: bot.shape, hue: bot.hue, eyes: bot.eyes } })),
-    edges, channels,
+    edges, channels, contracts: packs.flatMap(pack => Object.entries(pack.contracts ?? {})),
   };
   const digest = crypto.createHash("sha256").update(JSON.stringify(runtimeGraph)).digest("hex").slice(0, 16);
   const resources = Object.assign({}, ...packs.map((p) => p.resources));

@@ -22,7 +22,7 @@ const hash = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
 // Preserve ordinary existing item folders. The reserved ~ prefix prevents unsafe
 // IDs, Windows aliases and case-insensitive names from colliding with ordinary IDs.
 const segment = (s: string) => /^[a-z0-9][a-z0-9._-]{0,99}$/.test(s) && !s.endsWith(".") && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(s) ? s : `~${hash(s)}`;
-type Host = { state: FactoryState; compiled: CompiledFactory; journal: Pick<Journal, "read"> };
+type Host = { state: FactoryState; compiled: CompiledFactory; journal: Pick<Journal, "read">; runtime?: { roleResolver?: (station: string) => ReturnType<typeof readRole> } };
 export type CaseScope = { token: string; attempt: string };
 type Of<K extends Stamped["kind"]> = Extract<Stamped, { kind: K }>;
 const of = <K extends Stamped["kind"]>(events: Stamped[], kind: K) => events.filter((e): e is Of<K> => e.kind === kind);
@@ -178,7 +178,7 @@ export class Docs {
     const s = this.f.state, n = this.node(key), st = s.nodes[key];
     const name = key === "dispatcher" ? "主调度" : n?.name ?? key;
     let role = "（缺少 ROLE.md）";
-    try { const r = readRole(key); role = `${r.path} @ ${r.revision}`; } catch { /* reported below */ }
+    try { const r = this.f.runtime?.roleResolver?.(key) ?? readRole(key); role = `${r.path} @ ${r.revision}`; } catch { /* reported below */ }
     const isAgent = key === 'dispatcher' || n?.kind === 'agent' || n?.kind === 'review';
     const closed = key !== 'dispatcher' && Boolean(process.env.FACTORY_STATION_COMMAND);
     const executionLabel = (label: string) => caseRedactor([])(label) as string;
@@ -427,7 +427,7 @@ export class Docs {
   /** Everything an agent reads before it works on one item at one node (Spec §31). */
   envelope(node: CompiledNode | "dispatcher", caseId?: string, tools?: string[], scope?: CaseScope) {
     const key = node === "dispatcher" ? "dispatcher" : node.key;
-    const role = readRole(key);
+    const role = this.f.runtime?.roleResolver?.(key) ?? readRole(key);
     const project = digest(projectPaths(this.dir).project, 900);
     const parts = [
       role.content.trim(),

@@ -85,12 +85,12 @@ export async function checkExternalAccess(urls = ["https://api.github.com/zen", 
   return { ok: false, detail: tried.join("；") || "没有外网探测目标", fix: "外网探测均失败：检查系统代理和网络后重试" };
 }
 
-export async function preflight(dir: string, broker: Broker): Promise<{ ok: boolean; checks: PreflightCheck[] }> {
+export interface PreflightRequirements { network?: boolean; model?: boolean; browser?: boolean }
+export async function preflight(dir: string, broker: Broker, requirements: PreflightRequirements = {}): Promise<{ ok: boolean; checks: PreflightCheck[] }> {
   const checks = await Promise.all([
-    check("dns", "DNS 与代理", () => checkDnsProxy()),
-    check("web", "外网可达", () => checkExternalAccess()),
-    check("model", "模型凭据与接口", () => checkModelEndpoint()),
-    check("browser", "后台页能截出画面", () => checkBrowserCapture(broker)),
+    ...(requirements.network === false ? [] : [check("dns", "DNS 与代理", () => checkDnsProxy()), check("web", "外网可达", () => checkExternalAccess())]),
+    ...(requirements.model === false ? [] : [check("model", "模型凭据与接口", () => checkModelEndpoint())]),
+    ...(requirements.browser === false ? [] : [check("browser", "后台页能截出画面", () => checkBrowserCapture(broker))]),
     check("disk", "项目文件夹可写", async () => {
       const probe = path.join(dir, `.preflight-${process.pid}`);
       fs.writeFileSync(probe, "ok"); fs.rmSync(probe);
@@ -98,12 +98,12 @@ export async function preflight(dir: string, broker: Broker): Promise<{ ok: bool
       const freeGB = (st.bavail * st.bsize) / 1073741824;
       return { ok: freeGB > 1, detail: `可写，剩余 ${freeGB.toFixed(1)}GB`, fix: freeGB > 1 ? undefined : "磁盘剩余不足 1GB，清理后再开跑" };
     }),
-    check("memory", "内存", async () => checkMemoryCapacity(broker)),
-    check("auth", "共享浏览器登录状态", async () => {
+    check("memory", "内存", async () => requirements.browser === false ? { ok: true, detail: `空闲 ${broker.freeMemMB()}MB；当前工作流不申请浏览器，浏览器内存底线不适用` } : checkMemoryCapacity(broker)),
+    ...(requirements.browser === false ? [] : [check("auth", "共享浏览器登录状态", async () => {
       const st = await within(8000, browserCommand({ action: "state" })) as { tabs?: { attention?: string; title?: string }[] };
       const need = (st.tabs ?? []).filter((t) => t.attention);
       return { ok: true, detail: need.length ? `${need.length} 个页面需要处理：${need.map((t) => t.title).join("、").slice(0, 120)}` : "没有需要处理的页面" };
-    }),
+    })]),
   ]);
   const ok = checks.every((c) => c.ok);
   writeEnv(dir, checks, broker);

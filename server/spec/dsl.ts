@@ -29,6 +29,9 @@ export function chain(...ids: string[]): [string, string][] {
 }
 
 export type Pack = PackSpec & {
+  /** Installed packs declare executable contracts; legacy bundled packs may
+   * supply their bindings through the host adapter instead. */
+  contracts?: Record<string, { role: string; inputSchema: string; outputSchema: string; executor: string; revision: string }>;
   /** Edges between lines (qualified `line/station` keys). */
   links: EdgeSpec[];
   /** Named predicates used by `when` on edges. */

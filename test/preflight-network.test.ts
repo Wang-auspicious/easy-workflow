@@ -2,10 +2,28 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import dns from 'node:dns/promises';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { checkExternalAccess, checkMemoryCapacity, checkDnsProxy, checkBrowserCapture } from '../server/preflight.ts';
+import { checkExternalAccess, checkMemoryCapacity, checkDnsProxy, checkBrowserCapture, preflight } from '../server/preflight.ts';
 import {Broker}from'../server/broker.ts';
 import { closeNetwork, networkRoute } from '../server/network.ts';
+
+test('a local program-only workflow checks storage without contacting network, model or browser', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-cpu-preflight-'));
+  const lookup = t.mock.method(dns, 'lookup', async () => { throw new Error('program-only preflight must not resolve external hosts'); });
+  const broker = new Broker({ browser: 0, cpu: 1 }, 1_000_000); broker.freeMem = () => 420;
+  try {
+    const result = await preflight(root, broker, { network: false, model: false, browser: false });
+    assert.equal(result.ok, true); assert.deepEqual(result.checks.map(check => check.id), ['disk', 'memory']);
+    assert.equal(lookup.mock.callCount(), 0); assert.equal(broker.used.browser, 0);
+    assert.doesNotMatch(fs.readFileSync(path.join(root, 'ENV.md'), 'utf8'), /✓.*模型凭据|✓.*后台页/);
+  } finally {
+    lookup.mock.restore();
+    assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir())); fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('DNS preflight follows the proxy hop, bypass rules and credential redaction', async t => {
   const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy'];
