@@ -1,6 +1,7 @@
 // One-click correction (Spec §10.9 / F6.3): pick a reason (number keys work), optional note,
 // and the item goes back to the station that produced the evidence.
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { createPortal } from 'react-dom';
 import { actions } from "../api.ts";
 import { getState, useStore } from "../store.ts";
 import { CorrectionUndo } from './CorrectionUndo.tsx';
@@ -54,7 +55,9 @@ export function CorrectionPopover() {
   };
   const state = getState();
   const stations = state.factory!.nodes.filter(n => !['store', 'source'].includes(n.kind) && cur.items.every(item => item.node === n.key || state.fs.tokens[item.token]?.attempts.some(id => state.fs.attempts[id]?.node === n.key)));
-  return (
+  // The chat column has its own stacking context below canvas inspectors.
+  // Mount the dialog at the document root so its controls stay above its opener.
+  return createPortal(
     <div ref={ref} className="correction" role="dialog" aria-label="纠错与撤销" style={{ left: Math.max(8, cur.x), top: Math.max(8, cur.y) }} onPointerDown={(e) => e.stopPropagation()}>
       <div className="corr-title">{cur.items.length > 1 ? `批量纠错 ${cur.items.length} 件` : `不对：${cur.items[0].label}`}</div>
       {results ? <><div className="correction-receipts">{results.map((result, index) => <div key={result.correction ?? index}><b>{cur.items[index]?.label}</b><p className={result.ok ? '' : 'correction-error'}>{result.message}</p>{result.correction && <CorrectionUndo id={result.correction} />}</div>)}</div><div className="row-end"><button className="btn btn--sm" onClick={close}>完成</button></div></> : <>
@@ -76,6 +79,7 @@ export function CorrectionPopover() {
         <button className="btn btn--sm btn--primary" disabled={reason === null || busy || disabled || !node} onClick={() => void submit()}>{busy ? '正在退回…' : '退回重做'}</button>
       </div>
       </>}
-    </div>
+    </div>,
+    document.body,
   );
 }
