@@ -101,7 +101,10 @@ test('a failed repair owner receives the same redo contract after candidate retr
     factory.runtime.executors = node => async ctx => {
       if (node.key === 'curation/facts') { factCalls++; assert.deepEqual(ctx.redo, originalRedo); }
       if (node.key === 'curation/fact-review') reviewCalls++;
-      return { ok: true, summary: 'The repair has its original context.', data: node.key === 'curation/gate' ? { gate: 'pass' } : undefined };
+      return { ok: true, summary: 'The repair has its original context.', data: node.key === 'curation/gate' ? { gate: 'pass' } : undefined,
+        metrics: node.key === 'curation/facts' ? {usageReported: true,
+          execution: {adapter: 'fixture', model: 'local-fixture'},
+          time: {firstTokenMs: 1, outputMs: 1, toolMs: 0, programMs: 0, modelCalls: 1, toolCalls: 0}} : undefined };
     };
     factory.runtime.resume(); await factory.runtime.settle();
     assert.equal(factory.state.tokens[retry.id].status, 'published', JSON.stringify({ running: factory.runtime.running, paused: factory.runtime.paused, at: factory.state.tokens[retry.id].at, modelHold: factory.broker.modelHold, factCalls, reviewCalls, done: [...resumed.done] }));

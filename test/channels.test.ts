@@ -299,9 +299,12 @@ const sourceItem = (id: string): SourceCandidate => ({
 test('unmanaged source and channel backlogs both progress through the single available slot', async () => {
   const order: string[] = [];
   let peak = 0;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => {release = resolve;});
   const factory = await boot(async ctx => {
     order.push(ctx.token.source.startsWith('source:') ? 'source' : 'channel');
     peak = Math.max(peak, [...factory.runtime.tokens.values()].filter(token => !token.finished).length);
+    if (order.length === 1) await held;
     return {ok: true, summary: 'Fixture publication', finish: {status: 'published', reason: 'fixture'}};
   });
   try {
@@ -317,12 +320,118 @@ test('unmanaged source and channel backlogs both progress through the single ava
     factory.sources.configure(sourceSpec({enabled: true}));
     for (let i = 0; i < 2; i++) factory.journal.append({kind: 'source.candidate', candidate: sourceItem(`fair-${i}`)});
     factory.runtime.start('Continuous sources alongside historical channel deliveries');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    for (let i = 0; i < 10; i++) {
+      factory.sources.pump();
+      factory.channels!.pump();
+    }
+    assert.deepEqual(order, ['source']);
+    assert.equal(children(factory).length, 0, 'a fresh channel cannot take another slot while source work is running');
+    release();
     await settle(factory);
     assert.deepEqual(order, ['source', 'channel', 'source', 'channel', 'channel']);
     assert.equal(peak, 1, 'fairness cannot be achieved by admitting concurrent extra work');
     assert.equal(factory.sources.list()[0].counts.acknowledged, 2);
     assert.ok(factory.channels!.status().every(delivery => delivery.status === 'acknowledged'));
   } finally {
+    release();
+    await close(factory);
+  }
+});
+
+test('source admission bypasses an unrelated paused root but bounds a shared paused downstream frontier', async () => {
+  const calls: string[] = [];
+  const factory = await boot(async ctx => {
+    calls.push(`${ctx.token.item}:${ctx.node.key}`);
+    return success(ctx);
+  });
+  try {
+    await factory.sources.close();
+    factory.sources = new SourceSupervisor(factory);
+    const paused = parent(factory, 'unrelated-paused-root');
+    factory.runtime.setScopePaused({scope: 'station', key: 'source-work/paid', paused: true, reason: 'Inspect shared downstream'});
+    factory.sources.configure(sourceSpec({target: 'source-work/inbox', enabled: true}));
+    for (const id of ['isolated-one', 'isolated-two', 'isolated-three']) {
+      factory.journal.append({kind: 'source.candidate', candidate: sourceItem(id)});
+    }
+    factory.runtime.start('Locally paused intake isolation');
+    await settle(factory);
+    const admitted = () => Object.values(factory.state.tokens).filter(token => token.data.sourceCandidate);
+    assert.equal(admitted().length, 1, 'an unrelated paused root cannot hold a free source slot');
+    assert.equal(factory.runtime.tokens.get(paused.id)?.inflight.size, 0);
+    assert.deepEqual(factory.runtime.queues.get('source-work/paid'), [admitted()[0].id]);
+    for (let i = 0; i < 25; i++) {
+      factory.sources.pump();
+      await settle(factory);
+    }
+    assert.equal(admitted().length, 1, 'new inputs sharing the paused downstream cannot accumulate at its queue');
+    assert.equal(factory.sources.list()[0].counts.pending, 2);
+    factory.runtime.setScopePaused({scope: 'station', key: 'source-work/paid', paused: false, reason: 'Continue shared downstream'});
+    await settle(factory);
+    assert.equal(factory.sources.list()[0].counts.acknowledged, 3);
+    assert.ok(admitted().every(token => token.status === 'published'));
+    assert.equal(factory.state.tokens[paused.id].status, 'active');
+    factory.runtime.setScopePaused({scope: 'line', key: 'parent', paused: false, reason: 'Continue original task'});
+    await settle(factory);
+    assert.equal(factory.state.tokens[paused.id].status, 'published');
+    assert.equal(calls.filter(call => call === 'unrelated-paused-root:parent/prepare').length, 1);
+  } finally {
+    await close(factory);
+  }
+});
+
+test('channel resume and new delivery isolate unrelated paused children without multiplying the live child slot', async () => {
+  let componentCalls = 0;
+  let release!: () => void;
+  let hold = true;
+  const held = new Promise<void>(resolve => {release = resolve;});
+  const factory = await boot(async ctx => {
+    if (ctx.node.key === 'components/discover') {
+      componentCalls++;
+      if (componentCalls === 1) return {ok: false, summary: 'Fixture connection failure', failure: {
+        tag: 'network_timeout', category: 'network', owner: 'system', retryable: true, message: 'Fixture connection failure',
+      }};
+      if (hold) await held;
+    }
+    return success(ctx);
+  });
+  try {
+    factory.compiled.channels.push({id: 'fixture.independent', from: {line: 'parent', station: 'published'},
+      to: {line: 'components', station: 'inbox'}, label: 'Independent fixture'});
+    const upstream = parent(factory, 'channel-parent');
+    const independent = () => factory.journal.append({kind: 'channel.emitted', channel: 'fixture.independent', token: upstream.id, item: upstream.item, inventory: 'consumer'});
+    independent();
+    factory.runtime.start('Independent channel recovery');
+    await settle(factory);
+    const failed = factory.channels!.status().find(delivery => delivery.channel === 'fixture.independent')!;
+    assert.equal(failed.status, 'failed');
+    factory.runtime.setScopePaused({scope: 'station', key: 'child/paid', paused: true, reason: 'Inspect another child frontier'});
+    emit(factory, upstream.id);
+    await settle(factory);
+    const paused = factory.channels!.status().find(delivery => delivery.channel === 'fixture.ready')!;
+    assert.equal(factory.state.tokens[paused.targetToken!].status, 'active');
+    const resumed = factory.channels!.resumeFailed(failed.id);
+    assert.ok(resumed, 'an unrelated paused child cannot prevent the failed child from resuming');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(componentCalls, 2);
+    factory.journal.append({kind: 'token.data', token: upstream.id, patch: {nextDelivery: true}});
+    independent();
+    emit(factory, upstream.id);
+    for (let i = 0; i < 10; i++) factory.channels!.pump();
+    assert.equal(componentCalls, 2, 'the running recovery still owns the sole live child slot');
+    assert.equal(children(factory).filter(token => token.line === 'child').length, 1, 'same paused downstream remains bounded');
+    hold = false;
+    release();
+    await settle(factory);
+    assert.equal(componentCalls, 3, 'a new unrelated delivery progresses once the recovery completes');
+    assert.equal(children(factory).filter(token => token.line === 'child').length, 1);
+    factory.runtime.setScopePaused({scope: 'station', key: 'child/paid', paused: false, reason: 'Resume retained child work'});
+    await settle(factory);
+    assert.ok(factory.channels!.status().every(delivery => delivery.status === 'acknowledged'));
+    assert.equal(factory.state.nodes['child/inbox'].stock, 0);
+  } finally {
+    hold = false;
+    release();
     await close(factory);
   }
 });

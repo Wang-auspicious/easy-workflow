@@ -321,6 +321,21 @@ export class Runtime {
     return seen;
   }
 
+  /** A local pause releases intake only for work outside its queued frontier.
+   * Use the original checkpoint entry when a retry restores parallel branches. */
+  occupiesAdmission(token: TokenRun, targetEntry: string): boolean {
+    if (token.inflight.size) return true;
+    if (token.finished) return false;
+    if (!this.running || this.paused || this.ending || !this.nodes.has(targetEntry)) return true;
+    const frontier = [...token.closure].filter(key =>
+      !token.done.has(key) && !token.dead.has(key) && this.queues.get(key)?.includes(token.id));
+    // An unfinished task without a queued frontier may be restoring or waiting
+    // for repair. Lack of queue evidence must not make its slot free.
+    if (!frontier.length || frontier.some(key => !this.scopePaused(key))) return true;
+    const targetClosure = this.closureOf(targetEntry);
+    return frontier.some(key => targetClosure.has(key));
+  }
+
   /** Rebuild both live and skipped branches before a checkpoint or restart resumes.
    * A join must know that an unselected sibling (e.g. video vs screenshots) is
    * resolved; otherwise it waits forever for work that should never run. */

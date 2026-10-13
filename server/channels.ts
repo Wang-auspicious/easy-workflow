@@ -171,9 +171,9 @@ export class ChannelSupervisor {
     const delivery = this.deliveries.get(id);
     if (!delivery) throw new ControlError(404, 'channel_delivery_not_found', '没有这次信道投递');
     if (delivery.status !== 'failed') return null;
-    if ([...this.deliveryByToken.keys()].some(token => f.state.tokens[token]?.status === 'active')) return null;
-    const {failedAt} = this.retryPlan(delivery);
+    const {failedAt, entry} = this.retryPlan(delivery);
     if (f.runtime.scopePaused(delivery.target) || f.runtime.scopePaused(failedAt)) return null;
+    if (this.childOccupiesAdmission(entry)) return null;
     let token: TokenRun | null = null;
     f.runtime.atomicTransition(() => {
       token = this.resumeChild(delivery);
@@ -197,7 +197,7 @@ export class ChannelSupervisor {
         !this.f.runtime.nodes.has(saved.entry) || !failedAt || !this.f.runtime.closureOf(saved.entry).has(failedAt)) {
       throw new ControlError(409, 'channel_checkpoint_missing', '信道子任务缺少可恢复的持久检查点；请恢复原流水线包，不能从入口盲目重做');
     }
-    return { previous, saved: structuredClone(previous.data.runtimeCheckpoint), failedAt };
+    return {previous, saved: structuredClone(previous.data.runtimeCheckpoint), failedAt, entry: saved.entry};
   }
   private resumeChild(delivery: ChannelDelivery): TokenRun {
     const { previous, saved, failedAt } = this.retryPlan(delivery), runtime = this.f.runtime;
@@ -220,12 +220,26 @@ export class ChannelSupervisor {
     if (this.closed || this.scheduled) return;
     this.scheduled = true; queueMicrotask(() => { this.scheduled = false; if (!this.closed) try { this.pump(); } catch (error) { console.error('channel delivery', error); } });
   }
+
+  private childOccupiesAdmission(targetEntry: string): boolean {
+    for (const id of this.deliveryByToken.keys()) {
+      const token = this.f.runtime.tokens.get(id);
+      if (token && this.f.runtime.occupiesAdmission(token, targetEntry)) return true;
+    }
+    return false;
+  }
+
+  private sourceOccupiesAdmission(targetEntry: string): boolean {
+    const f = this.f;
+    if (f.state.batch?.runId === f.state.run.id) return false;
+    return [...f.runtime.tokens.values()].some(token =>
+      (token.data.sourceCandidate || token.source.startsWith('source:')) &&
+      f.runtime.occupiesAdmission(token, targetEntry));
+  }
+
   pump(): number {
     const f = this.f;
     if (this.closed || process.env.FACTORY_READONLY === '1' || !f.runtime.running || f.runtime.paused || f.runtime.ending) return 0;
-    // The main line owns the resource budget. Historical messages may add only
-    // one live child, even if dozens of downstream workers are available.
-    if ([...this.deliveryByToken.keys()].some(id => f.state.tokens[id]?.status === 'active')) return 0;
     // An unmanaged run shares its next free intake slot with new sources. This
     // direct admission does not call SourceSupervisor.pump, so neither feeder
     // can recursively delegate or yield to a peer that did not create a task.
@@ -245,10 +259,18 @@ export class ChannelSupervisor {
         if (delivery.status !== 'blocked') this.append({ ...delivery, status: 'blocked', reason: '下游工位尚未接线，消息保留等待接入' });
         continue;
       }
+      let entry = target;
       if (delivery.targetToken) {
-        try { if (f.runtime.scopePaused(this.retryPlan(delivery).failedAt)) continue; }
+        try {
+          const plan = this.retryPlan(delivery);
+          if (f.runtime.scopePaused(plan.failedAt)) continue;
+          entry = plan.entry;
+        }
         catch (error) { if (delivery.status !== 'blocked') f.runtime.atomicTransition(() => this.append({ ...delivery, status: 'blocked', reason: (error as Error).message })); continue; }
       }
+      // Keep one executing or ordinarily queued child. A locally paused child
+      // only releases that slot for a target that cannot reach its bottleneck.
+      if (this.childOccupiesAdmission(entry) || this.sourceOccupiesAdmission(entry)) continue;
       const pack = f.workflowPacks?.manifests.find(pack => pack.lines.some(line => line.id === node.line));
       f.runtime.atomicTransition(() => {
         const inventory = this.reservation(delivery);

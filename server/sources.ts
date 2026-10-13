@@ -499,7 +499,8 @@ export class SourceSupervisor {
       return;
     }
     const limit = 1;
-    const inFlight = [...f.runtime.tokens.values()].filter(token => !token.finished).length;
+    const inFlight = [...f.runtime.tokens.values()]
+      .filter(token => f.runtime.occupiesAdmission(token, source.target)).length;
     if (inFlight >= limit) return `已达到 ${limit} 件执行或排队任务的入场上限，等待现有任务让出名额`;
   }
 
@@ -510,8 +511,7 @@ export class SourceSupervisor {
       this.f.batch.schedule();
       return 0;
     }
-    const vacant = ![...this.f.runtime.tokens.values()].some(token => !token.finished);
-    if (vacant && this.channelHasNextTurn()) {
+    if (this.channelHasNextTurn()) {
       const admitted = this.f.channels?.pump() ?? 0;
       if (admitted) return admitted;
     }

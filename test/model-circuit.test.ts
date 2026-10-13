@@ -479,3 +479,287 @@ test('an ended unmanaged run does not retain its old model hold after a new-run 
     cleanup();
   }
 });
+
+test('an explicit retry rearms one exhausted model checkpoint and preserves provider backoff for manual and source work', {timeout: 30000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  for (const origin of ['manual', 'source'] as const) {
+    const factory = await ready();
+    const item = `${origin}-explicit`;
+    let calls = 0;
+    let prepared = 0;
+    let phase: 'exhaust' | 'model-fails' | 'healthy' = 'exhaust';
+    factory.runtime.executors = node => async ctx => {
+      if (node.key === 'curation/scout') {
+        prepared++;
+        ctx.addEvidence({id: `${origin}-preparation`, kind: 'text', label: 'Paid preparation kept'});
+        return {ok: true, summary: 'Prepared once', data: {canonical: ctx.token.url, retained: 'saved artifact'}};
+      }
+      if (node.key !== 'curation/reader') return {ok: true, summary: 'Fixture step'};
+      calls++;
+      assert.equal(ctx.token.data.retained, 'saved artifact');
+      if (calls <= 2 || phase === 'model-fails') return transport();
+      if (phase === 'healthy') return reportedReply();
+      return {ok: false, summary: 'Input tool is still unavailable', failure: {
+        tag: 'tool_error', category: 'system', owner: 'system', retryable: true, message: 'Fixture local tool unavailable',
+      }};
+    };
+    try {
+      factory.runtime.start('Explicit retry ' + origin);
+      if (origin === 'source') {
+        await factory.sources.close();
+        factory.sources = new SourceSupervisor(factory);
+        factory.sources.configure({id: 'fixture', name: 'Fixture source', url: 'https://feed.example/items',
+          platform: 'fixture', format: 'json', target: 'candidates/tidy', intervalMs: 86400000, enabled: true});
+        factory.journal.append({kind: 'source.candidate', candidate: {id: item, source: 'fixture', platform: 'fixture',
+          sourceUrl: 'https://feed.example/items', url: `https://${item}.example/`, title: item, discoveredAt: Date.now(), status: 'pending'}});
+      } else factory.runtime.create('curation/scout', {item, url: 'https://fixture.example/', source: 'manual'});
+      await settleRecovery(factory);
+      for (let i = 0; i < 6 && recoveryPlan(factory).plan.state !== 'exhausted'; i++) {
+        t.mock.timers.tick(recoveryPlan(factory).plan.nextAt - Date.now());
+        factory.recovery.pump();
+        await settleRecovery(factory);
+      }
+      assert.equal(calls, 5);
+      assert.equal(recoveryPlan(factory).plan.networkAttempts, 2);
+      assert.equal(recoveryPlan(factory).plan.modelFailures, 2);
+      assert.equal(recoveryPlan(factory).plan.state, 'exhausted');
+      for (let i = 0; i < 3; i++) {t.mock.timers.tick(3600000); factory.recovery.pump(); await settleRecovery(factory);}
+      assert.equal(calls, 5, 'waiting loops cannot reset exhausted automatic budgets');
+      if (origin === 'source') factory.sources.setEnabled('fixture', false);
+      factory.runtime.setScopePaused({scope: 'station', key: 'curation/reader', paused: true, reason: 'Inspect explicit retry before releasing it'});
+      const old = recoveryPlan(factory).token;
+      const count = factory.runtime.tokens.size;
+      const [requested] = factory.retryCandidates({items: [item], count: 1});
+      assert.equal(factory.runtime.tokens.size, count + 1);
+      assert.equal(requested.data.retryOf, old.id);
+      assert.equal(recoveryPlan(factory).plan.networkAttempts, 0);
+      assert.equal(recoveryPlan(factory).plan.modelFailures, 2);
+      assert.equal(recoveryPlan(factory).plan.state, 'waiting');
+      assert.deepEqual(factory.retryCandidates({items: [item], count: 1}), [], 'duplicate explicit requests cannot clone a claimed task');
+      factory.recovery.pump();
+      await settleRecovery(factory);
+      assert.equal(calls, 5, 'local pause remains in force');
+      factory.runtime.pause();
+      factory.runtime.setScopePaused({scope: 'station', key: 'curation/reader', paused: false, reason: 'Local inspection finished'});
+      factory.recovery.pump();
+      await settleRecovery(factory);
+      assert.equal(calls, 5, 'global pause remains in force');
+      phase = 'model-fails';
+      factory.runtime.resume();
+      factory.recovery.pump();
+      await settleRecovery(factory);
+      assert.equal(calls, 6);
+      assert.equal(factory.runtime.tokens.size, count + 1, 'the explicit token itself is the trial');
+      assert.equal(recoveryPlan(factory).plan.modelFailures, 3);
+      assert.equal(recoveryPlan(factory).plan.nextAt - Date.now(), 120000);
+      assert.ok(factory.broker.modelHold, 'another provider failure cannot reopen intake');
+      phase = 'healthy';
+      if (origin === 'source') {
+        factory.recovery.pump(recoveryPlan(factory).plan.nextAt);
+        await settleRecovery(factory);
+        assert.equal(calls, 6, 'parked automatic retries still respect a disabled source');
+        const [again] = factory.retryCandidates({items: [item], count: 1});
+        assert.equal(again.data.retryOf, requested.id);
+      } else t.mock.timers.tick(recoveryPlan(factory).plan.nextAt - Date.now());
+      factory.recovery.pump();
+      await settleRecovery(factory);
+      assert.equal(calls, 7);
+      assert.equal(prepared, 1);
+      assert.equal(recoveryPlan(factory).token.status, 'published');
+      assert.equal(factory.broker.modelHold, null);
+      assert.ok(recoveryPlan(factory).token.evidence.length > 0);
+      if (origin === 'source') {
+        assert.equal(factory.sources.list()[0].enabled, false, 'retrying accepted work does not reactivate collection');
+        assert.equal(factory.sources.list()[0].counts.acknowledged, 1);
+      }
+    } finally {
+      await close(factory);
+      cleanup();
+    }
+  }
+});
+
+test('explicit retry of a failed source entry retains its input and evidence without creating a model hold', {timeout: 30000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const factory = await ready();
+  let calls = 0;
+  let healthy = false;
+  factory.runtime.executors = node => async ctx => {
+    calls++;
+    assert.equal(node.key, 'candidates/tidy');
+    assert.deepEqual(ctx.token.data.input, {url: 'https://source-entry.example/', selector: 'original-input'});
+    if (!ctx.token.data.retryOf) ctx.addEvidence({id: 'entry-observation', kind: 'text', label: 'Original source observation'});
+    return healthy ? {ok: true, summary: 'Entry recovered', finish: {status: 'published', reason: 'fixture'}}
+      : {ok: false, summary: 'Entry request timed out', data: {partialResult: 'preserve failed-step output'}, failure: {
+        tag: 'network_timeout', category: 'network', owner: 'system', retryable: true, message: 'Fixture timeout',
+      }};
+  };
+  try {
+    await factory.sources.close();
+    factory.sources = new SourceSupervisor(factory);
+    factory.sources.configure({id: 'fixture', name: 'Fixture source', url: 'https://feed.example/items', platform: 'fixture',
+      format: 'json', target: 'candidates/tidy', input: {url: 'url'}, constants: {selector: 'original-input'}, intervalMs: 86400000, enabled: true});
+    factory.runtime.start('Explicit source entry retry');
+    factory.journal.append({kind: 'source.candidate', candidate: {id: 'entry-source', source: 'fixture', platform: 'fixture',
+      sourceUrl: 'https://feed.example/items', url: 'https://source-entry.example/', title: 'Entry source', discoveredAt: Date.now(), status: 'pending'}});
+    await settleRecovery(factory);
+    for (let i = 0; i < 2; i++) {
+      t.mock.timers.tick(recoveryPlan(factory).plan.nextAt - Date.now());
+      factory.recovery.pump();
+      await settleRecovery(factory);
+    }
+    assert.equal(recoveryPlan(factory).plan.state, 'exhausted');
+    assert.equal(calls, 3);
+    const previous = recoveryPlan(factory).token;
+    factory.sources.setEnabled('fixture', false);
+    healthy = true;
+    const [retry] = factory.retryCandidates({items: ['entry-source'], count: 1});
+    assert.equal(retry.source, 'source:fixture');
+    assert.equal(retry.data.sourceCandidate, 'entry-source');
+    assert.equal(retry.data.partialResult, 'preserve failed-step output');
+    assert.equal(factory.state.tokens[previous.id].data.retriedBy, retry.id);
+    assert.equal((retry.data.__runtimeRecovery as {networkAttempts: number}).networkAttempts, 0);
+    assert.equal(factory.broker.modelHold, null);
+    assert.equal(factory.broker.recoveryToken, null);
+    await settleRecovery(factory);
+    assert.equal(calls, 4);
+    assert.equal(factory.state.tokens[retry.id].status, 'published');
+    assert.ok(factory.state.tokens[retry.id].evidence.some(id => previous.evidence.includes(String(factory.state.evidence[id].meta?.reusedFrom))));
+    assert.equal(factory.sources.list()[0].counts.acknowledged, 1);
+    assert.equal(factory.sources.list()[0].enabled, false);
+    assert.equal(factory.broker.modelHold, null);
+  } finally {
+    await close(factory);
+    cleanup();
+  }
+});
+
+test('an explicit new-run retry resumes every unfinished branch without replaying completed work', {timeout: 30000}, async () => {
+  for (const source of ['candidates/pool', 'manual']) {
+    const factory = await ready();
+    const calls = new Map<string, number>();
+    const branches = ['curation/reader', 'curation/classify', 'curation/classify-review'];
+    factory.runtime.executors = node => async ctx => {
+      calls.set(node.key, (calls.get(node.key) ?? 0) + 1);
+      if (node.key === 'curation/scout') {
+        ctx.addEvidence({id: 'paid-preparation', kind: 'text', label: 'Original preparation'});
+        return {ok: true, summary: 'Prepared once', data: {
+          canonical: ctx.token.url, kindAgreed: true, mode: 'shots', needsProof: true, retained: 'original result',
+        }};
+      }
+      assert.equal(ctx.token.data.retained, 'original result');
+      return {ok: true, summary: 'Fixture continuation', data: node.key === 'curation/gate' ? {gate: 'pass'} : undefined};
+    };
+    try {
+      factory.runtime.start('Interrupted parallel work');
+      factory.runtime.setScopePaused({scope: 'station', key: 'curation/reader', paused: true, reason: 'End with all branches queued'});
+      const original = factory.runtime.create('curation/scout', {item: 'ended-parallel', url: 'https://fixture.example/', source});
+      await settleRecovery(factory);
+      assert.deepEqual([...original.done], ['curation/scout']);
+      original.rounds['curation/proof'] = 1;
+      original.notes.set('curation/reader', {reason: 'Keep the original reading contract', byHuman: true});
+      factory.runtime.checkpoint(original);
+      const priorRun = factory.runtime.end();
+      await settleRecovery(factory);
+      assert.equal(factory.state.recoveries[original.item].failure?.tag, 'run_ended');
+      const [retry] = factory.retryCandidates({items: [original.item], count: 1});
+      assert.notEqual(factory.state.run.id, priorRun);
+      assert.equal(retry.entry, original.entry);
+      assert.equal(retry.source, original.source);
+      assert.equal(retry.rounds['curation/proof'], 1);
+      assert.deepEqual(retry.notes.get('curation/reader'), original.notes.get('curation/reader'));
+      assert.deepEqual([...retry.done], ['curation/scout']);
+      for (const key of branches) {
+        assert.ok(factory.runtime.queues.get(key)?.includes(retry.id), `the complete unfinished frontier includes ${key}`);
+        assert.equal(factory.runtime.scopePaused(key), true, 'explicit retry cannot clear local pause');
+      }
+      assert.equal(factory.runtime.tokens.size, 2);
+      assert.deepEqual(factory.retryCandidates({items: [original.item], count: 1}), []);
+      for (const key of branches) factory.runtime.setScopePaused({scope: 'station', key, paused: false, reason: 'Resume saved work'});
+      await settleRecovery(factory);
+      assert.equal(factory.state.tokens[retry.id].status, 'published');
+      assert.equal(calls.get('curation/scout'), 1, 'paid preparation is reused');
+      for (const key of branches) assert.equal(calls.get(key), 1);
+      assert.equal(calls.get('curation/gate'), 1);
+      assert.equal([...factory.journal.read()].filter(event => event.kind === 'token.finished' && event.status === 'published').length, 1);
+      assert.ok(factory.state.tokens[retry.id].evidence.some(id => factory.state.evidence[id].meta?.reusedFrom === 'paid-preparation'));
+    } finally {
+      await close(factory);
+      cleanup();
+    }
+  }
+});
+
+test('an ended checkpoint with no runnable frontier cannot republish a completed terminal station', async () => {
+  const factory = await ready();
+  let calls = 0;
+  factory.runtime.executors = () => async () => ({ok: true, summary: `Gate result ${++calls}`, data: {gate: 'pass'}});
+  try {
+    factory.runtime.start('Completed terminal checkpoint');
+    const original = factory.runtime.create('curation/gate', {item: 'completed-terminal', url: 'https://fixture.example/', source: 'candidates/pool'});
+    await settleRecovery(factory);
+    assert.equal(factory.state.tokens[original.id].status, 'published');
+    factory.runtime.end();
+    // A stale recovery record may outlive the terminal station's successful
+    // checkpoint. It must not turn that paid, completed station into a retry.
+    factory.journal.append({kind: 'candidate.disposition', candidate: {
+      item: original.item, token: original.id, url: original.url, title: original.item,
+      source: original.source, disposition: 'retry', failure: {
+        tag: 'run_ended', category: 'system', message: 'Legacy unfinished record', retryable: true,
+      },
+    }});
+    const count = factory.runtime.tokens.size;
+    assert.throws(() => factory.retryCandidates({items: [original.item], count: 1}),
+      error => error instanceof Error && 'status' in error && error.status === 409);
+    assert.equal(factory.runtime.tokens.size, count);
+    assert.equal(calls, 1);
+    assert.equal([...factory.journal.read()].filter(event => event.kind === 'token.finished' && event.status === 'published').length, 1);
+    factory.runtime.start('Validation failure did not corrupt storage');
+    assert.equal(factory.runtime.running, true);
+  } finally {
+    await close(factory);
+    cleanup();
+  }
+});
+
+test('network recovery shares an empty slot only outside the paused task and full saved entry closure', {timeout: 30000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  for (const entry of ['curation/scout', 'candidates/route']) {
+    const factory = await ready();
+    let calls = 0;
+    factory.runtime.executors = node => async ctx => {
+      if (ctx.token.item === 'paused-skill') return {ok: true, summary: 'Released paused task', finish: {status: 'published', reason: 'fixture'}};
+      if (node.key !== 'curation/reader') return {ok: true, summary: 'Saved preparation', data: {canonical: ctx.token.url}};
+      calls++;
+      return calls === 1 ? {ok: false, summary: 'Temporary network failure', failure: {
+        tag: 'network_timeout', category: 'network', owner: 'system', retryable: true, message: 'Fixture timeout',
+      }} : {ok: true, summary: 'Saved checkpoint recovered', finish: {status: 'published', reason: 'fixture'}};
+    };
+    try {
+      factory.runtime.start('Independent paused work and network retry');
+      factory.runtime.setScopePaused({scope: 'line', key: 'skills', paused: true, reason: 'Inspect another workflow'});
+      const paused = factory.runtime.create('skills/fetch-file', {item: 'paused-skill', url: 'https://skill.example/', source: 'manual'});
+      factory.runtime.create(entry, {item: 'network-retry', url: 'https://fixture.example/', source: 'manual', data: {route: 'curation', express: true}});
+      await settleRecovery(factory);
+      assert.equal(calls, 1);
+      const due = recoveryPlan(factory).plan.nextAt;
+      t.mock.timers.tick(due - Date.now());
+      factory.recovery.pump();
+      await settleRecovery(factory);
+      assert.equal(factory.state.tokens[paused.id].status, 'active');
+      if (entry === 'candidates/route') {
+        assert.equal(calls, 1, 'the original intake closure includes Skills, even when the failed station does not');
+        factory.runtime.setScopePaused({scope: 'line', key: 'skills', paused: false, reason: 'Resume the shared bottleneck'});
+        await settleRecovery(factory);
+        factory.recovery.pump();
+        await settleRecovery(factory);
+      }
+      assert.equal(calls, 2, 'a paused unrelated workflow cannot starve this due recovery');
+      assert.equal(recoveryPlan(factory).token.status, 'published');
+      assert.equal(recoveryPlan(factory).plan.networkAttempts, 1);
+    } finally {
+      await close(factory);
+      cleanup();
+    }
+  }
+});

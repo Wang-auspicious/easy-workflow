@@ -88,9 +88,10 @@ export class UnmanagedRecoverySupervisor {
     return latestRunTokens(this.factory.state);
   }
 
-  private plan(token: TokenState): RecoveryPlan | undefined {
+  private plan(token: TokenState, allowPreviousRun = false): RecoveryPlan | undefined {
     const value = token.data[KEY];
-    if (!record(value) || value.version !== 1 || value.runId !== this.factory.state.run.id ||
+    if (!record(value) || value.version !== 1 || typeof value.runId !== 'string' ||
+        (!allowPreviousRun && value.runId !== this.factory.state.run.id) ||
         !['network', 'model'].includes(String(value.kind)) ||
         !['waiting', 'trial', 'completed', 'exhausted', 'blocked'].includes(String(value.state)) ||
         typeof value.station !== 'string' || typeof value.failureAttempt !== 'string' ||
@@ -190,6 +191,24 @@ export class UnmanagedRecoverySupervisor {
 
   /** Called inside result handling; inspect the failure only after its commit. */
   modelFailed() {
+    this.schedule();
+  }
+
+  /** A new user request owns this already-created token, not another clone. */
+  requestedRetry(previous: TokenState | undefined, token: TokenRun) {
+    const f = this.factory;
+    if (!previous || !this.writable() || token.data.retryOf !== previous.id) return;
+    const old = this.plan(previous, true);
+    if (!old) return;
+    const verifying = old.kind === 'model' && Boolean(f.state.alerts['model-transport'] || f.broker.modelHold);
+    const station = typeof token.data.recoveryStation === 'string' ? token.data.recoveryStation : old.station;
+    this.save(token.id, {
+      ...old, runId: f.state.run.id, kind: verifying ? 'model' : 'network',
+      state: verifying ? 'waiting' : 'trial', station, nextAt: verifying ? Date.now() : 0,
+      networkAttempts: 0, modelStation: verifying ? old.modelStation ?? old.station : undefined,
+      networkRetry: false, reason: undefined,
+    }, verifying ? '已接受显式重试；重置本次工具恢复预算，原工位的真实模型响应仍须通过验证'
+      : '已接受显式重试；保留原检查点与成果，为本次请求重新计工具恢复预算');
     this.schedule();
   }
 
@@ -303,13 +322,17 @@ export class UnmanagedRecoverySupervisor {
       const waiting = tokens.filter(token => {
         const plan = this.plan(token);
         return plan?.state === 'waiting' && plan.nextAt <= now &&
-          (!modelHold || plan.kind === 'model') && !f.runtime.scopePaused(plan.station) && this.sourceEnabled(token);
+          (!modelHold || plan.kind === 'model') && !f.runtime.scopePaused(plan.station) &&
+          (token.status === 'active' || this.sourceEnabled(token));
       }).sort((a, b) => this.plan(a)!.nextAt - this.plan(b)!.nextAt);
       for (const token of waiting) {
         const plan = this.plan(token)!;
         if (plan.kind === 'model' && f.broker.used.model > 0) return;
+        const saved = token.data.runtimeCheckpoint;
+        const entry = this.checkpoint(token) && record(saved) && typeof saved.entry === 'string' ? saved.entry : undefined;
         if (plan.kind === 'network' && !token.data.channelDelivery &&
-            [...f.runtime.tokens.values()].some(value => !value.finished)) return;
+            [...f.runtime.tokens.values()].some(value => entry
+              ? f.runtime.occupiesAdmission(value, entry) : !value.finished)) return;
         const hold = f.broker.modelHold;
         if (plan.kind === 'model') {
           f.broker.recoveryToken = 'pending-unmanaged-trial';

@@ -492,9 +492,15 @@ export class Factory {
       return { cleared: true, resumed: tasks.some(token => token.item === alert.item), message: tasks.some(token => token.item === alert.item) ? '访问已恢复，已从失败工位继续' : candidate?.disposition === 'retry' ? '访问已恢复，已排入恢复队列；在途任务腾出空位后自动继续' : '访问已恢复，该任务已不在待重试队列' };
     }
     if (alert.kind === 'model' || alert.kind === 'preflight') {
-      try { await this.ensureReady(true); } catch { /* Preserve the concrete preflight result. */ }
+      let checked = false;
+      try { checked = (await this.ensureReady(true))?.ok === true; }
+      catch { /* Preserve the concrete preflight result. */ }
       const cleared = !this.state.alerts[id];
-      if (id === 'model-transport' && !cleared && this.state.preflight?.ok && this.state.batch?.modelCircuit) return { cleared:false,resumed:false,message:this.runtime.paused ? '连接体检通过；本轮仍暂停，继续后用一个真实工位验证恢复' : '连接体检通过；只允许一个真实工位验证，完整提交通过后再恢复批量任务' };
+      if (id === 'model-transport' && !cleared && checked) return {
+        cleared: false, resumed: false,
+        message: this.runtime.paused ? '连接体检通过；本轮仍暂停，恢复计划与检查点保留'
+          : '连接体检通过；仍需原工位的真实模型响应才能解除暂停，请查看任务的恢复状态',
+      };
       return { cleared, resumed: false, message: cleared ? '体检已通过，提醒已解除' : '体检仍未通过，请查看当前检测结果' };
     }
     return { cleared: false, resumed: false, message: alert.nextAction ?? '问题尚未有修复证据，提醒保持' };
@@ -679,6 +685,15 @@ export class Factory {
       });
       return resumed;
     }
+    const requestedCheckpoints = new Map<string, ReturnType<Factory['candidateCheckpoint']>>();
+    if (!filter.automatic && !filter.preview && !filter.replan) {
+      for (const candidate of selected) {
+        const saved = this.state.tokens[candidate.token]?.data.runtimeCheckpoint;
+        if (saved && typeof saved === 'object' && (saved as {version?: number}).version === 1) {
+          requestedCheckpoints.set(candidate.token, this.candidateCheckpoint(candidate, true));
+        }
+      }
+    }
     if (!filter.automatic) {
       for (const candidate of selected) {
         for (const kind of ['tls', 'auth', 'browser']) {
@@ -689,6 +704,15 @@ export class Factory {
     if(!this.runtime.running)this.runtime.start(`失败重试 × ${selected.length}`);
     return selected.map(c=>{
       const previous=this.state.tokens[c.token];
+      const prepared = requestedCheckpoints.get(c.token);
+      if (prepared) {
+        let requested!: TokenRun;
+        this.runtime.atomicTransition(() => {
+          requested = this.resumeCandidateCheckpoint(c, prepared);
+          this.recovery?.requestedRetry(previous, requested);
+        });
+        return requested;
+      }
       const legacy:Record<string,string>={"curation/fetch":"curation/scout"};
       const failedAt=filter.replan?'curation/reader':filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode&&(legacy[previous.finishedAtNode]??previous.finishedAtNode);
       const legacyCandidate = !previous?.data.workflowPack && (previous?.line === 'candidates' || previous?.line === 'curation');
@@ -728,18 +752,18 @@ export class Factory {
       }
       this.journal.append({kind:"dispatch.note",node:checkpoint,tone:"info",text:`${c.title} 从${this.compiled.nodes.find(n=>n.key===checkpoint)?.name??checkpoint}继续，保留此前成果`});
       this.journal.append({kind:"candidate.disposition",candidate:{...c,token:t.id,disposition:"claimed"}});
-      if (this.runtime.nodes.has('candidates/pool')) this.runtime.stockDelta("candidates/pool",-1,`${c.item} 已取出重试`);return t;
+      if (this.runtime.nodes.has('candidates/pool')) this.runtime.stockDelta("candidates/pool",-1,`${c.item} 已取出重试`);
+      if (!filter.automatic) this.recovery?.requestedRetry(previous, t);
+      return t;
     });
   }
 
-  private candidateCheckpoint(candidate: CandidateRecovery) {
+  private candidateCheckpoint(candidate: CandidateRecovery, allowPaused = false) {
     const previous = this.state.tokens[candidate.token];
     const raw = previous?.data.runtimeCheckpoint;
     const saved = raw && typeof raw === 'object' ? raw as {
       version?: unknown; entry?: unknown; done?: unknown; rounds?: unknown; notes?: unknown;
     } : undefined;
-    const failedAt = previous?.finishedAtNode;
-    const node = failedAt && this.runtime.nodes.get(failedAt);
     if (!previous || !saved || saved.version !== 1 || typeof saved.entry !== 'string' ||
         !this.runtime.nodes.has(saved.entry) || !Array.isArray(saved.done) ||
         !saved.done.every(key => typeof key === 'string') ||
@@ -747,11 +771,31 @@ export class Factory {
         !Object.values(saved.rounds).every(value => Number.isSafeInteger(value) && value >= 0) ||
         !Array.isArray(saved.notes) || !saved.notes.every(note => Array.isArray(note) &&
           note.length === 2 && typeof note[0] === 'string' && note[1] &&
-          typeof note[1].reason === 'string' && typeof note[1].byHuman === 'boolean') ||
-        !node || !this.runtime.runnable(node) || !this.runtime.closureOf(saved.entry).has(node.key)) {
+          typeof note[1].reason === 'string' && typeof note[1].byHuman === 'boolean')) {
       throw new ControlError(409, 'recovery_checkpoint_missing', '缺少原失败工位的完整持久检查点；已保留成果，不能自动回入口重做');
     }
-    if (this.runtime.scopePaused(node.key)) throw new ControlError(409, 'scope_paused', '原失败工位已局部暂停，自动恢复继续等待');
+    let node = previous.finishedAtNode ? this.runtime.nodes.get(previous.finishedAtNode) : undefined;
+    if (allowPaused && candidate.failure?.tag === 'run_ended' &&
+        (!node || !this.runtime.runnable(node) || saved.done.includes(node.key))) {
+      // Ending parks inventory at its source, which need not be its unfinished
+      // station. Reconstruct from the saved decision, never historical success.
+      const original = this.runtime.tokens.get(previous.id);
+      node = undefined;
+      if (original) {
+        const snapshot = structuredClone(original);
+        snapshot.data = structuredClone(previous.data);
+        this.runtime.restoreCheckpoint(snapshot);
+        this.runtime.restoreFlow(snapshot);
+        const repair = snapshot.consult && (snapshot.consult.chain[0] ?? snapshot.consult.reviewer);
+        const frontier = repair ? [repair] : !snapshot.done.has(snapshot.entry) && !snapshot.dead.has(snapshot.entry)
+          ? [snapshot.entry] : this.runtime.readyFrontier(snapshot);
+        node = frontier.map(key => this.runtime.nodes.get(key)).find(value => value && this.runtime.runnable(value));
+      }
+    }
+    if (!node || !this.runtime.runnable(node) || !this.runtime.closureOf(saved.entry).has(node.key)) {
+      throw new ControlError(409, 'recovery_checkpoint_missing', '原持久检查点没有可恢复的未完成工位；已保留成果，不能回入口重做或重复发布');
+    }
+    if (!allowPaused && this.runtime.scopePaused(node.key)) throw new ControlError(409, 'scope_paused', '原失败工位已局部暂停，自动恢复继续等待');
     if (previous.status === 'active' || typeof previous.data.retriedBy === 'string' &&
         this.state.tokens[previous.data.retriedBy]) {
       throw new ControlError(409, 'recovery_already_claimed', '原任务已有执行或恢复记录，不能重复领取');

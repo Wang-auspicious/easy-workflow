@@ -60,6 +60,75 @@ test('station and line pauses preserve queued inputs while unrelated lines conti
   } finally { await runtime.close(); journal.close(); }
 });
 
+test('admission distinguishes a fully paused frontier from resource waits, inflight work and missing queues', async () => {
+  const fixturePack: Pack = {...pack, lines: [line({
+    id: 'parallel', name: 'Parallel work', layer: 3, priority: 'mid', wired: true, blurb: 'Admission fixture',
+    stations: [
+      station({id: 'start', name: 'Start', role: 'process', kind: 'program', resource: 'none',
+        accept: ['Both branches are queued'], workers: {min: 1, max: 1, initial: 1, policy: 'fixed'}}),
+      ...['left', 'right'].map(id => station({id, name: id, role: 'process', kind: 'program', resource: 'cpu',
+        accept: ['Branch is complete'], workers: {min: 1, max: 1, initial: 1, policy: 'fixed'}})),
+      station({id: 'published', name: 'Done', role: 'store', kind: 'store'}),
+    ],
+    edges: [['start', 'left'], ['start', 'right'], ['left', 'published'], ['right', 'published']],
+  }), pack.lines[1]], order: ['parallel', 'slow']};
+  const {runtime, broker, journal, state} = setup(fixturePack, {cpu: 0});
+  let release!: () => void;
+  const held = new Promise<void>(resolve => {release = resolve;});
+  runtime.executors = node => async () => {
+    if (node.key === 'slow/work') await held;
+    return {ok: true, summary: 'Fixture work completed'};
+  };
+  try {
+    runtime.setScopePaused({scope: 'station', key: 'parallel/left', paused: true, reason: 'Inspect left branch'});
+    const parallel = runtime.create('parallel/start', {item: 'parallel', url: '', source: 'fixture'});
+    await runtime.settle();
+    assert.deepEqual(runtime.queues.get('parallel/left'), [parallel.id]);
+    assert.deepEqual(runtime.queues.get('parallel/right'), [parallel.id]);
+    assert.equal(broker.used.cpu, 0);
+    assert.equal(runtime.occupiesAdmission(parallel, 'slow/work'), true,
+      'an unpaused branch waiting for CPU still owns its admission slot');
+    runtime.setScopePaused({scope: 'station', key: 'parallel/right', paused: true, reason: 'Inspect right branch'});
+    assert.equal(runtime.occupiesAdmission(parallel, 'slow/work'), false,
+      'a fully paused frontier releases an unrelated target');
+    assert.equal(runtime.occupiesAdmission(parallel, 'parallel/start'), true,
+      'the original entry includes both paused downstream branches');
+    runtime.pause();
+    assert.equal(runtime.occupiesAdmission(parallel, 'slow/work'), true, 'global pause cannot release intake');
+    runtime.resume();
+
+    const leftQueue = runtime.queues.get('parallel/left')!;
+    const rightQueue = runtime.queues.get('parallel/right')!;
+    runtime.queues.set('parallel/left', []);
+    runtime.queues.set('parallel/right', []);
+    assert.equal(runtime.occupiesAdmission(parallel, 'slow/work'), true,
+      'an active task with only stale queuedAt entries is not proven locally paused');
+    runtime.queues.set('parallel/left', leftQueue);
+    runtime.queues.set('parallel/right', rightQueue);
+
+    broker.limits.cpu = 1;
+    const active = runtime.create('slow/work', {item: 'active', url: '', source: 'fixture'});
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(active.inflight.size, 1);
+    runtime.setScopePaused({scope: 'line', key: 'slow', paused: true, reason: 'Pause while execution drains'});
+    assert.equal(runtime.occupiesAdmission(active, 'parallel/start'), true,
+      'pausing a line cannot discount an execution that has not stopped');
+    release();
+    await runtime.settle();
+    assert.equal(state.tokens[active.id].status, 'published');
+    assert.equal(runtime.occupiesAdmission(active, 'parallel/start'), false);
+    runtime.setScopePaused({scope: 'station', key: 'parallel/left', paused: false, reason: 'Continue left branch'});
+    runtime.setScopePaused({scope: 'station', key: 'parallel/right', paused: false, reason: 'Continue right branch'});
+    await runtime.settle();
+    assert.equal(state.tokens[parallel.id].status, 'published', 'resuming preserves both original branches');
+    assert.equal(state.tokens[parallel.id].attempts.length, 3);
+  } finally {
+    release();
+    await runtime.close();
+    journal.close();
+  }
+});
+
 test('ten independent completed items produce one durable proposal without changing staff before confirmation', async () => {
   const { runtime, journal, state } = setup();
   try {
