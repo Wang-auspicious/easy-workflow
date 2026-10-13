@@ -1,0 +1,61 @@
+# Easy Workflow：LangGraph 与 Google TypeScript 对照
+
+核查日期：2026-10-12。代码基线：`672d8d3` 加本轮工作区改动；报告 Worker、日志分页、UI 历史页修复同时进行中。下列“已有”表示可以定位的实现，不代表本轮重新完成了所有环境验收。代码行号供定位，后续以符号名为准。
+
+结论：保留现有 Journal / Runtime / Broker，优先把内存、外部副作用、并发写入和执行器恢复契约补齐。现在替换整个引擎会扩大迁移范围，无法直接解决历史页卡顿或外部命令重复执行。
+
+资料只使用 LangChain 官方 JavaScript/TypeScript 文档及 Google 官方 TypeScript 指南。按 agent-reach 网页路由和 web-access 静态获取指引读取，Jina 仅用于提取官方正文；没有打开用户浏览器、读取登录态或操作原项目。旧 `durable-execution` URL 本次重定向到 `persistence`，因此下面引用实际页面。没有安装 LangGraph，也没有用 Python 示例推断 TypeScript 能力。
+
+## 已有能力、真实差距与优先级
+
+| 能力 | 官方依据 | 当前仓库证据 | 差距与实现优先级 |
+|---|---|---|---|
+| 持久执行与检查点 | [Checkpointers](https://docs.langchain.com/oss/javascript/langgraph/checkpointers) 区分步骤快照与已完成节点的中间写入；失败恢复可以复用已完成节点 | [journal.ts](../server/journal.ts) `atomic/publish`：事务提交后投影和通知；[runtime.ts](../server/runtime.ts) `checkpoint/restoreCheckpoint/finishAttempt/haltForStorage`；[factory.ts](../server/factory.ts) `restore` 重建分支前沿；已有原子性、重启、存储故障回归 | **已有核心能力，不能列为“未实现”**。P0 保持日志提交失败后原进程停止的约束。工位内一次外部调用成功、工位结果未落盘的窗口另列为副作用问题，不能用工位检查点掩盖 |
+| 外部副作用与重试 | [Graph API：节点重执行及任务](https://docs.langchain.com/oss/javascript/langgraph/graph-api#re-execution-and-idempotency) 和 [Interrupts：副作用](https://docs.langchain.com/oss/javascript/langgraph/interrupts#side-effects-called-before-interrupt-must-be-idempotent) 要求关注节点重执行；中断前的写操作可能重做 | [workflow-tools.ts](../server/workflow-tools.ts):97 `invokeWorkflowTool` 可直接发 POST / 启动 CLI；[workflow-packs.ts](../server/workflow-packs.ts):219 调用后才返回结果，由 Runtime 落盘。内置 `publish-json` 已使用内容哈希路径和临时文件替换。Dispatcher 也已有独立的工具操作回执，不能把它误称为全平台无回执 | **P0：通用 executor 的副作用回执**。用项目、任务工作身份、工位版本、输入摘要和业务操作序号生成稳定键；持久记录 started/completed/unknown。远端支持时传幂等键；响应丢失先查询远端结果。无去重/查询能力的非幂等操作标结果未知，停止该项，不能自动重发或宣称 exactly-once |
+| 历史读取、流式更新与背压 | [Streaming](https://docs.langchain.com/oss/javascript/langgraph/streaming) 区分增量更新、全状态和消息流；[Event streaming](https://docs.langchain.com/oss/javascript/langgraph/event-streaming) 提供按类型消费的投影。本次读取的页面没有承诺本应用 HTTP 慢客户端缓冲有界 | [main.ts](../server/main.ts) `/api/journal` 已有分页、固定 through、`drain` 等待；[journal.ts](../server/journal.ts) `readPage` 上限 500。报告正移到 [report-reader.ts](../server/report-reader.ts) 单 Worker、相同报告合并请求、3 项缓存。核查时 `/api/events` 重放与 live 广播仍直接 `res.write` | **P0：SSE 也必须有界**。主 agent 正负责实现；历史追赶分批让出事件循环，慢连接设字节上限并按 `Last-Event-ID` 恢复，不能令浏览器读取速度拖慢工位提交。全量状态只用于初始化，普通更新继续传增量。Worker 移走计算并不自动减少数据驻留 |
+| 运行内存与长期记忆 | [Persistence](https://docs.langchain.com/oss/javascript/langgraph/persistence) 将线程状态与跨线程 Store 分开，并提示检查点增长问题；[Stores](https://docs.langchain.com/oss/javascript/langgraph/stores) 面向有命名空间的应用记忆。这与进程 RAM 上限不是同一个问题 | [shared/project.ts](../shared/project.ts) `tokens/attempts/evidence` 索引保留历史；[factory.ts](../server/factory.ts):86 全量恢复，`restore` 再遍历日志；[docs.ts](../server/docs.ts):227 `refresh` 增量读取但 `caseEvents` 持续保留原始案卷事件；[station-session.ts](../server/station-session.ts) 会话外置文件；ROLE/CONTEXT/CASE 和经验已提供领域记忆 | **P0/P1：先移除冗余数据，再做冷热分层**。本轮已移除 Channels 的长期第二份 token 数据投影。下一步按 seq 保存可校验的状态快照，只恢复快照后的尾部；活跃任务保持热状态，已结束案卷按需读取。会话文件、案卷缓存按引用/字节预算回收，保留可恢复检查点与审计日志。不要为了“memory”再引入一份全历史向量副本 |
+| 有界并发与持续补料 | [RunnableConfig](https://reference.langchain.com/javascript/langchain-core/runnables/RunnableConfig) 声明 `maxConcurrency`；这只是调用并发上限，不是浏览器、模型、HTTP 和 UI 缓冲的统一预算 | [broker.ts](../server/broker.ts) `tryAcquire/acquire/effectiveBrowser` 管实际资源与取消；[model-requests.ts](../server/model-requests.ts) 控模型请求；[batch.ts](../server/batch.ts) `maxInFlight/intakeWindow`；[channels.ts](../server/channels.ts) `pump` 最多一个在途信道子任务，暂停期间保留排队 | **已有基础，P1 统一 admission 指标**。显示 queued/admitted/running、阻塞资源和下一次重试时间。通用入口也应有持久入场窗口；仅限制 worker 数不能限制排队 token 总量。保留低并发和暂停线，不因有 backlog 就自动加人或启线 |
+| 重试、超时与故障处理 | [Fault tolerance](https://docs.langchain.com/oss/javascript/langgraph/fault-tolerance) 将节点超时、可配置重试和耗尽后的处理分开；取消信号不应进入重试循环 | [shared/failures.ts](../shared/failures.ts) 分类归责；[batch.ts](../server/batch.ts) 有退避及单任务恢复试探；[agent-station.ts](../server/agent-station.ts) 区分工位预算、单次模型请求和有限修复；外部工具各自有 timeout | **P1：从内置业务专用恢复，抽成包可声明策略**。声明失败标签、最大次数、退避/抖动、总 deadline 和耗尽去向，次数及下一次执行时间落盘。系统短暂错误自动恢复；凭据/权限问题只停相应依赖；质量失败进入修复支路。Node 模块执行器只有协作式 AbortSignal，不能把同步死循环包装成可强制取消；需要硬隔离时使用 Worker/子进程执行器 |
+| 人工输入与少打扰 | [Interrupts](https://docs.langchain.com/oss/javascript/langgraph/interrupts) 将中断 payload、恢复值和持久身份关联；[Thinking in LangGraph](https://docs.langchain.com/oss/javascript/langgraph/thinking-in-langgraph#handle-errors-appropriately) 区分系统可恢复、模型可修复和用户可处理的问题 | [runtime.ts](../server/runtime.ts) `setScopePaused/openConsult/consultResult/toManual` 已有范围暂停及岗位间修复；[agent-station.ts](../server/agent-station.ts):152 有有限程序反馈修复；但 `StationSpec` 没有通用 typed pending-input / resume-value 契约，`manual` 主要还是终态与原因字符串 | **P1：人工只接真正需要外部输入的节点**。将缺字段、授权、登录、质量修复耗尽分别编码；pending input 带任务、工位、问题 ID、响应 schema 和允许选项，恢复值去重落盘。通过确定性检查的常规产物继续流转；证据不足不能靠模型自报“通过”跳过。沿用已有结构修改边界，不给每次工具失败加确认弹窗 |
+| 并行状态合并 | [Graph API：Reducers](https://docs.langchain.com/oss/javascript/langgraph/graph-api#reducers) 明确每个状态字段的更新/合并语义 | [workflow-packs.ts](../server/workflow-packs.ts):133 只检查 outputKey 合法性，:203 输出该键；[runtime.ts](../server/runtime.ts):593 `Object.assign(t.data, res.data)`；四个内置模板使用不同键，但安装包可让无前后依赖的两个节点同时写同键 | **P1，具体可复现的编译缺口**：先拒绝可能并发节点同键写入，并给出冲突工位；顺序覆盖仍可允许。再按实际需要增加少量确定性 reducer，不能默认靠最后完成者覆盖。需要考虑条件互斥、return/repair 回路；不能把所有同名字段一概禁止 |
+| 子图/子任务 | [Subgraphs](https://docs.langchain.com/oss/javascript/langgraph/use-subgraphs) 区分每次调用隔离与跨调用保留状态，并用 checkpoint namespace 表达嵌套边界 | [channels.ts](../server/channels.ts) 有独立 delivery / child token、输入清洗、ack、续批；[shared/project.ts](../shared/project.ts) `tokenWorkKey` 区分父子同 item；项目 Pack 有持久角色/schema/代码版本 | **已有跨线异步任务，不等于通用嵌套子图**。P2 才补父任务等待子任务集合、取消传播、聚合规则、并行调用命名空间。不要为对齐术语改掉可靠的持久信道，也不要直接把父 checkpoint 复制给独立子任务 |
+| 时间旅行与可复现性 | [Use time-travel](https://docs.langchain.com/oss/javascript/langgraph/use-time-travel) 的 replay 会重新执行所选检查点之后的节点，fork 会产生新分支；模型及外部请求可能再次发生 | UI 已有只读事件回放；[runtime.ts](../server/runtime.ts) `correct/undoCorrection` 保存纠错快照、撤销未执行纠错；没有任意历史 checkpoint fork 到独立运行的公共 API | **P2：先明确“回看”与“重新执行”**。目前回看不产生新副作用，应继续保持。需要实验分支时给新 run/工作身份、父 checkpoint 和包版本，展示将重跑的节点与外部写影响；不要把拖动时间轴做成重新发布 |
+| 闭源 Agent / Claude Code 等节点 | [Streaming：任意模型](https://docs.langchain.com/oss/javascript/langgraph/streaming#use-with-any-llm) 允许将任意客户端的进度经 custom 流发出；框架接口不能证明某个厂商 CLI 已实际兼容 | [mcp-station.ts](../server/mcp-station.ts) `ClosedStationAgent/openStationMcp/runLauncher` 已有真实子进程、临时作用域 MCP、取消进程树、实际模型与用量回报；[docs/mcp-agent-contracts.md](mcp-agent-contracts.md) 明确 launcher 边界。选择仍是全局 `FACTORY_STATION_COMMAND/MODEL`。会话恢复只在 `agent instanceof Agent` 的 Pi 路径启用 | **P1：执行器按节点可选择**。项目级 adapter 注册和节点绑定应声明输入/submit schema、模型、工具能力、是否支持流式/取消/恢复，以及数据版本。闭源 adapter 保存厂商 session/checkpoint 引用，不能只保存当前进程 messages。将厂商 CLI 参数转换留在独立适配器；实际配置可用后再做厂商验收，fixture 通过不等于 Claude Code 已验收 |
+
+## Google TypeScript 在本仓库的落点
+
+[Google 官方 TypeScript 指南](https://google.github.io/styleguide/tsguide.html) 支持本轮采用的重点是：具名导出、`const` 优先、每次声明一个变量、稳定成员使用 `readonly`、边界数据使用 `unknown` 并缩窄、异常使用 `Error`、保持代码可读。该指南开篇也说明其内部环境约束未必适用于外部项目。
+
+当前 `tsconfig.json` 已启用 strict，但这不能验证来自 JSON、MCP、CLI 的运行时数据。`workflow-packs.ts` 的 `record`、`builtin`，`mcp-station.ts` 的 `StationTool.execute`，`main.ts` 的 body 边界仍有 `any`；优先在这些边界建立窄类型与 schema 解码，避免把断言当检查。压在同一行的声明、分支和清理代码，应在修改该函数时展开，尤其是事务和取消处理。
+
+仓库采用 `NodeNext`、原生 `.ts` 加载与 `erasableSyntaxOnly`。**不要机械套用指南的 constructor parameter property 示例**，也不要为格式统一改掉 Node 入口、外部包必须的 default import 或当前 schema 库。格式与类型边界改造不应和恢复状态机的大范围改写混成一个提交。当前 package scripts 没有专用 lint 检查；后续可逐模块启用规则，先处理边界类型和清理路径，不以全仓格式化制造与现场修复无关的 diff。
+
+## 可直接使用的实现约束
+
+这些是本仓库的设计建议，不是 LangGraph 的兼容 API：
+
+- **副作用记录**：`operationId + workIdentity + nodeRevision + inputHash + phase + remoteReceipt`。跨重试保留操作身份；结果未知时先核查，不能由超时直接推导为未执行。
+- **人工输入记录**：`interruptId + token + node + reasonCode + responseSchema + response + resumedAt`。缺输入与工具故障分开；同一响应不可重复推进两次。
+- **执行器能力**：`adapterId + supportedTools + stream + cancel + resume + usage`，不支持的能力明确为 false/unknown，不用统一包装伪造支持。
+- **资源可见性**：并发名额、内存预算、持久队列、客户端缓冲分别计数；后台继续执行不依赖界面是否打开。
+- **缓存边界**：原始证据和产物可按摘要复用；不同包版本、职责/schema 变化、修复理由变化必须参与失效。发送、发布等动作需要操作回执，不能简单用读取缓存代替。
+
+官网的 durability 模式不是要求本地应用切换数据库。本地 SQLite 的事务恢复与分布式服务的存储/租约需求不同；本轮不新增数据库或消息队列，也不把 LangGraph 的 super-step 强加给当前事件驱动流水线。上述建议均可逐项落在现有模块。
+
+## 本轮已落地及复用验收
+
+本轮唯一代码改动是 [channels.ts](../server/channels.ts) 的数据驻留修复：只在构造回放期间临时合并 token.data，回放结束释放；实时在 `channel.emitted` 的投影时刻读取 Factory 状态并复制所需消息，不再长期保存每个 token 的第二份完整数据，也不再每次 token.data 对整个记录做 spread。消息快照、重放去重、检查点重试和低并发行为保持原契约。
+
+- `node --test --test-concurrency=1 test/channels.test.ts`：10/10 通过，约 7.3 秒；覆盖同批快照、三类崩溃窗口、旧库存、暂停、跨重启复用结果和证据、父子身份、有限组件续批。
+- `npx tsc -p tsconfig.json --noEmit`：通过。
+- 本轮没有新增测试文件；没有测量具体 RSS 降幅，不将运行时长差异当内存或性能收益证据。
+
+| 后续改动 | 复用已有回归 | 必须证明的结果 |
+|---|---|---|
+| SSE / 历史读取 / 内存 | `test/report-responsive.test.ts`、`test/journal-atomic.test.ts`、`ui/test/history-loading.test.ts` | 慢读/断开后后台仍响应；游标不丢不重；读取范围固定；取消释放缓存和等待者 |
+| 外部副作用回执 | `test/workflow-packs.test.ts`、`test/runtime-storage-fault.test.ts` | 模拟外部已执行但本地未提交，重启先查结果，不重复调用 |
+| 并行写冲突 | `test/workflow-packs.test.ts` | 并行同键拒绝；顺序覆盖/独立字段仍可运行；不受完成顺序影响 |
+| 少打扰与恢复策略 | `test/station-safety.test.ts`、`test/runtime-retry-checkpoint.test.ts`、`test/runtime-restart.test.ts` | 程序可确认的修复自动继续；认证/未知副作用保留明确问题；取消不重试，修复预算跨重启保留 |
+| 闭源节点选择与恢复 | `test/agent-adapter.test.ts`、`test/mcp-security.test.ts` | 同图可选不同 adapter；重启恢复正确会话；作用域与取消保留；实际模型/用量缺报保持未知 |
+
+文档中的 P0/P1/P2 是缺陷影响和依赖关系的排序，不是另建开发流程。历史卡顿修复及持续低并发产出优先；资料不支持的能力不列为已交付。

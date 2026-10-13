@@ -16,7 +16,6 @@ function deliveryId(channel: string, token: string, data: Record<string, unknown
 export class ChannelSupervisor {
   private f: Host;
   private deliveries = new Map<string, ChannelDelivery>();
-  private tokenData = new Map<string, Record<string, unknown>>();
   private snapshots = new Map<number, Record<string, unknown>>();
   private tokensByDelivery = new Map<string, Set<string>>();
   private deliveryByToken = new Map<string, string>();
@@ -25,11 +24,13 @@ export class ChannelSupervisor {
   private closed = false;
   constructor(factory: Host) {
     this.f = factory;
+    const replayData = new Map<string, Record<string, unknown>>();
     const emissions: Extract<Stamped, { kind: 'channel.emitted' }>[] = [];
     for (const event of factory.journal.read()) {
-      this.project(event);
+      this.project(event, replayData);
       if (event.kind === 'channel.emitted') emissions.push(event);
     }
+    replayData.clear();
     this.unsubscribe = () => {};
     if (process.env.FACTORY_READONLY === '1') { this.snapshots.clear(); return; }
     const projection = factory.journal.subscribeProjection(event => this.project(event));
@@ -47,12 +48,22 @@ export class ChannelSupervisor {
   }
   /** Projections run for the complete committed batch before any consumer. This
    * keeps nested emissions deduplicated and captures data at the emission seq. */
-  private project(event: Stamped) {
+  private project(event: Stamped, replayData?: Map<string, Record<string, unknown>>) {
     if (event.kind === 'token.data') {
-      this.tokenData.set(event.token, { ...this.tokenData.get(event.token), ...event.patch });
+      if (replayData) {
+        const data = replayData.get(event.token) ?? {};
+        Object.assign(data, event.patch);
+        replayData.set(event.token, data);
+      }
       if (typeof event.patch.channelDelivery === 'string') this.bindToken(event.patch.channelDelivery, event.token);
     }
-    if (event.kind === 'channel.emitted') this.snapshots.set(event.seq, channelPayload(this.tokenData.get(event.token) ?? {}));
+    if (event.kind === 'channel.emitted') {
+      // Factory's projection applies each event before this projection. Read
+      // its state here, before the batch advances, instead of retaining a
+      // second complete token-data projection for the lifetime of the app.
+      const data = replayData ? replayData.get(event.token) : this.f.state.tokens[event.token]?.data;
+      this.snapshots.set(event.seq, channelPayload(data ?? {}));
+    }
     if (event.kind === 'channel.delivery') {
       this.deliveries.set(event.delivery.id, event.delivery);
       if (event.delivery.targetToken) this.bindToken(event.delivery.id, event.delivery.targetToken);
