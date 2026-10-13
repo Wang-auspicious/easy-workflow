@@ -11,7 +11,7 @@ import { pack } from "../packs/vislexicon/pack.ts";
 import { Journal } from "../server/journal.ts";
 import { Docs } from "../server/docs.ts";
 import { EvidenceStore } from "../server/evidence.ts";
-import { Lessons, groupLessonObservations } from "../server/lessons.ts";
+import { Lessons, groupLessonObservations, projectLessons } from "../server/lessons.ts";
 import { ensureProject } from "../server/workspace.ts";
 
 const hash = (value: string) => crypto.createHash("sha256").update(value).digest("hex");
@@ -120,6 +120,55 @@ test("LESSONS and pending CONTEXT persist from journal; private notes and stable
   } finally { f.close(); }
 });
 
+test('ordinary context reads retain only lesson records and do not rebuild the view for business events', t => {
+  const f = fixture();
+  try {
+    const draft = f.seed();
+    const expected = f.lessons.list();
+    const context = f.lessons.pendingContext(station);
+    // These cache invariants guard the measured permanent-retention regression;
+    // public output alone cannot reveal a second copy of every business event.
+    const cache = f.lessons as unknown as {cachedViews: unknown; cachedLessonEvents: {kind: string}[]};
+    const originalView = cache.cachedViews;
+    const marker = 'business-payload-must-not-stay-in-lessons-cache';
+    for (let i = 0; i < 32; i++) {
+      f.emit({kind: 'token.data', token: 'bad', patch: {unrelatedObservation: marker.repeat(300) + i}});
+      assert.equal(f.lessons.pendingContext(station), context);
+      assert.strictEqual(cache.cachedViews, originalView, 'a non-lesson event cannot invalidate the lesson projection');
+    }
+    assert.equal(cache.cachedLessonEvents.length, 1);
+    assert.ok(cache.cachedLessonEvents.every(event => event.kind.startsWith('lesson.')));
+    assert.ok(!JSON.stringify(cache.cachedLessonEvents).includes(marker));
+    const returned = f.lessons.list();
+    returned[0].suggestion = 'External mutation';
+    assert.deepEqual(f.lessons.list(), expected, 'callers still receive detached views');
+
+    f.create('ordinary', 'ordinary');
+    f.emit({kind: 'attempt.started', attempt: 'ordinary-active', token: 'ordinary', node: station,
+      worker: 'ordinary-worker', input: 'Ordinary production work'});
+    const read = f.journal.read.bind(f.journal);
+    const reads: number[] = [];
+    const observer = t.mock.method(f.journal, 'read', function* (since = 0, run?: string, through?: number) {
+      reads.push(since);
+      yield* read(since, run, through);
+    });
+    assert.equal(f.lessons.validationContext(station, 'ordinary', {token: 'ordinary', attempt: 'ordinary-active'}), '');
+    assert.ok(reads.length > 0 && reads.every(since => since > 0),
+      'checking an ordinary station for trial exposure must use the incremental lesson index, not full history');
+    observer.mock.restore();
+
+    const revised = f.lessons.revise(draft.id, {digest: draft.digest, suggestion: '保留直接出处，修复后重跑原工位。'}, 'user');
+    assert.notEqual(revised.digest, draft.digest);
+    assert.notStrictEqual(cache.cachedViews, originalView, 'a real lesson event refreshes the cached projection');
+    const authoritative = projectLessons([...f.journal.read()]);
+    assert.deepEqual(f.lessons.list(), authoritative);
+    const revisedContext = f.lessons.pendingContext(station);
+    assert.deepEqual(f.reload().list(), authoritative, 'restart reconstructs the same lesson state from the complete journal');
+    assert.equal(f.lessons.pendingContext(station), revisedContext);
+    assert.equal(fs.readFileSync(f.roleFile, 'utf8'), f.role, 'a cached draft is still not an approved production rule');
+  } finally {f.close();}
+});
+
 test("restored and orphan consultation replies remain in the new round with unknown frameworks stated honestly", () => {
   const f = fixture();
   try {
@@ -214,7 +263,9 @@ test("only a user can approve a digest-bound validated lesson; append is exact, 
     assert.ok(appended.startsWith(f.role), "existing role bytes remain unchanged");
     assert.match(appended, /## 已知坑/);
     assert.equal(appended.split(`H2:LESSON:${draft.id}`).length, 2);
+    const approvedView = f.lessons.list();
     f.reload().recoverApproved();
+    assert.deepEqual(f.lessons.list(), approvedView, 'lesson-only replay retains the exact approved and applied state');
     assert.equal(fs.readFileSync(f.roleFile, "utf8"), appended);
     assert.doesNotMatch(f.lessons.pendingContext(station), new RegExp(draft.id));
     assert.throws(() => f.lessons.revise(draft.id, { digest: draft.digest, suggestion: "try replacing the approved rule" }, "agent"), /只能修订/);

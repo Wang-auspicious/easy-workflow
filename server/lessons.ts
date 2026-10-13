@@ -135,8 +135,9 @@ export class Lessons {
   private roles: string;
   private store: EvidenceStore;
   private unsubscribe: () => void;
-  private eventSeq = 0;
-  private cachedEvents: Stamped[] = [];
+  private indexedSeq = 0;
+  private lessonSeq = 0;
+  private readonly cachedLessonEvents: LessonStamp[] = [];
   private viewSeq = -1;
   private cachedViews: LessonView[] = [];
 
@@ -148,17 +149,30 @@ export class Lessons {
   }
 
   close() { this.unsubscribe(); }
-  private events() {
-    if (this.eventSeq !== this.host.journal.seq) {
-      for (const e of this.host.journal.read(this.eventSeq)) this.cachedEvents.push(e);
-      this.eventSeq = this.host.journal.seq;
+  /** Ordinary context reads retain only lesson records, never business payloads. */
+  private lessonEvents() {
+    const through = this.host.journal.seq;
+    if (this.indexedSeq !== through) {
+      for (const event of this.host.journal.read(this.indexedSeq, undefined, through)) {
+        if (!isLesson(event)) continue;
+        this.cachedLessonEvents.push(event);
+        this.lessonSeq = event.seq;
+      }
+      this.indexedSeq = through;
     }
-    return this.cachedEvents;
+    return this.cachedLessonEvents;
   }
+
+  /** Audited review and validation need full history only for that operation. */
+  private history(through = this.host.journal.seq) {
+    return [...this.host.journal.read(0, undefined, through)];
+  }
+
   list() {
-    if (this.viewSeq !== this.host.journal.seq) {
-      this.cachedViews = projectLessons(this.events());
-      this.viewSeq = this.host.journal.seq;
+    const events = this.lessonEvents();
+    if (this.viewSeq !== this.lessonSeq) {
+      this.cachedViews = projectLessons(events);
+      this.viewSeq = this.lessonSeq;
     }
     return structuredClone(this.cachedViews);
   }
@@ -185,7 +199,7 @@ export class Lessons {
 
   /** Called after report.ready (cleanup is complete); idempotent across restarts. */
   draftRun(runId: string) {
-    const events = this.events();
+    const events = this.history();
     if (!events.some((e) => e.kind === "run.ended" && e.runId === runId)) throw new ControlError(409, "run_not_ended", "本轮尚未结束，不能提前复盘");
     const existing = this.list().filter((l) => l.runId === runId);
     const groups = groupLessonObservations(events, runId, this.host.compiled);
@@ -254,7 +268,7 @@ export class Lessons {
 
   /** Reserve samples before reruns. Regression baselines are copied immutably now. */
   beginValidation(id: string, args: { digest: string; regressionItems: string[] }) {
-    const l = this.current(id, args.digest), events = this.events();
+    const l = this.current(id, args.digest), events = this.history();
     const failures = unique(l.observations.map((o) => o.item)).map((item) => ({ item, url: l.observations.find((o) => o.item === item)!.url }));
     const items = unique(args.regressionItems);
     if (items.length < 2 || items.some((item) => failures.some((f) => f.item === item))) fail("验证需要全部失败样本，以及另外至少两个不同的已发布站点");
@@ -274,7 +288,7 @@ export class Lessons {
   }
 
   private trial(id: string) {
-    const e = this.events().find((e) => e.kind === "lesson.validation.started" && e.trial.id === id);
+    const e = this.lessonEvents().find((e) => e.kind === "lesson.validation.started" && e.trial.id === id);
     if (!e || e.kind !== "lesson.validation.started") throw new ControlError(404, "lesson_trial_not_found", "找不到经验验证批次");
     return e;
   }
@@ -283,7 +297,7 @@ export class Lessons {
   bindValidation(trialId: string, tokens: string[]) {
     const started = this.trial(trialId), trial = started.trial;
     this.current(trial.lessonId, trial.digest);
-    const events = this.events();
+    const events = this.history();
     const allowed = [...trial.failures, ...trial.regressions];
     const pending = unique(tokens).map((token) => {
       const created = events.find((e) => e.kind === "token.created" && e.token === token);
@@ -302,9 +316,9 @@ export class Lessons {
   /** Only bound trial attempts receive a candidate rule; production roles stay intact. */
   validationContext(station: string, item: string, scope: CaseScope) {
     if (process.env.FACTORY_READONLY === "1") return "";
-    const events = this.events();
     const attempt = this.host.state.attempts[scope.attempt];
     if (!attempt || attempt.token !== scope.token || attempt.node !== station || attempt.endedAt || this.host.state.tokens[scope.token]?.item !== item) return "";
+    const events = this.lessonEvents();
     const bound = events.find((e) => e.kind === "lesson.validation.bound" && e.token === attempt.token);
     if (bound?.kind !== "lesson.validation.bound") return "";
     const trial = this.trial(bound.trialId).trial, l = this.get(trial.lessonId);
@@ -316,7 +330,7 @@ export class Lessons {
 
   private evaluateValidation(trialId: string, throughSeq?: number) {
     const started = this.trial(trialId), trial = started.trial;
-    const l = this.current(trial.lessonId, trial.digest), events = this.events().filter((e) => throughSeq === undefined || e.seq <= throughSeq), s = this.replay(events);
+    const l = this.current(trial.lessonId, trial.digest), events = this.history(throughSeq), s = this.replay(events);
     const bound = events.filter((e): e is Stamped<Extract<LessonEvent, { kind: "lesson.validation.bound" }>> => e.kind === "lesson.validation.bound" && e.trialId === trialId);
     const check = (item: string) => {
       const binding = bound.findLast((e) => e.item === item);
