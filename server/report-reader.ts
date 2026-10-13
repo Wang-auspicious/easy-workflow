@@ -152,8 +152,6 @@ class ReportReader {
     job.done = true;
     clearTimeout(job.timer);
     this.jobs.delete(job.key);
-    if (job.worker) void job.worker.terminate();
-    if (this.active === job) this.active = undefined;
     for (const waiter of job.waiters) {
       waiter.cleanup();
       if (value) {
@@ -163,7 +161,17 @@ class ReportReader {
       }
     }
     job.waiters.clear();
-    queueMicrotask(() => this.pump());
+    const release = () => {
+      if (this.active === job) this.active = undefined;
+      this.pump();
+    };
+    // Keep the slot until the worker has exited, including after cancellation.
+    // Otherwise the next report can overlap the previous worker's large heap.
+    if (job.worker) {
+      void job.worker.terminate().finally(release).catch(() => {});
+    } else {
+      queueMicrotask(release);
+    }
   }
 
   close(): void {
