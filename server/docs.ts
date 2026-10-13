@@ -179,10 +179,18 @@ export class Docs {
     const name = key === "dispatcher" ? "主调度" : n?.name ?? key;
     let role = "（缺少 ROLE.md）";
     try { const r = readRole(key); role = `${r.path} @ ${r.revision}`; } catch { /* reported below */ }
-    const model = key === "dispatcher" || n?.kind === "agent" || n?.kind === "review" ? `pi · ${piSelection().id}` : n?.kind === "store" ? "资源库（不执行）" : "程序执行";
+    const isAgent = key === 'dispatcher' || n?.kind === 'agent' || n?.kind === 'review';
+    const closed = key !== 'dispatcher' && Boolean(process.env.FACTORY_STATION_COMMAND);
+    const executionLabel = (label: string) => caseRedactor([])(label) as string;
+    const model = isAgent ? closed
+      ? `closed-command · ${executionLabel(process.env.FACTORY_STATION_MODEL?.trim() || '未配置请求模型')}（请求配置，实际以回执为准）`
+      : `pi · ${piSelection().id}（当前配置）`
+      : n?.kind === 'store' ? '资源库（不执行）' : '程序执行';
     const notes = [...(s.contextNotes?.[key] ?? [])].reverse();
     const list = (kind: string, max: number) => notes.filter((x) => x.kind === kind).slice(0, max).map((x) => `- ${time(x.at)} · ${x.by}：${x.text}`).join("\n") || "- （无）";
     const attempts = Object.values(s.attempts).filter((a) => a.node === key && a.endedAt).sort((a, b) => b.endedAt! - a.endedAt!).slice(0, 8);
+    const actual = isAgent ? attempts[0]?.metrics?.execution : undefined;
+    const lastExecution = actual ? `- 最近执行回执：${executionLabel(actual.adapter)} · ${actual.model === 'unreported' ? '模型未回报' : executionLabel(actual.model)}` : '';
     const handoffs = attempts.map((a) => `- ${time(a.endedAt!)} · ${s.tokens[a.token]?.title || s.tokens[a.token]?.item || a.token} · ${a.cancelled ? "已取消" : a.ok ? "完成" : "失败"} · ${clip(a.ok ? a.summary ?? "" : a.error ?? a.summary ?? "", 120)}`).join("\n") || "- （本项目还没有处理记录）";
     const failures = Object.values(s.recoveries ?? {}).filter((c) => c.failure && s.tokens[c.token]?.finishedAtNode === key && c.disposition === "retry").slice(0, 6)
       .map((c) => `- ${c.title}：${failureLabels[c.failure!.tag]}——${clip(c.failure!.nextAction ?? c.failure!.message, 100)}`);
@@ -191,7 +199,7 @@ export class Docs {
     const progress = st ? `- 本轮 ${run}：处理 ${st.processed}，失败 ${st.failed}，退回 ${st.returned}，队列 ${st.queue.length}，在做 ${st.active.length}，中位耗时 ${(median(st.durations) / 1000).toFixed(1)}s` : `- 本轮 ${run}`;
     return [
       `# ${name} · CONTEXT`, "", CONTEXT_HEADER, "",
-      "## 版本", `- 角色：${role}`, `- 执行：${model}`, `- 规格：${this.f.compiled.specVersion} · ${this.f.compiled.digest.slice(0, 12)}`, `- 项目：${this.name}（${this.dir}）`, "",
+      "## 版本", `- 角色：${role}`, `- 执行：${model}`, ...(lastExecution ? [lastExecution] : []), `- 规格：${this.f.compiled.specVersion} · ${this.f.compiled.digest.slice(0, 12)}`, `- 项目：${this.name}（${this.dir}）`, "",
       "## 本轮进度", progress, "",
       "## 站长 / 主调度指示", list("instruction", 6), "",
       "## 最近交接", handoffs, "",

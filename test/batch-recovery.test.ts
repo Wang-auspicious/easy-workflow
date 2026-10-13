@@ -9,13 +9,18 @@ process.env.FACTORY_VAR = dir;
 process.env.FACTORY_PREFLIGHT = '0';
 process.env.FACTORY_HTTP_CACHE = '0';
 process.env.VISLEXICON_ROOT = path.join(dir, 'unconnected');
-const { Factory } = await import('../server/factory.ts');
+const { Factory: BaseFactory } = await import('../server/factory.ts');
 const { FactoryControl } = await import('../server/control.ts');
 const { batchSummary } = await import('../shared/batch.ts');
 const close = async (factory: InstanceType<typeof Factory>) => {
   await factory.runtime.close(); factory.docs.flush(); factory.lessons.close(); factory.journal.close();
 };
 const catalog = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `site-${i}`, name: `Site ${i}`, canonicalUrl: `https://site-${i}.example/` }));
+// These cases use in-memory executors. Test admission independently of the host's
+// free RAM; browser/memory backpressure has its own broker coverage.
+class Factory extends BaseFactory {
+  override async boot() { await super.boot(); this.broker.memoryFloorMB = 0; }
+}
 
 test('legacy system-created manual stops with a missing sibling become resumable without overriding real human review', async () => {
   let factory=new Factory();

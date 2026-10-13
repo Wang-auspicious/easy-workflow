@@ -51,6 +51,16 @@ interface Consultation {
   parent?: Consultation;
 }
 
+interface RuntimeCheckpoint {
+  version: 1;
+  entry: string;
+  done: string[];
+  rounds: Record<string, number>;
+  notes: [string, { reason: string; note?: string; byHuman: boolean }][];
+  consult?: Consultation;
+  pendingConsults?: TokenRun['pendingConsults'];
+}
+
 export interface Worker { id: string; label: string; node: string; busy: string | null; idleSince: number }
 
 export interface StationContext {
@@ -129,6 +139,7 @@ export class Runtime {
   private jobs = new Set<Promise<void>>();
   private timer: NodeJS.Timeout | null = null;
   private lastSample = 0;
+  private storageFault: ControlError | null = null;
   wiredLines: Set<string>;
 
   journal: Journal;
@@ -181,6 +192,7 @@ export class Runtime {
   }
 
   start(title: string) {
+    this.requireStorage();
     if(this.ending)throw new ControlError(409,"run_ending","正在结束上一轮，请等待报告生成");
     // Starting an existing paused run must never reset its identity or counters.
     if (this.running) return this.journal.run;
@@ -196,6 +208,7 @@ export class Runtime {
 
   pause() { if (!this.running || this.paused) return; this.paused = true; this.journal.append({ kind: "run.paused", runId: this.journal.run }); }
   resume() {
+    this.requireStorage();
     if (!this.running || !this.paused) return;
     this.paused = false;
     const now = Date.now();
@@ -206,6 +219,7 @@ export class Runtime {
 
   /** Manual end only (Spec §10.12): crashes and network loss never end a run. */
   end() {
+    this.requireStorage();
     if (!this.running) return null;
     for (const c of this.aborts.values()) c.abort();
     this.running = false; this.paused = false;
@@ -307,7 +321,37 @@ export class Runtime {
     });
   }
 
+  /** Attempt success is not flow completion: a successful review can request a
+   * repair. Persist the scheduler's decision, including nested repair ownership. */
+  checkpoint(t: TokenRun) {
+    const runtimeCheckpoint: RuntimeCheckpoint = structuredClone({
+      version: 1, entry: t.entry, done: [...t.done], rounds: t.rounds,
+      notes: [...t.notes], consult: t.consult, pendingConsults: t.pendingConsults,
+    });
+    t.data.runtimeCheckpoint = runtimeCheckpoint;
+    this.journal.append({ kind: 'token.data', token: t.id, patch: { runtimeCheckpoint } });
+  }
+
+  restoreCheckpoint(t: TokenRun) {
+    const checkpoint = t.data.runtimeCheckpoint as RuntimeCheckpoint | undefined;
+    if (checkpoint?.version !== 1) return false;
+    t.entry = checkpoint.entry;
+    t.closure = this.closureOf(t.entry);
+    t.done = new Set(checkpoint.done);
+    t.rounds = { ...checkpoint.rounds };
+    t.notes = new Map(checkpoint.notes);
+    t.consult = checkpoint.consult ? structuredClone(checkpoint.consult) : undefined;
+    t.pendingConsults = checkpoint.pendingConsults ? structuredClone(checkpoint.pendingConsults) : undefined;
+    return true;
+  }
+
+  awaitingRepair(t: TokenRun, key: string) {
+    for (let consult = t.consult; consult; consult = consult.parent) if (consult.reviewer === key) return true;
+    return t.pendingConsults?.some(consult => consult.reviewer === key) ?? false;
+  }
+
   create(entry: string, item: { item: string; url: string; title?: string; source: string; category?: string; data?: Record<string, unknown> }): TokenRun {
+    this.requireStorage();
     const t: TokenRun = {
       id: `t-${short()}`, item: item.item, url: item.url, title: item.title, source: item.source, entry,
       data: { ...(item.data ?? {}) }, closure: this.closureOf(entry), done: new Set(), dead: new Set(), edgeLive: new Map(),
@@ -322,6 +366,7 @@ export class Runtime {
 
   private enqueue(t: TokenRun, key: string, from?: string, returned = false) {
     const n = this.nodes.get(key)!;
+    this.checkpoint(t);
     this.journal.append({ kind: "token.queued", token: t.id, node: key, from, returned });
     (this.arrivals.get(key) ?? this.arrivals.set(key, []).get(key)!).push(Date.now());
     if (n.kind === "store") return this.arriveAtStore(t, n);
@@ -340,11 +385,19 @@ export class Runtime {
     // A store with outgoing edges is a buffer: express tokens (hand-pasted) pass straight through.
     if (t.data.express && (this.outFlow.get(n.key) ?? []).length) { this.complete(t, n.key); return; }
     t.finished = true;
+    this.cancelTokenWork(t);
     t.finishedStore=n.key;
     const status: TokenStatus = n.key.endsWith("/published") ? "published" : n.key.endsWith("/manual") ? "manual" : "parked";
     if (status === "published") t.data.published = true;
     this.journal.append({ kind: "token.finished", token: t.id, status, node: n.key, reason: status === "published" ? "通过发布闸门" : String(t.data.manualReason ?? "等候处理") });
     this.stockDelta(n.key, +1);
+  }
+
+  private cancelTokenWork(t: TokenRun) {
+    for (const [attempt, controller] of this.aborts) if (this.attemptTokens.get(attempt) === t.id) this.journal.afterCommit(() => controller.abort());
+    for (const queue of this.queues.values()) {
+      for (let i = queue.length - 1; i >= 0; i--) if (queue[i] === t.id) queue.splice(i, 1);
+    }
   }
 
   stock = new Map<string, number>();
@@ -415,11 +468,18 @@ export class Runtime {
     this.attemptTokens.set(attempt,t.id);
     w.busy = attempt;
     t.inflight.add(n.key);
-    this.journal.append({ kind: "attempt.started", attempt, token: t.id, node: n.key, worker: w.id, input: this.describeInput(t, n) });
+    try {
+      this.journal.append({ kind: "attempt.started", attempt, token: t.id, node: n.key, worker: w.id, input: this.describeInput(t, n) });
+    } catch (error) {
+      this.aborts.delete(attempt); this.attemptTokens.delete(attempt); t.inflight.delete(n.key);
+      w.busy = null; w.idleSince = Date.now();
+      this.haltForStorage(); lease.release();
+      throw error;
+    }
     const t0 = Date.now();
-    const exec = this.executors(n);
     let res: StationResult;
     try {
+      const exec = this.executors(n);
       if (!exec) throw new Error(`工位 ${n.key} 没有执行器`);
       const role=readRole(n.key);
       this.journal.append({kind:"attempt.progress",attempt,text:`按 ${n.name} 的 ROLE.md 执行`,step:{tool:"role",text:`${role.path} @ ${role.revision}`}});
@@ -448,6 +508,29 @@ export class Runtime {
       w.busy = null; w.idleSince = Date.now();
     }
     const ms = Date.now() - t0;
+    try {
+      this.journal.atomic(() => this.finishAttempt(t, n, attempt, ctrl, browserScope, epoch, res, ms, queuedMs));
+    } catch (error) {
+      // SQL rollback cannot rewind the scheduler's in-memory mutations. Only a
+      // fresh runtime rebuilt from the durable journal may continue after this.
+      this.haltForStorage();
+      throw error;
+    }
+  }
+
+  private requireStorage() {
+    if (this.storageFault) throw this.storageFault;
+  }
+
+  private haltForStorage() {
+    this.storageFault = new ControlError(503, 'journal_commit_failed', '项目日志提交失败，运行已停止。请修复项目存储并重启应用后从持久检查点恢复，不能在当前进程直接继续。');
+    this.running = false; this.paused = true;
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    for (const controller of this.aborts.values()) controller.abort();
+  }
+
+  private finishAttempt(t: TokenRun, n: CompiledNode, attempt: string, ctrl: AbortController,
+    browserScope: ReturnType<typeof browserAttemptScope>, epoch: number, res: StationResult, ms: number, queuedMs: number) {
     if (res.failure?.code === 'BROWSER_CAPACITY_TIMEOUT' && !ctrl.signal.aborted && !t.finished && this.running && !this.ending && (t.nodeEpochs?.get(n.key) ?? 0) === epoch) {
       this.journal.append({kind:'attempt.finished',attempt,ok:false,cancelled:true,summary:'共享浏览器容量不足，保留本工位排队；网站未记为失败',ms,queuedMs,error:'resource_wait'});
       t.inflight.delete(n.key);
@@ -475,7 +558,7 @@ export class Runtime {
     for (const c of res.ok ? res.caseNotes ?? [] : []) this.journal.append({ kind: "case.noted", caseId: t.item, token: t.id, note: { station: n.key, section: c.section, text: c.text, by: n.key } });
     if (res.ok && n.kind !== "store") this.journal.append({ kind: "case.noted", caseId: t.item, token: t.id, note: { station: n.key, section: res.verdict ? `审核：${({ pass: "通过", return: "退回", escalate: "交人", fix: "要求修改" } as Record<string, string>)[res.verdict.verdict]}` : "结果", text: res.verdict?.reason && res.verdict.verdict !== "pass" ? `${res.summary}\n${res.verdict.reason}` : res.summary, by: "runtime" } });
     t.inflight.delete(n.key);
-    t.notes.delete(n.key);
+    if (res.ok) t.notes.delete(n.key);
     if (res.ok) (this.durations.get(n.key) ?? this.durations.set(n.key, []).get(n.key)!).push(ms);
 
     if (!res.ok) {
@@ -483,8 +566,7 @@ export class Runtime {
       const failure=candidateFailure(res.failure ?? classifyFailure(res.error??res.summary,{url:t.url,stage:n.kind==="agent"||n.kind==="review"?"model":undefined}),String(t.data.canonical??t.url));
       if(failure.owner==="user"||failure.tag==="model_transport")this.onAlert?.(t,n,failure);
       t.finished=true;t.data.failure=failure;
-      for(const [id,controller] of this.aborts)if(this.attemptTokens.get(id)===t.id)controller.abort();
-      for(const q of this.queues.values()){const i=q.indexOf(t.id);if(i>=0)q.splice(i,1);}
+      this.cancelTokenWork(t);
       this.journal.append({kind:"token.data",token:t.id,patch:{failure}});
       const reason=failure.retryable?`已退回候选库，等待按标签重试：${failure.message}`:`已移出候选库：${failure.message}`;
       this.journal.append({kind:"token.finished",token:t.id,node:n.key,status:failure.retryable?"parked":"rejected",reason});
@@ -493,7 +575,7 @@ export class Runtime {
     } else if (res.finish) {
       this.closeConsult(t, "manual", res.finish.reason);
       t.finished = true;
-      for (const q of this.queues.values()) { const i = q.indexOf(t.id); if (i >= 0) q.splice(i, 1); }
+      this.cancelTokenWork(t);
       this.journal.append({ kind: "token.finished", token: t.id, status: res.finish.status, node: n.key, reason: res.finish.reason });
     } else if (t.consult && (t.consult.chain[0] === n.key || t.consult.reviewer === n.key)) {
       this.consultResult(t, n, res);
@@ -536,8 +618,7 @@ export class Runtime {
     const failure: Failure = { tag: "browser_capture", category: "system", code: "BROWSER_POOL_RECOVERY_EXHAUSTED", message: summary, url: t.url, retryable: true, owner: "system", nextAction: fault.nextAction, tried: [`${MAX_BROWSER_RECOVERIES} 次页面池自动恢复`, fault.code] };
     this.closeConsult(t, "manual", summary);
     t.finished = true; t.data.failure = failure;
-    for (const [id, controller] of this.aborts) if (this.attemptTokens.get(id) === t.id) controller.abort();
-    for (const q of this.queues.values()) { const at = q.indexOf(t.id); if (at >= 0) q.splice(at, 1); }
+    this.cancelTokenWork(t);
     this.journal.append({ kind: "token.data", token: t.id, patch: { failure } });
     this.journal.append({ kind: "token.finished", token: t.id, node: n.key, status: "parked", reason: summary });
     this.onRecovery?.(t, failure);
@@ -548,6 +629,7 @@ export class Runtime {
 
   private complete(t: TokenRun, key: string) {
     t.done.add(key);
+    this.checkpoint(t);
     for (const e of this.outFlow.get(key) ?? []) {
       if (!t.closure.has(e.to)) continue;
       const live = !e.when || Boolean(this.conditions[e.when]?.(t.data));
@@ -562,6 +644,9 @@ export class Runtime {
    *  if all are dead the node is dead too and the deadness propagates (Spec F2.3). */
   private evaluate(t: TokenRun, key: string, from: string) {
     if (t.finished || t.done.has(key) || t.dead.has(key) || t.inflight.has(key) || this.queues.get(key)?.includes(t.id)) return;
+    // A previous owner result can satisfy the ordinary flow edges while that
+    // owner is being repaired. Only nextConsult may dispatch its reviewer.
+    if (this.awaitingRepair(t, key)) return;
     const ins = (this.inFlow.get(key) ?? []).filter((e) => t.closure.has(e.from));
     if (ins.some((e) => !t.edgeLive.has(e.key))) return;
     if (!ins.some((e) => t.edgeLive.get(e.key))) {
@@ -599,7 +684,7 @@ export class Runtime {
     const manual = `${at.line}/manual`;
     for (const q of this.queues.values()) { const i = q.indexOf(t.id); if (i >= 0) q.splice(i, 1); }
     if (this.nodes.has(manual)) this.enqueue(t, manual, at.key);
-    else { t.finished = true; this.journal.append({ kind: "token.finished", token: t.id, status: "manual", node: at.key, reason }); }
+    else { t.finished = true; this.cancelTokenWork(t); this.journal.append({ kind: "token.finished", token: t.id, status: "manual", node: at.key, reason }); }
   }
 
   descendants(t: TokenRun, key: string): Set<string> {
@@ -622,7 +707,10 @@ export class Runtime {
     t.nodeEpochs??=new Map();
     for (const k of reset) {
       t.nodeEpochs.set(k,(t.nodeEpochs.get(k)??0)+1);
-      for(const worker of this.workers.get(k)??[])if(worker.busy&&this.attemptTokens.get(worker.busy)===t.id)this.aborts.get(worker.busy)?.abort();
+      for (const worker of this.workers.get(k) ?? []) if (worker.busy && this.attemptTokens.get(worker.busy) === t.id) {
+        const controller = this.aborts.get(worker.busy);
+        if (controller) this.journal.afterCommit(() => controller.abort());
+      }
       t.done.delete(k); t.dead.delete(k); t.inflight.delete(k);
       const q = this.queues.get(k)!; const i = q.indexOf(t.id); if (i >= 0) q.splice(i, 1);
       for (const e of this.outFlow.get(k) ?? []) t.edgeLive.delete(e.key);
@@ -648,6 +736,7 @@ export class Runtime {
     // it must not overwrite a chain whose owner is still running.
     if (existing && existing.reviewer !== reviewer.key && existing.chain[0] !== reviewer.key) {
       (t.pendingConsults ??= []).push({ reviewer: reviewer.key, fixes, reason });
+      this.checkpoint(t);
       return;
     }
     const parent = existing?.reviewer === reviewer.key ? existing.parent : existing;
@@ -751,12 +840,14 @@ export class Runtime {
   }
 
   private closeConsult(t: TokenRun, outcome: "resolved" | "manual", reason: string) {
+    if (!t.consult && !t.pendingConsults?.length) return;
     do {
       const c = t.consult;
       for (const id of c?.open ?? []) this.journal.append({ kind: "consult.closed", consult: id, token: t.id, outcome, reason });
       t.consult = c?.parent;
     } while (outcome === "manual" && t.consult);
     if (outcome === "manual") t.pendingConsults = [];
+    this.checkpoint(t);
   }
 
   correct(target: { token: string; node: string; evidence?: string }, reason: string, note?: string) {

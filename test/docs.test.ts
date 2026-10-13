@@ -24,6 +24,30 @@ function fixture() {
 
 const create = (journal: Journal, id: string, item = "site") => journal.append({ kind: "token.created", token: id, item, line: "curation", source: "manual", url: "https://example.test/" });
 
+test('station context distinguishes configured closed agents, actual model receipts and program nodes', () => {
+  const f = fixture();
+  const previous = { command: process.env.FACTORY_STATION_COMMAND, model: process.env.FACTORY_STATION_MODEL };
+  process.env.FACTORY_STATION_COMMAND = '["fixture-unused-launcher"]';
+  process.env.FACTORY_STATION_MODEL = 'requested-fixture-model';
+  try {
+    const configured = f.docs.renderContext('curation/facts');
+    assert.match(configured, /执行：closed-command · requested-fixture-model.*请求配置/);
+    assert.doesNotMatch(configured, /最近执行回执/);
+    create(f.journal, 'execution-model');
+    f.journal.append({ kind: 'attempt.started', attempt: 'execution-attempt', token: 'execution-model', node: 'curation/facts', worker: 'fixture', input: 'facts' });
+    f.journal.append({ kind: 'attempt.finished', attempt: 'execution-attempt', ok: true, summary: 'fixture result', ms: 20, queuedMs: 0, metrics: { execution: { adapter: 'closed-command', model: 'actual-fixture-model' } } });
+    const completed = f.docs.renderContext('curation/facts');
+    assert.match(completed, /执行：closed-command · requested-fixture-model.*请求配置/);
+    assert.match(completed, /最近执行回执：closed-command · actual-fixture-model/);
+    assert.match(f.docs.renderContext('curation/scout'), /执行：程序执行/);
+    assert.match(f.docs.renderContext('dispatcher'), /执行：pi · .*当前配置/);
+  } finally {
+    if (previous.command === undefined) delete process.env.FACTORY_STATION_COMMAND; else process.env.FACTORY_STATION_COMMAND = previous.command;
+    if (previous.model === undefined) delete process.env.FACTORY_STATION_MODEL; else process.env.FACTORY_STATION_MODEL = previous.model;
+    f.close();
+  }
+});
+
 test("a real multi-station run persists actions, facts, review repairs and immutable earlier run snapshots; restart rebuilds both files", async () => {
   const f = fixture();
   const names = ["scout", "reader", "facts", "fact-review", "copy", "copy-review", "published"];
@@ -58,7 +82,8 @@ test("a real multi-station run persists actions, facts, review repairs and immut
     assert.deepEqual(first.runs[0].stationOrder.map((x) => x.station), ["curation/scout", "curation/reader", "curation/facts", "curation/fact-review", "curation/facts", "curation/fact-review", "curation/copy", "curation/copy-review"]);
     assert.equal(first.runs[0].attempts[0].actions.filter((a) => a.tool === "page_text").length, 95, "case keeps the full journal rather than the UI's 80-step ring");
     assert.equal(first.runs[0].evidence[0].id, `source-${token.id}`);
-    assert.equal(first.runs[0].tokens[0].dataChanges.length, 5);
+    assert.equal(first.runs[0].tokens[0].dataChanges.filter(change => Object.keys(change.patch).some(key => key !== 'runtimeCheckpoint')).length, 5, 'all five business outputs remain recorded');
+    assert.ok(first.runs[0].tokens[0].dataChanges.some(change => 'runtimeCheckpoint' in change.patch), 'scheduler checkpoints remain part of the full case audit trail');
     assert.equal(first.runs[0].consultations.filter((e) => e.kind === "consult.closed" && e.outcome === "resolved").length, 1);
     assert.ok(first.runs[0].unresolved.some((i) => i.field === "facts.pricing" && i.status === "unknown"));
     assert.match(fs.readFileSync(f.docs.caseFile("site"), "utf8"), /已补许可原文/);

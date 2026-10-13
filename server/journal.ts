@@ -12,6 +12,10 @@ export class Journal {
   private db: DatabaseSync;
   private insert;
   private listeners = new Set<Listener>();
+  private projections = new Set<Listener>();
+  private transaction: { events: Stamped[]; afterCommit: (() => void)[] } | null = null;
+  private notifications: Stamped[] = [];
+  private notifying = false;
   seq = 0;
   run = "";
 
@@ -34,11 +38,59 @@ export class Journal {
     this.insert.run(stamped.seq, stamped.at, stamped.run, stamped.kind, JSON.stringify(event));
     this.seq = stamped.seq;
     if (event.kind === "run.started") this.run = event.runId;
-    for (const l of this.listeners) {
-      try { l(stamped); } catch (err) { console.error("journal listener", err); }
-    }
+    if (this.transaction) this.transaction.events.push(stamped);
+    else this.publish([stamped]);
     return stamped;
   }
+
+  /** One synchronous state transition is either entirely durable or invisible.
+   * Model calls and external I/O must finish before entering this transaction. */
+  atomic(action: () => void) {
+    if (action.constructor.name === 'AsyncFunction') throw new TypeError('Journal.atomic requires a synchronous action');
+    if (this.transaction) { action(); return; }
+    const before = { seq: this.seq, run: this.run };
+    const pending = { events: [] as Stamped[], afterCommit: [] as (() => void)[] };
+    this.db.exec('BEGIN IMMEDIATE');
+    this.transaction = pending;
+    try {
+      const result: unknown = action();
+      if (result && typeof (result as { then?: unknown }).then === 'function') throw new TypeError('Journal.atomic requires a synchronous action');
+      this.db.exec('COMMIT');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch (rollbackError) { console.error('journal rollback', rollbackError); }
+      this.seq = before.seq; this.run = before.run;
+      throw error;
+    } finally { this.transaction = null; }
+    this.publish(pending.events);
+    for (const effect of pending.afterCommit) effect();
+  }
+
+  afterCommit(action: () => void) {
+    if (this.transaction) this.transaction.afterCommit.push(action);
+    else action();
+  }
+
+  private publish(events: Stamped[]) {
+    // Materialize the committed batch before consumers react. A listener may
+    // append more events; its projections update synchronously, while broadcasts
+    // stay in sequence after the batch already waiting to be delivered.
+    for (const event of events) for (const projection of this.projections) {
+      try { projection(event); } catch (error) { console.error('journal projection', error); }
+    }
+    this.notifications.push(...events);
+    if (this.notifying) return;
+    this.notifying = true;
+    try {
+      while (this.notifications.length) {
+        const event = this.notifications.shift()!;
+        for (const listener of this.listeners) {
+          try { listener(event); } catch (error) { console.error('journal listener', error); }
+        }
+      }
+    } finally { this.notifying = false; }
+  }
+
+  subscribeProjection(l: Listener) { this.projections.add(l); return () => this.projections.delete(l); }
 
   subscribe(l: Listener) { this.listeners.add(l); return () => this.listeners.delete(l); }
 

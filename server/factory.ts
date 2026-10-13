@@ -76,7 +76,7 @@ export class Factory {
     if (this.compiled.issues.length) throw new ControlError(422, "invalid_spec", "规格校验失败，未启动运行时", this.compiled.issues);
     this.state = initialState(this.compiled);
     for (const e of this.journal.read(0)) apply(this.state, e);
-    this.journal.subscribe((e) => apply(this.state, e));
+    this.journal.subscribeProjection((e) => apply(this.state, e));
     if (process.env.FACTORY_READONLY !== "1" && this.state.digest !== this.compiled.digest) this.journal.append({ kind: "factory.loaded", digest: this.compiled.digest, specVersion: this.compiled.specVersion });
     this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
     this.docs = new Docs(this, VAR, this.project.name);
@@ -407,14 +407,19 @@ export class Factory {
       }
       const recoveryRoot=String(previous?.data.recoveryRoot??(previous&&this.state.attempts[previous.attempts[0]]?.node)??checkpoint);
       const completed=new Map((previous?.attempts??[]).map(id=>this.state.attempts[id]).filter(Boolean).map(a=>[a.node,a.ok]));
+      const saved = previous?.data.runtimeCheckpoint as { version?: number; done: string[]; rounds: Record<string, number>; notes: [string, { reason: string; note?: string; byHuman: boolean }][] } | undefined;
       const t=this.runtime.create(checkpoint,{item:c.item,url:c.url,title:c.title,source:"candidates/pool",category:c.category,data:{...data,express:true,retryOf:c.token,retryTag:c.failure?.tag,recoveryStation:checkpoint,recoveryRoot}});
       if(checkpoint!=="candidates/tidy") {
         t.entry=recoveryRoot;t.closure=this.runtime.closureOf(recoveryRoot);
         const invalidated=this.runtime.descendants(t,checkpoint);
-        t.done=new Set([...(previous.data.checkpointDone as string[]??[]),...[...completed].filter(([,ok])=>ok).map(([key])=>key)].filter(key=>!invalidated.has(key)));
+        const previousDone = saved?.version === 1 ? saved.done : [...(previous.data.checkpointDone as string[]??[]),...[...completed].filter(([,ok])=>ok).map(([key])=>key)];
+        t.done=new Set(previousDone.filter(key=>!invalidated.has(key)));
+        t.rounds = { ...(saved?.version === 1 ? saved.rounds : previous.rounds) };
+        if (saved?.version === 1) t.notes = new Map(saved.notes);
         this.runtime.restoreFlow(t);
         this.runtime.resumeFrontier(t, checkpoint);
         t.data.checkpointDone=[...t.done];this.journal.append({kind:"token.data",token:t.id,patch:{checkpointDone:[...t.done]}});
+        this.runtime.checkpoint(t);
       }
       if(previous&&checkpoint!=="candidates/tidy"){
         for(const id of previous.evidence){const ev=this.state.evidence[id];if(!ev)continue;this.journal.append({kind:"evidence.added",evidence:{...ev,id:`${ev.id}-${t.id}`,token:t.id,at:Date.now(),meta:{...ev.meta,reusedFrom:ev.id}}});}
@@ -475,15 +480,21 @@ export class Factory {
     // Which nodes each token has finished, per the journal (returns reset descendants).
     const done = new Map<string, Set<string>>(Object.values(this.state.tokens).map(t=>[t.id,new Set((t.data.checkpointDone as string[])??[])]));
     const notes=new Map<string,TokenRun["notes"]>();
+    const checkpointed = new Set<string>();
     for (const e of this.journal.read(0)) {
-      if(e.kind==="token.returned"){
+      if (e.kind === 'token.data' && (e.patch.runtimeCheckpoint as { version?: number } | undefined)?.version === 1) {
+        const checkpoint = e.patch.runtimeCheckpoint as { done: string[]; notes: [string, { reason: string; note?: string; byHuman: boolean }][] };
+        done.set(e.token, new Set(checkpoint.done));
+        notes.set(e.token, new Map(checkpoint.notes));
+        checkpointed.add(e.token);
+      } else if(e.kind==="token.returned"){
         const entries=notes.get(e.token)??new Map();entries.set(e.to,{reason:e.reason,byHuman:e.byHuman});notes.set(e.token,entries);
-      }else if(e.kind==="attempt.finished"&&e.error!=="restart"&&e.error!=="stale"){
+      }else if(e.kind==="attempt.finished"&&e.ok&&e.error!=="restart"&&e.error!=="stale"){
         const a=this.state.attempts[e.attempt];if(a)notes.get(a.token)?.delete(a.node);
       }
       if (e.kind === "attempt.finished" && e.ok && e.error !== "stale") {
         const a = this.state.attempts[e.attempt];
-        if (a) (done.get(a.token) ?? done.set(a.token, new Set()).get(a.token)!).add(a.node);
+        if (a && !checkpointed.has(a.token)) (done.get(a.token) ?? done.set(a.token, new Set()).get(a.token)!).add(a.node);
       } else if (e.kind === "token.returned") for (const k of e.reset ?? []) done.get(e.token)?.delete(k);
       else if (e.kind === "token.queued" && this.compiled.nodes.find((n) => n.key === e.node)?.kind === "store") (done.get(e.token) ?? done.set(e.token, new Set()).get(e.token)!).add(e.node);
     }
@@ -496,6 +507,9 @@ export class Factory {
         queuedAt: new Map(), failures: new Map(), rounds: { ...ts.rounds }, epoch: 0, finished: ts.status!=="active", notes: notes.get(ts.id)??new Map(),
         finishedStore:ts.finishedAtNode&&rt.nodes.get(ts.finishedAtNode)?.kind==="store"?ts.finishedAtNode:undefined,
       };
+      rt.restoreCheckpoint(t);
+      t.done = done.get(ts.id) ?? t.done;
+      t.notes = notes.get(ts.id) ?? t.notes;
       rt.restoreFlow(t);
       rt.tokens.set(t.id, t);
       const legacyFrontier = ts.status === 'parked' && this.state.recoveries[ts.item]?.failure?.message.startsWith('恢复分支状态不完整');
@@ -520,7 +534,8 @@ export class Factory {
           voided++;
         }
       }
-      for (const old of [...ts.at]) {
+      const repairAt = t.consult && (t.consult.chain[0] ?? t.consult.reviewer);
+      for (const old of new Set([...ts.at, ...(repairAt ? [repairAt] : [])])) {
         // Preparation's former pass-through stations were merged into tidy.
         // Resume any parked-in-flight legacy item there without losing its data.
         const k = old === "candidates/extract" || old === "candidates/index" ? "candidates/tidy" : old;
@@ -528,10 +543,13 @@ export class Factory {
           t.done.delete(k);
           this.journal.append({ kind: "token.queued", token: t.id, node: k, from: old, returned: true });
         }
-        if (t.done.has(k)) continue;
+        if (k !== repairAt && (t.done.has(k) || rt.awaitingRepair(t, k))) continue;
         const q = rt.queues.get(k);
         if (q && !q.includes(t.id)) { q.push(t.id); t.queuedAt.set(k, Date.now()); requeued++; }
       }
+      // A process can stop between saving a completed result and queuing its
+      // successor. Exact scheduler checkpoints let us reconstruct that gap.
+      if (checkpointed.has(t.id)) rt.resumeFrontier(t, t.entry);
     }
     if (requeued || voided) this.journal.append({ kind: "dispatch.note", tone: "warn", text: `重启后从日志续跑：${requeued} 件货重新排队，${voided} 次中断的处理作废重做；已完成的工位结果不重做` });
     rt.schedule();
