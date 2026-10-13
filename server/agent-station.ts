@@ -8,6 +8,7 @@ import { execFileSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import { Type, type TSchema } from "typebox";
+import { Check, Errors } from 'typebox/value';
 import type { AttemptMetrics, Usage } from "../shared/types.ts";
 import type { Docs } from "./docs.ts";
 import { BASE_TOOLS, type Toolbox } from "./toolbox.ts";
@@ -103,6 +104,17 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   const skipped = def.skip?.(ctx);
   if (skipped) return skipped;
   const input = await def.input(ctx);
+  ctx.signal.throwIfAborted();
+  const missingImages = (input.images ?? []).filter(image => {
+    try { return !image.file || !fs.statSync(image.file).isFile(); } catch { return true; }
+  });
+  if (missingImages.length) {
+    const message = `工位需要的图片证据不可读：${missingImages.map(image => image.label).join('、')}`;
+    return { ok: false, summary: message, error: message, failure: {
+      tag: 'missing_artifact', category: 'system', code: 'STATION_IMAGE_MISSING', message, retryable: true, owner: 'system',
+      nextAction: '先从持久证据恢复缺失图片，只补做丢失的角色，再交回当前工位；不能删除图片输入后继续审核。',
+    } };
+  }
   const usage: Usage = { input: 0, output: 0, cost: 0 };
   const caseId = ctx.token.item;
   const allowed = [...BASE_TOOLS, ...(def.tools ?? [])];
@@ -212,7 +224,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
       if ((e as { toolName?: string }).toolName === "submit") ctx.progress("提交结构化结果", { tool: "submit", text: "按 I/O 契约校验" });
     }
   });
-  const images = (input.images ?? []).filter((i) => fs.existsSync(i.file)).map((i) => ({ type: "image" as const, data: jpeg(i.file).toString("base64"), mimeType: "image/jpeg" }));
+  const images = (input.images ?? []).map((i) => ({ type: "image" as const, data: jpeg(i.file).toString("base64"), mimeType: "image/jpeg" }));
   ctx.progress(`读取身份、案卷与输入${images.length ? `：${images.length} 张图 + 文字` : ""}；调用 ${external ? "闭源 Agent / " : ""}${modelId}`, { tool: "model", text: input.text.slice(0, 160) });
   const redo = ctx.redo ? `\n\nTHIS IS A REDO. ${ctx.redo.byHuman ? "The human owner corrected" : "A reviewer sent back"} this work: ${ctx.redo.reason}${ctx.redo.note ? ` (${ctx.redo.note})` : ""}. Change only what is named; keep everything else as it was, and say in your submission what you changed.` : "";
   const sessionRoot = docs?.dir;
@@ -305,6 +317,11 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     if (issues.length) {
       const saved = def.salvage?.(out, issues, ctx) ?? null;
       if (!saved) return { ok: false, summary: `重答后仍不合格：${issues[0]}`, error: issues.join("; "), usage: usageReported ? usage : undefined, metrics: metrics() };
+      // Salvage is a deterministic correction, never an exemption from the
+      // station contract (e.g. removing bad facets cannot fix a bad category).
+      const remaining = Check(def.schema, saved) ? def.check?.(saved, ctx) ?? []
+        : [...Errors(def.schema, saved)].slice(0, 5).map(error => `schema ${error.instancePath}: ${error.message}`);
+      if (remaining.length) return { ok: false, summary: `修剪后仍不合格：${remaining[0]}`, error: remaining.join('; '), usage: usageReported ? usage : undefined, metrics: metrics() };
       ctx.progress(`逐项修剪后保留可用部分（丢弃：${issues.slice(0, 3).join("；")}）`, { tool: "salvage", text: issues.join("\n") });
       out = saved;
     } else ctx.progress("程序检查全部通过 ✓", { tool: "check", text: "", ok: true });
