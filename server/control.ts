@@ -307,11 +307,16 @@ function definitions(f: Factory): Tool[] {
         },
       },
       {
-        name: "inspect", label: "查看货 / 工位 / 证据", description: "Details of a token, station, or evidence. An exact token id reads that historical token; item/host resolves current-run work or its latest historical token, excluding superseded retries.",
-        parameters: Type.Object({ token: Type.Optional(name()), station: Type.Optional(name()), evidence: Type.Optional(name()), worker: Type.Optional(name()), part: Type.Optional(name()) }),
+        name: "inspect", label: "查看货 / 工位 / 证据", description: "Details of a token, station, evidence, or exact attempt including its recorded steps, metrics and output. An exact token id reads that historical token; item/host resolves current-run work or its latest historical token, excluding superseded retries.",
+        parameters: Type.Object({ token: Type.Optional(name()), station: Type.Optional(name()), evidence: Type.Optional(name()), worker: Type.Optional(name()), part: Type.Optional(name()), attempt: Type.Optional(name()) }),
         execute: async (_id, p) => {
           const s = f.state;
-          if (Object.keys(p).length !== 1) throw new ControlError(400, "one_target_required", "请选择一个 token、station、evidence、worker 或 part");
+          if (Object.keys(p).length !== 1) throw new ControlError(400, "one_target_required", "请选择一个 token、station、evidence、worker、part 或 attempt");
+          if (p.attempt) {
+            const attempt = s.attempts[p.attempt];
+            if (!attempt) throw new ControlError(404, 'attempt_not_found', '没有这次尝试');
+            return ok(attempt, '查看本次尝试的完整记录');
+          }
           if (p.part) {
             const f0 = f.compiled, part = layoutFactory(f0.nodes, f0.edges, f0.ui.order, f0.ui.hints, f0.ui.collapsed).bays?.find((b) => b.id === p.part);
             if (!part) throw new ControlError(404, "part_not_found", "没有这个部分；请从 bootstrap.parts 读取 ID");

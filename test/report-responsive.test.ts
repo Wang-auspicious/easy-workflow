@@ -13,7 +13,10 @@ import {JournalEventStream} from '../server/event-stream.ts';
 import { readReportJson, closeReportReaders } from '../server/report-reader.ts';
 import { compile } from '../server/spec/compile.ts';
 import { line, station, type Pack } from '../server/spec/dsl.ts';
-import { initialState } from '../shared/project.ts';
+import {apply, initialState, latestRunTokens, tokenWorkKey} from '../shared/project.ts';
+import {applyUiEvent, isUiState, uiEvent, uiState} from '../shared/client-view.ts';
+import {batchSummary} from '../shared/batch.ts';
+import type {JournalEvent, Stamped} from '../shared/types.ts';
 import type { Factory } from '../server/factory.ts';
 import type { RunReport } from '../server/report.ts';
 
@@ -269,4 +272,118 @@ test('a live update arriving during snapshot drain cannot be overwritten by the 
     stream.close();
     empty.close();
   }
+});
+
+test('UI summaries preserve retry and cross-line identities, scheduling, evidence and usage without retaining business payloads', () => {
+  const raw = initialState(compiled);
+  const compact = uiState(raw);
+  let sequence = 0;
+  const events: Stamped[] = [];
+  const emit = (event: JournalEvent) => {
+    const stamped = {...event, seq: ++sequence, at: 1000 + sequence, run: 'run-client-view'} as Stamped;
+    events.push(stamped);
+    apply(raw, stamped);
+    applyUiEvent(compact, uiEvent(stamped));
+    assert.deepEqual(latestRunTokens(compact).map(token => [token.id, tokenWorkKey(token)]),
+      latestRunTokens(raw).map(token => [token.id, tokenWorkKey(token)]));
+    assert.deepEqual(batchSummary(compact), batchSummary(raw));
+    for (const key of ['seq', 'run', 'nodes', 'workers', 'totals', 'recoveries', 'consults', 'pausedScopes', 'corrections'] as const) {
+      assert.deepEqual(compact[key], raw[key], key);
+    }
+    return stamped;
+  };
+  const create = (token: string, line: string, data: Record<string, unknown>) => {
+    emit({kind: 'token.created', token, line, item: 'shared-item', url: 'https://fixture.invalid/', source: 'fixture'});
+    emit({kind: 'token.data', token, patch: data});
+  };
+  emit({kind: 'run.started', runId: 'run-client-view', title: 'UI identity fixture'});
+  emit({kind: 'batch.configured', batch: {runId: 'run-client-view', target: 5, maxInFlight: 1,
+    intakeWindow: 1, maxRecoveries: 2, mode: 'running', startedAt: 1001}});
+  create('parent', 'curation', {large: 'x'.repeat(1024 * 1024), style: {applicable: true, subjectVisible: true,
+    styles: [{id: 'fixture-style', reason: 'full rationale'}]}, facts: {price: 'free', license: 'MIT', receipts: ['full evidence']},
+    copy: {takeawayZh: '可见摘要', descriptionZh: '可见说明', longReport: 'private full copy'}});
+  emit({kind: 'token.finished', token: 'parent', status: 'parked', node: 'fixture/work', reason: 'await recovery'});
+  create('retry', 'curation', {batchRecovery: {count: 1, nextAt: 60000, tag: 'network_timeout', station: 'fixture/work', replan: false}});
+  emit({kind: 'token.data', token: 'parent', patch: {retriedBy: 'retry'}});
+  create('child', 'components', {channelDelivery: 'delivery-1'});
+  create('generic', 'fixture', {workflowPack: 'generic-pack'});
+  assert.equal(latestRunTokens(compact).length, 3);
+  assert.equal(batchSummary(compact)!.admitted, 1);
+  assert.equal(compact.tokens.parent.data.large, undefined);
+  assert.deepEqual(compact.tokens.parent.data.style, {applicable: true, subjectVisible: true, styles: [{id: 'fixture-style'}]});
+  assert.equal(raw.tokens.parent.data.large, 'x'.repeat(1024 * 1024));
+  emit({kind: 'scope.paused', scope: 'line', key: 'components', paused: true, reason: 'fixture'});
+  emit({kind: 'token.queued', token: 'retry', node: 'fixture/work'});
+  emit({kind: 'worker.spawned', node: 'fixture/work', worker: 'worker-ui', label: 'Fixture', reason: 'fixture'});
+  emit({kind: 'attempt.started', attempt: 'attempt-ui', token: 'retry', node: 'fixture/work', worker: 'worker-ui', input: 'input'});
+  for (let i = 0; i < 85; i++) emit({kind: 'attempt.progress', attempt: 'attempt-ui', text: `Full step ${i}`, step: {tool: 'http', text: `Full step ${i}`, ok: true}});
+  emit({kind: 'attempt.activity', attempt: 'attempt-ui', activity: {id: 'activity', kind: 'tool', source: 'tool-executor', startedAt: 1100, endedAt: 1200, status: 'completed'}});
+  assert.equal(uiState(raw).attempts['attempt-ui'].metrics, compact.attempts['attempt-ui'].metrics,
+    'an activity-only in-flight attempt has the same summary via bootstrap and SSE');
+  emit({kind: 'evidence.added', evidence: {id: 'e-ui', token: 'retry', attempt: 'attempt-ui', station: 'fixture/work', at: 1200,
+    kind: 'text', label: 'full document', meta: {role: 'proof', href: 'https://fixture.invalid/', content: 0.6, framing: 'stage', document: 'full evidence'}}});
+  emit({kind: 'attempt.finished', attempt: 'attempt-ui', ok: true, summary: 'done', ms: 200, queuedMs: 10,
+    usage: {input: 0, output: 0, cost: 0}, output: {business: 'full result'},
+    metrics: {usageReported: false, usageComplete: false, modelTimeReported: false, execution: {adapter: 'launcher', model: 'unreported'}}});
+  assert.equal(compact.attempts['attempt-ui'].steps.length, 1);
+  assert.equal(raw.attempts['attempt-ui'].steps.length, 80);
+  assert.equal(compact.attempts['attempt-ui'].output, undefined);
+  assert.equal(compact.attempts['attempt-ui'].metrics?.usageReported, false, 'missing model usage must remain unknown');
+  assert.deepEqual(compact.attempts['attempt-ui'].usage, raw.attempts['attempt-ui'].usage);
+  assert.equal(compact.evidence['e-ui'].meta?.document, undefined);
+  assert.equal(raw.evidence['e-ui'].meta?.document, 'full evidence');
+  emit({kind: 'case.noted', caseId: 'shared-item', token: 'retry', note: {station: 'fixture/work', section: 'result', text: 'full case', by: 'fixture'}});
+  emit({kind: 'context.noted', node: 'fixture/work', note: {kind: 'instruction', text: 'full context', by: 'fixture'}});
+  emit({kind: 'consult.opened', consult: 'consult-ui', token: 'retry', reviewer: 'fixture/work', owner: 'fixture/work', fields: ['facts'], problem: 'fixture', round: 1});
+  assert.deepEqual(compact.cases, {});
+  assert.deepEqual(compact.contextNotes, {});
+  assert.equal(Object.keys(compact.consults).length, 1, 'consults still contribute to node counts');
+  const fullBefore = JSON.stringify(raw);
+  const snapshot = uiState(raw);
+  assert.ok(isUiState(snapshot));
+  assert.equal(isUiState(raw), false);
+  assert.equal(isUiState(null), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(snapshot)), JSON.parse(JSON.stringify(compact)));
+  const queued = {kind: 'token.queued', token: 'child', node: 'fixture/work', seq: sequence + 1, at: 2000, run: 'run-client-view'} as const;
+  applyUiEvent(snapshot, queued);
+  applyUiEvent(snapshot, queued);
+  assert.equal(snapshot.nodes['fixture/work'].queue.filter(id => id === 'child').length, 1);
+  assert.equal(JSON.stringify(raw), fullBefore, 'applying a detached UI snapshot must not mutate backend state');
+  assert.equal(events.find(event => event.kind === 'token.data')?.kind, 'token.data');
+});
+
+test('UI patches retain explicit clears, and correction snapshots restore summaries without recovery internals', () => {
+  const raw = initialState(compiled);
+  const compact = uiState(raw);
+  let sequence = 0;
+  const emit = (event: JournalEvent) => {
+    const stamped = {...event, seq: ++sequence, at: sequence * 1000, run: 'run-correction-ui'} as Stamped;
+    apply(raw, stamped);
+    applyUiEvent(compact, uiEvent(stamped));
+    return stamped;
+  };
+  emit({kind: 'token.created', token: 't', line: 'curation', item: 'one', url: 'https://fixture.invalid/', source: 'fixture'});
+  emit({kind: 'token.data', token: 't', patch: {style: {applicable: true, subjectVisible: true}, facts: {price: 'free'}, copy: {takeawayZh: 'old'}}});
+  emit({kind: 'token.data', token: 't', patch: {title: 'new'}});
+  assert.deepEqual(compact.tokens.t.data.facts, {price: 'free'}, 'an absent patch field cannot clear prior values');
+  emit({kind: 'token.data', token: 't', patch: {style: null, facts: null, copy: null}});
+  assert.equal(compact.tokens.t.data.style, null);
+  assert.equal(compact.tokens.t.data.facts, null);
+  assert.equal(compact.tokens.t.data.copy, null);
+  const snapshot = {data: {title: 'restored', channelDelivery: 'delivery-id', internal: 'must stay server-side'},
+    checkpoint: {rounds: {'fixture/work': 2}, completed: ['private checkpoint']}, status: 'active', at: ['fixture/work'], touchedAt: 1234};
+  emit({kind: 'correction.created', correction: 'c', token: 't', node: 'fixture/work', reason: 'fixture', snapshot});
+  assert.equal(compact.corrections?.c.status, 'pending');
+  const reverted = emit({kind: 'correction.reverted', correction: 'c', token: 't', snapshot});
+  assert.deepEqual(compact.tokens.t.at, raw.tokens.t.at);
+  assert.deepEqual(compact.tokens.t.rounds, raw.tokens.t.rounds);
+  assert.equal(compact.tokens.t.touchedAt, raw.tokens.t.touchedAt);
+  assert.equal(compact.tokens.t.data.title, 'restored');
+  assert.equal(compact.tokens.t.data.internal, undefined);
+  assert.equal(raw.tokens.t.data.internal, 'must stay server-side');
+  assert.deepEqual(compact.corrections, raw.corrections);
+  assert.deepEqual(compact.nodes, raw.nodes);
+  const oldSummary = uiEvent(reverted);
+  emit({kind: 'token.data', token: 't', patch: {title: 'future'}});
+  assert.deepEqual(uiEvent(reverted), oldSummary, 'transforming an old event never reads future state');
 });

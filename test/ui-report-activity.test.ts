@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildTimeView, usageSummary, timeStrip, type DisplayInterval, type ActivityAttempt } from "../ui/src/report/activity.ts";
 import type { ActivitySpan } from "../shared/types.ts";
+import {DetailCache, type DetailTarget} from '../ui/src/details.ts';
 
 const recorded = (id: string, kind: ActivitySpan["kind"], startedAt: number, endedAt?: number, requestId?: string): ActivitySpan => ({
   id, kind, source: kind === "tool" ? "tool-executor" : "model-stream", startedAt, endedAt, requestId,
@@ -151,4 +152,70 @@ test('a dense timeline renders at bounded resolution while retaining original in
   assert.ok(display.every(segment => segment.keys.includes('tool') && segment.keys.includes('output')));
   assert.equal(strip.segments.length, 30007, 'display aggregation cannot replace the original exact timeline');
   assert.equal(display[0].from, strip.start); assert.equal(display.at(-1)!.to, strip.end);
+});
+
+test('lazy detail reads reject an older response and cancel only when the last view leaves', async () => {
+  const requests: {signal: AbortSignal; resolve: (value: {seq: number; result: unknown; bytes: number}) => void}[] = [];
+  const target: DetailTarget = {kind: 'attempt', id: 'recorded-attempt'};
+  const cache = new DetailCache(async (_target, signal) => new Promise(resolve => requests.push({signal, resolve})));
+  const first = cache.watch(target, 10, () => {});
+  const second = cache.watch(target, 10, () => {});
+  assert.equal(requests.length, 1, 'two views share one request');
+  cache.invalidate(target, 12);
+  requests[0].resolve({seq: 11, result: {steps: ['stale response']}, bytes: 20});
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.equal(cache.snapshot(target).data, undefined, 'a stale response cannot replace new projected progress');
+  assert.equal(requests.length, 2);
+  requests[1].resolve({seq: 12, result: {steps: ['complete current transcript']}, bytes: 30});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(cache.snapshot(target).data, {steps: ['complete current transcript']});
+  cache.invalidate(target, 13);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.equal(requests.length, 3);
+  first();
+  assert.equal(requests[2].signal.aborted, false, 'leaving one view does not cancel another reader');
+  second();
+  assert.equal(requests[2].signal.aborted, true, 'leaving the last view cancels its actual fetch');
+  requests[2].resolve({seq: 13, result: {steps: ['cancelled result']}, bytes: 30});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(cache.snapshot(target).seq, 12, 'cancelled work cannot enter the cache');
+  cache.clear();
+});
+
+test('detail cache bounds retained records and bytes without merging full data into the projection', async () => {
+  let reads = 0;
+  const cache = new DetailCache(async target => {
+    reads++;
+    return {seq: 20, result: {id: target.id, output: 'full output'}, bytes: target.id === 'oversized' ? 30 : 8};
+  }, 2, 20);
+  const targets: DetailTarget[] = ['one', 'two', 'three'].map(id => ({kind: 'attempt', id}));
+  for (const target of targets) {
+    const leave = cache.watch(target, 10, () => {});
+    await new Promise(resolve => setImmediate(resolve));
+    leave();
+  }
+  assert.equal(cache.snapshot(targets[0]).data, undefined);
+  assert.ok(cache.snapshot(targets[1]).data);
+  assert.ok(cache.snapshot(targets[2]).data);
+  const before = reads;
+  const cached = cache.watch(targets[2], 100, () => {});
+  assert.equal(reads, before, 'unrelated global events do not invalidate a tracked target');
+  cached();
+  const oversized: DetailTarget = {kind: 'token', id: 'oversized'};
+  const leave = cache.watch(oversized, 10, () => {});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(cache.snapshot(oversized).error ?? '', /超过缓存上限/);
+  assert.equal(cache.snapshot(oversized).data, undefined);
+  leave();
+  cache.clear();
+  assert.equal(cache.snapshot(targets[2]).data, undefined);
+  const previousView = cache.watch(targets[0], 10, () => {});
+  cache.clear();
+  const nextView = cache.watch(targets[0], 10, () => {});
+  previousView();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(cache.snapshot(targets[0]).data, {id: targets[0].id, output: 'full output'},
+    'a watcher from a previous projection cannot delete a newer snapshot entry');
+  nextView();
+  cache.clear();
 });

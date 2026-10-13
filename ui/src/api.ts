@@ -1,11 +1,12 @@
 // Talking to the factory server: boot snapshot, SSE stream, actions.
-import type { Attachment, Stamped } from "../../shared/types.ts";
+import type { Attachment } from "../../shared/types.ts";
 import type { FactoryState } from "../../shared/project.ts";
 import { getState, ingest, setState, type LayoutFile, type NodeAgentBinding } from "./store.ts";
 import { toast } from "./shell/Toasts.tsx";
 import { legacyReply } from "../../shared/conversation.ts";
 import { idleDispatcher, reconcileChatLive, reduceChatLive, type ChatEvent, type DispatcherStatus } from "./chat/live.ts";
 import {executionIndex} from './canvas/status.ts';
+import type {UiEvent} from '../../shared/client-view.ts';
 
 export const api = {
   async get<T>(path: string, options?: { signal?: AbortSignal }): Promise<T> { const r = await fetch(path, options); if (!r.ok) throw new Error(`${path} ${r.status}`); return r.json(); },
@@ -23,7 +24,7 @@ let es: EventSource | null = null;
 
 export async function boot() {
   const f = await api.get<{ factory: any; layout: Partial<LayoutFile>; defaultLayout: any; settings: Record<string, number>; model: string; keyPresent: boolean; agentBindings?: NodeAgentBinding[] }>("/api/factory");
-  const fs = await api.get<FactoryState & { dispatcher?: DispatcherStatus }>("/api/state");
+  const fs = await api.get<FactoryState & { dispatcher?: DispatcherStatus }>("/api/state?view=ui-v1");
   // A window can reload while an older desktop backend is still shutting down.
   fs.activity ??= fs.chat.filter(m=>m.role==="note");
   fs.recoveries ??= {};
@@ -51,12 +52,12 @@ export async function boot() {
 
 export function connect(since: number) {
   es?.close();
-  es = new EventSource(`/api/events?since=${since}`);
+  es = new EventSource(`/api/events?since=${since}&view=ui-v1`);
   es.onopen = () => setState({ connected: true });
   es.onerror = () => setState({ connected: false });
   es.onmessage = (m) => {
     if (getState().replay) return;
-    const event = JSON.parse(m.data) as Stamped;
+    const event = JSON.parse(m.data) as UiEvent;
     ingest([event]);
     if (event.kind === 'agent.binding') void refreshAgentBindings(event.node);
     if (event.kind === "factory.loaded" || event.kind === "spec.patched") void refreshSpec();

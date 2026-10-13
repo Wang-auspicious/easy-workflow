@@ -2,7 +2,7 @@
 // workers and, for the chosen worker, its work as a narrated trace — like a Claude Code
 // sub-agent view: input, thoughts, folded tool steps with their evidence, current activity.
 // A token card shows that item's evidence chain from URL to publication.
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
 import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, CircleMinus, Check, AlertTriangle, Loader2, ExternalLink, Play, Pause } from "lucide-react";
 import type { CompiledNode, EvidenceRef, StationAgentBinding } from "../../../shared/types.ts";
@@ -24,6 +24,7 @@ import { toast } from "../shell/Toasts.tsx";
 import { inspectPart, partTone } from "../../../shared/parts.ts";
 import { recordedUsage, stationStatus, tokenStatus } from './status.ts';
 import { CrewStrip, CrewTimeline, WorkerTrace } from "./CrewTrace.tsx";
+import {useDetail, type TokenDetail} from '../details.ts';
 
 export function Inspectors({ geo, cam }: { geo: Geometry; cam: Camera }) {
   const list = useStore((s) => s.inspectors);
@@ -417,9 +418,10 @@ function Trace({ a, node, c, now }: { a: AttemptState; node: CompiledNode; c: st
   const [open, setOpen] = useState<Record<number, boolean>>({});
   const [inputOpen, setInputOpen] = useState(false);
   const token = s.fs.tokens[a.token];
-  const groups = useMemo(() => {
+  const detail = useDetail<AttemptState>({kind: 'attempt', id: a.id}, a);
+  const groups = (() => {
     const out: { kind: "say" | "tools" | "think"; items: AttemptState["steps"] }[] = [];
-    for (const st of a.steps) {
+    for (const st of detail.data?.steps ?? []) {
       const tool = st.step?.tool ?? "say";
       const isTool = ["browser", "shot", "reject", "http", "record", "webp"].includes(tool);
       const kind = isTool ? "tools" : tool === "think" ? "think" : "say";
@@ -429,7 +431,7 @@ function Trace({ a, node, c, now }: { a: AttemptState; node: CompiledNode; c: st
       else out.push({ kind, items: [st] });
     }
     return out;
-  }, [a.steps.length, a.id]);
+  })();
   const running = a.endedAt === undefined;
   return (
     <div className="trace" style={{ ["--tc" as string]: c }}>
@@ -441,6 +443,8 @@ function Trace({ a, node, c, now }: { a: AttemptState; node: CompiledNode; c: st
       </button>
       {inputOpen && <div className="trace-input-body sel">{a.input}{token?.url ? `\n${token.url}` : ""}</div>}
       <div className="trace-steps">
+        {detail.loading && <p className="muted" role="status">{detail.data ? '正在更新完整步骤…' : '正在读取完整步骤…'}</p>}
+        {detail.error && <p role="alert">完整步骤读取失败：{detail.error} <button className="btn btn--sm" onClick={detail.retry}>重新读取</button></p>}
         {groups.map((g, gi) => g.kind === "say" ? g.items.map((st, i) => <SayRow key={`${gi}-${i}`} st={st} />) : g.kind === "think" ? <ThinkRow key={gi} items={g.items} /> : (
           <div key={gi} className="tool-group">
             <button className="tool-sum" onClick={() => setOpen((o) => ({ ...o, [gi]: !o[gi] }))}>
@@ -535,9 +539,14 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
   const now = useNow(1000);
   const s = getState();
   const t = s.fs.tokens[insp.key];
+  const detail = useDetail<TokenDetail>({kind: 'token', id: insp.key}, t ? {
+    id: t.id, data: t.data,
+    attempts: t.attempts.map(id => s.fs.attempts[id]).filter(Boolean),
+    evidence: t.evidence.map(id => s.fs.evidence[id]).filter(Boolean),
+  } : undefined, Boolean(t));
   if (!t) return null;
   const currentStatus = tokenStatus(t, s.fs, s.replay?.at ?? now);
-  const d = t.data as Record<string, any>;
+  const d = {...detail.data?.data, ...t.data} as Record<string, any>;
   const steps: { node: string; a: AttemptState; ev: EvidenceRef[] }[] = [];
   for (const id of t.attempts) {
     const a = s.fs.attempts[id];
@@ -556,6 +565,8 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
         <span className={`chip st-${t.status}`} title={currentStatus.detail}>{currentStatus.label}</span>
       </Head>
       <div className="scope-notice" data-token-status={currentStatus.label}>{currentStatus.detail}</div>
+      {detail.loading && <div className="scope-notice muted" role="status">正在读取完整任务详情；当前状态来自实时摘要。</div>}
+      {detail.error && <div className="scope-notice" role="alert">完整任务详情读取失败：{detail.error} <button className="btn btn--sm" onClick={detail.retry}>重新读取</button></div>}
       <div className="chain-facts">
         {d.kind && <span className="chip">分类 {d.kind}{d.kindAgreed ? " ✓" : d.kindAgreed === false ? " · 仲裁" : ""}</span>}
         {d.mode && <span className="chip">{d.mode === "video" ? "录屏路线" : "三张图"}</span>}

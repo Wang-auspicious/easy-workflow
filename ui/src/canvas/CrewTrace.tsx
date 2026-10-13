@@ -14,6 +14,7 @@ import { grokShape } from "../chat/avatar-look.ts";
 import { useHoverPreview, previewSet } from "../shell/HoverPreview.tsx";
 import { openCorrection } from "../board/Correction.tsx";
 import { fmt, secs } from "./Node.tsx";
+import {useDetail} from '../details.ts';
 
 /** 同一个工位的人共用形状，用色相区分开；撤下的人变灰。 */
 export function crewLook(node: CompiledNode, index: number, retired: boolean) {
@@ -64,7 +65,8 @@ export function CrewStrip({ node, workers, attempts, current, onPick }: {
 export function WorkerTrace({ a, node, now }: { a: AttemptState; node: CompiledNode; now: number }) {
   const s = getState();
   const token = s.fs.tokens[a.token];
-  const groups = useMemo(() => groupSteps(a.steps), [a.steps.length, a.id]);
+  const detail = useDetail<AttemptState>({kind: 'attempt', id: a.id}, a);
+  const groups = groupSteps(detail.data?.steps ?? []);
   const running = a.endedAt === undefined;
   const c = roleColors(node.role).border;
   return (
@@ -77,12 +79,14 @@ export function WorkerTrace({ a, node, now }: { a: AttemptState; node: CompiledN
         <span className="num muted">{running ? secs(now - a.startedAt) : secs(a.ms ?? 0)}</span>
       </div>
       <div className="wt-log">
+        {detail.loading && <p className="muted" role="status">{detail.data ? '正在更新完整步骤…' : '正在读取完整步骤…'}</p>}
+        {detail.error && <p role="alert">完整步骤读取失败：{detail.error} <button className="btn btn--sm" onClick={detail.retry}>重新读取</button></p>}
         {groups.map((g, gi) => g.kind === "say"
           ? g.items.map((st, i) => <SayRow key={`${gi}-${i}`} st={st} />)
           : g.kind === "think"
             ? <ThinkRow key={gi} items={g.items} />
             : <ToolGroup key={gi} items={g.items} />)}
-        {!groups.length && <div className="wt-empty muted">{running ? "刚开始，还没有输出…" : "这次没有留下步骤记录。"}</div>}
+        {detail.data && !groups.length && <div className="wt-empty muted">{running ? "刚开始，还没有输出…" : "这次没有留下步骤记录。"}</div>}
       </div>
       <div className={`wt-foot ${running ? "is-running" : a.cancelled ? "is-cancelled" : a.ok ? "is-ok" : "is-bad"}`}>
         {running ? <><Loader2 size={12} className="spin-i" /><span>{a.steps[a.steps.length - 1]?.text ?? "开始处理…"}</span></>

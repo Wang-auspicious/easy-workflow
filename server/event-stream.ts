@@ -1,6 +1,8 @@
 import type {ServerResponse} from 'node:http';
 import {setImmediate as yieldLoop} from 'node:timers/promises';
 import type {Journal} from './journal.ts';
+import type {Stamped} from '../shared/types.ts';
+import type {UiEvent} from '../shared/client-view.ts';
 
 const PAGE_SIZE = 100;
 const DRAIN_TIMEOUT_MS = 15_000;
@@ -13,18 +15,21 @@ export class JournalEventStream {
   private readonly unsubscribe: () => void;
   private readonly lifetime = new AbortController();
   private readonly drainTimeoutMs: number;
+  private readonly projectEvent: (event: Stamped) => UiEvent;
   private cursor: number;
   private pumping = false;
   private needsSnapshot = true;
 
   constructor(
       journal: Journal, response: ServerResponse, since: number,
-      snapshot: () => unknown[], drainTimeoutMs = DRAIN_TIMEOUT_MS) {
+      snapshot: () => unknown[], drainTimeoutMs = DRAIN_TIMEOUT_MS,
+      projectEvent: (event: Stamped) => UiEvent = event => event) {
     this.journal = journal;
     this.response = response;
     this.cursor = since;
     this.snapshot = snapshot;
     this.drainTimeoutMs = drainTimeoutMs;
+    this.projectEvent = projectEvent;
     this.unsubscribe = journal.subscribe(() => this.schedule());
     response.once('close', () => this.close());
     response.once('error', () => this.close());
@@ -78,7 +83,7 @@ export class JournalEventStream {
         if (!page.events.length) throw new Error('Event stream cursor did not advance');
         for (const event of page.events) {
           if (this.lifetime.signal.aborted) return;
-          const writable = this.response.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+          const writable = this.response.write(`id: ${event.seq}\ndata: ${JSON.stringify(this.projectEvent(event))}\n\n`);
           this.cursor = event.seq;
           if (!writable) await this.drain();
         }

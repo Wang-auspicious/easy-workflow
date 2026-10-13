@@ -8,6 +8,7 @@ import { apply, initialState, type FactoryState } from "../../shared/project.ts"
 import type { LayoutResult } from "../../shared/layout.ts";
 import { emptyLive, idleDispatcher, type DispatcherStatus, type LiveChat } from "./chat/live.ts";
 import {executionIndex, recordNodeExecution, type NodeExecution} from './canvas/status.ts';
+import {applyUiEvent, isUiState, type UiEvent} from '../../shared/client-view.ts';
 export type { LiveChat } from "./chat/live.ts";
 
 export type View = "canvas" | "board" | "candidates" | "library" | "runs" | "browser" | "settings" | "report";
@@ -121,7 +122,7 @@ export function useStore<T>(sel: (s: Store) => T): T {
 const eventTaps = new Set<(e: Stamped) => void>();
 export const onEvent = (f: (e: Stamped) => void) => { eventTaps.add(f); return () => { eventTaps.delete(f); }; };
 
-let pending: Stamped[] = [];
+let pending: UiEvent[] = [];
 let raf = 0;
 
 function touched(e: Stamped, fs: FactoryState): string[] {
@@ -142,7 +143,7 @@ function touched(e: Stamped, fs: FactoryState): string[] {
   }
 }
 
-export function ingest(events: Stamped[]) {
+export function ingest(events: UiEvent[]) {
   for (const event of events) pending.push(event);
   if (!raf) raf = requestAnimationFrame(flush);
 }
@@ -162,13 +163,20 @@ function flush() {
   const flashes = { ...state.flashes };
   const nodeExecutions = {...state.nodeExecutions};
   let unread = state.unread;
+  let changedProjection = false;
   const started = performance.now();
   let cursor = 0;
   for (; cursor < batch.length && cursor < 200 && performance.now() - started < 8; cursor++) {
     const e = batch[cursor];
     if (e.seq <= fs.seq) continue;
+    if (e.kind === 'ui.cursor') {
+      applyUiEvent(fs, e);
+      continue;
+    }
+    changedProjection = true;
     const changed = touched(e, fs);
-    apply(fs, e);
+    if (isUiState(fs) && !state.replay) applyUiEvent(fs, e);
+    else apply(fs, e);
     if (e.kind === 'attempt.finished') recordNodeExecution(nodeExecutions, fs.attempts[e.attempt]);
     for (const k of new Set([...changed, ...touched(e, fs)])) rev[k] = (rev[k] ?? 0) + 1;
     if (e.kind === "evidence.added") flashes[e.evidence.id] = e.at;
@@ -176,7 +184,9 @@ function flush() {
     for (const t of eventTaps) t(e);
   }
   if (cursor < batch.length) pending = batch.slice(cursor).concat(pending);
-  setState({ version: state.version + 1, nodeRev: rev, nodeExecutions, flashes, unread });
+  if (changedProjection) {
+    setState({ version: state.version + 1, nodeRev: rev, nodeExecutions, flashes, unread });
+  }
   if (pending.length && !raf) raf = requestAnimationFrame(flush);
 }
 

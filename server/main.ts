@@ -12,6 +12,7 @@ import { publishConnection } from "./discovery.ts";
 import { readReportJson, closeReportReaders } from './report-reader.ts';
 import { setImmediate as yieldLoop } from 'node:timers/promises';
 import { JournalEventStream } from './event-stream.ts';
+import {uiEvent, uiState} from '../shared/client-view.ts';
 import { closeBrowser, browserCommand, browserEvents } from "./browser.ts";
 import { closeNetwork } from "./network.ts";
 import { layoutFactory } from "../shared/layout.ts";
@@ -140,7 +141,14 @@ const server = http.createServer(async (req, res) => {
       const pi = piStatus();
       return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: pi.id, pi, keyPresent: pi.ready, patches: factory.patches, agentBindings: factory.agentBindings().bindings });
     }
-    if (p === "/api/state") return send(res, 200, { ...factory.state, dispatcher: dispatcher.status });
+    const view = url.searchParams.get('view');
+    if (['/api/state', '/api/events'].includes(p) && view !== null && view !== 'raw' && view !== 'ui-v1') {
+      throw new ControlError(400, 'invalid_view', 'view 只支持 raw 或 ui-v1');
+    }
+    if (p === '/api/state') {
+      const state = view === 'ui-v1' ? uiState(factory.state) : factory.state;
+      return send(res, 200, {...state, dispatcher: dispatcher.status});
+    }
     if (p === "/api/browser" && req.method === "GET") return send(res, 200, await browserCommand({action:"state"}));
     if (p === "/api/events") {
       const since = Number(req.headers["last-event-id"] ?? url.searchParams.get("since") ?? 0);
@@ -157,7 +165,7 @@ const server = http.createServer(async (req, res) => {
         snapshot.push({kind: 'chat.status', ...dispatcher.status});
         if (latestBrowserState) snapshot.push({kind: 'browser.state', state: latestBrowserState});
         return snapshot;
-      });
+      }, undefined, view === 'ui-v1' ? uiEvent : undefined);
       clients.add(client);
       res.once('close', () => clients.delete(client));
       return;

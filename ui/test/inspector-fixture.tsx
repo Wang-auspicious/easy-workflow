@@ -7,9 +7,12 @@ import "../src/styles/base.css";
 import "../src/styles/shell.css";
 import "../src/styles/panels.css";
 import "../src/styles/studio.css";
+import '../src/views/recovery.css';
 import { Inspectors } from "../src/canvas/Inspector.tsx";
-import { setState, getState } from "../src/store.ts";
+import { setState, getState, ingest, useStore } from "../src/store.ts";
 import { apply, initialState } from "../../shared/project.ts";
+import {uiState, uiEvent} from '../../shared/client-view.ts';
+import {EvidenceBoard} from '../src/board/EvidenceBoard.tsx';
 import { botFor } from "../../shared/palette.ts";
 import type { CompiledFactory, CompiledNode, Stamped } from "../../shared/types.ts";
 import type { Geometry } from "../src/canvas/geometry.ts";
@@ -65,16 +68,27 @@ fs.attempts.a2.steps = [
 ];
 fs.evidence.ev1 = { id: "ev1", token: "t1", station: "curation/review", attempt: "a1", kind: "image", label: "原页面", src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='320' height='200'%3E%3Crect width='320' height='200' fill='%23dbeafe'/%3E%3Ctext x='16' y='110' font-size='20' fill='%232563eb'%3Eshot 1%3C/text%3E%3C/svg%3E", verdict: "待判定", at: now - 45_000 } as never;
 fs.evidence.ev2 = { id: "ev2", token: "t1", station: "curation/review", attempt: "a1", kind: "image", label: "截图 2", src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='320' height='200'%3E%3Crect width='320' height='200' fill='%23fee2e2'/%3E%3Ctext x='16' y='110' font-size='20' fill='%23dc2626'%3Eshot 2%3C/text%3E%3C/svg%3E", verdict: "不一致", at: now - 44_000 } as never;
+fs.evidence.evtext = {id: 'evtext', token: 't1', station: 'curation/review', attempt: 'a1', kind: 'verdict', label: '完整文字判定', verdict: '退回', meta: {rawText: 'FULL-EVIDENCE-NOT-IN-SUMMARY', verdicts: [{quote: '完整证据引文', accepted: false}]}, at: now - 43000} as never;
+fs.evidenceOrder = ['ev1', 'ev2', 'evtext'];
+fs.tokens.t1.evidence = [...fs.evidenceOrder];
 fs.activity = events.filter((e) => e.kind === "dispatch.note").map((e, i) => ({ id: `n${i}`, role: "note" as const, text: (e as { text: string }).text, at: (e as { at: number }).at, tone: (e as { tone?: "info" | "fork" | "warn" }).tone, node: "curation/review" }));
 fs.run = { id: "fixture-run", title: "候选 × 100", startedAt: now - 60_000, pausedMs: 0, status: "running" };
 
 const geo: Geometry = { nodes: [], place: {}, capsules: [], capsuleOf: {}, docks: [], dockOf: {}, edges: [], returns: [], bounds: { x: 0, y: 0, w: 1200, h: 800 }, halls: [], bays: [], shelf: null };
-setState({ fs, factory, ready: true, connected: true, version: 1, model: "fixture-model", inspectors: [{ key: "curation/review", kind: "node", x: 40, y: 40, pinned: true }] });
-(window as any).inspectorFixture = { getState, setState };
+setState({fs: uiState(fs), factory, ready: true, connected: true, version: 1, view: 'canvas', model: "fixture-model", inspectors: [{ key: "curation/review", kind: "node", x: 40, y: 40, pinned: true }]});
+(window as any).inspectorFixture = {getState, setState, fullState: fs, emit: (event: Stamped) => {
+  const stamped = {...event, seq: fs.seq + 1, at: Date.now(), run: fs.run.id} as Stamped;
+  apply(fs, stamped);
+  ingest([uiEvent(stamped)]);
+}};
+function Fixture() {
+  const view = useStore(state => state.view);
+  return view === 'board' ? <EvidenceBoard /> : <Inspectors geo={geo} cam={{x: 0, y: 0, k: 1}} />;
+}
 createRoot(document.getElementById("root")!).render(
   <div className="app" style={{ ["--chat-w" as string]: "0px" }}>
     <main className="workspace" style={{ position: "relative", width: 760, height: 820 }}>
-      <Inspectors geo={geo} cam={{ x: 0, y: 0, k: 1 }} />
+      <Fixture />
     </main>
   </div>,
 );

@@ -370,6 +370,8 @@
 .bd-note span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .bd-note svg { flex: none; }
 .bd-note:hover { background: var(--line-2); }
+.bd-note-open { flex: none; padding: 0 3px; color: var(--ink-3); font-size: 10px; }
+.bd-note-open:hover, .bd-note-open:focus-visible { color: var(--accent); text-decoration: underline; }
 .bd-note.tone-ok svg { color: var(--ok); }
 .bd-note.tone-warn { background: oklch(0.975 0.03 80); color: oklch(0.5 0.12 65); }
 .bd-note.tone-warn b { color: oklch(0.45 0.12 65); }

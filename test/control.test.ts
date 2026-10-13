@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import h2Extension from "../integrations/pi/h2-factory.ts";
 import {Journal} from '../server/journal.ts';
 import type {SourceSpec} from '../shared/types.ts';
+import type {AttemptState, FactoryState} from '../shared/project.ts';
+import type {UiEvent} from '../shared/client-view.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const secret = "factory-test-only";
@@ -48,6 +50,95 @@ async function stop(child: ChildProcess) {
     if (child.connected) child.send({ type: "shutdown" }); else child.kill();
   });
 }
+
+test('UI snapshot and SSE opt-in preserve raw APIs and expose exact attempt details through read-only inspect', {timeout: 30000}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-client-view-http-'));
+  const journal = new Journal(path.join(dir, 'journal.db'));
+  const business = 'business-payload-'.repeat(65536);
+  journal.append({kind: 'run.started', runId: 'run-client-view-http', title: 'UI transport fixture'});
+  journal.append({kind: 'worker.spawned', node: 'curation/reader', worker: 'fixture-worker', label: 'Fixture', reason: 'fixture'});
+  journal.append({kind: 'token.created', token: 'fixture-token', line: 'curation', item: 'fixture-item', url: 'https://fixture.invalid/', source: 'fixture'});
+  journal.append({kind: 'token.data', token: 'fixture-token', patch: {title: 'visible title', hiddenBusiness: business}});
+  journal.append({kind: 'token.queued', token: 'fixture-token', node: 'curation/reader'});
+  journal.append({kind: 'attempt.started', attempt: 'fixture-attempt', token: 'fixture-token', node: 'curation/reader', worker: 'fixture-worker', input: 'fixture'});
+  for (let index = 0; index < 3; index++) journal.append({kind: 'attempt.progress', attempt: 'fixture-attempt', text: `Detailed step ${index}`});
+  journal.append({kind: 'attempt.finished', attempt: 'fixture-attempt', ok: true, summary: 'done', ms: 100, queuedMs: 2,
+    output: {fullOutput: business}, metrics: {execution: {adapter: 'pi', model: 'fixture-model'}, usageReported: false}});
+  journal.append({kind: 'case.noted', caseId: 'fixture-item', token: 'fixture-token', note: {station: 'curation/reader', section: 'result', text: 'Full case', by: 'fixture'}});
+  journal.append({kind: 'token.finished', token: 'fixture-token', node: 'curation/published', status: 'published', reason: 'fixture'});
+  journal.append({kind: 'run.ended', runId: 'run-client-view-http', manual: true});
+  const last = journal.seq;
+  journal.close();
+  let server: Awaited<ReturnType<typeof start>> | undefined;
+  try {
+    server = await start(dir, true);
+    const raw = (await server.request('/api/state')).body as FactoryState & {view?: string};
+    const compact = (await server.request('/api/state?view=ui-v1')).body as FactoryState & {view?: string};
+    assert.equal(raw.view, undefined);
+    assert.equal(compact.view, 'ui-v1');
+    assert.equal(compact.seq, raw.seq);
+    assert.equal(raw.tokens['fixture-token'].data.hiddenBusiness, business);
+    assert.equal(compact.tokens['fixture-token'].data.hiddenBusiness, undefined);
+    assert.equal(compact.tokens['fixture-token'].data.title, 'visible title');
+    assert.equal(raw.attempts['fixture-attempt'].steps.length, 3);
+    assert.equal(compact.attempts['fixture-attempt'].steps.length, 1);
+    assert.equal(raw.attempts['fixture-attempt'].output?.fullOutput, business);
+    assert.equal(compact.attempts['fixture-attempt'].output, undefined);
+    assert.deepEqual(compact.totals, raw.totals);
+    assert.deepEqual(compact.nodes, raw.nodes);
+    assert.ok(JSON.stringify(compact).length < JSON.stringify(raw).length / 10);
+    assert.equal((await server.request('/api/state?view=unknown')).status, 400);
+    assert.equal((await server.request('/api/events?view=unknown')).status, 400);
+    const detail = await server.tool('inspect', {attempt: 'fixture-attempt'});
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.seq, compact.seq);
+    assert.deepEqual(detail.body.result as AttemptState, raw.attempts['fixture-attempt']);
+    assert.equal((await server.tool('inspect', {attempt: 'missing'})).status, 404);
+    assert.equal((await server.tool('inspect', {attempt: 'fixture-attempt', token: 'fixture-token'})).status, 400);
+    const receive = async (view?: string, since = 0) => {
+      const response = await fetch(server!.url + `/api/events?since=0${view ? `&view=${view}` : ''}`, {
+        headers: {authorization: `Bearer ${secret}`, 'last-event-id': String(since)}, signal: AbortSignal.timeout(10000),
+      });
+      const reader = response.body!.getReader();
+      const events: UiEvent[] = [];
+      const decoder = new TextDecoder();
+      let pending = '';
+      try {
+        while ((events.at(-1)?.seq ?? since) < last) {
+          const chunk = await reader.read();
+          assert.equal(chunk.done, false);
+          pending += decoder.decode(chunk.value, {stream: true});
+          let boundary: number;
+          while ((boundary = pending.indexOf('\n\n')) !== -1) {
+            const frame = pending.slice(0, boundary);
+            pending = pending.slice(boundary + 2);
+            const id = /^id: (\d+)/.exec(frame);
+            if (!id) continue;
+            const event = JSON.parse(frame.slice(frame.indexOf('data: ') + 6)) as UiEvent;
+            assert.equal(event.seq, Number(id[1]));
+            events.push(event);
+          }
+        }
+        return events;
+      } finally { await reader.cancel(); }
+    };
+    const rawEvents = await receive();
+    const uiEvents = await receive('ui-v1');
+    assert.deepEqual(uiEvents.map(event => event.seq), rawEvents.map(event => event.seq));
+    assert.equal(rawEvents.find(event => event.kind === 'token.data')?.patch.hiddenBusiness, business);
+    assert.equal(uiEvents.find(event => event.kind === 'token.data')?.patch.hiddenBusiness, undefined);
+    assert.ok(rawEvents.some(event => event.kind === 'case.noted'));
+    assert.ok(uiEvents.some(event => event.kind === 'ui.cursor'));
+    assert.deepEqual((await receive('ui-v1', last - 2)).map(event => event.seq), [last - 1, last]);
+    const unchanged = (await server.request('/api/state?view=raw')).body as FactoryState;
+    assert.equal(unchanged.seq, raw.seq);
+    assert.equal(unchanged.tokens['fixture-token'].data.hiddenBusiness, business);
+  } finally {
+    if (server) await stop(server.child);
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
 
 test("headless service: real HTTP capability discovery, control, validation, activation and restart", { timeout: 60000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-control-"));

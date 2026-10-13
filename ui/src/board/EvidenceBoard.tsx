@@ -10,6 +10,7 @@ import type { TokenState } from "../../../shared/project.ts";
 import { getState, setState, useStore } from "../store.ts";
 import { openCorrection, REASONS } from "./Correction.tsx";
 import { toggleInspector } from "../canvas/Canvas.tsx";
+import {useDetail} from '../details.ts';
 
 type Mode = "rows" | "tiles";
 const KIND_ZH: Record<string, string> = { gallery: "灵感合集", "component-source": "组件源", "design-system": "设计规范", assets: "素材与模板", tool: "工具与库", knowledge: "知识", work: "作品" };
@@ -249,6 +250,7 @@ function Note({ e, sel, onClick, onZoom }: { e: EvidenceRef; sel: boolean; onCli
   return (
     <span className={`bd-note tone-${e.tone ?? "none"} ${sel ? "is-sel" : ""}`} data-ev={e.id} onClick={(ev) => { ev.stopPropagation(); onClick(ev); }} onDoubleClick={(ev) => { ev.stopPropagation(); onZoom(); }} data-tip={`${e.label}：${e.verdict ?? ""}  双击看全文`}>
       <Icon size={12} /><b>{e.label}</b>{e.verdict && <span>{e.verdict}</span>}
+      <button className="bd-note-open" aria-label={`${e.label}：查看完整证据`} onClick={event => { event.stopPropagation(); onZoom(); }}>全文</button>
     </span>
   );
 }
@@ -261,10 +263,16 @@ function Reviews({ t }: { t: TokenState }) {
 
 function Lightbox({ e, onClose }: { e: EvidenceRef; onClose: () => void }) {
   const t = getState().fs.tokens[e.token];
+  const detail = useDetail<EvidenceRef>({kind: 'evidence', id: e.id}, e, !isVisual(e));
+  const document = useMemo(() => JSON.stringify(detail.data?.meta ?? {}, null, 2), [detail.data]);
   return (
     <div className="lightbox" onClick={onClose}>
       <div className="lb-inner" onClick={(ev) => ev.stopPropagation()}>
-        {e.kind === "video" ? <video src={e.src} poster={e.poster} autoPlay loop muted controls /> : e.kind==="image"?<img src={e.src?.replace(/\.webp$/, ".webp") ?? e.card} alt="" />:<article className="evidence-document"><h2>{e.label}</h2><p>{e.verdict}</p><pre>{JSON.stringify(e.meta??{},null,2)}</pre></article>}
+        {e.kind === "video" ? <video src={e.src} poster={e.poster} autoPlay loop muted controls /> : e.kind==="image"?<img src={e.src?.replace(/\.webp$/, ".webp") ?? e.card} alt="" />:<article className="evidence-document"><h2>{e.label}</h2><p>{e.verdict}</p>
+          {detail.loading && <p role="status">正在读取完整证据…</p>}
+          {detail.error && <p role="alert">完整证据读取失败：{detail.error} <button className="btn btn--sm" onClick={detail.retry}>重新读取</button></p>}
+          {detail.data && <pre>{document}</pre>}
+        </article>}
         <div className="lb-meta">
           <b>{t?.item}</b><span className="muted">{e.label}{e.meta?.href ? ` · ${String(e.meta.href).replace(/^https?:\/\//, "")}` : ""}{e.meta?.framing ? ` · ${e.meta.framing}` : ""}</span>
           <span className="grow" />
