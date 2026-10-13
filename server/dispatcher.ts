@@ -53,6 +53,8 @@ export class Dispatcher {
   private requestTimedOut = false;
   private restored = false;
   private replayOperations: DispatcherCheckpoint["operations"] = [];
+  private preparingInputs: Promise<void> = Promise.resolve();
+  private readonly queuedInputIds = new Set<string>();
 
   constructor(f: Factory, control = new FactoryControl(f), options: DispatcherOptions = {}) {
     this.f = f; this.control = control;
@@ -206,22 +208,44 @@ export class Dispatcher {
     const current = (await this.control.execute("status", {}, "dispatcher")).result;
     return `${this.attachmentText(text, attachments)}\n\n<EASY_WORKFLOW_CURRENT_STATE at="${new Date().toISOString()}">${JSON.stringify(current)}</EASY_WORKFLOW_CURRENT_STATE>\n以上为本次对话开始时的实时快照，历史数字可能已过期。若后续操作改变状态，回答前再次核对。`;
   }
-  private images(attachments: Attachment[]) {
+  private async images(attachments: Attachment[], signal: AbortSignal) {
+    signal.throwIfAborted();
     const files = attachments.filter(a => a.type === "evidence").map(a => this.f.state.evidence[a.id]).filter(e => e?.card && e.kind !== "video").slice(0, 6)
       .map(e => this.f.store.resolve(e!.card!)).filter((p): p is string => Boolean(p && fs.existsSync(p)));
     if (!files.length) return undefined;
-    return files.map(p => ({ type: "image" as const, data: EvidenceStore.jpeg(p).toString("base64"), mimeType: "image/jpeg" }));
-  }
-  private inputMessage(input: DispatcherCheckpoint["inputs"][number]): Extract<AgentMessage, { role: "user" }> {
-    return { role: "user", content: [{ type: "text", text: this.attachmentText(input.text, input.attachments) }, ...this.images(input.attachments) ?? []], timestamp: input.timestamp };
-  }
-  private queueInputs() {
-    if (!this.agent) return;
-    this.agent.clearAllQueues();
-    for (const input of this.checkpoint.inputs.filter(input => !input.delivered)) {
-      const message = this.inputMessage(input);
-      if (input.mode === "followUp") this.agent.followUp(message); else this.agent.steer(message);
+    const images: { type: 'image'; data: string; mimeType: string }[] = [];
+    for (const file of files) {
+      const bytes = await EvidenceStore.jpegAsync(file, 720, { signal, timeoutMs: 15000 });
+      signal.throwIfAborted();
+      images.push({ type: 'image', data: bytes.toString('base64'), mimeType: 'image/jpeg' });
     }
+    return images;
+  }
+  private async inputMessage(input: DispatcherCheckpoint["inputs"][number], signal: AbortSignal): Promise<Extract<AgentMessage, { role: "user" }>> {
+    return { role: "user", content: [{ type: "text", text: this.attachmentText(input.text, input.attachments) }, ...await this.images(input.attachments, signal) ?? []], timestamp: input.timestamp };
+  }
+  private queueInputs(signal: AbortSignal) {
+    const agent = this.agent;
+    const checkpoint = this.checkpoint;
+    if (!agent) return Promise.resolve();
+    this.preparingInputs = this.preparingInputs.then(async () => {
+      for (const input of checkpoint.inputs.filter(input => !input.delivered)) {
+        if (this.queuedInputIds.has(input.id)) continue;
+        const message = await this.inputMessage(input, signal);
+        signal.throwIfAborted();
+        if (this.checkpoint !== checkpoint || this.agent !== agent) return;
+        this.queuedInputIds.add(input.id);
+        if (input.mode === 'followUp') agent.followUp(message); else agent.steer(message);
+      }
+    }).catch(error => {
+      // The durable input stays pending. The owner turn reports the preparation
+      // error and can resume; it must never silently omit an evidence image.
+      if (this.stop?.signal === signal && !signal.aborted) {
+        this.stop.abort(error);
+        agent.abort();
+      }
+    });
+    return this.preparingInputs;
   }
   async chat(text: string, attachments: Attachment[], requestId?: string) {
     if (requestId && this.receipt(requestId)) return this.receipt(requestId)!;
@@ -239,11 +263,10 @@ export class Dispatcher {
     const id = `m-${requestId ?? crypto.randomUUID()}`;
     const timestamp = Math.max(Date.now(), (this.checkpoint.inputs.at(-1)?.timestamp ?? 0) + 1);
     const input: DispatcherCheckpoint["inputs"][number] = { id, text, attachments, timestamp, delivered: false, mode };
-    const message = this.inputMessage(input);
     this.f.journal.append({ kind: "chat.user", id, text, attachments });
     this.checkpoint.inputs.push(input);
     this.save();
-    if (mode === "followUp") this.agent?.followUp(message); else this.agent?.steer(message);
+    if (this.stop) void this.queueInputs(this.stop.signal);
     this.f.emit({ kind: "chat.queued", id, turn: this.status.turn, mode });
     return { ok: true, queued: true, id, turn: this.status.turn, mode };
   }
@@ -255,6 +278,8 @@ export class Dispatcher {
   async recover() { if (this.restored && process.env.FACTORY_READONLY !== "1") return this.resume(); }
   private async run(continuing: boolean) {
     this.busy = true; this.stop = new AbortController(); this.stopKind = null;
+    this.preparingInputs = Promise.resolve();
+    this.queuedInputIds.clear();
     const id = this.status.turn;
     this.update("running", continuing ? "正在从已保存的工具结果继续回答。" : "正在处理你的请求。", { attempt: 1, maxAttempts: this.options.maxAttempts, recoverable: false, error: undefined });
     this.f.emit({ kind: "chat.start", id, turn: id });
@@ -265,16 +290,18 @@ export class Dispatcher {
       if (continuing) {
         agent.state.messages = recoverDispatcherMessages(agent.state.messages, this.checkpoint.operations);
         const pending = this.checkpoint.inputs.filter(input => !input.delivered);
-        agent.state.messages = agent.state.messages.filter(m => m.role !== "user" || !pending.some(input => textOf(m) === input.text)); this.queueInputs();
+        agent.state.messages = agent.state.messages.filter(m => m.role !== "user" || !pending.some(input => textOf(m) === input.text));
+        agent.clearAllQueues();
+        await this.queueInputs(this.stop.signal);
         if (reloadAttachments && this.checkpoint.prompted) {
           const message = agent.state.messages.find(m => m.role === "user" && textOf(m) === this.checkpoint.request.text);
           if (message?.role === "user") {
             const content = await this.promptContent(this.checkpoint.request.text, this.checkpoint.request.attachments);
-            message.content = [{ type: "text", text: content }, ...await this.images(this.checkpoint.request.attachments) ?? []];
+            message.content = [{ type: "text", text: content }, ...await this.images(this.checkpoint.request.attachments, this.stop.signal) ?? []];
           }
           for (const input of this.checkpoint.inputs.filter(input => input.delivered)) {
             const message = agent.state.messages.find(m => m.role === "user" && textOf(m) === input.text);
-            if (message?.role === "user") message.content = this.inputMessage(input).content;
+            if (message?.role === "user") message.content = (await this.inputMessage(input, this.stop.signal)).content;
           }
         }
       }
@@ -285,13 +312,23 @@ export class Dispatcher {
         try {
           if (first) {
             const { text, attachments } = this.checkpoint.request;
-            const content = await this.promptContent(text, attachments); const images = await this.images(attachments);
+            const content = await this.promptContent(text, attachments); const images = await this.images(attachments, this.stop.signal);
             this.stop.signal.throwIfAborted(); first = false; await agent.prompt(content, images);
           } else {
             agent.state.messages = recoverDispatcherMessages(agent.state.messages, this.checkpoint.operations);
             if (agent.state.messages.at(-1)?.role !== "assistant" || this.checkpoint.inputs.some(input => !input.delivered)) await agent.continue();
           }
+          await this.queueInputs(this.stop.signal);
           this.stop.signal.throwIfAborted();
+          // An answer can finish while a newly accepted image is converting.
+          // Wait for that input, then continue Pi before declaring the turn done.
+          while (this.checkpoint.inputs.some(input => !input.delivered)) {
+            const previous = agent.state.messages.at(-1);
+            if (this.requestTimedOut || previous?.role === 'assistant' && ['error', 'aborted'].includes(previous.stopReason)) break;
+            await agent.continue();
+            await this.queueInputs(this.stop.signal);
+            this.stop.signal.throwIfAborted();
+          }
           const last = [...agent.state.messages].reverse().find(m => m.role === "assistant");
           if (this.requestTimedOut) throw new Error("模型响应超时，已保留完成的工具结果");
           if (last?.role === "assistant" && ["error", "aborted"].includes(last.stopReason)) throw new Error(last.errorMessage || "模型请求中断");
@@ -306,7 +343,9 @@ export class Dispatcher {
         }
         const waitMs = this.options.retryDelaysMs[Math.min(attempt - 1, this.options.retryDelaysMs.length - 1)] ?? 1000;
         this.update("recovering", `连接暂时中断，正在保留进度并自动恢复（${attempt + 1}/${this.options.maxAttempts}）。`, { recoverable: true, error: message, nextRetryAt: Date.now() + waitMs });
-        await delay(waitMs, undefined, { signal: this.stop.signal }); this.queueInputs();
+        await delay(waitMs, undefined, { signal: this.stop.signal });
+        agent.clearAllQueues(); this.queuedInputIds.clear();
+        await this.queueInputs(this.stop.signal);
         this.replayOperations = this.checkpoint.operations.filter(o => o.phase === "completed");
         this.update("running", "正在从上一次工具结果继续，已完成的操作不会重复执行。", { attempt: attempt + 1, recoverable: false });
       }
@@ -315,6 +354,8 @@ export class Dispatcher {
       else if (this.stopKind === "shutdown") this.update("interrupted", "服务正在关闭，重启后将继续本次回答。", { recoverable: true, error: undefined });
       else this.update("failed", "本次回答未完成，已保存上下文，可从这里继续。", { recoverable: true, error: dispatcherError(error) });
     } finally {
+      this.stop.abort(new DOMException('Dispatcher turn finished', 'AbortError'));
+      await this.preparingInputs;
       this.busy = false; this.live = null; this.stop = null; this.checkpoint.state.busy = false; this.save();
       this.f.emit({ kind: "chat.status", ...this.status }); this.f.emit({ kind: "chat.end", id, turn: id, status: this.status.status });
     }

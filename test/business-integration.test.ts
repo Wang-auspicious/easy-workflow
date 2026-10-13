@@ -130,6 +130,15 @@ test('PDF decks render every original page without replacing the source file', {
   assert.equal(result.finished?.status, 'published'); assert.equal((result.token.data.deckPreview as any).pageCount, 2);
   assert.equal((result.token.data.deckPreview as any).pages.length, 2);
   assert.deepEqual(fs.readFileSync(result.services.store.resolve((result.token.data.mediaOriginal as any).src)!), fs.readFileSync(path.join(dir, 'original.pdf')));
+  const attempt = result.events.find(event => event.kind === 'attempt.started' && event.node === 'ppt/deck-preview');
+  assert.ok(attempt?.kind === 'attempt.started');
+  const rendered = path.join(result.services.workDir, 'business', sha(Buffer.from(result.token.id)).slice(0, 20), sha(Buffer.from(attempt.attempt)).slice(0, 20));
+  const pages = (result.token.data.deckPreview as {pages: {page: number; src: string; card: string}[]}).pages;
+  for (const page of pages) {
+    const png = fs.readFileSync(path.join(rendered, `slide-${String(page.page).padStart(4, '0')}.png`));
+    assert.deepEqual(fs.readFileSync(result.services.store.resolve(page.src)!), EvidenceStore.webp(png, 1280));
+    assert.deepEqual(fs.readFileSync(result.services.store.resolve(page.card)!), EvidenceStore.webp(png, 720));
+  }
 });
 
 test('PPTX decks render all original slides through an installed native renderer', { timeout: 150000 }, async () => {

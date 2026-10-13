@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "typebox";
 import type { AgentStationDef } from "../../server/agent-station.ts";
 import type { StationContext, StationResult, Fix } from "../../server/runtime.ts";
-import { EvidenceStore, pixelStats } from "../../server/evidence.ts";
+import {EvidenceStore, pixelStatsAsync} from '../../server/evidence.ts';
 import { readText, readEvidence, evidenceURL } from "../../server/network.ts";
 import { repoSources, type RepoMeta } from "../../server/repo.ts";
 import { FRONTEND, KINDS, KIND_ZH, VOCAB, ruleExcerpt } from "./env.ts";
@@ -309,7 +309,12 @@ function shotReviewResult(out: ShotReviewOut, ctx: StationContext): StationResul
 /* ------------------------------------------------------------------ ⑫ style (VisLexicon §2.6.1 prompt kept verbatim) */
 
 type StyleOut = { subjectVisible: boolean; mixed: boolean; styles: { id: string; images: number[]; evidenceZh: string }[]; signatureZh: string };
-let styleLib: Promise<{ checkStyle: Function; salvage: Function }> | null = null;
+type StylePixelStats = Awaited<ReturnType<typeof pixelStatsAsync>>;
+interface StyleLibrary {
+  checkStyle: (out: StyleOut, stats: StylePixelStats[], subject: string | null, mixed: boolean) => string[];
+  salvage: (out: StyleOut, stats: StylePixelStats[], subject: string | null, mixed: boolean) => {out: StyleOut | null} | null;
+}
+let styleLib: Promise<StyleLibrary> | null = null;
 const loadStyleLib = () => {
   const source = path.join(FRONTEND, "scripts/style/site-style.mjs");
   const fallback = path.join(process.env.VISLEXICON_BUNDLED ?? FRONTEND, "scripts/style/site-style.mjs");
@@ -321,6 +326,21 @@ const SUBJECT_RULE: Record<string, string> = {
   assets: "SUBJECT = the assets themselves (glyphs, icons, illustrations, typefaces) as previewed, not the website around them. Many asset styles are outside this vocabulary; then return an empty list.",
 };
 const subjectOf = (kind: string) => (kind === "component-source" ? "components" : kind === "design-system" ? "design-system" : kind === "assets" ? "assets" : null);
+
+interface PreparedStyleInput {
+  signature: string;
+  stats: StylePixelStats[];
+  library: StyleLibrary;
+}
+const preparedStyleInputs = new WeakMap<StationContext, PreparedStyleInput>();
+function styleInputSignature(ctx: StationContext) {
+  const images = (data(ctx).images ?? []) as {role: string; card: string; href: string}[];
+  return JSON.stringify([ctx.attempt, data(ctx).kind, images.map(image => [image.role, image.card, image.href])]);
+}
+function preparedStyleInput(ctx: StationContext) {
+  const prepared = preparedStyleInputs.get(ctx);
+  return !ctx.signal.aborted && prepared?.signature === styleInputSignature(ctx) ? prepared : undefined;
+}
 
 export const style = (store: EvidenceStore): AgentStationDef<StyleOut> => ({
   system: prompt("style.md").replace("{VOCAB}", VOCAB.styles.map((s) => `- ${s.id}: ${s.en} — looks like: ${s.plain}`).join("\n")).replace("{SUBJECT}", "SUBJECT: see the user message."),
@@ -335,21 +355,43 @@ export const style = (store: EvidenceStore): AgentStationDef<StyleOut> => ({
     ctx.progress(`${KIND_ZH[data(ctx).kind]}不打风格词（VisLexicon §2.6.1 只给组件源 / 设计规范 / 素材）`, { tool: "rules", text: "subjectOf(kind) = null" });
     return { ok: true, summary: "此类不打风格", data: { style: { applicable: false } } };
   },
-  input: (ctx) => {
+  input: async (ctx) => {
+    preparedStyleInputs.delete(ctx);
+    ctx.signal.throwIfAborted();
     const subject = subjectOf(data(ctx).kind)!;
-    const imgs = ((data(ctx).images ?? []) as { role: string; card: string; href: string }[]).map((im) => ({ file: store.resolve(im.card)!, label: `${im.role}: ${new URL(im.href).pathname}` }));
+    const signature = styleInputSignature(ctx);
+    const imgs = ((data(ctx).images ?? []) as { role: string; card: string; href: string }[]).map(im => {
+      const file = store.resolve(im.card);
+      if (!file) throw new Error(`风格图片证据不可读：${im.role}`);
+      return {file, label: `${im.role}: ${new URL(im.href).pathname}`};
+    });
+    if (!imgs.length) throw new Error('风格判定缺少图片证据，不能提交空统计');
+    const library = (globalThis as D).__styleLib ?? await loadStyleLib();
+    if (typeof library.checkStyle !== 'function' || typeof library.salvage !== 'function') {
+      throw new Error('风格校验库未完整加载，不能跳过程序审查');
+    }
+    const stats: PreparedStyleInput['stats'] = [];
+    for (const image of imgs) {
+      stats.push(await pixelStatsAsync(image.file, {signal: ctx.signal}));
+    }
+    ctx.signal.throwIfAborted();
+    if (!stats.every(stat => Object.values(stat).every(Number.isFinite))) {
+      throw new Error('风格图片像素统计无效，不能提交');
+    }
+    if (signature !== styleInputSignature(ctx)) throw new Error('风格图片在准备过程中已变化，请重新读取证据');
+    preparedStyleInputs.set(ctx, {signature, stats, library});
     const names = data(ctx).shots?.breadth?.visual?.basis === "name-list" ? "\nImage 2 is a catalogue of item NAMES (this site has no preview wall); do not expect rendered items there. Judge from the rendered item in image 3 and any items visible in image 1." : "";
     return { text: `${SUBJECT_RULE[subject]}${names}\nSite: ${data(ctx).title} (${data(ctx).host}). Subject kind: ${subject}. Mixed allowed: no.\n${imgs.map((im, i) => `image ${i + 1}: ${im.label}`).join("\n")}`, images: imgs };
   },
   check: (out, ctx) => {
-    const stats = ((data(ctx).images ?? []) as { card: string }[]).map((im) => pixelStats(store.resolve(im.card)!));
-    const lib = (globalThis as D).__styleLib;
-    return lib ? lib.checkStyle(out, stats, subjectOf(data(ctx).kind), false) : [];
+    const prepared = preparedStyleInput(ctx);
+    if (!prepared) return ['本次风格图片的像素统计未完成或已经失效，不能跳过程序审查'];
+    return prepared.library.checkStyle(out, prepared.stats, subjectOf(data(ctx).kind), false);
   },
   salvage: (out, _issues, ctx) => {
-    const stats = ((data(ctx).images ?? []) as { card: string }[]).map((im) => pixelStats(store.resolve(im.card)!));
-    const lib = (globalThis as D).__styleLib;
-    return lib ? lib.salvage(out, stats, subjectOf(data(ctx).kind), false).out : null;
+    const prepared = preparedStyleInput(ctx);
+    if (!prepared) return null;
+    return prepared.library.salvage(out, prepared.stats, subjectOf(data(ctx).kind), false)?.out ?? null;
   },
   describe: (o) => (o.subjectVisible ? `${o.styles.map((s) => `${VOCAB.styles.find((v) => v.id === s.id)?.zh ?? s.id}@${s.images.join(",")}`).join(" · ") || "无合适的词"}${o.signatureZh ? ` —— ${o.signatureZh}` : ""}` : "截图里看不到主体 → 未判定"),
   after: (out, ctx, meta) => {

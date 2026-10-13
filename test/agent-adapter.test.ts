@@ -17,6 +17,7 @@ import { apply, initialState } from '../shared/project.ts';
 import { closeNetwork, readEvidence, rememberRead } from "../server/network.ts";
 import { ClosedStationAgent, closedAgentConfig } from '../server/mcp-station.ts';
 import { ClaudeCodeProtocol, type ClaudeSessionReference } from '../server/claude-code.ts';
+import { EvidenceStore, type ImageProcessOptions } from '../server/evidence.ts';
 
 test("closed launcher receives envelope first, calls scoped MCP, repairs and reports real usage", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-closed-agent-test-"));
@@ -168,6 +169,42 @@ test('Claude station failures preserve signed sessions, read evidence and tool b
     assert.equal(second.ok, true, second.error ?? 'Saved station should resume'); assert.equal(reads(), 1);
     assert.ok(Math.abs(second.usage!.cost - .05) < 1e-12);
     assert.deepEqual(second.data?.closedStationSessions, {});
+  });
+});
+
+test('cancelling image preparation preserves a restored Claude checkpoint without a new model charge', { timeout: 15000 }, async t => {
+  await nativeFixture(async (dir, reads) => {
+    const image = path.join(dir, 'fixture.ppm');
+    fs.writeFileSync(image, Buffer.concat([Buffer.from('P6\n4 6\n255\n'), Buffer.alloc(4 * 6 * 3, 128)]));
+    const definition = { system: 'Fixture image contract', schema: Type.Object({ score: Type.Integer() }), tools: ['fetch_text'],
+      input: () => ({ text: 'native-restart', images: [{ file: image, label: 'fixture image' }] }), after: () => ({ ok: true, summary: 'done' }) };
+    const first = await runAgentStation(definition, nativeContext('image-original'));
+    assert.equal(first.failure?.tag, 'model_transport');
+    const reference = (first.data!.closedStationSessions as Record<string, ClaudeSessionReference>)['curation/reader'];
+    let entered!: () => void;
+    const preparing = new Promise<void>(resolve => { entered = resolve; });
+    const convert = t.mock.method(EvidenceStore, 'jpegAsync', async (_file: string, _width?: number, options?: ImageProcessOptions) => {
+      assert.ok(options?.signal);
+      assert.ok(readEvidence().some(evidence => evidence.text === 'Persisted fixture observation'));
+      entered();
+      await new Promise<void>((_resolve, reject) => options.signal!.addEventListener('abort', () => reject(options.signal!.reason), { once: true }));
+      return Buffer.alloc(0);
+    });
+    try {
+      const controller = new AbortController();
+      const pending = runAgentStation(definition, { ...nativeContext('image-retry', first.data), signal: controller.signal });
+      const rejected = assert.rejects(pending, error => {
+        const partial = error as Error & StationResult;
+        assert.equal(partial.name, 'AbortError');
+        assert.equal(partial.sessionCheckpoint?.closed?.id, reference.id);
+        assert.equal(partial.sessionCheckpoint?.closed?.context?.calls, 1);
+        assert.equal(partial.usage, undefined);
+        assert.equal(partial.metrics?.time?.modelCalls, 0);
+        return true;
+      });
+      await preparing; controller.abort(); await rejected;
+      assert.equal(reads(), 1); assert.equal(first.usage?.cost, .1);
+    } finally { convert.mock.restore(); }
   });
 });
 

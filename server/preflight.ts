@@ -8,7 +8,7 @@ import type { PreflightCheck } from "../shared/types.ts";
 import { networkFetch, networkRoute } from "./network.ts";
 import { openPage, browserCommand } from "./browser.ts";
 import { probeModelConnection } from "./pi.ts";
-import { imageStats } from "./evidence.ts";
+import { imageStatsAsync } from './evidence.ts';
 import type { Broker } from "./broker.ts";
 import { projectPaths } from "./workspace.ts";
 
@@ -58,7 +58,7 @@ export async function checkBrowserCapture(broker: Broker, options: { open?: type
         const { withBrowserFrames } = await import('./browser.ts');
         const png = await withBrowserFrames(page, () => page.screenshot({ timeout: timeoutMs }));
         controller.signal.throwIfAborted();
-        const stats = imageStats(png);
+        const stats = await imageStatsAsync(png, {signal: controller.signal, timeoutMs});
         return { ok: stats.content > 0.01, detail: `内容占比 ${(stats.content * 100).toFixed(1)}%`, fix: stats.content > 0.01 ? undefined : '后台页没有画面帧：重启应用；仍不行请报告给系统' };
       } finally { await close(); }
     } finally { resource.release(); }

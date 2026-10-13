@@ -17,8 +17,14 @@ async function render(mode:string,config:Record<string,unknown>,ctx:StationConte
   const {stdout,stderr}=await command(process.env.FACTORY_PYTHON??'python',['-I',worker,mode,file,dir],ctx,dir,180000);
   const result=JSON.parse(stdout.trim().split(/\r?\n/).at(-1)!);return {dir,result,stderr};
 }
-function image(ctx:StationContext,svc:Services,file:string,label:string){
-  const bytes=fs.readFileSync(file),full=svc.store.put(EvidenceStore.webp(bytes,1280),'webp'),card=svc.store.put(EvidenceStore.webp(bytes,720),'webp');
+async function image(ctx: StationContext, svc: Services, file: string, label: string) {
+  ctx.signal.throwIfAborted();
+  const bytes = fs.readFileSync(file);
+  const fullBytes = await EvidenceStore.webpAsync(bytes, 1280, 80, {signal: ctx.signal});
+  const cardBytes = await EvidenceStore.webpAsync(bytes, 720, 80, {signal: ctx.signal});
+  ctx.signal.throwIfAborted();
+  const full = svc.store.put(fullBytes, 'webp');
+  const card = svc.store.put(cardBytes, 'webp');
   const ev=ctx.addEvidence({id:`media-${full.sha.slice(0,20)}`,kind:'image',src:full.src,card:card.src,label,tone:'ok',meta:{source:source(ctx)}});
   return {src:full.src,card:card.src,sha256:full.sha,evidence:ev.id};
 }
@@ -58,7 +64,14 @@ const deckPreview:BusinessTool=async(ctx,svc)=>{
   const d=dataOf(ctx),original=d.mediaOriginal;if(!original)return fail('缺少原始演示文件');
   const file=svc.store.resolve(original.src);if(!file||hash(fs.readFileSync(file))!==original.sha256)return fail('原始演示文件摘要不符');
   const {dir,result,stderr}=await render('deck',{input:file},ctx,svc);
-  const pages=result.pages.map((v:any)=>({...v,file:undefined,...image(ctx,svc,path.join(dir,v.file),`演示第 ${v.page} 页`)}));
+  const pages = [];
+  // Rendering may return up to 500 pages. Retain one page's codec input at a
+  // time; the shared queue must not receive hundreds of native processes.
+  for (const page of result.pages) {
+    ctx.signal.throwIfAborted();
+    const preview = await image(ctx, svc, path.join(dir, page.file), `演示第 ${page.page} 页`);
+    pages.push({...page, file: undefined, ...preview});
+  }
   if(pages.length!==result.pageCount||!pages.length)return fail('没有完整渲染所有页面');
   return {ok:true,summary:`逐页渲染 ${pages.length} 页`,data:{deckPreview:{...result,pages,warnings:stderr}}};
 };
@@ -89,7 +102,7 @@ const reproduce:BusinessTool=async(ctx,svc)=>{
 };
 const figurePreview:BusinessTool=async(ctx,svc)=>{
   const run=dataOf(ctx).figureRun;if(!run?.png||!fs.existsSync(run.png))return fail('未找到已运行代码的真实输出');
-  return {ok:true,summary:'保存实际绘图预览',data:{figurePreview:image(ctx,svc,run.png,'科研绘图实际输出')}};
+  return {ok:true,summary:'保存实际绘图预览',data:{figurePreview:await image(ctx,svc,run.png,'科研绘图实际输出')}};
 };
 const fxCode:BusinessTool=async(ctx,svc)=>{
   const d=dataOf(ctx),effect=d.effect;if(!effect||!['grayscale','blur','contrast','edges','resize'].includes(effect.kind)||typeof effect.imageUrl!=='string')return fail('需要 effect.kind 与实际 imageUrl；支持灰度、模糊、对比度、边缘和缩放');
@@ -103,7 +116,9 @@ const beforeAfter:BusinessTool=async(ctx,svc)=>{
   const d=dataOf(ctx),input=svc.store.resolve(d.mediaOriginal?.src);if(!input||hash(fs.readFileSync(input))!==d.mediaOriginal.sha256)return fail('原图不存在或内容摘要不匹配');
   const recipe=d.effectCode?.recipe;if(!recipe)return fail('没有已声明的图像处理程序');
   const {dir,result}=await render('effect',{...recipe,input},ctx,svc);
-  return {ok:true,summary:'实际运行并生成前后对比',data:{effectRun:{...result,before:image(ctx,svc,path.join(dir,'before.png'),'处理前'),after:image(ctx,svc,path.join(dir,'after.png'),'处理后')}}};
+  const before = await image(ctx, svc, path.join(dir, 'before.png'), '处理前');
+  const after = await image(ctx, svc, path.join(dir, 'after.png'), '处理后');
+  return {ok:true,summary:'实际运行并生成前后对比',data:{effectRun:{...result,before,after}}};
 };
 export const MEDIA_TOOLS:Record<string,BusinessTool>={'skills.fetch-file':fetchFile,'ppt.fetch-deck':fetchDeck,'ppt.deck-preview':deckPreview,'sci-figure.reproduce':reproduce,'sci-figure.preview':figurePreview,'image-fx.fx-code':fxCode,'image-fx.before-after':beforeAfter};
 

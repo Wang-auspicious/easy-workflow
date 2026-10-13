@@ -1,10 +1,10 @@
 import test, {after} from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import http from 'node:http';
 import {compile} from '../server/spec/compile.ts';import {pack} from '../packs/vislexicon/pack.ts';import {readRole} from '../server/roles.ts';
-import {EvidenceStore} from '../server/evidence.ts';import type {StationContext} from '../server/runtime.ts';
+import {EvidenceStore, runFfmpeg} from '../server/evidence.ts';import type {StationContext} from '../server/runtime.ts';
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'h2-capture-recovery-'));
 const previousProject=process.env.FACTORY_VAR;process.env.FACTORY_VAR=dir;
-const {findStage,links,pageKey,shoot}=await import('../packs/vislexicon/capture.ts');
+const {findStage,links,pageKey,shoot,checkImage,letterbox}=await import('../packs/vislexicon/capture.ts');
 const {TOOLS}=await import('../packs/vislexicon/tools.ts');
 const {facts,factReview,shotReview}=await import('../packs/vislexicon/agents.ts');
 after(async()=>{
@@ -13,6 +13,36 @@ after(async()=>{
  if(previousProject===undefined)delete process.env.FACTORY_VAR;else process.env.FACTORY_VAR=previousProject;
  assert.equal(path.dirname(path.resolve(dir)),path.resolve(os.tmpdir()));assert.ok(path.basename(dir).startsWith('h2-capture-recovery-'));
  fs.rmSync(dir,{recursive:true,force:true});
+});
+
+test('image checks and letterboxing yield to HTTP while retaining pixel quality and cancellation', async () => {
+  const png = await runFfmpeg(['-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc=size=640x400:rate=1', '-frames:v', '1', '-f', 'image2', '-c:v', 'png', 'pipe:1']);
+  const server = http.createServer((_request, response) => response.end('responsive'));
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${(server.address() as {port: number}).port}`;
+  let finished = false;
+  try {
+    const response = fetch(url);
+    const processing = (async () => {
+      const padded = await letterbox(png, {width: 640, height: 400});
+      const checked = await checkImage(padded, [], {stage: true});
+      finished = true;
+      return {padded, checked};
+    })();
+    assert.equal(await (await response).text(), 'responsive');
+    assert.equal(finished, false, 'native image work cannot block an unrelated HTTP response');
+    const {padded, checked} = await processing;
+    assert.deepEqual([padded.readUInt32BE(16), padded.readUInt32BE(20)], [640, 400]);
+    assert.deepEqual(checked.issues, []);
+    assert.ok((await checkImage(padded, [checked.hash])).issues.includes('duplicate'));
+    const controller = new AbortController();
+    controller.abort(new Error('Fixture image cancellation'));
+    await assert.rejects(checkImage(png, [], {signal: controller.signal}), /Fixture image cancellation/);
+    await assert.rejects(letterbox(png, {width: 640, height: 400}, {signal: controller.signal}), /Fixture image cancellation/);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 });
 
 test('every node has a role handbook; curation roles are handwritten and teach the toolbox',()=>{
@@ -63,7 +93,7 @@ test('capture chooses a bounded demo, keeps SPA routes and survives review resho
    await t.test('image processing stores durable references and reuses unaffected roles after a reshoot',async()=>{
      const work=path.join(dir,'work');fs.mkdirSync(work);const original=path.join(work,'identity.png');fs.writeFileSync(original,await shoot(page));
      const store=new EvidenceStore(path.join(dir,'evidence'));
-     const ctx={token:{data:{mode:'shots',shots:{identity:{file:original,href:page.url(),hash:'',evidence:'original-evidence'}}}},progress:()=>{}} as unknown as StationContext;
+     const ctx={token:{data:{mode:'shots',shots:{identity:{file:original,href:page.url(),hash:'',evidence:'original-evidence'}}}},signal:new AbortController().signal,progress:()=>{}} as unknown as StationContext;
      const svc={store,workDir:work,publishDir:path.join(dir,'publish'),inFlight:()=>new Set<string>()};
      const first=await TOOLS['curation.process'](ctx,svc);assert.equal(first.ok,true);assert.ok(!fs.existsSync(original));
      Object.assign(ctx.token.data,first.data);const canonical=(ctx.token.data.shots as any).identity.file;assert.ok(fs.existsSync(canonical));

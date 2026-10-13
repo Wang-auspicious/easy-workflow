@@ -7,7 +7,8 @@ import http from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { configureAgentStations, runAgentStation } from "../server/agent-station.ts";
+import { configureAgentStations, pickByImages, runAgentStation } from "../server/agent-station.ts";
+import { EvidenceStore, type ImageProcessOptions } from '../server/evidence.ts';
 import { models, closeModelTransport } from "../server/pi.ts";
 import type { Docs } from "../server/docs.ts";
 import type { Toolbox } from "../server/toolbox.ts";
@@ -126,6 +127,42 @@ test("station clocks: real Pi requests and tools may outlive the old whole-loop 
       const ctrl = new AbortController(); ctrl.abort();
       await assert.rejects(run("cancelled", ctrl.signal), { name: "AbortError" });
       assert.equal(current.requests.length, 0); assert.equal(current.tools, 0);
+    });
+    await t.test('image preparation forwards cancellation before either Pi input path can charge a request', async () => {
+      const image = path.join(dir, 'input.ppm');
+      fs.writeFileSync(image, Buffer.concat([Buffer.from('P6\n4 6\n255\n'), Buffer.alloc(4 * 6 * 3, 128)]));
+      for (const picker of [false, true]) {
+        const current = { requests: [] as any[], tools: 0, progress: [] as string[] }; scenarios.set('image-cancel', current);
+        let entered!: () => void;
+        const started = new Promise<void>(resolve => { entered = resolve; });
+        const convert = t.mock.method(EvidenceStore, 'jpegAsync', async (_file: string, _width?: number, options?: ImageProcessOptions) => {
+          assert.ok(options?.signal); entered();
+          await delay(10000, undefined, { signal: options.signal });
+          return Buffer.alloc(0);
+        });
+        try {
+          const controller = new AbortController();
+          const images = [{ file: image, label: 'image input' }];
+          const pending = picker
+            ? pickByImages({ node: { key: 'curation/copy-review' }, signal: controller.signal } as StationContext, 'Choose image', images)
+            : run('image-cancel', controller.signal, { input: () => ({ text: 'clock-case:image-cancel', images }) });
+          const rejected = assert.rejects(pending, { name: 'AbortError' });
+          await started; controller.abort(); await rejected;
+          assert.equal(current.requests.length, 0); assert.equal(current.tools, 0);
+        } finally { convert.mock.restore(); }
+      }
+    });
+    await t.test('local codec timeouts do not open the model provider circuit', async () => {
+      const image = path.join(dir, 'input.ppm');
+      const current = { requests: [] as any[], tools: 0, progress: [] as string[] }; scenarios.set('image-timeout', current);
+      const convert = t.mock.method(EvidenceStore, 'jpegAsync', async () => {
+        throw Object.assign(new Error('Image conversion timed out'), { name: 'TimeoutError', code: 'FFMPEG_TIMEOUT' });
+      });
+      try {
+        const result = await run('image-timeout', new AbortController().signal, { input: () => ({ text: 'clock-case:image-timeout', images: [{ file: image, label: 'image input' }] }) });
+        assert.equal(result.failure?.tag, 'tool_error'); assert.equal(result.failure?.category, 'system');
+        assert.equal(result.failure?.code, 'FFMPEG_TIMEOUT'); assert.equal(current.requests.length, 0);
+      } finally { convert.mock.restore(); }
     });
   } finally {
     t.mock.restoreAll(); await closeModelTransport(); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r()));

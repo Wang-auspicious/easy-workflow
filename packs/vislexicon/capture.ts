@@ -3,11 +3,11 @@
 // `preview-rules.json`; read-only browsing: never accept cookies, log in or fill forms.
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { setTimeout as wait } from "node:timers/promises";
 import type { ElementHandle, Frame, Page } from "playwright-core";
-import { aHash, hamming, imageStats } from "../../server/evidence.ts";
+import {aHashAsync, hamming, imageStatsAsync, runFfmpeg, type ImageProcessOptions} from '../../server/evidence.ts';
 import { PREVIEW_RULES } from "./env.ts";
 import { browserAttention, inspectBrowserAttention, withBrowserFrames } from "../../server/browser.ts";
 import { ClassifiedFailure, classifyFailure } from "../../shared/failures.ts";
@@ -192,9 +192,16 @@ async function prepareScreenshot(page: Page) {
   await hideFloating(page);
 }
 
-export async function shoot(page: Page, clip?: { x: number; y: number; width: number; height: number }) {
+export async function shoot(page: Page, clip?: { x: number; y: number; width: number; height: number }, options: ImageProcessOptions = {}) {
   return withBrowserFrames(page,async()=>{
-    if(!clip){await prepareScreenshot(page);return page.screenshot({fullPage:false});}
+    options.signal?.throwIfAborted();
+    if (!clip) {
+      await prepareScreenshot(page);
+      options.signal?.throwIfAborted();
+      const png = await page.screenshot({fullPage: false});
+      options.signal?.throwIfAborted();
+      return png;
+    }
     // Full-page capture can reposition responsive/sticky content after the DOM
     // coordinates were measured. Crop the real viewport pixels instead, and tile
     // taller stages without changing viewport dimensions or reflowing the page.
@@ -206,6 +213,7 @@ export async function shoot(page: Page, clip?: { x: number; y: number; width: nu
       for(let dy=0;dy<height;){
         let rowHeight=height-dy;
         for(let dx=0;dx<width;){
+          options.signal?.throwIfAborted();
           const x=Math.round(clip.x)+dx,y=Math.round(clip.y)+dy;
           await page.evaluate(async({x,y})=>{window.scrollTo(Math.max(0,x-32),Math.max(0,y-Math.min(160,innerHeight/4)));await new Promise<void>(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r())));},{x,y});
           await prepareScreenshot(page);
@@ -214,24 +222,25 @@ export async function shoot(page: Page, clip?: { x: number; y: number; width: nu
           const w=Math.min(width-dx,view.w-sx),h=Math.min(height-dy,view.h-sy);
           if(sx<0||sy<0||w<1||h<1)throw new Error('舞台裁剪超出页面范围');
           const viewport=await page.screenshot({fullPage:false,scale:'css'});
-          const raw=execFileSync('ffmpeg',['-loglevel','error','-f','image2pipe','-i','pipe:0','-vf',`scale=${view.w}:${view.h}`,'-f','rawvideo','-pix_fmt','rgba','pipe:1'],{input:viewport,maxBuffer:1<<26});
+          const raw = await runFfmpeg(['-loglevel', 'error', '-f', 'image2pipe', '-i', 'pipe:0', '-vf', `scale=${view.w}:${view.h}`, '-f', 'rawvideo', '-pix_fmt', 'rgba', 'pipe:1'], {...options, input: viewport, maxBuffer: 1 << 26});
+          if (raw.length !== view.w * view.h * 4) throw new Error('舞台截图像素解码不完整');
           for(let row=0;row<h;row++)raw.copy(pixels,((dy+row)*width+dx)*4,((sy+row)*view.w+sx)*4,((sy+row)*view.w+sx+w)*4);
           dx+=w;rowHeight=Math.min(rowHeight,h);
         }
         dy+=rowHeight;
       }
-      return execFileSync('ffmpeg',['-loglevel','error','-f','rawvideo','-pix_fmt','rgba','-s',`${width}x${height}`,'-i','pipe:0','-frames:v','1','-f','image2','-c:v','png','pipe:1'],{input:pixels,maxBuffer:1<<26});
+      return await runFfmpeg(['-loglevel', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${width}x${height}`, '-i', 'pipe:0', '-frames:v', '1', '-f', 'image2', '-c:v', 'png', 'pipe:1'], {...options, input: pixels, maxBuffer: 1 << 26});
     }finally{await page.evaluate(p=>window.scrollTo(p.x,p.y),original).catch(()=>{});}
   });
 }
 
-export function checkImage(png: Buffer, others: string[], { stage = false } = {}) {
+export async function checkImage(png: Buffer, others: string[], options: ImageProcessOptions & {stage?: boolean} = {}) {
   const issues: string[] = [];
-  const stats = imageStats(png);
+  const stats = await imageStatsAsync(png, options);
   if (stats.std < 6 || stats.content < 0.02) issues.push(`blank(std ${stats.std.toFixed(1)}, content ${(stats.content * 100).toFixed(1)}%)`);
-  else if (stage && stats.content < 0.03) issues.push(`stage-nearly-empty(${(stats.content * 100).toFixed(1)}%)`);
+  else if (options.stage && stats.content < 0.03) issues.push(`stage-nearly-empty(${(stats.content * 100).toFixed(1)}%)`);
   if (stats.flatBlock) issues.push("flat-block");
-  const hash = aHash(png);
+  const hash = await aHashAsync(png, options);
   for (const other of others) if (other && hamming(hash, other) <= 6) issues.push("duplicate");
   return { issues, stats, hash };
 }
@@ -441,8 +450,9 @@ export function stageClip(stage: Stage, pageWidth: number) {
 }
 
 /** Border colour = the mode of the outermost pixel ring (works for oklch pages too). */
-function borderColor(png: Buffer, width: number, height: number) {
-  const rgb = execFileSync("ffmpeg", ["-loglevel", "error", "-f", "image2pipe", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], { input: png, maxBuffer: 1 << 26 });
+async function borderColor(png: Buffer, width: number, height: number, options: ImageProcessOptions) {
+  const rgb = await runFfmpeg(['-loglevel', 'error', '-f', 'image2pipe', '-i', 'pipe:0', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'], {...options, input: png, maxBuffer: 1 << 26});
+  if (rgb.length !== width * height * 3) throw new Error('舞台截图尺寸与像素解码不一致');
   const counts = new Map<number, { n: number; c: number[] }>();
   const add = (x: number, y: number) => {
     const i = (y * width + x) * 3;
@@ -457,14 +467,17 @@ function borderColor(png: Buffer, width: number, height: number) {
   return best.c.map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 
-export function letterbox(png: Buffer, clip: { width: number; height: number }) {
+export async function letterbox(png: Buffer, clip: { width: number; height: number }, options: ImageProcessOptions = {}) {
+  if (!Number.isSafeInteger(clip.width) || !Number.isSafeInteger(clip.height) || clip.width < 2 || clip.height < 2 || clip.width * clip.height > 16_000_000) {
+    throw new Error('舞台补边尺寸无效或过大');
+  }
   const ratio = 16 / 10;
   const w = clip.width % 2 ? clip.width + 1 : clip.width;
   const h = clip.height % 2 ? clip.height + 1 : clip.height;
   const outW = Math.max(w, Math.ceil((h * ratio) / 2) * 2);
   const outH = Math.max(h, Math.ceil(outW / ratio / 2) * 2);
-  const hex = borderColor(png, clip.width, clip.height);
-  return execFileSync("ffmpeg", ["-loglevel", "error", "-f", "image2pipe", "-i", "pipe:0", "-vf", `pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2:color=0x${hex}`, "-f", "image2", "-c:v", "png", "pipe:1"], { input: png, maxBuffer: 1 << 26 });
+  const hex = await borderColor(png, clip.width, clip.height, options);
+  return runFfmpeg(['-loglevel', 'error', '-f', 'image2pipe', '-i', 'pipe:0', '-vf', `pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2:color=0x${hex}`, '-f', 'image2', '-c:v', 'png', 'pipe:1'], {...options, input: png, maxBuffer: 1 << 26});
 }
 
 /** Visible iframe content belonging to this exact stage, including nested demos.

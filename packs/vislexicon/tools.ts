@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { EvidenceRef, Usage } from "../../shared/types.ts";
-import { EvidenceStore, aHash, hamming } from "../../server/evidence.ts";
+import { EvidenceStore, aHashAsync, hamming } from "../../server/evidence.ts";
 import { openPage } from "../../server/browser.ts";
 import { webGet } from "../../server/network.ts";
 import { classifyFailure, candidateFailure, type Failure } from "../../shared/failures.ts";
@@ -231,8 +231,10 @@ function workDir(svc: Services, ctx: StationContext) {
   return d;
 }
 
-function shotEvidence(ctx: StationContext, svc: Services, png: Buffer, role: string, meta: Record<string, unknown>): EvidenceRef {
-  const card = svc.store.put(EvidenceStore.webp(png, 720), "webp");
+async function shotEvidence(ctx: StationContext, svc: Services, png: Buffer, role: string, meta: Record<string, unknown>): Promise<EvidenceRef> {
+  const bytes = await EvidenceStore.webpAsync(png, 720, 80, {signal: ctx.signal});
+  ctx.signal.throwIfAborted();
+  const card = svc.store.put(bytes, 'webp');
   return ctx.addEvidence({ id: `img-${card.sha.slice(0, 12)}-${ctx.attempt.slice(2, 8)}`, kind: "image", src: card.src, card: card.src, label: ROLE_ZH[role] ?? role, meta: { role, ...meta } });
 }
 const ROLE_ZH: Record<string, string> = { identity: "首屏", breadth: "目录", proof: "组件特写" };
@@ -277,13 +279,14 @@ const identity: Tool = async (ctx, svc) => {
       return { ok: false, summary: "首页没打开", error: home.issues.join(", ") };
     }
     const motion = await motionFirst(page);
-    let png = await shoot(page);
-    let check = checkImage(png, []);
+    let png = await shoot(page, undefined, {signal: ctx.signal});
+    let check = await checkImage(png, [], {signal: ctx.signal});
     if (check.issues.includes("flat-block")) {
       ctx.progress("首屏是大块单色：轻推滚动、等 4 秒再拍", { tool: "browser", text: "flat-block retry" });
       const firstHash = check.hash;
       await page.mouse.wheel(0, 2); await sleep(300); await page.mouse.wheel(0, -2); await sleep(4000);
-      png = await shoot(page); check = checkImage(png, []);
+      png = await shoot(page, undefined, {signal: ctx.signal});
+      check = await checkImage(png, [], {signal: ctx.signal});
       // Unchanged after 4s: not a placeholder that never rendered, but a real solid-colour design.
       if (check.issues.includes("flat-block") && hamming(firstHash, check.hash) <= 3) {
         check.issues = check.issues.filter((i) => i !== "flat-block");
@@ -294,7 +297,7 @@ const identity: Tool = async (ctx, svc) => {
     const issues = [...home.issues, ...check.issues];
     const file = path.join(workDir(svc, ctx), "identity.png");
     fs.writeFileSync(file, png);
-    const ev = shotEvidence(ctx, svc, png, "identity", { href: page.url(), issues, hidden: home.hidden.length, content: Number(check.stats.content.toFixed(3)) });
+    const ev = await shotEvidence(ctx, svc, png, "identity", { href: page.url(), issues, hidden: home.hidden.length, content: Number(check.stats.content.toFixed(3)) });
     ctx.progress(`截首屏 ${issues.length ? `（问题：${issues.join("、")}）` : "✓"}`, { tool: "shot", text: "1280×800 视口", ok: !issues.length, evidence: [ev.id] });
     const motionVideo = (motion.scrollHijacked || motion.canvasHero) && ctx.token.data.kind !== "component-source" && ctx.token.data.kind !== "design-system";
     const mode = ctx.token.data.mode === "video" || motionVideo ? "video" : "shots";
@@ -369,10 +372,10 @@ const breadth: Tool = async (ctx, svc) => {
   try {
     const hashes = [shots.identity?.hash ?? ""];
     const accessFailures: Failure[] = [];
-    const save = (png: Buffer, hash: string, href: string, reason: string, previews: number, visual?: BreadthVisual, compared?: { href: string; previews: number; y: number }[]) => {
+    const save = async (png: Buffer, hash: string, href: string, reason: string, previews: number, visual?: BreadthVisual, compared?: { href: string; previews: number; y: number }[]) => {
       const file = path.join(workDir(svc, ctx), "breadth.png");
       fs.writeFileSync(file, png);
-      const ev = shotEvidence(ctx, svc, png, "breadth", { href, reason, previews, visual, compared });
+      const ev = await shotEvidence(ctx, svc, png, "breadth", { href, reason, previews, visual, compared });
       ctx.progress(`截目录 ✓ ${pathOf(href)}（${reason}）`, { tool: "shot", text: `程序数到首屏预览 ${previews} 个${visual ? ` · 判定：${visual.basis === "name-list" ? "名称目录" : visual.basis === "owner-choice" ? "站长指定" : "渲染出的内容"}` : ""}`, ok: true, evidence: [ev.id] });
       shots.breadth = { file, href, hash, evidence: ev.id, title: "", previews, visual };
     };
@@ -390,15 +393,15 @@ const breadth: Tool = async (ctx, svc) => {
           await sleep(1000);
           ctx.progress("按复审保留原页，等待预览并重新取景", { tool: "browser", text: "保留 URL，更新画面" });
         }
-        const png = await shoot(page);
-        const check = checkImage(png, hashes);
+        const png = await shoot(page, undefined, {signal: ctx.signal});
+        const check = await checkImage(png, hashes, {signal: ctx.signal});
         const previews = await previewsInViewport(page);
         const previous = shots.breadth?.visual && pageKey(shots.breadth.href) === pageKey(page.url()) ? shots.breadth.visual : undefined;
         const visual: BreadthVisual | undefined = direct.why === "explicit-choice" ? { basis: "owner-choice", reason: "站长通过指定采集页给出", compared: 1 } : previous;
         const issues = [...v.issues, ...check.issues, ...breadthPreviewIssues(kind, previews, visual)];
         if (!issues.length) {
           const pageLinks = (await links(page)).filter((l) => sameSite(l.href, host));
-          save(png, check.hash, page.url(), direct.why === "explicit-choice" ? "已指定目录页" : "按复审重新取景", previews, visual);
+          await save(png, check.hash, page.url(), direct.why === "explicit-choice" ? "已指定目录页" : "按复审重新取景", previews, visual);
           shots.breadth!.title = await page.title().catch(() => "");
           return { ok: true, summary: `目录 ✓ ${pathOf(page.url())}`, data: { shots, breadthLinks: pageLinks.slice(0, 200), candidateAccessFailures: accessFailures } };
         }
@@ -437,8 +440,8 @@ const breadth: Tool = async (ctx, svc) => {
       if (seen.some((s) => pageKey(s.href) === key) || (!c.home && homeKeys.has(key))) { ctx.progress(`${pathOf(c.href)} 跳到了已看过的页面，略过`, { tool: "rules", text: page.url() }); continue; }
       const frame = await bestScrollFrame(page, { skipFirst: Boolean(c.home) });
       if (!frame) continue;
-      const png = await shoot(page);
-      const check = checkImage(png, [...hashes, ...seen.map((s) => s.hash)]);
+      const png = await shoot(page, undefined, {signal: ctx.signal});
+      const check = await checkImage(png, [...hashes, ...seen.map((s) => s.hash)], {signal: ctx.signal});
       if (check.issues.length) { ctx.progress(`拒收 ${pathOf(page.url())}：${check.issues.join("、")}`, { tool: "reject", text: check.issues.join(", "), ok: false }); continue; }
       const file = path.join(workDir(svc, ctx), `breadth-look-${seen.length + 1}.png`);
       fs.writeFileSync(file, png);
@@ -469,7 +472,7 @@ const breadth: Tool = async (ctx, svc) => {
       const why = pick ? `看了 ${seen.length} 页截图，没有一页能体现范围：${pick.reason}` : `模型不可用，程序计数也不足 4 个预览（看过 ${seen.length} 页）`;
       return { ok: false, summary: "没有合格的目录页", error: `所有候选都被拒收：${why}`, usage, data: { needsPick: { breadth: [...seen.map((s) => s.href), ...options.map((l) => l.href)].filter((h, i, all) => all.indexOf(h) === i).map((h, i) => `${i + 1}. ${h}`) }, candidateAccessFailures: accessFailures, breadthCompared: compared } };
     }
-    save(chosen.png, chosen.hash, chosen.href, reason, chosen.previews, visual, compared);
+    await save(chosen.png, chosen.hash, chosen.href, reason, chosen.previews, visual, compared);
     shots.breadth!.title = chosen.title;
     cleanup();
     return { ok: true, summary: `目录 ✓ ${pathOf(chosen.href)}`, data: { shots, breadthLinks: chosen.links.slice(0, 200), candidateAccessFailures: accessFailures }, usage };
@@ -555,14 +558,14 @@ const proof: Tool = async (ctx, svc) => {
         if (await iframeEmpty(page, stage, stageWait)) { ctx.progress(`拒收 ${new URL(href).pathname}：舞台 iframe 是空的`, { tool: "reject", text: "iframe-empty", ok: false }); continue; }
         const pageWidth = await page.evaluate(() => document.documentElement.scrollWidth);
         const clip = stageClip(stage, pageWidth);
-        png = letterbox(await shoot(page, clip), clip);
+        png = await letterbox(await shoot(page, clip, {signal: ctx.signal}), clip, {signal: ctx.signal});
         framing = `舞台 ${stage.sel} ${Math.round(stage.w)}×${Math.round(stage.h)}`;
       }
       if (!png) {
         if (usesStage) { ctx.progress(`拒收 ${new URL(href).pathname}：没找到舞台`, { tool: "reject", text: "no-stage-found", ok: false }); continue; }
-        png = await shoot(page);
+        png = await shoot(page, undefined, {signal: ctx.signal});
       }
-      const check = checkImage(png, hashes, { stage: Boolean(stage) });
+      const check = await checkImage(png, hashes, {stage: Boolean(stage), signal: ctx.signal});
       if (check.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${check.issues.join("、")}`, { tool: "reject", text: check.issues.join(", "), ok: false }); continue; }
       ctx.progress(`候选 ${new URL(href).pathname}：${framing}，内容占比 ${(check.stats.content * 100).toFixed(1)}%`, { tool: "shot", text: framing, ok: true });
       if (!best || check.stats.content > best.content || (locateOf.has(norm(href)) && !locateOf.has(norm(best.href)))) best = { href, png, content: check.stats.content, hash: check.hash, framing, title: await page.title().catch(() => ""), location };
@@ -573,7 +576,7 @@ const proof: Tool = async (ctx, svc) => {
     if (!best) return { ok: false, summary: "没有合格的特写", error: tried ? `试了 ${tried} 页都不合格` : "需要重新选页：交阅读员重新查找公开特写页面",failure:accessFailures.length===tried?accessFailures.at(-1):undefined, data:{needsPick:{proof:candidates},candidateAccessFailures:accessFailures},usage };
     const file = path.join(workDir(svc, ctx), "proof.png");
     fs.writeFileSync(file, best.png);
-    const ev = shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, location: best.location, content: Number(best.content.toFixed(3)), tried });
+    const ev = await shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, location: best.location, content: Number(best.content.toFixed(3)), tried });
     ctx.progress(`选中 ${new URL(best.href).pathname}（试 ${tried} 页，内容占比最高 ${(best.content * 100).toFixed(1)}%）`, { tool: "shot", text: best.framing, ok: true, evidence: [ev.id] });
     shots.proof = { file, href: best.href, hash: best.hash, evidence: ev.id, framing: best.framing, content: best.content, title: best.title, location: best.location };
     return { ok: true, summary: `特写 ✓ ${new URL(best.href).pathname}`, data: { shots, candidateAccessFailures: accessFailures }, usage };
@@ -614,14 +617,19 @@ const processShots: Tool = async (ctx, svc) => {
   const previous = (ctx.token.data.images ?? []) as typeof images;
   const temporary:string[]=[];
   for (const role of roles) {
+    ctx.signal.throwIfAborted();
     const s = shots[role];
     const reusable=previous.find(image=>image.role===role&&image.evidence===s.evidence&&fs.existsSync(svc.store.resolve(image.src)??""));
     if(reusable){images.push(reusable);shots[role]={...s,file:svc.store.resolve(reusable.src)!};ctx.progress(`${ROLE_ZH[role]}沿用已验收的持久图像，无需重新拍摄`,{tool:"reuse",text:reusable.sha256,ok:true});continue;}
     if (!fs.existsSync(s.file)) return { ok: false, summary: `${ROLE_ZH[role]}原图丢失`, error: `${s.file} missing` };
     const png = fs.readFileSync(s.file);
-    const full = svc.store.put(EvidenceStore.webp(png, 1280, 82), "webp");
-    const card = svc.store.put(EvidenceStore.webp(png, 720, 80), "webp");
-    images.push({ role, src: full.src, card: card.src, sha256: full.sha, ahash: aHash(png), href: s.href, evidence: s.evidence, title: s.title });
+    const fullBytes = await EvidenceStore.webpAsync(png, 1280, 82, {signal: ctx.signal});
+    const cardBytes = await EvidenceStore.webpAsync(png, 720, 80, {signal: ctx.signal});
+    const ahash = await aHashAsync(png, {signal: ctx.signal});
+    ctx.signal.throwIfAborted();
+    const full = svc.store.put(fullBytes, 'webp');
+    const card = svc.store.put(cardBytes, 'webp');
+    images.push({ role, src: full.src, card: card.src, sha256: full.sha, ahash, href: s.href, evidence: s.evidence, title: s.title });
     shots[role]={...s,file:full.file};
     if(path.resolve(s.file).startsWith(path.resolve(svc.workDir)+path.sep)&&path.extname(s.file)===".png")temporary.push(s.file);
   }

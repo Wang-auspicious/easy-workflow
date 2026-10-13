@@ -4,7 +4,6 @@
 // narrated trace for the inspector.
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import { Type, type TSchema } from "typebox";
@@ -20,6 +19,7 @@ import { StationActivity } from "./activity.ts";
 import { withEvidenceReads, readEvidence, rememberRead } from "./network.ts";
 import { classifyFailure, type Failure } from "../shared/failures.ts";
 import { loadStationSession, saveStationSession, sessionSignature, type SessionRef } from './station-session.ts';
+import { EvidenceStore } from './evidence.ts';
 export { models, MODEL_ID, apiKeyPresent } from "./pi.ts";
 
 export async function promptAgent(agent: Pick<Agent, "prompt" | "abort"> | ClosedStationAgent, text: string, images?: { type: "image"; data: string; mimeType: string }[], signal?: AbortSignal, timeoutMs = 120_000) {
@@ -56,9 +56,6 @@ export interface AgentStationDef<T = any> {
   /** Extra submissions within the same fixed deadline; defaults to one, capped at two. */
   repairAttempts?: 0 | 1 | 2;
 }
-
-/** Cards are WebP; the endpoint takes JPEG reliably. */
-const jpeg = (file: string) => execFileSync("ffmpeg", ["-loglevel", "error", "-i", file, "-vf", "scale='min(720,iw)':-2", "-f", "image2", "-c:v", "mjpeg", "-q:v", "4", "pipe:1"], { maxBuffer: 1 << 25, timeout: 15000 });
 
 /* Late-bound so tests and the dispatcher can run without a project. */
 let wired: { docs?: () => Docs; toolbox?: () => Toolbox } = {};
@@ -232,8 +229,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
       if ((e as { toolName?: string }).toolName === "submit") ctx.progress("提交结构化结果", { tool: "submit", text: "按 I/O 契约校验" });
     }
   });
-  const images = (input.images ?? []).map((i) => ({ type: "image" as const, data: jpeg(i.file).toString("base64"), mimeType: "image/jpeg" }));
-  ctx.progress(`读取身份、案卷与输入${images.length ? `：${images.length} 张图 + 文字` : ""}；调用 ${external ? "闭源 Agent / " : ""}${modelId}`, { tool: "model", text: input.text.slice(0, 160) });
+  const images: { type: 'image'; data: string; mimeType: string }[] = [];
   const redo = ctx.redo ? `\n\nTHIS IS A REDO. ${ctx.redo.byHuman ? "The human owner corrected" : "A reviewer sent back"} this work: ${ctx.redo.reason}${ctx.redo.note ? ` (${ctx.redo.note})` : ""}. Change only what is named; keep everything else as it was, and say in your submission what you changed.` : "";
   const sessionRoot = docs?.dir;
   const sessions = (ctx.token.data?.stationSessions ?? {}) as Record<string, SessionRef>;
@@ -282,7 +278,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     activity: activity.snapshot(),
     tokens: {
       system: Math.max(0, estimateTokens(env.text) - Math.round((env.sizes.context + env.sizes.caseFile) / 2.2)), context: Math.round(env.sizes.context / 2.2), caseFile: Math.round(env.sizes.caseFile / 2.2),
-      input: estimateTokens(input.text + redo + contract), images: images.length * 1100,
+      input: estimateTokens(input.text + redo + contract), images: (input.images?.length ?? 0) * 1100,
       toolDefs: estimateTokens(JSON.stringify(tools.map((t) => ({ n: t.name, d: t.description, p: t.parameters })))), toolResults: Math.round(toolResultChars / 3),
       output: usage.output, actualInput: usage.input, actualOutput: usage.output, cacheRead: usage.cacheRead ?? 0, cacheWrite: usage.cacheWrite ?? 0,
     },
@@ -319,7 +315,20 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     agent.state.messages = messages.slice(0, -1);
     await invoke(() => agent.continue());
   };
+  let preparingImages = true;
   try {
+  // A recovered Pi transcript already contains its images. All other attempts
+  // prepare the current input within the owner signal and the checkpoint catch.
+  if (!(saved && agent instanceof Agent)) {
+    for (const image of input.images ?? []) {
+      const bytes = await EvidenceStore.jpegAsync(image.file, 720, { signal: sessionSignal, timeoutMs: 15000 });
+      sessionSignal.throwIfAborted();
+      images.push({ type: 'image', data: bytes.toString('base64'), mimeType: 'image/jpeg' });
+    }
+  }
+  sessionSignal.throwIfAborted();
+  preparingImages = false;
+  ctx.progress(`读取身份、案卷与输入${input.images?.length ? `：${input.images.length} 张图 + 文字` : ""}；调用 ${external ? "闭源 Agent / " : ""}${modelId}`, { tool: "model", text: input.text.slice(0, 160) });
   if (saved && agent instanceof Agent) await invoke(() => agent.continue());
   else await ask(input.text + redo, images.length ? images : undefined);
   if (!submitted && !modelError()) {
@@ -387,7 +396,13 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     if (ctx.signal.aborted) throwStationAbort(ctx.signal, { ok: false, summary: "模型调用已取消", usage: usageReported ? usage : undefined, metrics: metrics(), sessionCheckpoint: sessionCheckpoint() });
     if (sessionSignal.aborted && awaitingModel) return modelFailure(`工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留`, '工位工作预算已用完');
     const failure = sessionSignal.aborted ? sessionSignal.reason : err;
-    return { ok: false, summary: sessionSignal.aborted ? "工位工作预算已用完" : "模型调用失败", error: sessionSignal.aborted ? `工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留` : failure instanceof Error ? failure.message : String(failure), failure: (failure as { failure?: Failure })?.failure ?? classifyFailure(failure, { stage: 'model' }), data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics() };
+    const imageFailure: Failure | undefined = preparingImages ? {
+      tag: 'tool_error', category: 'system', retryable: true, owner: 'system',
+      code: (failure as { code?: string })?.code ?? 'STATION_IMAGE_PREPARATION',
+      message: sessionSignal.aborted ? '图像输入准备超出工位总工作预算' : failure instanceof Error ? failure.message : String(failure),
+      nextAction: '检查本地图像转换和共享处理容量，从当前工位恢复；保留已有证据与会话，不重复模型请求。',
+    } : undefined;
+    return { ok: false, summary: sessionSignal.aborted ? "工位工作预算已用完" : preparingImages ? '图像输入准备失败' : "模型调用失败", error: sessionSignal.aborted ? `工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留` : failure instanceof Error ? failure.message : String(failure), failure: (failure as { failure?: Failure })?.failure ?? imageFailure ?? classifyFailure(failure, { stage: 'model' }), data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics() };
   } finally { activity.close("failed"); narration.flush(); }
 }
 
@@ -404,7 +419,12 @@ export async function pickByImages(ctx: StationContext, question: string, shots:
   const usage: Usage = { input: 0, output: 0, cost: 0 };
   let picked: { index: number; basis: PageBasis; reason: string } | null = null;
   let invalidSubmissions = 0;
-  const images = shots.map((s) => ({ type: "image" as const, data: jpeg(s.file).toString("base64"), mimeType: "image/jpeg" }));
+  const images: { type: 'image'; data: string; mimeType: string }[] = [];
+  for (const shot of shots) {
+    const bytes = await EvidenceStore.jpegAsync(shot.file, 720, { signal: ctx.signal, timeoutMs: 15000 });
+    ctx.signal.throwIfAborted();
+    images.push({ type: 'image', data: bytes.toString('base64'), mimeType: 'image/jpeg' });
+  }
   const prompt = `${question}\n\n${shots.map((s, i) => `image ${i + 1}: ${s.label}`).join("\n")}`;
   ctx.progress(`把 ${shots.length} 个候选页的截图并排交给模型看，按画面选页`, { tool: "model", text: shots.map((s) => s.label).join("\n") });
   for (let round = 1; round <= 2 && !picked; round++) {

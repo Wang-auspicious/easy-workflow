@@ -9,7 +9,7 @@ import { createAssistantMessageEventStream, type AssistantMessage, type Transcri
 import { Dispatcher, type DispatcherOptions } from "../server/dispatcher.ts";
 import { dispatcherOperationKey } from "../server/dispatcher-recovery.ts";
 import { Journal } from "../server/journal.ts";
-import { EvidenceStore } from "../server/evidence.ts";
+import { EvidenceStore, type ImageProcessOptions } from "../server/evidence.ts";
 import { legacyReply, type ConversationEntry } from "../shared/conversation.ts";
 import type { Factory } from "../server/factory.ts";
 import type { FactoryControl } from "../server/control.ts";
@@ -224,4 +224,78 @@ test("steered evidence images reach Pi before and after restart while binary con
     assert.deepEqual(seen, [true, true]);
     assert.ok(!JSON.stringify([...f.journal.read()]).includes('"type":"image"'), "only evidence references, never base64 image messages, are persisted");
   } finally { f.cleanup(); }
+});
+
+test('image preparation cancellation preserves the initial or steered request and never injects a late image', { timeout: 20000 }, async t => {
+  for (const steering of [false, true]) {
+    const modelEntered = deferred();
+    const imageEntered = deferred();
+    const imageSeen: boolean[] = [];
+    const f = fixture(async (count, context, signal) => {
+      imageSeen.push(context.messages.some(message => message.role === 'user' && Array.isArray(message.content) && message.content.some(part => part.type === 'image')));
+      if (steering && count === 1) { modelEntered.resolve(); await delay(10000, undefined, { signal }); }
+      return answer();
+    });
+    const pixels = Buffer.concat([Buffer.from('P6\n4 6\n255\n'), Buffer.alloc(4 * 6 * 3, 128)]);
+    const stored = f.factory.store.put(await EvidenceStore.webpAsync(pixels, 4), 'webp');
+    f.factory.state.evidence['cancel-image'] = { id: 'cancel-image', kind: 'screenshot', token: 'fixture', station: 'curation/shots', label: 'cancel fixture', card: stored.src } as never;
+    const attachments = [{ type: 'evidence' as const, id: 'cancel-image', label: 'cancel fixture' }];
+    const convert = t.mock.method(EvidenceStore, 'jpegAsync', async (_file: string, _width?: number, options?: ImageProcessOptions) => {
+      assert.ok(options?.signal); imageEntered.resolve();
+      await delay(10000, undefined, { signal: options.signal });
+      return Buffer.alloc(0);
+    });
+    const dispatcher = f.newDispatcher();
+    let pending: ReturnType<Dispatcher['chat']> | undefined;
+    try {
+      pending = dispatcher.chat('original image request', steering ? [] : attachments);
+      if (steering) { await modelEntered.promise; assert.equal(dispatcher.steer('pending evidence', attachments).ok, true); }
+      await imageEntered.promise;
+      dispatcher.abort(); await pending;
+      assert.equal(dispatcher.status.status, 'aborted');
+      assert.equal(f.calls, steering ? 1 : 0);
+      const checkpoint = [...f.journal.read()].findLast(event => event.kind === 'chat.checkpoint');
+      assert.equal(checkpoint?.kind, 'chat.checkpoint');
+      if (checkpoint?.kind === 'chat.checkpoint' && steering) assert.equal(checkpoint.checkpoint.inputs[0].delivered, false);
+      convert.mock.restore();
+      const restarted = f.newDispatcher(); await restarted.resume();
+      assert.equal(restarted.status.status, 'completed');
+      assert.equal(imageSeen.at(-1), true);
+      assert.equal(f.calls, steering ? 2 : 1);
+      assert.ok(!JSON.stringify([...f.journal.read()]).includes('"type":"image"'));
+    } finally { convert.mock.restore(); dispatcher.abort(); await pending; f.cleanup(); }
+  }
+});
+
+test('a slow steered image is consumed exactly once before the dispatcher declares completion', { timeout: 15000 }, async t => {
+  const modelEntered = deferred(), modelRelease = deferred(), imageEntered = deferred(), imageRelease = deferred();
+  let receivedImages = 0, receivedInstructions = 0;
+  const f = fixture(async (count, context) => {
+    if (count === 1) { modelEntered.resolve(); await modelRelease.promise; return answer('First response'); }
+    const inputs = context.messages.filter(message => message.role === 'user' && JSON.stringify(message.content).includes('late image instruction'));
+    receivedInstructions = inputs.length;
+    receivedImages = inputs.reduce((count, message) => count + (Array.isArray(message.content) ? message.content.filter(part => part.type === 'image').length : 0), 0);
+    return answer('Evidence inspected');
+  });
+  const pixels = Buffer.concat([Buffer.from('P6\n4 6\n255\n'), Buffer.alloc(4 * 6 * 3, 128)]);
+  const stored = f.factory.store.put(await EvidenceStore.webpAsync(pixels, 4), 'webp');
+  f.factory.state.evidence['slow-image'] = { id: 'slow-image', kind: 'screenshot', token: 'fixture', station: 'curation/shots', label: 'slow fixture', card: stored.src } as never;
+  const jpeg = EvidenceStore.jpegAsync;
+  const convert = t.mock.method(EvidenceStore, 'jpegAsync', async (file: string, width?: number, options?: ImageProcessOptions) => {
+    imageEntered.resolve(); await imageRelease.promise;
+    options?.signal?.throwIfAborted();
+    return jpeg(file, width, options);
+  });
+  const dispatcher = f.newDispatcher();
+  const pending = dispatcher.chat('original', []);
+  try {
+    await modelEntered.promise;
+    assert.equal(dispatcher.steer('late image instruction', [{ type: 'evidence', id: 'slow-image', label: 'slow fixture' }]).ok, true);
+    await imageEntered.promise; modelRelease.resolve();
+    await delay(20);
+    assert.equal(dispatcher.busy, true); assert.notEqual(dispatcher.status.status, 'completed'); assert.equal(f.calls, 1);
+    imageRelease.resolve(); await pending;
+    assert.equal(dispatcher.status.status, 'completed'); assert.equal(f.calls, 2);
+    assert.equal(receivedInstructions, 1); assert.equal(receivedImages, 1);
+  } finally { imageRelease.resolve(); modelRelease.resolve(); dispatcher.abort(); await pending; convert.mock.restore(); f.cleanup(); }
 });

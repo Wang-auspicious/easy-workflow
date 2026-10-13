@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { arbiter, audit, classify, facts, factReview, FACT_FIELDS, shotReview } from '../packs/vislexicon/agents.ts';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { arbiter, audit, classify, facts, factReview, FACT_FIELDS, shotReview, style } from '../packs/vislexicon/agents.ts';
 import { KINDS } from '../packs/vislexicon/env.ts';
 import { rememberRead, withEvidenceReads } from '../server/network.ts';
-import type { EvidenceStore } from '../server/evidence.ts';
+import {runFfmpeg, type EvidenceStore} from '../server/evidence.ts';
 import type { StationContext } from '../server/runtime.ts';
 
 const context = (patch: Record<string, unknown> = {}) => ({
@@ -97,4 +100,49 @@ test('final audit receives the complete record and the persisted source material
   const input = await audit(store).input(context({ draftV3: record, factPages: [{ url: 'https://site.example/license', text: source }] }));
   assert.ok(input.text.includes(JSON.stringify(record, null, 1)), 'never cut a JSON record in the middle of a field');
   assert.ok(input.text.includes(source), 'reviewers need the source, not only the producer’s quote');
+});
+
+test('style validation reuses only its own completed pixel statistics and never accepts absent preparation', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-style-contract-'));
+  const file = path.join(directory, 'image.png');
+  const globals = globalThis as typeof globalThis & {__styleLib?: unknown};
+  const previous = globals.__styleLib;
+  const answer = {subjectVisible: true, mixed: false, styles: [], signatureZh: ''};
+  let verified = 0;
+  globals.__styleLib = {
+    checkStyle: (_out: unknown, stats: {luma: number; sat: number; vivid: number}[]) => {
+      assert.equal(stats.length, 3);
+      assert.ok(stats.every(stat => stat.sat > 0.9 && stat.vivid > 0.9));
+      verified++;
+      return [];
+    },
+    salvage: (out: unknown) => ({out}),
+  };
+  const definition = style(store);
+  const ctx = context({kind: 'component-source', images: ['identity', 'breadth', 'proof'].map(role => ({role, card: file, href: `https://site.example/${role}`}))});
+  try {
+    assert.ok(definition.check!(answer, ctx).length);
+    assert.equal(definition.salvage!(answer, ['not prepared'], ctx), null);
+    fs.writeFileSync(file, await runFfmpeg(['-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=red:s=64x40', '-frames:v', '1', '-f', 'image2', '-c:v', 'png', 'pipe:1']));
+    const prepared = await definition.input(ctx);
+    assert.equal(prepared.images?.length, 3);
+    fs.unlinkSync(file);
+    assert.deepEqual(definition.check!(answer, ctx), [], 'synchronous submission checks do not decode the same files again');
+    assert.deepEqual(definition.salvage!(answer, ['repair'], ctx), answer);
+    assert.equal(verified, 1);
+    ctx.attempt = 'next-attempt';
+    assert.ok(definition.check!(answer, ctx).length, 'another attempt cannot reuse an old pixel preparation');
+    assert.equal(definition.salvage!(answer, ['repair'], ctx), null);
+    await assert.rejects(async () => definition.input(ctx), /ffmpeg|No such file|not found/i);
+    ctx.attempt = 'contract-test';
+    assert.ok(definition.check!(answer, ctx).length, 'a failed preparation clears earlier statistics');
+    globals.__styleLib = {};
+    await assert.rejects(async () => definition.input(ctx), /校验库/);
+    assert.ok(definition.check!(answer, ctx).length, 'a missing verifier cannot silently approve the output');
+  } finally {
+    if (previous === undefined) delete globals.__styleLib;
+    else globals.__styleLib = previous;
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
 });

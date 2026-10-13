@@ -18,7 +18,7 @@ const { webpSize, ownerOf, validateV3, loadTaxonomy } = await import("../packs/v
 const { CONTEXT_HEADER, CASE_HEADER } = await import("../server/docs.ts");
 const { Factory } = await import("../server/factory.ts");
 const { closeNetwork } = await import("../server/network.ts");
-const { EvidenceStore } = await import("../server/evidence.ts");
+const { EvidenceStore, runFfmpeg, imageStats, imageStatsAsync, aHash, aHashAsync, pixelStats, pixelStatsAsync } = await import("../server/evidence.ts");
 const { FRONTEND } = await import("../packs/vislexicon/env.ts");
 const taxonomyAvailable = [FRONTEND, process.env.VISLEXICON_BUNDLED].filter(Boolean).some(root => fs.existsSync(path.join(root!, "src", "data", "curation-taxonomy.js")));
 
@@ -78,6 +78,67 @@ test("WebP headers give real widths and heights", async () => {
   const png = execFileSync("ffmpeg", ["-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=4x6", "-frames:v", "1", "-f", "image2", "-c:v", "png", "pipe:1"]);
   const webp = store.put(EvidenceStore.webp(png, 1280), "webp");
   assert.deepEqual(webpSize(webp.file), { width: 4, height: 6 });
+  assert.deepEqual(await EvidenceStore.webpAsync(png, 1280), fs.readFileSync(webp.file));
+  assert.deepEqual(await EvidenceStore.jpegAsync(webp.file), EvidenceStore.jpeg(webp.file));
+  assert.equal(await aHashAsync(png), aHash(png));
+  assert.deepEqual(await imageStatsAsync(png), imageStats(png));
+  assert.deepEqual(await pixelStatsAsync(webp.file), pixelStats(webp.file));
+});
+
+test('image codecs yield to HTTP work and clean up active and queued cancellation', {timeout: 20000}, async () => {
+  const {createServer} = await import('node:http');
+  const {performance} = await import('node:perf_hooks');
+  const server = createServer((_request, response) => response.end('responsive'));
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${(server.address() as {port: number}).port}`;
+  const nativeOutput = path.join(dir, 'active-codec.png');
+  const queuedOutput = path.join(dir, 'queued-codec.png');
+  const running = new AbortController();
+  const runningReason = new Error('cancel active image operation');
+  const active = runFfmpeg(['-v', 'error', '-re', '-f', 'lavfi', '-i', 'testsrc2=s=64x64:r=10', '-t', '20', '-update', '1', '-y', nativeOutput], {signal: running.signal, timeoutMs: 10000});
+  const activeRejected = assert.rejects(active, error => error === runningReason);
+  try {
+    for (let i = 0; i < 100 && !fs.existsSync(nativeOutput); i++) await delay(10);
+    assert.ok(fs.existsSync(nativeOutput), 'the long native conversion really started');
+    const started = performance.now();
+    const response = await fetch(url);
+    assert.equal(await response.text(), 'responsive');
+    assert.ok(performance.now() - started < 500, 'a running codec must not block HTTP request dispatch');
+
+    const queued = new AbortController();
+    const queuedReason = new Error('cancel queued image operation');
+    const waiting = runFfmpeg(['-v', 'error', '-f', 'lavfi', '-i', 'color=c=red:s=4x6', '-frames:v', '1', '-y', queuedOutput], {signal: queued.signal});
+    const waitingRejected = assert.rejects(waiting, error => error === queuedReason);
+    await delay(250);
+    assert.equal(fs.existsSync(queuedOutput), false, 'a second codec waits for the shared slot');
+    queued.abort(queuedReason);
+    await waitingRejected;
+    running.abort(runningReason);
+    await activeRejected;
+    const stoppedAt = fs.statSync(nativeOutput).mtimeMs;
+    await delay(250);
+    assert.equal(fs.statSync(nativeOutput).mtimeMs, stoppedAt, 'cancellation also stops the native child behind a Windows shim');
+    assert.equal(fs.existsSync(queuedOutput), false, 'a cancelled waiter never starts later');
+
+    await assert.rejects(runFfmpeg(['-v', 'error', '-re', '-f', 'lavfi', '-i', 'color=c=blue:s=32x32:r=10', '-t', '20', '-f', 'null', '-'], {timeoutMs: 250}),
+      error => {
+        const local = error as {code?: string; failure?: {tag: string; category: string; owner?: string}};
+        assert.equal(local.code, 'FFMPEG_TIMEOUT');
+        assert.equal(local.failure?.tag, 'tool_error');
+        assert.equal(local.failure?.category, 'system');
+        assert.equal(local.failure?.owner, 'system');
+        return true;
+      });
+    await assert.rejects(runFfmpeg(['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=64x64', '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'], {maxBuffer: 8}),
+      error => (error as {code?: string}).code === 'FFMPEG_OUTPUT_LIMIT');
+    const recovered = await runFfmpeg(['-v', 'error', '-f', 'lavfi', '-i', 'color=c=red:s=4x6', '-frames:v', '1', '-f', 'image2', '-c:v', 'png', 'pipe:1']);
+    assert.equal(recovered.toString('ascii', 1, 4), 'PNG', 'timeout and output-limit failures release the slot');
+  } finally {
+    running.abort(runningReason);
+    await activeRejected;
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 });
 
 test("v3 assembly passes VisLexicon's own validators and reports field-addressed problems", { skip: !taxonomyAvailable && "VisLexicon is not connected; set VISLEXICON_ROOT or VISLEXICON_BUNDLED to run the real validator" }, async () => {
