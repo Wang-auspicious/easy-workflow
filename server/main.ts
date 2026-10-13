@@ -53,17 +53,51 @@ async function body(req: http.IncomingMessage): Promise<any> {
 function serveFile(res: http.ServerResponse, file: string, req: http.IncomingMessage) {
   if (!fs.existsSync(file)) { res.writeHead(404); res.end(); return; }
   const stat = fs.statSync(file);
+  if (!stat.isFile()) { res.writeHead(404); res.end(); return; }
   const type = MIME[path.extname(file)] ?? "application/octet-stream";
   const range = req.headers.range;
-  if (range && type === "video/mp4") {
-    const [a, b] = range.replace("bytes=", "").split("-");
-    const start = Number(a), end = b ? Number(b) : stat.size - 1;
-    res.writeHead(206, { "Content-Type": type, "Content-Range": `bytes ${start}-${end}/${stat.size}`, "Accept-Ranges": "bytes", "Content-Length": end - start + 1, "Cache-Control": "public, max-age=31536000, immutable" });
-    fs.createReadStream(file, { start, end }).pipe(res);
-    return;
+  const headers: http.OutgoingHttpHeaders = {
+    "Content-Type": type,
+    "Cache-Control": file.includes(`${path.sep}evidence${path.sep}`) ? "public, max-age=31536000, immutable" : "no-cache",
+    "Access-Control-Allow-Origin": "*",
+  };
+  let span: { start: number; end: number } | undefined;
+  if (type === "video/mp4") {
+    headers["Accept-Ranges"] = "bytes";
+    // Chromium seeks using both suffix and open ranges. Unsupported multipart
+    // ranges may be ignored, but an invalid single range must never reach fs.
+    if (range?.startsWith("bytes=") && !range.includes(",")) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      let start = 0, end = stat.size - 1;
+      let valid = Boolean(match && (match[1] || match[2]) && stat.size > 0);
+      if (valid && match) {
+        if (!match[1]) {
+          const suffix = Number(match[2]);
+          valid = Number.isSafeInteger(suffix) && suffix > 0;
+          start = Math.max(0, stat.size - suffix);
+        } else {
+          start = Number(match[1]);
+          end = match[2] ? Number(match[2]) : end;
+          valid = Number.isSafeInteger(start) && Number.isSafeInteger(end) && start < stat.size && start <= end;
+          end = Math.min(end, stat.size - 1);
+        }
+      }
+      if (!valid) {
+        res.writeHead(416, { ...headers, "Content-Range": `bytes */${stat.size}`, "Content-Length": 0 });
+        res.end(); return;
+      }
+      span = { start, end };
+      headers["Content-Range"] = `bytes ${start}-${end}/${stat.size}`;
+    }
   }
-  res.writeHead(200, { "Content-Type": type, "Content-Length": stat.size, "Cache-Control": file.includes(`${path.sep}evidence${path.sep}`) ? "public, max-age=31536000, immutable" : "no-cache", "Access-Control-Allow-Origin": "*" });
-  fs.createReadStream(file).pipe(res);
+  headers["Content-Length"] = span ? span.end - span.start + 1 : stat.size;
+  res.writeHead(span ? 206 : 200, headers);
+  const stream = fs.createReadStream(file, span);
+  // Leaving a preview or seeking again cancels the old read. A removed evidence
+  // file must terminate this response, rather than crash the entire backend.
+  res.once("close", () => stream.destroy());
+  stream.once("error", error => res.destroy(error));
+  stream.pipe(res);
 }
 
 const clients = new Set<http.ServerResponse>();
