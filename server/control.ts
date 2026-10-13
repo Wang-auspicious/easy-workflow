@@ -78,6 +78,25 @@ function definitions(f: Factory): Tool[] {
     const files = () => Type.Record(Type.String(), Type.String());
     return [
       {
+        name: 'agent_bindings', label: '工位 Agent 配置',
+        description: 'Read configured and effective per-station adapters and their capability boundaries. A program station returns no bindings. Actual model is reported separately from the requested model.',
+        parameters: object({node: Type.Optional(name())}),
+        execute: async (_id, parameters) => ok(f.agentBindings(parameters.node), '读取工位 Agent 配置'),
+      },
+      {
+        name: 'set_agent_binding', label: '设置工位 Agent',
+        description: 'User-only per-station adapter selection. Changes apply to the next attempt. A null binding restores the workflow or project environment default. Credentials and tool scope remain host-managed.',
+        parameters: object({node: name(), binding: Type.Union([
+          Type.Null(),
+          object({adapter: Type.Literal('pi'), provider: Type.Optional(name()), model: Type.Optional(name())}),
+          object({adapter: choice('claude-code', 'launcher'), command: Type.Array(Type.String({minLength: 1, maxLength: 4000}), {minItems: 1, maxItems: 32}), model: name(), requestTimeoutMs: Type.Optional(Type.Integer({minimum: 1, maximum: 900000}))}),
+        ])}),
+        execute: async (_id, parameters, actor) => {
+          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '工位 Agent 配置由用户选择，不能由执行中的 Agent 自行更换');
+          return ok(f.setAgentBinding(parameters.node, parameters.binding), parameters.binding ? '已保存工位 Agent 配置，下次尝试生效' : '已恢复继承默认 Agent，下次尝试生效');
+        },
+      },
+      {
         name: 'source_list', label: '持续来源状态',
         description: 'List explicitly configured sources, valid entry stations, durable candidates, deduplication, rate deadlines and per-source attention. An empty project has no automatic sources.',
         parameters: object({}),
@@ -437,7 +456,7 @@ function definitions(f: Factory): Tool[] {
     ];
   }
 
-const READS = new Set(["source_list", "workflow_templates", "status", "inspect", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
+const READS = new Set(["agent_bindings", "source_list", "workflow_templates", "status", "inspect", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
 
 export class FactoryControl {
   private f: Factory;

@@ -178,6 +178,26 @@ test("headless service: real HTTP capability discovery, control, validation, act
         assert.match(chunk, new RegExp(`^id: ${cursor + 1}\\n`));
       } finally { await reader.cancel(); controller.abort(); }
     });
+    await t.test('per-station adapters validate and persist without changing other stations', async () => {
+      const node = 'curation/copy';
+      const binding = {adapter: 'claude-code', command: ['claude'], model: 'haiku', requestTimeoutMs: 30000};
+      const previous = (await tool('agent_bindings', {node: 'curation/classify'})).body.result.bindings;
+      assert.deepEqual((await tool('agent_bindings', {node: 'curation/process'})).body.result.bindings, []);
+      assert.equal((await tool('set_agent_binding', {node, binding})).status, 403);
+      assert.equal((await request('/api/agents/binding', {node: 'curation/process', binding})).status, 422);
+      assert.equal((await request('/api/agents/binding', {node: 'absent/node', binding})).status, 404);
+      assert.equal((await request('/api/agents/binding', {node, binding: {...binding, command: ['node', secret]}})).status, 422);
+      const saved = await request('/api/agents/binding', {node, binding});
+      assert.equal(saved.status, 200);
+      const effective = saved.body.result.bindings[0];
+      assert.deepEqual(effective.configured, binding);
+      assert.deepEqual(effective.effective, binding);
+      assert.equal(effective.source, 'project');
+      assert.equal(effective.capabilities.resume, true);
+      assert.equal(effective.lastModel, undefined, 'configuration is not evidence of a real model call');
+      assert.deepEqual((await tool('agent_bindings', {node: 'curation/classify'})).body.result.bindings, previous);
+      assert.deepEqual((await request('/api/state')).body.agentBindings[node], binding);
+    });
     await stop(server.child);
     server = await start(dir);
     ({ request, tool } = server);
@@ -188,6 +208,17 @@ test("headless service: real HTTP capability discovery, control, validation, act
       assert.equal((await request("/api/state")).body.run.id, runId);
       assert.equal((await tool("read_spec")).body.result.patches.find((p: any) => p.id === patchId).status, "accepted");
     });
+    await t.test('adapter inheritance can be restored after a real process restart', async () => {
+      const node = 'curation/copy';
+      const inherited = (await tool('agent_bindings', {node: 'curation/classify'})).body.result.bindings[0].effective;
+      assert.equal((await tool('agent_bindings', {node})).body.result.bindings[0].effective.adapter, 'claude-code');
+      const restored = await request('/api/agents/binding', {node, binding: null});
+      assert.equal(restored.status, 200);
+      assert.equal(restored.body.result.bindings[0].source, 'default');
+      assert.equal(restored.body.result.bindings[0].configured, null);
+      assert.deepEqual(restored.body.result.bindings[0].effective, inherited);
+      assert.equal((await request('/api/state')).body.agentBindings[node], undefined);
+    });
     await stop(server.child);
     server = await start(dir, true);
     ({ request, tool } = server);
@@ -195,6 +226,8 @@ test("headless service: real HTTP capability discovery, control, validation, act
       const before = (await request("/api/state")).body.seq;
       assert.equal((await tool("status")).status, 200);
       assert.equal((await tool("settings")).status, 200);
+      assert.equal((await tool('agent_bindings', {node: 'curation/copy'})).status, 200);
+      assert.equal((await request('/api/agents/binding', {node: 'curation/copy', binding: {adapter: 'pi'}})).status, 403);
       assert.equal((await tool("inspect", { station: "curation/proof" })).body.result.locked, true);
       assert.equal((await tool("workers", { station: "curation/proof", action: "unlock", reason: "must be rejected" })).status, 403);
       assert.equal((await tool("feed_urls", { urls: ["https://c.example.test"] })).status, 403);

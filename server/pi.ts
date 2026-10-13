@@ -28,12 +28,14 @@ export async function closeModelTransport() { const current = transport; transpo
 export const piDirectory = () => process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
 const json = (file: string): any => { try { return JSON.parse(fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "")); } catch { return {}; } };
 
-export function piSelection() {
+export interface PiModelSelection { provider?: string; model?: string }
+
+export function piSelection(selection?: PiModelSelection) {
   const settings = json(path.join(piDirectory(), "settings.json"));
   return {
-    provider: process.env.FACTORY_PROVIDER ?? settings.defaultProvider ?? "opencode-go",
-    id: process.env.FACTORY_MODEL ?? settings.defaultModel ?? "deepseek-v4.1-flash",
-    source: process.env.FACTORY_MODEL || process.env.FACTORY_PROVIDER ? "environment" : settings.defaultModel ? "pi" : "fallback",
+    provider: selection?.provider ?? process.env.FACTORY_PROVIDER ?? settings.defaultProvider ?? "opencode-go",
+    id: selection?.model ?? process.env.FACTORY_MODEL ?? settings.defaultModel ?? "deepseek-v4.1-flash",
+    source: selection ? 'explicit' : process.env.FACTORY_MODEL || process.env.FACTORY_PROVIDER ? "environment" : settings.defaultModel ? "pi" : "fallback",
   };
 }
 
@@ -67,8 +69,9 @@ const credentials: CredentialStore = {
   delete: async () => { throw new Error("Easy Workflow does not write Pi credentials"); },
 };
 
-export function models() {
-  const selection = piSelection();
+export function models(requested?: PiModelSelection) {
+  const selection = piSelection(requested);
+  const selected = { provider: selection.provider, model: selection.id };
   const m = createModels({ credentials });
   const builtin = opencodeGoProvider();
   m.setProvider(builtin);
@@ -120,13 +123,16 @@ export function models() {
           const e = error as {message?:string;code?:string;cause?:{code?:string;message?:string}};
           let endpoint = model.provider;
           try { endpoint = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url).host; } catch {}
-          transportDetail = redactModelError([endpoint,e.cause?.code??e.code,e.cause?.message??e.message].filter(Boolean).join(' · ')).slice(0,400);
+          transportDetail = redactModelError([endpoint,e.cause?.code??e.code,e.cause?.message??e.message].filter(Boolean).join(' · '), selected).slice(0,400);
           throw error;
         }
       };
       const response = m.streamSimple(model, context, { ...options, signal, maxRetries: 0, fetch: observedFetch });
       void response.result().then(result => {
-        if (result.stopReason === 'error' && transportDetail) result.errorMessage = `${redactModelError(result.errorMessage ?? '模型连接失败')}（模型出口：${transportDetail}）`;
+        if (result.stopReason === 'error') {
+          const message = redactModelError(result.errorMessage ?? '模型连接失败', selected);
+          result.errorMessage = transportDetail ? `${message}（模型出口：${transportDetail}）` : message;
+        }
         cleanup();
       }, cleanup);
       return response;
@@ -135,33 +141,36 @@ export function models() {
   return { models: m, model: model as Model<Api>, stream };
 }
 
-export function piStatus() {
-  const selection = piSelection();
+export function piStatus(requested?: PiModelSelection) {
+  const selection = piSelection(requested);
+  const selected = { provider: selection.provider, model: selection.id };
   try {
-    const { model } = models();
+    const { model } = models(selected);
     return { ...selection, name: model.name, ready: Boolean(credential(selection.provider)?.key), error: null };
   } catch (error) {
-    return { ...selection, name: selection.id, ready: false, error: (error as Error).message };
+    return { ...selection, name: selection.id, ready: false, error: redactModelError((error as Error).message, selected) };
   }
 }
 
 /** Provider errors may echo credentials; never forward them to conversation/SSE. */
-export function redactModelError(message: string): string {
+export function redactModelError(message: string, selection?: PiModelSelection): string {
   let secret: string | undefined;
-  try { secret = credential(piSelection().provider)?.key; } catch { /* Invalid credential configuration is itself reportable. */ }
+  try { secret = credential(piSelection(selection).provider)?.key; } catch { /* Invalid credential configuration is itself reportable. */ }
   return redactText(message, [secret, process.env.FACTORY_TOKEN]).replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [redacted]");
 }
 
 /** A bounded authenticated request: a reachable provider homepage proves no model capability. */
-export async function probeModelConnection(timeoutMs = 20000): Promise<{ ok: boolean; detail: string; fix?: string }> {
-  const status = piStatus();
+export async function probeModelConnection(timeoutMs = 20000, requested?: PiModelSelection, ownerSignal?: AbortSignal): Promise<{ ok: boolean; detail: string; fix?: string }> {
+  ownerSignal?.throwIfAborted();
+  const status = piStatus(requested);
   const label = `${status.provider}/${status.id}`;
   if (!status.ready) return { ok: false, detail: status.error ?? `${label} 没有可用凭据`, fix: "在 Pi 配置里补上 API key，或设置对应环境变量" };
   const secret = credential(status.provider)?.key;
-  const signal = AbortSignal.timeout(timeoutMs);
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = ownerSignal ? AbortSignal.any([ownerSignal, timeout]) : timeout;
   const redact = (text: string) => redactText(text, [secret]).replace(/Bearer\s+[^\s"'<>]+/gi, "Bearer [redacted]").slice(0, 400);
   try {
-    const selection = models();
+    const selection = models({ provider: status.provider, model: status.id });
     const request = await selection.stream(selection.model, normalizeContext({ messages: [{ role: "user", content: "Reply with exactly OK. No explanation.", timestamp: Date.now() }] }), { signal, maxTokens: 1024, reasoning: 'minimal', sessionId: `easy-workflow-preflight-${Date.now()}` });
     const result = await request.result();
     if (signal.aborted) throw new Error(`模型请求超时（${timeoutMs}ms）`);
@@ -170,11 +179,12 @@ export async function probeModelConnection(timeoutMs = 20000): Promise<{ ok: boo
     if (result.stopReason === 'length' || !/^OK[.!。！]?$/i.test(answer)) throw new Error('模型未完成体检回答（空答、截断或未遵循指令）；不能据此恢复批量任务');
     return { ok: true, detail: `${label} · 已收到完整体检回答；批量恢复仍需真实工位验证` };
   } catch (error) {
+    if (ownerSignal?.aborted) throw ownerSignal.reason;
     const message = signal.aborted ? `模型请求超时（${timeoutMs}ms）` : redact(String((error as Error)?.message ?? error));
     const failure = classifyFailure(new Error(message), { stage: "model" });
     return { ok: false, detail: `${label} · ${message}`, fix: failure.nextAction };
   }
 }
 
-export const apiKeyPresent = () => piStatus().ready;
+export const apiKeyPresent = (selection?: PiModelSelection) => piStatus(selection).ready;
 export const MODEL_ID = piSelection().id;

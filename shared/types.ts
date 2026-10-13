@@ -219,9 +219,15 @@ export interface OperationReceipt {
   reason?: 'interrupted' | 'execution_failed' | 'receipt_failed';
 }
 
+/** Host-selected executor settings. Credentials remain in the vendor profile. */
+export type StationAgentBinding =
+  | {adapter: 'pi'; provider?: string; model?: string}
+  | {adapter: 'claude-code' | 'launcher'; command: string[]; model: string; requestTimeoutMs?: number};
+
 export type JournalEvent =
   | import("./lessons.ts").LessonEvent
   | { kind: "factory.loaded"; digest: string; specVersion: string }
+  | { kind: 'agent.binding'; node: string; binding: StationAgentBinding | null }
   | { kind: "run.started"; runId: string; title: string }
   | { kind: "run.paused"; runId: string }
   | { kind: "run.resumed"; runId: string }

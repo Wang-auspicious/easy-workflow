@@ -1,6 +1,66 @@
 import { batchSummary, type BatchRecovery } from '../../../shared/batch.ts';
 import { latestRunTokens, type AttemptState, type FactoryState, type Light, type TokenState } from '../../../shared/project.ts';
-import type { CompiledNode } from '../../../shared/types.ts';
+import type { CompiledNode, StationAgentBinding } from '../../../shared/types.ts';
+
+export interface NodeExecution {
+  readonly adapter: string;
+  readonly model: string;
+  readonly at: number;
+}
+
+export function recordNodeExecution(index: Record<string, NodeExecution>, attempt: AttemptState | undefined) {
+  const execution = attempt?.metrics?.execution;
+  if (attempt && execution && attempt.startedAt >= (index[attempt.node]?.at ?? 0)) {
+    index[attempt.node] = {...execution, at: attempt.startedAt};
+  }
+}
+
+export function executionIndex(state: FactoryState) {
+  const index: Record<string, NodeExecution> = {};
+  for (const attempt of Object.values(state.attempts)) {
+    recordNodeExecution(index, attempt);
+  }
+  return index;
+}
+
+const adapterNames: Record<string, string> = {
+  pi: 'Pi',
+  'claude-code': 'Claude Code',
+  launcher: 'launcher',
+  'closed-command': 'launcher',
+};
+
+export function nodeExecutionPresentation(
+  node: Pick<CompiledNode, 'kind'>,
+  actual: NodeExecution | undefined,
+  metadata: {effective: StationAgentBinding | null; error?: string} | undefined,
+  replay = false,
+) {
+  if (node.kind === 'source' || node.kind === 'store') {
+    return {label: node.kind === 'store' ? '资源库' : '来源', usesModel: false};
+  }
+  const usesModel = Boolean(metadata) || node.kind === 'agent' || node.kind === 'review';
+  if (!usesModel) {
+    return {label: node.kind === 'gate' ? '规则门禁 · 程序' : '程序执行', usesModel: false};
+  }
+  if (actual) {
+    const adapter = adapterNames[actual.adapter] ?? actual.adapter;
+    const model = actual.model === 'unreported' ? '模型未回报' : actual.model;
+    return {label: `${adapter} · ${model}（实际）`, usesModel};
+  }
+  if (replay) {
+    return {label: 'Agent · 历史执行模型未记录', usesModel};
+  }
+  if (metadata?.error) {
+    return {label: 'Agent · 配置错误', usesModel};
+  }
+  const binding = metadata?.effective;
+  const adapter = binding ? adapterNames[binding.adapter] ?? binding.adapter : '';
+  return {
+    label: binding ? `${adapter} · ${binding.model || '默认模型'}（配置）` : 'Agent · 配置待同步',
+    usesModel,
+  };
+}
 
 export interface StatusPresentation { label: string; detail: string; light: Light; pulse?: boolean }
 type NodeIdentity = Pick<CompiledNode, 'key' | 'line' | 'kind' | 'resource'>;

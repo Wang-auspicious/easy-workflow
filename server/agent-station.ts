@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import { Type, type TSchema } from "typebox";
 import { Check, Errors } from 'typebox/value';
-import type { AttemptMetrics, Usage } from "../shared/types.ts";
+import type { AttemptMetrics, StationAgentBinding, Usage } from "../shared/types.ts";
 import type { Docs } from "./docs.ts";
 import { BASE_TOOLS, type Toolbox } from "./toolbox.ts";
 import type { StationContext, StationResult } from "./runtime.ts";
@@ -35,6 +35,8 @@ export async function promptAgent(agent: Pick<Agent, "prompt" | "abort"> | Close
 export interface AgentInput { text: string; images?: { file: string; label: string }[] }
 
 export interface AgentStationDef<T = any> {
+  /** Captured per attempt; omitted bindings retain the existing process defaults. */
+  agent?: StationAgentBinding;
   role?: ReturnType<typeof readRole>;
   system: string;
   schema: TSchema;
@@ -96,7 +98,8 @@ function throwStationAbort(signal: AbortSignal, partial: StationResult): never {
 
 /** Recover a Pi model turn in its existing transcript; completed tools are never replayed. */
 export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationContext): Promise<StationResult> {
-  return withEvidenceReads(() => executeAgentStation(def, ctx));
+  const definition = { ...def, agent: def.agent && structuredClone(def.agent) };
+  return withEvidenceReads(() => executeAgentStation(definition, ctx));
 }
 
 async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationContext): Promise<StationResult> {
@@ -138,8 +141,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   };
   const projectDirectory = path.resolve(docs?.dir ?? process.env.FACTORY_VAR ?? process.cwd());
   const workDirectory = path.join(projectDirectory, 'work');
-  const external = closedAgentConfig(path.join(workDirectory, ctx.token.id.replace(/[^a-zA-Z0-9_-]/g, '_')), { projectDirectory, workDirectory });
-  const selection = external ? null : models();
+  const external = closedAgentConfig(path.join(workDirectory, ctx.token.id.replace(/[^a-zA-Z0-9_-]/g, '_')), { projectDirectory, workDirectory }, def.agent);
+  const selection = external ? null : models(def.agent?.adapter === 'pi' ? def.agent : undefined);
+  const selectedPi = selection ? { provider: selection.model.provider, model: selection.model.id } : undefined;
   const activity = new StationActivity(ctx.activity);
   let modelId = external?.model ?? selection!.model.id;
   let usageReported = false;
@@ -234,9 +238,14 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   const sessionRoot = docs?.dir;
   const sessions = (ctx.token.data?.stationSessions ?? {}) as Record<string, SessionRef>;
   const closedSessions = (ctx.token.data?.closedStationSessions ?? {}) as Record<string, unknown>;
-  const signature = sessionSignature({
+  const sessionIdentity = {
     node: ctx.node.key, model: modelId, role: role.revision, contract: def.system,
     schema: def.schema, input: input.text + redo, images: input.images,
+  };
+  const signature = sessionSignature({
+    ...sessionIdentity,
+    execution: { adapter: external?.adapter ?? (external ? 'launcher' : 'pi'), provider: selectedPi?.provider,
+      ...(external ? { command: sessionSignature(external.command) } : {}) },
     ...(external ? { policy: 'sessionPolicy' in env ? env.sessionPolicy : env.text, tools: [...allowed].sort() } : {}),
   });
   if (agent instanceof ClosedStationAgent) {
@@ -264,7 +273,18 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     if (!['user', 'toolResult'].includes(messages.at(-1)?.role ?? '')) return;
     return { pi: saveStationSession(sessionRoot, signature, { messages, evidence: readEvidence(), calls: envCalls }) };
   };
-  const saved = sessionRoot && agent instanceof Agent ? loadStationSession(sessionRoot, sessions[ctx.node.key], signature) : undefined;
+  let saved = sessionRoot && agent instanceof Agent ? loadStationSession(sessionRoot, sessions[ctx.node.key], signature) : undefined;
+  if (!saved && sessionRoot && agent instanceof Agent && selectedPi) {
+    const legacy = loadStationSession(sessionRoot, sessions[ctx.node.key], sessionSignature(sessionIdentity));
+    const assistants = legacy?.messages.filter((message): message is Record<string, unknown> =>
+      !!message && typeof message === 'object' && (message as { role?: unknown }).role === 'assistant') ?? [];
+    // Older checkpoints did not hash the provider. Only the actual SDK receipt
+    // may prove its identity; current environment defaults are not evidence.
+    if (assistants.length && assistants.every(message => message.provider === selectedPi.provider && message.model === selectedPi.model)) {
+      saved = legacy;
+      ctx.progress('已核对旧 Pi 回执的 provider/model，保留已付费工具上下文并迁移会话签名', { tool: 'recover', text: '' });
+    }
+  }
   if (saved && agent instanceof Agent) {
     agent.state.messages = saved.messages as typeof agent.state.messages;
     envCalls = saved.calls;
@@ -272,7 +292,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     ctx.progress('恢复本工位已经完成的工具读取与对话，从中断的模型请求继续', {tool:'recover',text:'不重复打开页面或重做已完成的工具调用'});
   }
   const metrics = (): AttemptMetrics => ({
-    usageReported, modelTimeReported: modelTimeReported && (!external || externalReplies === promptCalls), execution: { adapter: external ? external.adapter === 'claude-code' ? 'claude-code' : "closed-command" : "pi", model: external && !externalReplies ? "unreported" : modelId },
+    usageReported, modelTimeReported: modelTimeReported && (!external || externalReplies === promptCalls), execution: { adapter: external ? external.adapter === 'claude-code' ? 'claude-code' : "closed-command" : "pi", model: (external ? externalReplies : usageResponses) ? modelId : 'unreported' },
     usageComplete: usageReported && !usageMissing && usageResponses === (external ? promptCalls : activity.count("model_request")),
     cacheUsageComplete: usageReported && !usageMissing && !cacheUsageMissing && usageResponses === (external ? promptCalls : activity.count("model_request")),
     activity: activity.snapshot(),
@@ -286,7 +306,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
       toolMs: activity.duration("tool"), programMs: 0, modelCalls: external ? modelCalls : activity.count("model_request"), toolCalls: activity.count("tool") },
   });
   let continued = false;
-  const modelError = () => requestTimedOut ? `模型单次请求超时（${requestTimeoutMs}ms）${continued ? "；本工位的原地续答次数已用完" : ""}` : agent.state.errorMessage && redactModelError(agent.state.errorMessage);
+  const modelError = () => requestTimedOut ? `模型单次请求超时（${requestTimeoutMs}ms）${continued ? "；本工位的原地续答次数已用完" : ""}` : agent.state.errorMessage && redactModelError(agent.state.errorMessage, selectedPi);
   const modelFailure = (error: string, summary: string): StationResult => {
     let data: Record<string, unknown> | undefined = closedCheckpoint();
     const checkpoint = sessionCheckpoint();

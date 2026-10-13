@@ -25,6 +25,56 @@ try {
   await page.addInitScript(() => { localStorage.setItem('pf.view', JSON.stringify('library')); localStorage.setItem('pf.chatOpen', 'false'); });
   await page.goto(app.url);
   await page.locator('.rail-conn.is-on').waitFor();
+  if (!sourcesOnly) {
+    const original = (await app.request('/api/tools/agent_bindings', {})).result.bindings;
+    await page.locator('[data-tip^="画布 · 流水线"]').click();
+    await page.evaluate(async () => {
+      const store = await import('/src/store.ts');
+      store.setState(state => ({layout: {...state.layout, open: {...state.layout.open, curation: true}}}));
+      (await import('/src/canvas/Canvas.tsx')).toggleInspector('curation/reader', 'node');
+    });
+    const inspector = page.locator('[data-inspector="curation/reader"]');
+    await inspector.getByRole('button', {name: '规格', exact: true}).click();
+    const settings = inspector.getByRole('region', {name: '工位 Agent 配置'});
+    await settings.getByLabel('执行适配器').waitFor();
+    assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'inherit');
+    await settings.getByLabel('执行适配器').selectOption('launcher');
+    await settings.getByLabel('Agent 请求模型').fill('isolated-requested-model');
+    const oversizedCommand = JSON.stringify(Array(33).fill('argument'));
+    await settings.getByLabel('Agent 启动命令').fill(oversizedCommand);
+    await settings.getByRole('button', {name: '保存配置'}).click();
+    await settings.getByRole('alert').waitFor();
+    assert.equal(await settings.getByLabel('Agent 启动命令').inputValue(), oversizedCommand, 'server rejection preserves the actual edited command');
+    assert.equal((await app.request('/api/state')).agentBindings['curation/reader'], undefined);
+    await settings.getByLabel('Agent 启动命令').fill('["node","fixture-launcher.mjs"]');
+    const saved = page.waitForResponse(response => response.url().endsWith('/api/agents/binding') && response.request().method() === 'POST');
+    await settings.getByRole('button', {name: '保存配置'}).click();
+    const receipt = await (await saved).json();
+    assert.equal(receipt.ok, true, JSON.stringify(receipt));
+    const expected = {adapter: 'launcher', command: ['node', 'fixture-launcher.mjs'], model: 'isolated-requested-model'};
+    assert.deepEqual((await app.request('/api/state')).agentBindings['curation/reader'], expected);
+    await page.locator('[data-node="curation/reader"] .node-type').filter({hasText: 'launcher · isolated-requested-model（配置）'}).waitFor();
+    await inspector.locator('.spec-view').evaluate(element => { element.scrollTop = 0; });
+    await page.screenshot({path: path.join(out, 'agent-binding-live.png')});
+    await page.reload();
+    await page.locator('.rail-conn.is-on').waitFor();
+    await page.locator('[data-tip^="画布 · 流水线"]').click();
+    await page.evaluate(async () => (await import('/src/canvas/Canvas.tsx')).toggleInspector('curation/reader', 'node'));
+    await inspector.getByRole('button', {name: '规格', exact: true}).click();
+    await settings.getByLabel('Agent 请求模型').waitFor();
+    assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'launcher');
+    assert.equal(await settings.getByLabel('Agent 请求模型').inputValue(), expected.model);
+    assert.equal(await settings.getByLabel('Agent 请求超时').inputValue(), '', 'effective timeout defaults do not overwrite the configured form');
+    await settings.getByRole('button', {name: '恢复继承'}).click();
+    await page.waitForFunction(async () => !(await (await fetch('/api/state')).json()).agentBindings['curation/reader']);
+    await page.waitForFunction(async () => (await import('/src/store.ts')).getState().agentBindings['curation/reader']?.configured === null);
+    assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'inherit');
+    assert.deepEqual((await app.request('/api/tools/agent_bindings', {})).result.bindings, original, 'the entire Agent binding view returns to the original values');
+    assert.equal(Object.keys((await app.request('/api/state')).attempts).length, 0, 'editing a binding never starts a model call');
+    await page.evaluate(async () => (await import('/src/store.ts')).setState({inspectors: []}));
+    await page.locator('[data-tip="流水线库"]').click();
+    checks.push('real node binding form preserves rejected drafts, persists launcher settings across reload, updates canvas labels immediately and restores inheritance without changing other stations');
+  }
   await page.locator('[data-workflow-template="fanout"]').getByRole('button', { name: '创建工作流' }).click();
   await page.getByLabel('工作流名称').fill('浏览器验收文本分析');
   const created = page.waitForResponse(response => response.url().endsWith('/api/workflows/template') && response.request().method() === 'POST');
@@ -38,6 +88,14 @@ try {
   checks.push('user template creation installs a real compiled pack without duplicating line cards');
 
   if (!sourcesOnly) {
+  await page.locator('[data-tip^="画布 · 流水线"]').click();
+  await page.evaluate(async node => (await import('/src/canvas/Canvas.tsx')).toggleInspector(node, 'node'), pack.entry);
+  const programInspector = page.locator(`[data-inspector="${pack.entry}"]`);
+  await programInspector.getByRole('button', {name: '规格', exact: true}).click();
+  await programInspector.getByText('程序执行，不使用 Agent 模型。').waitFor();
+  assert.equal(await programInspector.getByLabel('执行适配器').count(), 0);
+  await page.evaluate(async () => (await import('/src/store.ts')).setState({inspectors: []}));
+  await page.locator('[data-tip="流水线库"]').click();
   const line = page.locator(`[data-workflow-line="${pack.lines[0].id}"]`);
   await line.getByRole('button', { name: '暂停此线' }).click();
   await line.getByRole('button', { name: '恢复此线' }).waitFor();

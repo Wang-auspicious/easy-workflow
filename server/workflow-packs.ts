@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { Check, Errors } from 'typebox/value';
 import type { TSchema } from 'typebox';
-import type { CompiledNode, EdgeSpec, LineSpec, PackSpec } from '../shared/types.ts';
+import type { CompiledNode, EdgeSpec, LineSpec, PackSpec, StationAgentBinding } from '../shared/types.ts';
 import type { AgentStationDef } from './agent-station.ts';
 import type { Executor, StationContext, StationResult } from './runtime.ts';
 import type { Pack } from './spec/dsl.ts';
@@ -12,6 +12,7 @@ import { compile, type Patch } from './spec/compile.ts';
 import { ControlError } from './errors.ts';
 import { invokeWorkflowTool, type WorkflowTool } from './workflow-tools.ts';
 import type { Journal } from './journal.ts';
+import {parseAgentBinding} from './agent-bindings.ts';
 export type { WorkflowTool } from './workflow-tools.ts';
 
 export type JsonSchema = Record<string, unknown>;
@@ -20,7 +21,7 @@ export type WorkflowInput = { path: string; default?: unknown } | { value: unkno
 export interface WorkflowCondition { path: string; op: 'equals' | 'in' | 'exists' | 'truthy'; value?: unknown }
 export type WorkflowExecution =
   | { kind: 'builtin'; name: 'normalize-text' | 'text-statistics' | 'keywords' | 'aggregate' | 'page-text' | 'prepare-source' | 'route' | 'publish-json' }
-  | { kind: 'agent'; instructions: string; tools?: string[]; timeoutMs?: number }
+  | { kind: 'agent'; instructions: string; tools?: string[]; timeoutMs?: number; agent?: StationAgentBinding }
   | { kind: 'node'; module: string; export?: string }
   | { kind: 'tool'; tool: string };
 export interface WorkflowBinding {
@@ -133,6 +134,19 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
   const roles = new Map<string, WorkflowRole>(), contracts: NonNullable<Pack['contracts']> = {};
   for (const [key, binding] of Object.entries(manifest.bindings)) {
     if (!keys.has(key) || !record(binding) || !record(binding.input) || typeof binding.outputKey !== 'string' || !safeKey(binding.outputKey) || !record(binding.execute)) bad(`工位绑定 ${key} 无效`);
+    if (binding.execute.kind !== 'agent' && 'agent' in binding.execute) {
+      bad(`${key} 是程序执行器，不能声明工位 Agent 配置`);
+    }
+    if (binding.execute.kind === 'agent') {
+      if (typeof binding.execute.instructions !== 'string' || binding.execute.instructions.trim().length < 20) bad(`${key} 的 Agent 必须有具体任务指令`);
+      if (binding.execute.agent !== undefined) {
+        try {
+          binding.execute.agent = parseAgentBinding(binding.execute.agent);
+        } catch (error) {
+          bad(`${key} 的 Agent 配置无效：${error instanceof Error ? error.message : '参数不符合契约'}`);
+        }
+      }
+    }
     if (!manifest.schemas[binding.inputSchema] || !manifest.schemas[binding.outputSchema]) bad(`${key} 缺少输入或输出 schema`);
     for (const [field, selector] of Object.entries(binding.input)) {
       if (!safeKey(field) || !record(selector) || (!('value' in selector) && (!('path' in selector) || typeof selector.path !== 'string'))) bad(`${key} 的输入映射无效`);
@@ -150,9 +164,7 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
         if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || tool.method && !['GET', 'POST'].includes(tool.method)) bad(`${key} 的 HTTP 工具必须声明无内嵌凭据的 HTTP(S) 地址和 GET/POST 方法`);
       } else if (typeof tool.command !== 'string' || !tool.command.trim() || tool.args && (!Array.isArray(tool.args) || tool.args.some(arg => typeof arg !== 'string')) || tool.kind === 'mcp' && !tool.tool) bad(`${key} 的进程工具命令、参数或 MCP 工具名无效`);
       code += JSON.stringify(tool);
-    } else if (binding.execute.kind === 'agent') {
-      if (binding.execute.instructions.trim().length < 20) bad(`${key} 的 Agent 必须有具体任务指令`);
-    } else if (binding.execute.kind !== 'builtin' || !['normalize-text', 'text-statistics', 'keywords', 'aggregate', 'page-text', 'prepare-source', 'route', 'publish-json'].includes(binding.execute.name)) bad(`${key} 没有已实现的执行器`);
+    } else if (binding.execute.kind !== 'agent' && (binding.execute.kind !== 'builtin' || !['normalize-text', 'text-statistics', 'keywords', 'aggregate', 'page-text', 'prepare-source', 'route', 'publish-json'].includes(binding.execute.name))) bad(`${key} 没有已实现的执行器`);
     const revision = digest(content + code + JSON.stringify([binding, manifest.schemas[binding.inputSchema], manifest.schemas[binding.outputSchema]])).slice(0, 16);
     roles.set(key, { station: key, path: path.relative(projectDir, contained(directory, binding.role)).split(path.sep).join('/'), revision, content });
     contracts[key] = { role: binding.role, inputSchema: binding.inputSchema, outputSchema: binding.outputSchema, executor: binding.execute.kind, revision, outputKey: binding.outputKey };
@@ -211,7 +223,7 @@ export async function loadWorkflowPacks(projectDir: string, options: { builtins?
           return result;
         };
         if (binding.execute.kind === 'agent') {
-          const def: AgentStationDef & { role: WorkflowRole } = { role, system: `${role.content}\n\n${binding.execute.instructions}`, schema: manifest.schemas[binding.outputSchema] as TSchema, tools: binding.execute.tools ?? [], timeoutMs: binding.execute.timeoutMs, input: () => ({ text: JSON.stringify(input) }), after: output => finish(output), check: output => [
+          const def: AgentStationDef & { role: WorkflowRole } = { role, agent: binding.execute.agent, system: `${role.content}\n\n${binding.execute.instructions}`, schema: manifest.schemas[binding.outputSchema] as TSchema, tools: binding.execute.tools ?? [], timeoutMs: binding.execute.timeoutMs, input: () => ({ text: JSON.stringify(input) }), after: output => finish(output), check: output => [
             ...(binding.reviewTarget && output.verdict === 'pass' && output.issues?.length ? ['通过审查时 issues 必须为空；否则退回并说明原因'] : []),
             ...Object.entries(binding.preserveInput ?? {}).filter(([field, source]) => JSON.stringify(workflowValue(output, field)) !== JSON.stringify(workflowValue(input, source))).map(([, source]) => `必须原样保留输入字段 ${source}，不能补造内容`),
           ] };

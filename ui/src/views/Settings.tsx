@@ -26,10 +26,11 @@ export function Settings() {
       <div className="view-inner narrow">
         <div className="view-head"><div><h1 className="view-title">设置</h1><div className="view-sub">配额对所有流水线一起生效：线再多，浏览器页面总数也不会超过这里的上限。</div></div></div>
         <section className="set-sec">
-          <h3>模型</h3>
+          <h3>Pi 默认与主调度</h3>
           <div className="set-row"><span>底座</span><b>pi agent（@earendil-works/pi-agent-core 1.1.0）</b></div>
-          <div className="set-row"><span>模型</span><b className="mono">opencode-go / {model}</b></div>
-          <div className="set-row"><span>密钥</span><b className={key ? "ok-c" : "bad-c"}>{key ? "已找到（只在本机环境里，不写日志）" : "未找到：设置 OPENCODE_API_KEY"}</b></div>
+          <div className="set-row"><span>默认模型</span><b className="mono">{model || '未配置'}</b></div>
+          <div className="set-row"><span>Pi 凭据</span><b className={key ? "ok-c" : "bad-c"}>{key ? "已找到本机凭据，不写入日志" : "未找到，请检查 Pi 默认 provider 的本机凭据"}</b></div>
+          <p className="muted">Agent 工位可在节点的“规格”中单独选择 Pi、Claude Code 或 launcher。各工位按所选适配器检查就绪状态；此处仅显示 Pi 默认信息。</p>
         </section>
         <section className="set-sec">
           <h3>资源配额</h3>

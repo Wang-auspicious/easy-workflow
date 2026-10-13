@@ -4,14 +4,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { CompiledFactory, CompiledNode, Stamped } from "../shared/types.ts";
+import type { CompiledFactory, CompiledNode, Stamped, StationAgentBinding } from "../shared/types.ts";
 import { apply, initialState, latestRunTokens, tokenWorkKey, type FactoryState } from "../shared/project.ts";
 import { compile, type Patch } from "./spec/compile.ts";
 import { Journal } from "./journal.ts";
 import { Broker } from "./broker.ts";
 import { EvidenceStore } from "./evidence.ts";
 import { Runtime, type Executor, type TokenRun } from "./runtime.ts";
-import { runAgentStation } from "./agent-station.ts";
+import { runAgentStation, type AgentStationDef } from "./agent-station.ts";
 import { pack } from "../packs/vislexicon/pack.ts";
 import { TOOLS, canonical, type Services } from "../packs/vislexicon/tools.ts";
 import { agentDefs, warmStyleLib } from "../packs/vislexicon/agents.ts";
@@ -34,6 +34,9 @@ import { loadWorkflowPacks, type LoadedWorkflowPacks } from './workflow-packs.ts
 import { flushAtlas } from '../packs/vislexicon/components.ts';
 import { ChannelSupervisor } from './channels.ts';
 import { SourceSupervisor } from './sources.ts';
+import {agentCapabilities, parseAgentBinding} from './agent-bindings.ts';
+import {closedAgentConfig} from './mcp-station.ts';
+import {piSelection} from './pi.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -62,6 +65,7 @@ export class Factory {
   channels?: ChannelSupervisor;
   sources!: SourceSupervisor;
   private services!: Services;
+  private stationAgents: Record<string, AgentStationDef> = {};
 
   constructor() {
     const readOnly = process.env.FACTORY_READONLY === "1";
@@ -101,12 +105,13 @@ export class Factory {
     };
     this.services = services;
     const defs = agentDefs(this.store, services);
+    this.stationAgents = defs;
     const executors = (n: CompiledNode): Executor | null => {
       const installed = this.workflowPacks?.executor(n);
       if (installed) return installed;
       if (n.tool && TOOLS[n.tool]) return (ctx) => TOOLS[n.tool!](ctx, services);
       const def = defs[n.key];
-      return def ? (ctx) => runAgentStation(def, ctx) : null;
+      return def ? (ctx) => runAgentStation(this.bindAgent(n.key, def), ctx) : null;
     };
     this.runtime = new Runtime(this.compiled, this.journal, this.broker, this.workflowPacks.conditions, executors);
     this.runtime.roleResolver = key => this.workflowPacks?.role(key) ?? readRole(key);
@@ -172,7 +177,7 @@ export class Factory {
   private loadWorkflowPacks() {
     return loadWorkflowPacks(VAR, { builtins: [pack], services: {
       journal: this.journal,
-      runAgent: (definition, context) => runAgentStation(definition, context),
+      runAgent: (definition, context) => runAgentStation(this.bindAgent(context.node.key, definition), context),
       callCapability: (name, args, context) => this.toolbox.call([name], name, args, { node: context.node.key, token: context.token.id, caseId: context.token.item, signal: context.signal, progress: context.progress }),
     } });
   }
@@ -194,6 +199,85 @@ export class Factory {
     this.journal.append({ kind: 'factory.loaded', digest: compiled.digest, specVersion: compiled.specVersion });
     this.lastPreflight = 0;
     return { digest: compiled.digest, packs: loaded.manifests, lines: compiled.lines };
+  }
+
+  private bindAgent(node: string, definition: AgentStationDef): AgentStationDef {
+    const binding = this.state.agentBindings?.[node] ?? definition.agent;
+    return binding ? {...definition, agent: parseAgentBinding(binding)} : definition;
+  }
+
+  private agentDefault(node: string): {binding?: StationAgentBinding} | undefined {
+    const installed = this.workflowPacks?.manifests.find(manifest => manifest.bindings[node]);
+    const execution = installed?.bindings[node].execute;
+    if (execution) return execution.kind === 'agent' ? {binding: execution.agent} : undefined;
+    const definition = this.stationAgents[node];
+    return definition ? {binding: definition.agent} : undefined;
+  }
+
+  private defaultAgentBinding(): StationAgentBinding {
+    const workDirectory = path.join(VAR, 'work');
+    const external = closedAgentConfig(path.join(workDirectory, 'binding-preview'), {
+      projectDirectory: VAR, workDirectory,
+    });
+    if (external) return parseAgentBinding({
+      adapter: external.adapter ?? 'launcher', command: external.command, model: external.model,
+      requestTimeoutMs: external.requestTimeoutMs,
+    });
+    const selection = piSelection();
+    return {adapter: 'pi', provider: selection.provider, model: selection.id};
+  }
+
+  agentBindings(node?: string) {
+    if (node && !this.runtime.nodes.has(node)) {
+      throw new ControlError(404, 'node_not_found', '工位不存在');
+    }
+    const bindings = [];
+    const latestModels = new Map<string, {at: number; model: string}>();
+    for (const attempt of Object.values(this.state.attempts)) {
+      const execution = attempt.metrics?.execution;
+      if (execution && (!node || attempt.node === node) &&
+          attempt.startedAt >= (latestModels.get(attempt.node)?.at ?? 0)) {
+        latestModels.set(attempt.node, {at: attempt.startedAt, model: execution.model});
+      }
+    }
+    for (const current of this.compiled.nodes) {
+      if (node && current.key !== node) continue;
+      const declared = this.agentDefault(current.key);
+      if (!declared) continue;
+      const configured = this.state.agentBindings?.[current.key] ?? null;
+      const source = configured ? 'project' as const : declared.binding ? 'workflow' as const : 'default' as const;
+      let effective: StationAgentBinding | null = null;
+      let error: string | undefined;
+      try {
+        const requested = parseAgentBinding(configured ?? declared.binding ?? this.defaultAgentBinding());
+        if (requested.adapter === 'pi') {
+          const selection = piSelection(requested);
+          effective = {adapter: 'pi', provider: selection.provider, model: selection.id};
+        } else {
+          effective = {...requested, requestTimeoutMs: requested.requestTimeoutMs ?? 180000};
+        }
+      } catch (reason) {
+        error = reason instanceof Error ? reason.message : 'Agent 配置无效';
+      }
+      bindings.push({
+        node: current.key, configured, effective, source, error,
+        capabilities: effective ? agentCapabilities(effective) : {stream: false, cancel: false, resume: false, usage: 'unknown' as const},
+        lastModel: latestModels.get(current.key)?.model,
+      });
+    }
+    return {bindings};
+  }
+
+  setAgentBinding(node: string, input: unknown) {
+    if (process.env.FACTORY_READONLY === '1') throw new ControlError(403, 'read_only', '只读项目不能配置工位 Agent');
+    if (!this.runtime.nodes.has(node)) throw new ControlError(404, 'node_not_found', '工位不存在');
+    if (!this.agentDefault(node)) throw new ControlError(422, 'not_agent_station', '这个工位使用程序执行器，不支持 Agent 绑定');
+    const binding = input === null ? null : parseAgentBinding(input);
+    if (JSON.stringify(binding) !== JSON.stringify(this.state.agentBindings?.[node] ?? null)) {
+      this.journal.append({kind: 'agent.binding', node, binding});
+      this.lastPreflight = 0;
+    }
+    return this.agentBindings(node);
   }
 
   private maintainRuntime() {
@@ -406,16 +490,35 @@ export class Factory {
   }
 
   private lastPreflight = 0;
+  private lastPreflightSignature = '';
   /** Runs the health check before a run starts or resumes; throws with the failed items. */
   async ensureReady(force = false) {
     if (process.env.FACTORY_PREFLIGHT === "0" || process.env.FACTORY_READONLY === "1") return null;
-    if (!force && this.state.preflight?.ok && Date.now() - this.lastPreflight < 10 * 60_000) return this.state.preflight;
-    const runnable = this.compiled.nodes.filter(node => this.runtime.runnable(node));
+    const runnable = this.compiled.nodes.filter(node => this.runtime.runnable(node) && !this.runtime.scopePaused(node.key));
     const executions = (this.workflowPacks?.manifests ?? []).flatMap(manifest => Object.entries(manifest.bindings).filter(([key]) => runnable.some(node => node.key === key)).map(([, binding]) => binding.execute));
     const browser = runnable.some(node => node.resource === 'browser') || executions.some(execution => execution.kind === 'builtin' && execution.name === 'page-text' || execution.kind === 'agent' && execution.tools?.some(name => ['page_text', 'page_find'].includes(name)));
     const model = runnable.some(node => node.resource === 'model' || node.kind === 'agent' || node.kind === 'review') || executions.some(execution => execution.kind === 'agent');
     const network = browser || model || runnable.some(node => node.resource === 'http');
-    const r = await preflight(VAR, this.broker, { network, model, browser });
+    const entries = this.agentBindings().bindings.filter(entry => runnable.some(node => node.key === entry.node));
+    const invalid = entries.find(entry => !entry.effective);
+    if (invalid) throw new ControlError(412, 'invalid_agent_binding', `${invalid.node}：${invalid.error}`);
+    const selected = entries.flatMap(entry => entry.effective ? [entry.effective] : []);
+    // Built-in browser selectors call pickByImages directly and still use Pi.
+    // A pure installed Claude workflow must not be blocked by an unused Pi key.
+    if (runnable.some(node => node.tool && ['curation.breadth', 'curation.proof'].includes(node.tool))) {
+      const selection = piSelection();
+      selected.push({adapter: 'pi', provider: selection.provider, model: selection.id});
+    }
+    const agents = [...new Map(selected.map(binding => [JSON.stringify(binding), binding])).values()];
+    const signature = JSON.stringify({nodes: runnable.map(node => node.key), agents});
+    if (!force && this.state.preflight?.ok && signature === this.lastPreflightSignature &&
+        Date.now() - this.lastPreflight < 10 * 60_000) return this.state.preflight;
+    const configuration = JSON.stringify([this.state.agentBindings, this.state.pausedScopes, this.compiled.digest]);
+    const r = await preflight(VAR, this.broker, {network, model, browser, agents});
+    if (configuration !== JSON.stringify([this.state.agentBindings, this.state.pausedScopes, this.compiled.digest])) {
+      throw new ControlError(409, 'agent_configuration_changed', '体检期间工位配置或暂停范围已变化，请按当前配置重新体检');
+    }
+    this.lastPreflightSignature = signature;
     this.lastPreflight = Date.now();
     this.journal.append({ kind: "preflight.checked", ok: r.ok, checks: r.checks });
     if (!r.ok) {

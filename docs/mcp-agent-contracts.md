@@ -17,7 +17,25 @@ MCP 配置中的 `command` 指向 Node 24+，`args` 指向 Easy Workflow 仓库�
 
 ## 闭源工位 Agent
 
-工位入口与控制面分开。`runAgentStation` 在配置了 `FACTORY_STATION_COMMAND` 时使用外部 launcher，未配置时继续使用 Pi。该变量必须是 JSON argv 数组，例如一个 Node 可执行文件和一个本地 launcher 文件；不拼 shell 命令。`FACTORY_STATION_MODEL` 指定请求的模型，launcher 的回复必须写实际使用的模型。
+工位入口与控制面分开。用户可在节点检查器的“规格 → 工位 Agent”中，为实际 Agent 工位选择继承默认、Pi、Claude Code 或自定义 launcher。程序工位不显示 Agent 配置；其执行方式仍是程序。界面同时显示生效来源、请求模型、最近回报模型和适配器能力，未回报用量不补成零。
+
+配置优先级是项目中的节点覆盖、工作流包的 `execute.agent`、应用默认。项目覆盖由用户路由 `POST /api/agents/binding` 保存，参数为 `{node, binding}`；`binding:null` 恢复继承。变更写入项目 journal 并在重启后恢复，不修改其他节点和全局环境变量。仅下一次 attempt 使用新配置，已开始的尝试保持原配置；执行适配器、命令或模型变更不会复用旧签名的会话。只读能力 `agent_bindings({node?})` 返回配置、生效值、来源及真实能力；程序节点的查询结果为 `bindings:[]`。
+
+Pi 配置格式为 `{adapter:"pi", provider?:string, model?:string}`，省略字段使用应用默认。外部配置为 `{adapter:"claude-code"|"launcher", command:string[], model:string, requestTimeoutMs?:number}`；启动命令必须是 JSON argv 数组，不能传 shell 命令字符串，超时为 1–900000 毫秒。角色、工具范围、结构化提交、修复与程序校验对所有适配器继续有效。凭据沿各客户端已有认证方式使用，不通过节点配置写入。
+
+工作流包可在真正的 Agent 执行器中声明同样的默认值，例如：
+
+```json
+{
+  "execute": {
+    "kind": "agent",
+    "instructions": "按本站职责处理给定输入，并通过 submit 提交符合输出契约的结果。",
+    "agent": {"adapter": "claude-code", "command": ["claude"], "model": "haiku"}
+  }
+}
+```
+
+安装时校验适配器字段，非法配置在替换安装清单前被拒绝；省略 `agent` 保持原有默认。程序执行器不能附加此配置。应用默认继续兼容环境变量：配置了 `FACTORY_STATION_COMMAND` 时使用外部 launcher，未配置时使用 Pi。该变量必须是 JSON argv 数组，例如一个 Node 可执行文件和一个本地 launcher 文件；不拼 shell 命令。`FACTORY_STATION_MODEL` 指定请求的模型，launcher 的回复必须写实际使用的模型。
 
 launcher 在 `<项目>/work/<token>/` 中运行，标准输入接收 JSON。使用平台实际传入的协议版本和临时 MCP 配置，不硬编码旧客户端的字段取值：
 

@@ -138,7 +138,7 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/factory") {
       const c = factory.compiled;
       const pi = piStatus();
-      return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: pi.id, pi, keyPresent: pi.ready, patches: factory.patches });
+      return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: pi.id, pi, keyPresent: pi.ready, patches: factory.patches, agentBindings: factory.agentBindings().bindings });
     }
     if (p === "/api/state") return send(res, 200, { ...factory.state, dispatcher: dispatcher.status });
     if (p === "/api/browser" && req.method === "GET") return send(res, 200, await browserCommand({action:"state"}));
@@ -237,6 +237,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST") {
       const b = await body(req);
       switch (p) {
+        case '/api/agents/binding': return send(res, 200, await control.execute('set_agent_binding', b, 'user'));
         case '/api/sources/configure': return send(res, 200, await control.execute('source_configure', b, 'user'));
         case '/api/sources/enable': return send(res, 200, await control.execute('source_enable', b, 'user'));
         case '/api/sources/poll': return send(res, 200, await control.execute('source_poll', b, 'user'));

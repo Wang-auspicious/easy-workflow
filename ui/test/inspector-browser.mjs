@@ -17,11 +17,39 @@ try {
   const page = await browser.newPage({ viewport: { width: 1000, height: 900 } });
   page.on("pageerror", (error) => errors.push(error.message));
   const calls = [];
+  const savedBindings = [];
+  let configured = null;
+  let rejectSave = false;
+  const bindingResult = () => ({bindings: [{
+    node: 'curation/review', configured,
+    effective: configured?.adapter === 'pi'
+      ? {adapter: 'pi', provider: configured.provider || 'fixture-provider', model: configured.model || 'fixture-model'}
+      : configured ? {...configured, requestTimeoutMs: configured.requestTimeoutMs ?? 180000}
+        : {adapter: 'pi', provider: 'fixture-provider', model: 'fixture-model'},
+    source: configured ? 'project' : 'default',
+    capabilities: {stream: !configured || configured.adapter === 'pi', cancel: true, resume: configured?.adapter !== 'launcher', usage: configured?.adapter === 'launcher' ? 'unknown' : 'reported'},
+    lastModel: 'last-actual-fixture-model',
+  }]});
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(url.pathname);
     if (url.pathname === "/api/tools/read_role") {
       await route.fulfill({ json: { ok: true, result: { content: "# 截图审查员\n\n只做判定，不改内容。\n\n- 输入：候选 + 证据\n- 输出：结论\n- 异常：截图失败退回采集，最多 2 轮" } } });
+      return;
+    }
+    if (url.pathname === '/api/tools/agent_bindings') {
+      const args = route.request().postDataJSON();
+      await route.fulfill({json: {ok: true, result: args.node === 'curation/review' ? bindingResult() : {bindings: []}}});
+      return;
+    }
+    if (url.pathname === '/api/agents/binding') {
+      if (rejectSave) {
+        await route.fulfill({status: 422, json: {ok: false, error: 'Fixture server rejected this configuration'}});
+        return;
+      }
+      configured = route.request().postDataJSON().binding;
+      savedBindings.push(configured);
+      await route.fulfill({json: {ok: true, result: bindingResult()}});
       return;
     }
     await route.fulfill({ json: { ok: true, result: {} } });
@@ -62,6 +90,54 @@ try {
   await page.getByText("ROLE.md · 职责与异常处理").waitFor();
   assert.match(await page.locator(".node-role pre").innerText(), /只做判定，不改内容/);
   assert.ok(calls.includes("/api/tools/read_role"), "职责来自接口，不是写死的文案");
+
+  const settings = page.getByRole('region', {name: '工位 Agent 配置'});
+  await settings.getByLabel('执行适配器').waitFor();
+  assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'inherit');
+  assert.match(await settings.locator('.agent-binding-effective').innerText(), /Pi · fixture-model.*应用默认/s);
+  assert.match(await settings.innerText(), /最近回报模型：last-actual-fixture-model/);
+  await settings.getByLabel('执行适配器').selectOption('claude-code');
+  await settings.getByLabel('Agent 请求模型').fill('fixture-claude');
+  await settings.getByLabel('Agent 启动命令').fill('not-json');
+  await settings.getByRole('button', {name: '保存配置'}).click();
+  assert.match(await settings.getByRole('alert').innerText(), /JSON 字符串数组/);
+  assert.equal(savedBindings.length, 0, 'invalid JSON never sends a write');
+  assert.equal(await settings.getByLabel('Agent 启动命令').inputValue(), 'not-json');
+  await settings.getByLabel('Agent 启动命令').fill('["claude"]');
+  rejectSave = true;
+  await settings.getByRole('button', {name: '保存配置'}).click();
+  await settings.getByText('Fixture server rejected this configuration').waitFor();
+  assert.equal(await settings.getByLabel('Agent 请求模型').inputValue(), 'fixture-claude');
+  rejectSave = false;
+  await settings.getByRole('button', {name: '保存配置'}).click();
+  await settings.getByRole('status').waitFor();
+  await page.waitForFunction(() => window.inspectorFixture.getState().agentBindings['curation/review']?.effective?.adapter === 'claude-code');
+  assert.deepEqual(configured, {adapter: 'claude-code', command: ['claude'], model: 'fixture-claude'});
+  assert.match(await settings.locator('.agent-binding-effective').innerText(), /Claude Code · fixture-claude.*本项目覆盖/s);
+  const statsHeight = await page.locator('.insp-stats').evaluate(element => element.getBoundingClientRect().height);
+  assert.ok(statsHeight >= 40, `a long adapter form must not collapse the station statistics (${statsHeight}px)`);
+  await page.locator('.spec-view').evaluate(element => { element.scrollTop = 0; });
+  await page.locator('.inspector').screenshot({path: path.join(out, 'agent-binding.png')});
+  await settings.getByLabel('执行适配器').selectOption('launcher');
+  await settings.getByLabel('Agent 请求模型').fill('fixture-launcher');
+  await settings.getByLabel('Agent 启动命令').fill('["node","fixture.mjs"]');
+  await settings.getByLabel('Agent 请求超时').fill('12000');
+  await settings.getByRole('button', {name: '保存配置'}).click();
+  await page.waitForFunction(() => window.inspectorFixture.getState().agentBindings['curation/review']?.effective?.adapter === 'launcher');
+  assert.match(await settings.locator('.agent-binding-capabilities').innerText(), /续接 不支持.*用量 未提供/);
+  await settings.getByLabel('执行适配器').selectOption('pi');
+  await settings.getByRole('button', {name: '保存配置'}).click();
+  await page.waitForFunction(() => window.inspectorFixture.getState().agentBindings['curation/review']?.configured?.adapter === 'pi');
+  assert.deepEqual(configured, {adapter: 'pi'}, 'empty Pi values inherit defaults instead of copying effective model into configured');
+  assert.equal(await settings.getByLabel('Agent 请求模型').inputValue(), '');
+  await settings.getByRole('button', {name: '恢复继承'}).click();
+  await page.waitForFunction(() => window.inspectorFixture.getState().agentBindings['curation/review']?.configured === null);
+  assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'inherit');
+  assert.equal(savedBindings.length, 4);
+  await page.evaluate(() => window.inspectorFixture.setState({inspectors: [{key: 'curation/capture', kind: 'node', x: 40, y: 40, pinned: true}]}));
+  await page.getByRole('button', {name: '规格', exact: true}).click();
+  await settings.getByText('程序执行，不使用 Agent 模型。').waitFor();
+  assert.equal(await settings.getByLabel('执行适配器').count(), 0, 'programs never show a fake Agent selector');
 
   await page.locator(".inspector").screenshot({ path: path.join(out, "station-card.png") });
   assert.deepEqual(errors, [], `页面不能有运行时错误：${errors.join(" | ")}`);

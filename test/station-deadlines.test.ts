@@ -162,6 +162,7 @@ test("station clocks: real Pi requests and tools may outlive the old whole-loop 
         const result = await run('image-timeout', new AbortController().signal, { input: () => ({ text: 'clock-case:image-timeout', images: [{ file: image, label: 'image input' }] }) });
         assert.equal(result.failure?.tag, 'tool_error'); assert.equal(result.failure?.category, 'system');
         assert.equal(result.failure?.code, 'FFMPEG_TIMEOUT'); assert.equal(current.requests.length, 0);
+        assert.equal(result.metrics?.execution?.model, 'unreported', 'image preparation is not a real model response');
       } finally { convert.mock.restore(); }
     });
   } finally {

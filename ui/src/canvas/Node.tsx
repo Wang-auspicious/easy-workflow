@@ -13,7 +13,7 @@ import { toggleInspector } from "./Canvas.tsx";
 import { useNow } from "../util/useNow.ts";
 import { bottleneck, trailOf } from "./stats.ts";
 import { nodeCountPresentation } from './node-counts.ts';
-import { stationStatus } from './status.ts';
+import { nodeExecutionPresentation, stationStatus } from './status.ts';
 
 export const fmt = (n: number) => (n >= 10000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : n.toLocaleString("en-US"));
 export const secs = (ms: number) => (ms >= 60000 ? `${(ms / 60000).toFixed(1)}m` : ms >= 10000 ? `${Math.round(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`);
@@ -36,6 +36,9 @@ const plainNum = (s: string) => {
 
 export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onHover }: { node: CompiledNode; place: Placed; selected: boolean; dim: boolean; onHover: (k: string | null) => void }) {
   useStore((s) => s.nodeRev[node.key]);
+  const agentBinding = useStore(state => state.agentBindings[node.key]);
+  const actualExecution = useStore(state => state.nodeExecutions[node.key]);
+  const replay = useStore(state => Boolean(state.replay));
   const colorOverride = useStore((s) => s.layout.colors[node.key]);
   const open = useStore((s) => s.inspectors.some((i) => i.key === node.key));
   const trail = useStore((s) => s.trail);
@@ -69,8 +72,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   }
 
   const numPrefix = node.num ? plainNum(node.num) : "";
-  const usesModel = node.kind === "agent" || node.kind === "review";
-  const execution = usesModel ? `pi · ${s.model}` : ({ program: "程序执行", gate: "规则门禁", store: "资源库", source: "来源", agent: "pi Agent", review: "pi Agent" })[node.kind];
+  const {usesModel, label: execution} = nodeExecutionPresentation(node, actualExecution, agentBinding, replay);
 
   return (
     <div className={cls} data-node={node.key} style={{ left: place.x, top: place.y, width: place.w, height: place.h, ...vars, borderStyle: node.role === "channel" ? "dashed" : undefined }}

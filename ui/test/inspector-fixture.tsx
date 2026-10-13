@@ -21,7 +21,8 @@ const station = (key: string, name: string, role: CompiledNode["role"], kind: Co
   workers: { min: 1, max: 3, initial: 1, policy: "auto" }, bot: botFor(key, role),
   returnTo: [{ station: "curation/capture", maxRounds: 2 }], pseudo: "读入候选与证据 → 判定 → submit",
 });
-const nodes = [station("curation/review", "截图审查员", "review", "review")];
+const nodes = [station("curation/review", "截图审查员", "review", "review"),
+  station('curation/capture', '截图程序', 'process', 'program')];
 const lines = [{ id: "curation", name: "策展线", layer: 3 as const, priority: "mid" as const, blurb: "fixture", stations: nodes, edges: [], wired: true }];
 const factory: CompiledFactory = { nodes, lines, edges: [], packs: [], channels: [], resources: { browser: 0, model: 0, cpu: 0, http: 0 }, issues: [], digest: "fixture", specVersion: "fixture", ui: { order: ["curation"], hints: {}, collapsed: [] } };
 

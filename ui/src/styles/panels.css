@@ -21,6 +21,7 @@
 }
 .inspector--token { width: 520px; }
 .inspector.is-pinned { box-shadow: var(--shadow-3), 0 0 0 1.5px var(--ink-4); }
+.inspector > .insp-head, .inspector > .insp-stats, .inspector > .scope-notice, .inspector > .insp-actions, .inspector > .insp-tabs { flex-shrink: 0; }
 .insp-head { display: flex; align-items: center; gap: 10px; padding: 12px 10px 8px 14px; cursor: grab; user-select: none; }
 .insp-head:active { cursor: grabbing; }
 .insp-title { display: flex; flex-direction: column; line-height: 1.3; min-width: 0; }
@@ -37,6 +38,21 @@
 .insp-tabs button.is-on { color: var(--ink); border-bottom-color: var(--ink); font-weight: 600; }
 .insp-body { overflow-y: auto; padding: 10px 14px 14px; min-height: 0; flex: 1; }
 .insp-empty { padding: 18px 4px; color: var(--ink-3); }
+.agent-binding { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 14px; }
+.agent-binding-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.agent-binding-heading b { font-size: 12px; font-weight: 600; }
+.agent-binding p { margin: 8px 0; font-size: 11px; line-height: 1.65; overflow-wrap: anywhere; }
+.agent-binding-effective { color: var(--ink); }
+.agent-binding-effective small { display: block; color: var(--ink-3); }
+.agent-binding-capabilities { color: var(--ink-3); }
+.agent-binding label { display: flex; flex-direction: column; gap: 5px; margin: 10px 0; font-size: 11.5px; color: var(--ink-2); }
+.agent-binding input, .agent-binding select, .agent-binding textarea { min-width: 0; width: 100%; border: 1px solid var(--line-2); border-radius: 6px; padding: 7px 8px; color: var(--ink); background: var(--panel); font: inherit; font-size: 12px; }
+.agent-binding textarea { resize: vertical; max-height: 180px; font-family: var(--mono); }
+.agent-binding input:focus, .agent-binding select:focus, .agent-binding textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.agent-binding-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; margin-top: 12px; }
+.agent-binding-error { color: var(--bad); }
+.agent-binding-receipt { color: var(--ok); }
+.spec-view > * { flex-shrink: 0; }
 .workers { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
 .worker { display: grid; grid-template-columns: 24px 1fr auto auto; align-items: center; gap: 8px; padding: 4px 8px 4px 4px; border-radius: 9px; text-align: left; font-size: 12.5px; }
 .worker:hover { background: var(--panel-2); }

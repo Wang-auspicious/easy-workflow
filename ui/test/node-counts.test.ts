@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { apply, initialState } from '../../shared/project.ts';
 import type { Stamped } from '../../shared/types.ts';
 import { nodeCountPresentation } from '../src/canvas/node-counts.ts';
-import { recordedUsage, runStatus, stationStatus, tokenStatus } from '../src/canvas/status.ts';
+import { executionIndex, nodeExecutionPresentation, recordNodeExecution, recordedUsage, runStatus, stationStatus, tokenStatus } from '../src/canvas/status.ts';
 
 test('resource counters report journaled arrivals even though stores never execute attempts', () => {
   const state = initialState(); let seq = 0;
@@ -107,4 +107,34 @@ test('unreported and estimated model usage stays unknown; an explicitly reported
   assert.equal(recordedUsage([attempt]).total, null);
   attempt.usage.input = 0; attempt.metrics = { usageReported: true };
   assert.equal(recordedUsage([attempt]).total, 0);
+});
+
+test('node execution labels distinguish actual receipts, requested bindings and plain programs', async () => {
+  const {state, emit, create} = statusFixture();
+  const node = {kind: 'agent' as const};
+  const binding = {effective: {adapter: 'claude-code' as const, command: ['claude'], model: 'requested-model'}};
+  assert.equal(nodeExecutionPresentation(node, undefined, binding).label, 'Claude Code · requested-model（配置）');
+  assert.equal(nodeExecutionPresentation({kind: 'program'}, undefined, undefined).label, '程序执行');
+  assert.match(nodeExecutionPresentation(node, undefined, undefined).label, /待同步/);
+  assert.match(nodeExecutionPresentation(node, undefined, binding, true).label, /历史执行模型未记录/);
+  create('one');
+  for (const [attempt, model] of [['old', 'old-model'], ['new', 'actual-model']] as const) {
+    emit({kind: 'attempt.started', token: 'one', node: 'curation/reader', attempt, worker: 'fixture', input: ''});
+    emit({kind: 'attempt.finished', attempt, ok: true, summary: '', ms: 1, queuedMs: 0, metrics: {execution: {adapter: 'claude-code', model}}});
+  }
+  const index = executionIndex(state);
+  assert.equal(nodeExecutionPresentation(node, index['curation/reader'], binding).label, 'Claude Code · actual-model（实际）');
+  recordNodeExecution(index, state.attempts.old);
+  assert.equal(index['curation/reader'].model, 'actual-model', 'a late older receipt cannot replace the latest actual model');
+  assert.equal(nodeExecutionPresentation(node, {...index['curation/reader'], model: 'unreported'}, binding).label, 'Claude Code · 模型未回报（实际）');
+  const store = await import('../src/store.ts');
+  const previous = store.getState();
+  try {
+    store.setState({fs: state});
+    assert.equal(store.getState().nodeExecutions['curation/reader'].model, 'actual-model');
+    store.setState({fs: initialState()});
+    assert.deepEqual(store.getState().nodeExecutions, {}, 'loading an earlier replay cannot retain a future actual-model receipt');
+  } finally {
+    store.setState(previous);
+  }
 });

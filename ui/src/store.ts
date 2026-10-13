@@ -3,10 +3,11 @@
 // same `apply` the server uses, so what the canvas shows is exactly what the journal says.
 import { useSyncExternalStore } from "react";
 import { emptyBrowser, type BrowserState } from "../../shared/browser.ts";
-import type { Attachment, CompiledFactory, Stamped } from "../../shared/types.ts";
+import type { Attachment, CompiledFactory, Stamped, StationAgentBinding } from "../../shared/types.ts";
 import { apply, initialState, type FactoryState } from "../../shared/project.ts";
 import type { LayoutResult } from "../../shared/layout.ts";
 import { emptyLive, idleDispatcher, type DispatcherStatus, type LiveChat } from "./chat/live.ts";
+import {executionIndex, recordNodeExecution, type NodeExecution} from './canvas/status.ts';
 export type { LiveChat } from "./chat/live.ts";
 
 export type View = "canvas" | "board" | "candidates" | "library" | "runs" | "browser" | "settings" | "report";
@@ -24,6 +25,15 @@ export interface LayoutFile {
 }
 
 export interface Inspector { key: string; kind: "node" | "token" | "part"; x: number; y: number; pinned: boolean; pinScale?: number; worker?: string }
+export interface NodeAgentBinding {
+  node: string;
+  configured: StationAgentBinding | null;
+  effective: StationAgentBinding | null;
+  source: 'project' | 'workflow' | 'default';
+  capabilities: {stream: boolean; cancel: boolean; resume: boolean; usage: 'reported' | 'unknown'};
+  lastModel?: string;
+  error?: string;
+}
 
 export interface Store {
   ready: boolean;
@@ -34,6 +44,8 @@ export interface Store {
   fs: FactoryState;
   version: number;
   nodeRev: Record<string, number>;
+  agentBindings: Record<string, NodeAgentBinding>;
+  nodeExecutions: Record<string, NodeExecution>;
   view: View;
   layer: Layer;
   reportRun: string | null;
@@ -75,7 +87,7 @@ const LS = (k: string, v?: unknown) => {
 let state: Store = {
   ready: false, connected: false, factory: null, defaultLayout: null, replayLoading: null,
   layout: { pos: {}, open: {}, colors: {}, bots: {}, capsules: {} },
-  fs: initialState(), version: 0, nodeRev: {},
+  fs: initialState(), version: 0, nodeRev: {}, agentBindings: {}, nodeExecutions: {},
   view: (LS("view") as View) ?? "canvas", layer: "pipeline", reportRun: null,
   attachments: [], chatOpen: (LS("chatOpen") as boolean) ?? false, chatWidth: (LS("chatWidth") as number) ?? 320, unread: 0,
   live: emptyLive(), dispatcher: idleDispatcher(),
@@ -88,7 +100,9 @@ const listeners = new Set<() => void>();
 export const getState = () => state;
 export function setState(patch: Partial<Store> | ((s: Store) => Partial<Store>)) {
   const p = typeof patch === "function" ? patch(state) : patch;
-  state = { ...state, ...p };
+  state = {...state, ...p,
+    ...(p.fs && p.fs !== state.fs && !('nodeExecutions' in p) ? {nodeExecutions: executionIndex(p.fs)} : {}),
+  };
   if ("view" in p) LS("view", state.view);
   if ("chatOpen" in p) LS("chatOpen", state.chatOpen);
   if ("chatWidth" in p) LS("chatWidth", state.chatWidth);
@@ -119,7 +133,7 @@ function touched(e: Stamped, fs: FactoryState): string[] {
     case "token.finished": return [e.node, ...(fs.tokens[e.token]?.at ?? [])];
     case "token.returned": return [e.from, e.to, ...(e.reset ?? [])];
     case "worker.spawned": case "worker.forked": case "worker.retired": case "review.verdict": return [e.node];
-    case "stock.set": return [e.node];
+    case "stock.set": case 'agent.binding': return [e.node];
     case "token.created": return [e.source];
     case "run.started": case "run.paused": case "run.resumed": case "resource.sample": case "run.ended": case "batch.configured": case "correction.reverted": return Object.keys(fs.nodes);
     case 'scope.paused': return e.scope === 'station' ? [e.key] : Object.keys(fs.nodes).filter(key => key.startsWith(`${e.key}/`));
@@ -146,6 +160,7 @@ function flush() {
   const fs = state.fs;
   const rev = { ...state.nodeRev };
   const flashes = { ...state.flashes };
+  const nodeExecutions = {...state.nodeExecutions};
   let unread = state.unread;
   const started = performance.now();
   let cursor = 0;
@@ -154,18 +169,19 @@ function flush() {
     if (e.seq <= fs.seq) continue;
     const changed = touched(e, fs);
     apply(fs, e);
+    if (e.kind === 'attempt.finished') recordNodeExecution(nodeExecutions, fs.attempts[e.attempt]);
     for (const k of new Set([...changed, ...touched(e, fs)])) rev[k] = (rev[k] ?? 0) + 1;
     if (e.kind === "evidence.added") flashes[e.evidence.id] = e.at;
     if (e.kind === "chat.assistant" && !state.chatOpen) unread++;
     for (const t of eventTaps) t(e);
   }
   if (cursor < batch.length) pending = batch.slice(cursor).concat(pending);
-  setState({ version: state.version + 1, nodeRev: rev, flashes, unread });
+  setState({ version: state.version + 1, nodeRev: rev, nodeExecutions, flashes, unread });
   if (pending.length && !raf) raf = requestAnimationFrame(flush);
 }
 
 export function resetProjection(factory: CompiledFactory) {
-  setState({ fs: initialState(factory), nodeRev: {}, version: state.version + 1 });
+  setState({ fs: initialState(factory), nodeRev: {}, nodeExecutions: {}, version: state.version + 1 });
 }
 
 /* ------------------------------------------------------------------ helpers */

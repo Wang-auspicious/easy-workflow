@@ -9,7 +9,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Check } from "typebox/value";
 import type { TSchema } from "typebox";
-import type { Usage } from "../shared/types.ts";
+import type { StationAgentBinding, Usage } from "../shared/types.ts";
 import { mcpText, type McpTool } from "./mcp-protocol.ts";
 import { factorySecrets, launcherEnvironment, redactText, redactValue } from "./mcp-security.ts";
 import { ClaudeCodeProtocol, validClaudeSession, type ClaudeSessionReference } from './claude-code.ts';
@@ -38,18 +38,26 @@ export interface ClosedAgentReply {
 }
 type Message = { role: "user" | "assistant"; content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] };
 
-export function closedAgentConfig(cwd: string, sessionScope?: ClosedSessionScope): ClosedAgentConfig | null {
-  if (!process.env.FACTORY_STATION_COMMAND) return null;
-  let command: unknown;
-  try { command = JSON.parse(process.env.FACTORY_STATION_COMMAND); } catch { throw new Error("FACTORY_STATION_COMMAND must be a JSON argv array."); }
-  if (!Array.isArray(command) || !command.length || command.some(x => typeof x !== "string" || !x.trim())) throw new Error("FACTORY_STATION_COMMAND must be a nonempty JSON argv array.");
-  if (!process.env.FACTORY_STATION_MODEL?.trim()) throw new Error("Set FACTORY_STATION_MODEL to the launcher's requested model.");
-  const adapter = process.env.FACTORY_STATION_ADAPTER?.trim() || 'launcher';
+export function closedAgentConfig(cwd: string, sessionScope?: ClosedSessionScope, binding?: StationAgentBinding): ClosedAgentConfig | null {
+  // An explicit Pi station never parses or inherits a global launcher setting.
+  if (binding?.adapter === 'pi') return null;
+  if (!binding && !process.env.FACTORY_STATION_COMMAND) return null;
+  let command: unknown = binding?.command;
+  if (!binding) {
+    try { command = JSON.parse(process.env.FACTORY_STATION_COMMAND!); }
+    catch { throw new Error('FACTORY_STATION_COMMAND must be a JSON argv array.'); }
+  }
+  if (!Array.isArray(command) || !command.length || command.some(value => typeof value !== 'string' || !value.trim())) {
+    throw new Error('The station launcher command must be a nonempty argv array.');
+  }
+  const model = binding?.model ?? process.env.FACTORY_STATION_MODEL;
+  if (!model?.trim()) throw new Error('Set the station launcher requested model.');
+  const adapter = binding?.adapter ?? (process.env.FACTORY_STATION_ADAPTER?.trim() || 'launcher');
   if (!['launcher', 'claude-code'].includes(adapter)) throw new Error('FACTORY_STATION_ADAPTER must be launcher or claude-code.');
-  const requestTimeoutMs = Number(process.env.FACTORY_STATION_TIMEOUT_MS ?? 180000);
+  const requestTimeoutMs = binding ? binding.requestTimeoutMs ?? 180000 : Number(process.env.FACTORY_STATION_TIMEOUT_MS ?? 180000);
   if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 900000) throw new Error('FACTORY_STATION_TIMEOUT_MS must be an integer from 1 to 900000.');
-  if (factorySecrets().some(secret => command.some(x => x.includes(secret)) || process.env.FACTORY_STATION_MODEL!.includes(secret))) throw new Error("Do not pass Easy Workflow control credentials to a station launcher.");
-  return { command, model: process.env.FACTORY_STATION_MODEL, cwd, adapter: adapter as ClosedAgentConfig['adapter'], requestTimeoutMs, sessionScope };
+  if (factorySecrets().some(secret => command.some(value => value.includes(secret)) || model.includes(secret))) throw new Error("Do not pass Easy Workflow control credentials to a station launcher.");
+  return { command: [...command], model, cwd, adapter: adapter as ClosedAgentConfig['adapter'], requestTimeoutMs, sessionScope };
 }
 
 function inside(parent: string, candidate: string) {
@@ -283,11 +291,19 @@ async function runLauncher(config: ClosedAgentConfig, request: { messages: Messa
     MCP_CONNECTION_NONBLOCKING: '0', MCP_CONNECT_TIMEOUT_MS: '10000', MCP_TIMEOUT: '10000',
   } : {}) }, shell: false, windowsHide: true,
     detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+  const processClosed = new Promise<void>(resolve => child.once('close', () => resolve()));
   return new Promise<ClosedAgentReply>((resolve, reject) => {
     let output = "", size = 0, done = false, failure: Error | undefined;
     let stopping: Promise<void> | undefined;
     const finish = (error?: Error, reply?: ClosedAgentReply) => { if (done) return; done = true; clearTimeout(timeout); signal.removeEventListener("abort", abort); error ? reject(error) : resolve(reply!); };
-    const stop = (error: Error) => { failure ??= error; stopping ??= stopLauncher(child); void stopping.finally(() => finish(failure)); };
+    const stop = (error: Error) => {
+      failure ??= error;
+      stopping ??= (async () => {
+        try { await stopLauncher(child); }
+        finally { await processClosed; }
+      })();
+      void stopping.then(() => finish(failure), () => finish(failure));
+    };
     const abort = () => stop(new Error("Closed agent cancelled"));
     const timeout = setTimeout(() => stop(new Error('Closed agent request timed out; its process tree and station scope were cancelled.')), config.requestTimeoutMs ?? 180000);
     timeout.unref();

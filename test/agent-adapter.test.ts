@@ -3,9 +3,10 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from 'node:http';
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
-import { configureAgentStations, runAgentStation } from "../server/agent-station.ts";
+import { configureAgentStations, runAgentStation, type AgentStationDef } from "../server/agent-station.ts";
 import { Toolbox } from "../server/toolbox.ts";
 import { Broker } from "../server/broker.ts";
 import { Docs } from "../server/docs.ts";
@@ -18,6 +19,9 @@ import { closeNetwork, readEvidence, rememberRead } from "../server/network.ts";
 import { ClosedStationAgent, closedAgentConfig } from '../server/mcp-station.ts';
 import { ClaudeCodeProtocol, type ClaudeSessionReference } from '../server/claude-code.ts';
 import { EvidenceStore, type ImageProcessOptions } from '../server/evidence.ts';
+import { closeModelTransport, models, piStatus, probeModelConnection, redactModelError } from '../server/pi.ts';
+import type { StationAgentBinding } from '../shared/types.ts';
+import { sessionSignature, type SessionRef } from '../server/station-session.ts';
 
 test("closed launcher receives envelope first, calls scoped MCP, repairs and reports real usage", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-closed-agent-test-"));
@@ -137,6 +141,260 @@ const nativeContext = (id: string, data: Record<string, unknown> = {}) => ({
   token: { id, item: 'fixture-item', data }, node: { key: 'curation/reader' }, attempt: `attempt-${id}`,
   worker: { id: 'fixture-worker' }, signal: new AbortController().signal, progress: () => {},
 }) as unknown as StationContext;
+
+test('explicit station bindings override compatibility defaults without sharing mutable commands', () => {
+  const keys = ['FACTORY_STATION_COMMAND', 'FACTORY_STATION_MODEL', 'FACTORY_STATION_ADAPTER', 'FACTORY_STATION_TIMEOUT_MS'];
+  const before = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  try {
+    process.env.FACTORY_STATION_COMMAND = 'invalid default JSON';
+    process.env.FACTORY_STATION_MODEL = 'wrong-default';
+    process.env.FACTORY_STATION_ADAPTER = 'wrong-default';
+    process.env.FACTORY_STATION_TIMEOUT_MS = 'invalid';
+    assert.equal(closedAgentConfig('unused', undefined, { adapter: 'pi' }), null);
+    for (const adapter of ['launcher', 'claude-code'] as const) {
+      const binding = { adapter, command: ['fixture', '--bounded'], model: 'selected-model' };
+      const config = closedAgentConfig('unused', undefined, binding)!;
+      binding.command.push('changed-after-selection');
+      assert.equal(config.adapter, adapter); assert.equal(config.model, 'selected-model');
+      assert.equal(config.requestTimeoutMs, 180000); assert.deepEqual(config.command, ['fixture', '--bounded']);
+    }
+    assert.equal(process.env.FACTORY_STATION_COMMAND, 'invalid default JSON');
+  } finally {
+    for (const [key, value] of Object.entries(before)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+});
+
+test('Pi and Claude bindings run concurrently, cancel independently and isolate provider session signatures', { timeout: 20000 }, async () => {
+  await nativeFixture(async (dir, reads) => {
+    const keys = ['PI_CODING_AGENT_DIR', 'FACTORY_PROVIDER', 'FACTORY_MODEL'];
+    const before = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    process.env.PI_CODING_AGENT_DIR = dir;
+    process.env.FACTORY_PROVIDER = 'unselected-global-provider';
+    process.env.FACTORY_MODEL = 'unselected-global-model';
+    process.env.FACTORY_STATION_COMMAND = 'invalid global launcher JSON';
+    const requests: { provider: string; body: Record<string, unknown> }[] = [];
+    let holdProbe = false, probeArrived: (() => void) | undefined;
+    let enterInput!: () => void, releaseInput!: () => void, enterPi!: () => void, releasePi!: () => void;
+    const preparing = new Promise<void>(resolve => { enterInput = resolve; });
+    const inputReady = new Promise<void>(resolve => { releaseInput = resolve; });
+    const piEntered = new Promise<void>(resolve => { enterPi = resolve; });
+    const piReady = new Promise<void>(resolve => { releasePi = resolve; });
+    const server = http.createServer(async (request, response) => {
+      const provider = request.url?.startsWith('/a/') ? 'a' : 'b';
+      assert.equal(request.headers.authorization, `Bearer local-binding-${provider}-secret`);
+      const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+      requests.push({ provider, body });
+      if (holdProbe && !body.tools) { probeArrived?.(); return; }
+      if (JSON.stringify(body).includes('token=pi-held;')) { enterPi(); await piReady; }
+      if (response.destroyed) return;
+      if (JSON.stringify(body).includes('token=pi-redact;')) {
+        response.writeHead(401, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { message: 'Invalid API key: local-binding-b-secret' } }));
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      const delta = body.tools
+        ? { role: 'assistant', tool_calls: [{ index: 0, id: `binding-${requests.length}`, type: 'function', function: { name: 'submit', arguments: '{"score":7}' } }] }
+        : { role: 'assistant', content: 'OK' };
+      for (const part of [
+        { choices: [{ index: 0, delta, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: body.tools ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 20, completion_tokens: 8, total_tokens: 28 } },
+      ]) response.write(`data: ${JSON.stringify({ id: 'binding-fixture', model: 'shared-model', ...part })}\n\n`);
+      response.end('data: [DONE]\n\n');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ defaultProvider: 'a', defaultModel: 'shared-model' }));
+    fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify(Object.fromEntries(['a', 'b'].map(provider => [provider, { type: 'api_key', key: `local-binding-${provider}-secret` }]))));
+    fs.writeFileSync(path.join(dir, 'models.json'), JSON.stringify({ providers: Object.fromEntries(['a', 'b'].map(provider => [provider, {
+      api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/${provider}/v1`, models: [{ id: 'shared-model', input: ['text'], cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }],
+    }])) }));
+    const definition: AgentStationDef<{ score: number }> = {
+      system: 'Return the requested fixture score', schema: Type.Object({ score: Type.Integer() }), tools: ['fetch_text'],
+      input: () => ({ text: 'Per-station configuration fixture' }), after: output => ({ ok: true, summary: 'done', data: output }),
+    };
+    const binding: StationAgentBinding = { adapter: 'pi', provider: 'a', model: 'shared-model' };
+    const controller = new AbortController();
+    let checkpoint: StationResult['sessionCheckpoint'];
+    try {
+      const selected = { provider: 'b', model: 'shared-model' };
+      assert.equal(models(selected).model.provider, 'b'); assert.equal(piStatus(selected).ready, true);
+      assert.equal(piStatus(selected).source, 'explicit');
+      assert.equal(redactModelError('failure local-binding-b-secret', selected), 'failure [redacted]');
+      const piTask = runAgentStation({ ...definition, agent: binding, input: async () => {
+        enterInput(); await inputReady; return { text: 'Per-station configuration fixture' };
+      } }, { ...nativeContext('pi-held'), signal: controller.signal });
+      const cancelled = assert.rejects(piTask, error => {
+        const partial = error as Error & StationResult;
+        assert.equal(partial.name, 'AbortError'); checkpoint = partial.sessionCheckpoint;
+        return true;
+      });
+      await preparing;
+      binding.provider = 'unselected-mutated-provider'; binding.model = 'unselected-mutated-model';
+      releaseInput(); await piEntered;
+      const claudeTask = runAgentStation({ ...definition, agent: { adapter: 'claude-code', command: [process.execPath, '-e', claudeFixture, '--'], model: 'explicit-claude', requestTimeoutMs: 10000 } }, nativeContext('claude-parallel'));
+      const deadline = Date.now() + 5000;
+      while (!reads() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+      assert.equal(reads(), 1);
+      controller.abort(); releasePi(); await cancelled;
+      const closed = await claudeTask;
+      assert.equal(closed.ok, true, closed.error ?? 'Explicit Claude station failed');
+      assert.deepEqual(closed.metrics?.execution, { adapter: 'claude-code', model: 'fixture-actual-claude' });
+      assert.equal(closed.usage?.cost, .1);
+      assert.ok(checkpoint?.pi, 'cancelled Pi work retains its own transcript reference');
+      const recovered = await runAgentStation({ ...definition, agent: { adapter: 'pi', ...selected } }, nativeContext('pi-other-provider', { stationSessions: { 'curation/reader': checkpoint.pi } }));
+      assert.equal(recovered.ok, true, recovered.error ?? 'Selected Pi station failed');
+      assert.deepEqual(recovered.metrics?.execution, { adapter: 'pi', model: 'shared-model' });
+      assert.equal(recovered.usage?.input, 20); assert.equal(recovered.usage?.output, 8);
+      const last = requests.at(-1)!;
+      assert.equal(last.provider, 'b'); assert.equal(last.body.model, 'shared-model');
+      assert.match(JSON.stringify(last.body), /token=pi-other-provider;/);
+      assert.ok(!JSON.stringify(last.body).includes('token=pi-held;'), 'same model ID on another provider must not resume the old conversation');
+      assert.equal((await probeModelConnection(2000, selected)).ok, true);
+      assert.equal(requests.at(-1)?.provider, 'b');
+      holdProbe = true;
+      const probeEntered = new Promise<void>(resolve => { probeArrived = resolve; });
+      const probeOwner = new AbortController();
+      const probing = probeModelConnection(5000, selected, probeOwner.signal);
+      const probeStopped = assert.rejects(probing, error => error === probeOwner.signal.reason);
+      await probeEntered; probeOwner.abort(new Error('Fixture probe cancelled by its owner')); await probeStopped;
+      holdProbe = false;
+      assert.equal((await probeModelConnection(2000, selected)).ok, true, 'cancelled probes release the model request slot');
+      const failed = await runAgentStation({ ...definition, agent: { adapter: 'pi', ...selected } }, nativeContext('pi-redact'));
+      assert.equal(failed.failure?.tag, 'model_unavailable');
+      assert.ok(!JSON.stringify(failed).includes('local-binding-b-secret'));
+      assert.match(failed.error ?? '', /\[redacted\]/);
+      assert.equal(process.env.FACTORY_PROVIDER, 'unselected-global-provider');
+      assert.equal(process.env.FACTORY_STATION_COMMAND, 'invalid global launcher JSON');
+    } finally {
+      controller.abort(); releaseInput(); releasePi();
+      await closeModelTransport(); server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      for (const [key, value] of Object.entries(before)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+});
+
+test('closed station references are isolated by the selected model, command and adapter', { timeout: 15000 }, async () => {
+  await nativeFixture(async (_dir, reads) => {
+    const binding: StationAgentBinding = { adapter: 'claude-code', command: [process.execPath, '-e', claudeFixture, '--'], model: 'binding-model', requestTimeoutMs: 10000 };
+    const definition: AgentStationDef<{ score: number }> = { agent: binding, system: 'Configuration signature fixture', schema: Type.Object({ score: Type.Integer() }), tools: ['fetch_text'],
+      input: () => ({ text: 'native-restart' }), after: output => ({ ok: true, summary: 'done', data: output }) };
+    const first = await runAgentStation(definition, nativeContext('binding-original'));
+    assert.equal(first.failure?.tag, 'model_transport');
+    const reference = (first.data!.closedStationSessions as Record<string, ClaudeSessionReference>)['curation/reader'];
+    const resumed = await runAgentStation(definition, nativeContext('binding-same', first.data));
+    assert.equal(resumed.ok, true); assert.equal(reads(), 1);
+    for (const [index, changed] of [
+      { ...binding, model: 'other-selected-model' },
+      { ...binding, command: [...binding.command, '--fixture-binding', 'different-command'] },
+    ].entries()) {
+      const result = await runAgentStation({ ...definition, agent: changed }, nativeContext(`binding-changed-${index}`, first.data));
+      assert.equal(result.failure?.tag, 'model_transport');
+      const changedReference = (result.data!.closedStationSessions as Record<string, ClaudeSessionReference>)['curation/reader'];
+      assert.notEqual(changedReference.id, reference.id);
+    }
+    assert.equal(reads(), 3);
+    const legacy = String.raw`
+const fs = require('node:fs'); let input = '';
+process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('end', async () => {
+  const request = JSON.parse(input);
+  const connection = JSON.parse(fs.readFileSync(request.mcpServers.h2_station.env.EASY_WORKFLOW_STATION_CONNECTION, 'utf8'));
+  const response = await fetch(connection.url + '/call', { method: 'POST', headers: { authorization: 'Bearer ' + connection.token, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'submit', arguments: { score: 7 } }) });
+  if (!response.ok) process.exit(1);
+  process.stdout.write(JSON.stringify({ model: 'actual-legacy-binding', usage: { input: 11, output: 3, cost: .002 } }));
+});`;
+    const result = await runAgentStation({ ...definition, agent: { adapter: 'launcher', command: [process.execPath, '-e', legacy], model: binding.model } }, nativeContext('binding-legacy', first.data));
+    assert.equal(result.ok, true, result.error ?? 'Explicit legacy launcher failed');
+    assert.deepEqual(result.metrics?.execution, { adapter: 'closed-command', model: 'actual-legacy-binding' });
+    assert.equal(result.usage?.cost, .002); assert.deepEqual(result.data?.closedStationSessions, {});
+  });
+});
+
+test('legacy Pi checkpoints migrate only with verified receipt identity and never repeat an observed tool', { timeout: 20000 }, async () => {
+  await nativeFixture(async (dir, reads) => {
+    const previousDirectory = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const requests: Record<string, unknown>[] = [];
+    let mode = 'capture';
+    let waiting: (() => void) | undefined;
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+      requests.push(body);
+      const observed = JSON.stringify(body).includes('Persisted fixture observation');
+      if (mode !== 'complete' && observed) { waiting?.(); return; }
+      const call = mode === 'capture' ? { name: 'env_call', arguments: '{"name":"fetch_text","arguments":{"url":"https://fixture.invalid/source"}}' }
+        : { name: 'submit', arguments: '{"score":7}' };
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const part of [
+        { choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: `legacy-${requests.length}`, type: 'function', function: call }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 20, completion_tokens: 8, total_tokens: 28 } },
+      ]) response.write(`data: ${JSON.stringify({ id: 'legacy-fixture', model: 'legacy-model', ...part })}\n\n`);
+      response.end('data: [DONE]\n\n');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify({ a: { type: 'api_key', key: 'local-legacy-a' }, b: { type: 'api_key', key: 'local-legacy-b' } }));
+    fs.writeFileSync(path.join(dir, 'models.json'), JSON.stringify({ providers: Object.fromEntries(['a', 'b'].map(provider => [provider, {
+      api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/${provider}/v1`, models: [{ id: 'legacy-model', input: ['text'] }],
+    }])) }));
+    const definition: AgentStationDef<{ score: number }> = {
+      agent: { adapter: 'pi', provider: 'a', model: 'legacy-model' },
+      role: { station: 'curation/reader', path: 'fixture/ROLE.md', revision: 'legacy-fixture-role', content: 'Read the fixture then submit.' },
+      system: 'Legacy session fixture', schema: Type.Object({ score: Type.Integer() }), tools: ['fetch_text'],
+      input: () => ({ text: 'Preserve the observed fixture tool result.' }), after: output => ({ ok: true, summary: 'done', data: output }),
+    };
+    const cancelAfterObservation = async (token: string, data: Record<string, unknown> = {}) => {
+      let entered!: () => void;
+      const observed = new Promise<void>(resolve => { entered = resolve; }); waiting = entered;
+      const controller = new AbortController();
+      let reference: SessionRef | undefined;
+      const task = runAgentStation(definition, { ...nativeContext(token, data), signal: controller.signal });
+      const cancelled = assert.rejects(task, error => {
+        const partial = error as Error & StationResult;
+        assert.equal(partial.name, 'AbortError'); reference = partial.sessionCheckpoint?.pi; return true;
+      });
+      await observed; controller.abort(); await cancelled;
+      assert.ok(reference); return reference;
+    };
+    try {
+      const current = await cancelAfterObservation('legacy-original');
+      assert.equal(reads(), 1);
+      const file = path.join(dir, current.file);
+      const saved = JSON.parse(fs.readFileSync(file, 'utf8')) as { signature: string; messages: Record<string, unknown>[] };
+      assert.ok(saved.messages.some(message => message.role === 'assistant' && message.provider === 'a' && message.model === 'legacy-model'), 'the genuine Pi transcript supplies identity evidence');
+      const legacySignature = sessionSignature({ node: 'curation/reader', model: 'legacy-model', role: definition.role!.revision,
+        contract: definition.system, schema: definition.schema, input: 'Preserve the observed fixture tool result.', images: undefined });
+      const legacy = { file: current.file, signature: legacySignature };
+      fs.writeFileSync(file, JSON.stringify({ ...saved, signature: legacySignature }));
+      const legacyData = { stationSessions: { 'curation/reader': legacy } };
+      mode = 'migrate';
+      const migrated = await cancelAfterObservation('legacy-migrating', legacyData);
+      assert.equal(reads(), 1, 'verified migration must not repeat the completed fetch');
+      assert.equal(migrated.signature, current.signature, 'the next save writes the new execution identity');
+      mode = 'complete';
+      const finished = await runAgentStation(definition, nativeContext('legacy-complete', { stationSessions: { 'curation/reader': migrated } }));
+      assert.equal(finished.ok, true); assert.equal(reads(), 1); assert.deepEqual(finished.data?.stationSessions, {});
+      const changed = await runAgentStation({ ...definition, agent: { adapter: 'pi', provider: 'b', model: 'legacy-model' } }, nativeContext('legacy-other-provider', legacyData));
+      assert.equal(changed.ok, true);
+      assert.match(JSON.stringify(requests.at(-1)), /token=legacy-other-provider;/);
+      assert.ok(!JSON.stringify(requests.at(-1)).includes('Persisted fixture observation'));
+      for (const message of saved.messages) if (message.role === 'assistant') delete message.provider;
+      fs.writeFileSync(file, JSON.stringify({ ...saved, signature: legacySignature }));
+      const unverified = await runAgentStation(definition, nativeContext('legacy-no-identity', legacyData));
+      assert.equal(unverified.ok, true);
+      assert.match(JSON.stringify(requests.at(-1)), /token=legacy-no-identity;/);
+      assert.ok(!JSON.stringify(requests.at(-1)).includes('Persisted fixture observation'));
+    } finally {
+      await closeModelTransport(); server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      if (previousDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousDirectory;
+    }
+  });
+});
 
 test('Claude protocol adapter uses only station tools and sums each CLI process cost without fabricated timing', { timeout: 30000 }, async () => {
   await nativeFixture(async (_dir, reads) => {
@@ -392,7 +650,20 @@ test('structured launcher failures preserve category and timeout stops a silent 
       const agent = new ClosedStationAgent({ command: [process.execPath, '-e', code], model: 'requested', cwd: dir }, 'Fixture', [], () => assert.fail('No model receipt was reported'));
       await assert.rejects(agent.prompt('input'), error => (error as { failure?: { tag?: string } }).failure?.tag === tag);
     }
-    const silent = new ClosedStationAgent({ command: [process.execPath, '-e', 'process.stdin.resume();setInterval(()=>{},1000);'], model: 'requested', cwd: dir, requestTimeoutMs: 100 }, 'Fixture', [], () => assert.fail('Timed-out work must not report success'));
+    const timeoutPid = path.join(dir, 'timeout.pid');
+    const silentCode = `require('node:fs').writeFileSync(${JSON.stringify(timeoutPid)},String(process.pid));process.stdin.resume();setInterval(()=>{},1000);`;
+    const silent = new ClosedStationAgent({ command: [process.execPath, '-e', silentCode], model: 'requested', cwd: dir, requestTimeoutMs: 500 }, 'Fixture', [], () => assert.fail('Timed-out work must not report success'));
     await assert.rejects(silent.prompt('input'), /timed out/);
+    const pid = Number(fs.readFileSync(timeoutPid, 'utf8'));
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'timeout must await child exit before returning to a directory cleanup caller');
+    const abortPid = path.join(dir, 'abort.pid');
+    const abortCode = `require('node:fs').writeFileSync(${JSON.stringify(abortPid)},String(process.pid));process.stdin.resume();setInterval(()=>{},1000);`;
+    const cancellable = new ClosedStationAgent({ command: [process.execPath, '-e', abortCode], model: 'requested', cwd: dir, requestTimeoutMs: 5000 }, 'Fixture', [], () => assert.fail('Cancelled work must not report success'));
+    const cancelled = assert.rejects(cancellable.prompt('input'), /cancelled/);
+    const deadline = Date.now() + 4000;
+    while (!fs.existsSync(abortPid) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+    const cancelledPid = Number(fs.readFileSync(abortPid, 'utf8'));
+    cancellable.abort(); await cancelled;
+    assert.throws(() => process.kill(cancelledPid, 0), { code: 'ESRCH' }, 'owner cancellation also waits for child close');
   } finally { assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir())); fs.rmSync(dir, { recursive: true, force: true }); }
 });

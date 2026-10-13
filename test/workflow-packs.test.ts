@@ -10,6 +10,7 @@ import { installWorkflowPack, loadWorkflowPacks, readWorkflowIndex, addWorkflowL
 import { invokeWorkflowTool, describeWorkflowTool } from '../server/workflow-tools.ts';
 import { compile } from '../server/spec/compile.ts';
 import { station, line } from '../server/spec/dsl.ts';
+import type {StationAgentBinding} from '../shared/types.ts';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-packs-'));
 process.env.FACTORY_VAR = root;
@@ -161,6 +162,81 @@ test('all four templates compile and execute their concrete programs, review ret
     }
     const reload = await loadWorkflowPacks(dir); assert.equal(compile(reload.packs).digest, compiled.digest);
   } finally { await runtime.close(); journal.close(); }
+});
+
+test('workflow Agent defaults are validated, versioned and forwarded without changing other stations', async () => {
+  const dir = path.join(root, 'station-agent-bindings');
+  const manifest = await instantiateWorkflowTemplate(dir, {templateId: 'review-loop', id: 'bound-agents', name: 'Bound Agent fixture', includeBuiltins: false}, idle);
+  const installed = readWorkflowIndex(dir).packages[0];
+  const directory = path.join(dir, 'packs', installed.id, 'versions', installed.revision);
+  const files = Object.fromEntries(Object.values(manifest.bindings).map(binding => [binding.role, fs.readFileSync(path.join(directory, binding.role), 'utf8')]));
+  const bindings: StationAgentBinding[] = [
+    {adapter: 'pi', provider: 'fixture-provider', model: 'fixture-pi'},
+    {adapter: 'claude-code', command: ['claude'], model: 'fixture-claude', requestTimeoutMs: 12000},
+    {adapter: 'launcher', command: ['node', 'fixture-launcher.mjs'], model: 'fixture-launcher'},
+  ];
+  const revisions = new Set<string>();
+  for (const agent of bindings) {
+    const request = structuredClone(manifest);
+    const producer = request.bindings['bound-agents/produce'].execute;
+    assert.equal(producer.kind, 'agent');
+    if (producer.kind !== 'agent') throw new Error('Fixture producer is not an Agent');
+    producer.agent = agent.adapter === 'pi' ? {...agent, provider: ` ${agent.provider} `, model: ` ${agent.model} `} : agent;
+    const normalizedManifest = await installWorkflowPack(dir, {manifest: request, files, replace: true}, idle);
+    const seen = new Map<string, StationAgentBinding | undefined>();
+    const loaded = await loadWorkflowPacks(dir, {services: {runAgent: async (definition, ctx) => {
+      seen.set(ctx.node.key, definition.agent);
+      const output = ctx.node.key.endsWith('/produce')
+        ? {title: 'Fixture document', body: 'The supplied fixture requirement has been fulfilled explicitly.'}
+        : {verdict: 'pass', reason: 'The supplied requirement was checked.', issues: []};
+      return definition.after(output, ctx, {rounds: 1, issues: []});
+    }}});
+    revisions.add(loaded.role('bound-agents/produce')!.revision);
+    const compiled = compile(loaded.packs);
+    const journal = new Journal(':memory:');
+    const state = initialState(compiled);
+    journal.subscribeProjection(event => apply(state, event));
+    const runtime = new Runtime(compiled, journal, new Broker({model: 2, cpu: 1}, 0), loaded.conditions, loaded.executor);
+    runtime.roleResolver = key => loaded.role(key)!;
+    try {
+      runtime.ensureWorkers([]);
+      runtime.start('Workflow binding fixture');
+      const token = runtime.create(manifest.entry, {item: agent.adapter, url: '', source: 'manual', data: {input: {brief: 'Produce the supplied fixture requirement explicitly.', requirements: ['State the requirement.']}}});
+      await runtime.settle();
+      assert.equal(state.tokens[token.id].status, 'published');
+      assert.deepEqual(seen.get('bound-agents/produce'), agent);
+      assert.equal(seen.has('bound-agents/review'), true);
+      assert.equal(seen.get('bound-agents/review'), undefined, 'the reviewer keeps its existing inherited default');
+      const reloaded = await loadWorkflowPacks(dir);
+      assert.equal(reloaded.role('bound-agents/produce')!.revision, loaded.role('bound-agents/produce')!.revision);
+    } finally {
+      await runtime.close();
+      journal.close();
+    }
+    if (agent.adapter === 'pi') {
+      await installWorkflowPack(dir, {manifest: normalizedManifest, files, replace: true}, idle);
+      const normalizedReload = await loadWorkflowPacks(dir);
+      assert.equal(normalizedReload.role('bound-agents/produce')!.revision, loaded.role('bound-agents/produce')!.revision,
+        'equivalent normalized defaults keep the same station revision after reinstall and reload');
+    }
+  }
+  assert.equal(revisions.size, 3, 'changing the adapter participates in the station contract revision');
+  const indexFile = path.join(dir, 'packs/installed.json');
+  const before = fs.readFileSync(indexFile, 'utf8');
+  for (const agent of [null, {adapter: 'unsupported'}, {adapter: 'pi', command: ['claude']},
+    {adapter: 'claude-code', command: 'claude', model: 'fixture'},
+    {adapter: 'claude-code', command: [], model: 'fixture'},
+    {adapter: 'launcher', command: ['node'], model: ''},
+    {adapter: 'launcher', command: ['node'], model: 'fixture', requestTimeoutMs: 0}]) {
+    const invalid = structuredClone(manifest);
+    Object.assign(invalid.bindings['bound-agents/produce'].execute, {agent});
+    await assert.rejects(installWorkflowPack(dir, {manifest: invalid, files, replace: true}, idle), /Agent 配置无效/);
+    assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
+  }
+  const program = structuredClone(manifest);
+  Object.assign(program.bindings['bound-agents/publish'].execute, {agent: {adapter: 'pi'}});
+  await assert.rejects(installWorkflowPack(dir, {manifest: program, files, replace: true}, idle), /程序执行器/);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
 });
 
 test('install is idle-only, rejects missing contracts and keeps the last valid index after failure', async () => {

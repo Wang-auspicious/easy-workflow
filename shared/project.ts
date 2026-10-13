@@ -112,6 +112,7 @@ export interface ChatMessage {
 export interface Transfer { seq: number; at: number; token: string; from: string; to: string; returned: boolean }
 
 export interface FactoryState {
+  agentBindings?: Record<string, import('./types.ts').StationAgentBinding>;
   corrections?: Record<string, { id: string; token: string; node: string; at: number; seq: number; status: 'pending' | 'executed' | 'reverted' }>;
   pausedScopes?: { lines: string[]; stations: string[] };
   measurement?: Extract<JournalEvent, { kind: 'measurement.proposed' }>['proposal'] & { status: 'proposed' | 'accepted' | 'rejected' };
@@ -167,7 +168,7 @@ export function initialState(factory?: CompiledFactory): FactoryState {
     totals: { usage: zeroUsage(), published: 0, manual: 0, failed: 0, rejected: 0, merged: 0, returned: 0, corrections: 0 },
     resources: { used: {}, limits: {}, freeMemMB: 0, at: 0, waiting: {} },
     transfers: [], patches: [], reportReady: null, lockedStations: [],
-    alerts: {}, preflight: null, cases: {}, contextNotes: {}, consults: {}, corrections: {}, pausedScopes: { lines: [], stations: [] },
+    alerts: {}, preflight: null, cases: {}, contextNotes: {}, consults: {}, corrections: {}, pausedScopes: { lines: [], stations: [] }, agentBindings: {},
   };
 }
 
@@ -189,6 +190,12 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
   s.seq = e.seq;
   const node = (key: string) => (s.nodes[key] ??= emptyNode(key));
   switch (e.kind) {
+    case 'agent.binding': {
+      const bindings = s.agentBindings ??= {};
+      if (e.binding === null) delete bindings[e.node];
+      else bindings[e.node] = e.binding;
+      break;
+    }
     case 'scope.paused': {
       const scopes = s.pausedScopes ??= { lines: [], stations: [] };
       const list = e.scope === 'line' ? scopes.lines : scopes.stations;

@@ -1,10 +1,11 @@
 // Talking to the factory server: boot snapshot, SSE stream, actions.
 import type { Attachment, Stamped } from "../../shared/types.ts";
 import type { FactoryState } from "../../shared/project.ts";
-import { getState, ingest, setState, type LayoutFile } from "./store.ts";
+import { getState, ingest, setState, type LayoutFile, type NodeAgentBinding } from "./store.ts";
 import { toast } from "./shell/Toasts.tsx";
 import { legacyReply } from "../../shared/conversation.ts";
 import { idleDispatcher, reconcileChatLive, reduceChatLive, type ChatEvent, type DispatcherStatus } from "./chat/live.ts";
+import {executionIndex} from './canvas/status.ts';
 
 export const api = {
   async get<T>(path: string, options?: { signal?: AbortSignal }): Promise<T> { const r = await fetch(path, options); if (!r.ok) throw new Error(`${path} ${r.status}`); return r.json(); },
@@ -21,7 +22,7 @@ export const api = {
 let es: EventSource | null = null;
 
 export async function boot() {
-  const f = await api.get<{ factory: any; layout: Partial<LayoutFile>; defaultLayout: any; settings: Record<string, number>; model: string; keyPresent: boolean }>("/api/factory");
+  const f = await api.get<{ factory: any; layout: Partial<LayoutFile>; defaultLayout: any; settings: Record<string, number>; model: string; keyPresent: boolean; agentBindings?: NodeAgentBinding[] }>("/api/factory");
   const fs = await api.get<FactoryState & { dispatcher?: DispatcherStatus }>("/api/state");
   // A window can reload while an older desktop backend is still shutting down.
   fs.activity ??= fs.chat.filter(m=>m.role==="note");
@@ -37,6 +38,8 @@ export async function boot() {
   }
   setState({
     factory: f.factory, defaultLayout: f.defaultLayout,
+    agentBindings: Object.fromEntries((f.agentBindings ?? []).map(binding => [binding.node, binding])),
+    nodeExecutions: executionIndex(fs),
     layout,
     fs, version: getState().version + 1, settings: f.settings, model: f.model, keyPresent: f.keyPresent, ready: true,
     dispatcher: fs.dispatcher ?? idleDispatcher(),
@@ -55,6 +58,7 @@ export function connect(since: number) {
     if (getState().replay) return;
     const event = JSON.parse(m.data) as Stamped;
     ingest([event]);
+    if (event.kind === 'agent.binding') void refreshAgentBindings(event.node);
     if (event.kind === "factory.loaded" || event.kind === "spec.patched") void refreshSpec();
   };
   es.addEventListener("live", (m) => {
@@ -71,11 +75,34 @@ export function connect(since: number) {
 
 async function refreshSpec() {
   try {
-    const f = await api.get<{ factory: any; defaultLayout: any }>("/api/factory");
+    const f = await api.get<{ factory: any; defaultLayout: any; agentBindings?: NodeAgentBinding[] }>("/api/factory");
     if (!getState().replay) setState((s) => ({ factory: f.factory, defaultLayout: f.defaultLayout,
+      agentBindings: Object.fromEntries((f.agentBindings ?? []).map(binding => [binding.node, binding])),
       inspectors: s.inspectors.filter((i) => i.kind === "token" || f.factory.nodes.some((n: { key: string }) => n.key === i.key)),
     }));
   } catch (err) { toast(`规格刷新失败：${(err as Error).message}`); }
+}
+
+const bindingReads = new Map<string, number>();
+async function refreshAgentBindings(node: string) {
+  const generation = (bindingReads.get(node) ?? 0) + 1;
+  bindingReads.set(node, generation);
+  try {
+    const response = await fetch('/api/tools/agent_bindings', {
+      method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({node}),
+      signal: AbortSignal.timeout(15000),
+    });
+    const body = await response.json();
+    if (!response.ok || !body.ok || !Array.isArray(body.result?.bindings)) return;
+    if (getState().replay || bindingReads.get(node) !== generation) return;
+    const binding = (body.result.bindings as NodeAgentBinding[]).find(binding => binding.node === node);
+    setState(state => {
+      const metadata = {...state.agentBindings};
+      if (binding) metadata[node] = binding;
+      else delete metadata[node];
+      return {agentBindings: metadata};
+    });
+  } catch { /* Preserve recorded execution; a later read can resolve default metadata. */ }
 }
 
 export function disconnect() { es?.close(); es = null; }

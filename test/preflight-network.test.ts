@@ -19,6 +19,10 @@ test('a local program-only workflow checks storage without contacting network, m
     assert.equal(result.ok, true); assert.deepEqual(result.checks.map(check => check.id), ['disk', 'memory']);
     assert.equal(lookup.mock.callCount(), 0); assert.equal(broker.used.browser, 0);
     assert.doesNotMatch(fs.readFileSync(path.join(root, 'ENV.md'), 'utf8'), /✓.*模型凭据|✓.*后台页/);
+    const explicit = await preflight(root, broker, {network: false, browser: false, model: true, agents: []});
+    assert.equal(explicit.ok, true);
+    assert.deepEqual(explicit.checks.map(check => check.id), ['disk', 'memory'], 'an explicit empty agent set does not probe default Pi');
+    assert.doesNotMatch(fs.readFileSync(path.join(root, 'ENV.md'), 'utf8'), /✓.*模型凭据/);
   } finally {
     lookup.mock.restore();
     assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir())); fs.rmSync(root, { recursive: true, force: true });
