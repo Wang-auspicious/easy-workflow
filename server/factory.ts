@@ -33,14 +33,16 @@ import { loadWorkflowPacks, type LoadedWorkflowPacks } from './workflow-packs.ts
 import { flushAtlas } from '../packs/vislexicon/components.ts';
 import { ChannelSupervisor } from './channels.ts';
 import { SourceSupervisor } from './sources.ts';
-import {agentCapabilities, closedModelDependency, parseAgentBinding} from './agent-bindings.ts';
+import {agentCapabilities, closedModelDependency, parseAgentBinding, resolveNativeCommand} from './agent-bindings.ts';
 import {models, piSelection} from './pi.ts';
 import {UnmanagedRecoverySupervisor} from './recovery.ts';
+import {ModelCircuits} from './model-circuits.ts';
+import {withModelAdmission} from './model-requests.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
 
-export interface Settings { browser: number; model: number; cpu: number; http: number; memoryFloorMB: number; socialPerMinute: number; socialPerDay: number }
+export interface Settings { browser: number; model: number; modelWorkers: number; cpu: number; http: number; memoryFloorMB: number; socialPerMinute: number; socialPerDay: number }
 
 export class Factory {
   compiled!: CompiledFactory;
@@ -64,6 +66,7 @@ export class Factory {
   channels?: ChannelSupervisor;
   sources!: SourceSupervisor;
   recovery!: UnmanagedRecoverySupervisor;
+  modelCircuits!: ModelCircuits;
   private services!: Services;
   private stationAgents: Record<string, AgentStationDef> = {};
 
@@ -74,10 +77,17 @@ export class Factory {
     this.project = readOnly ? { name: path.basename(directory), dir: directory, pack: "vislexicon", createdAt: "" } : ensureProject(directory, process.env.FACTORY_PROJECT_NAME ?? path.basename(directory));
     this.journal = new Journal(path.join(this.project.dir, 'journal.db'), readOnly);
     this.store = new EvidenceStore(path.join(this.project.dir, 'evidence'), readOnly);
-    const saved = this.readJson<Partial<Settings> & { browserCapV2?: boolean }>(path.join(this.project.dir, 'settings.json'), {});
+    const settingsFile = path.join(this.project.dir, 'settings.json');
+    const saved = this.readJson<Partial<Settings> & { browserCapV2?: boolean }>(settingsFile, {});
+    if (saved.modelWorkers === undefined) {
+      // Allow independent stations to run while Pi waits for tools.
+      // Persist this independently so later model quota changes keep user intent.
+      saved.modelWorkers = Math.max(3, saved.model ?? 8);
+      if (!readOnly) fs.writeFileSync(settingsFile, JSON.stringify(saved, null, 2));
+    }
     // Browser pages were capped at three before Spec §30.6; lift old saved caps once to the new default.
     if (!saved.browserCapV2 && (saved.browser ?? 0) <= 3) delete saved.browser;
-    this.settings = { browser: 8, model: 8, cpu: 4, http: 6, memoryFloorMB: 1024, socialPerMinute: 6, socialPerDay: 300, ...saved };
+    this.settings = { browser: 8, model: 8, modelWorkers: saved.modelWorkers, cpu: 4, http: 6, memoryFloorMB: 1024, socialPerMinute: 6, socialPerDay: 300, ...saved };
     this.patches = this.readJson(path.join(this.project.dir, 'patches.json'), []);
   }
 
@@ -99,7 +109,7 @@ export class Factory {
       else this.journal.append({kind: 'agent.defaults', defaults});
     }
     if (process.env.FACTORY_READONLY !== "1" && this.state.digest !== this.compiled.digest) this.journal.append({ kind: "factory.loaded", digest: this.compiled.digest, specVersion: this.compiled.specVersion });
-    this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
+    this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, modelWorkers: this.settings.modelWorkers, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
     this.docs = new Docs(this, this.project.dir, this.project.name);
     this.lessons = new Lessons(this, this.project.dir);
     this.toolbox = new Toolbox({ journal: this.journal, broker: this.broker, docs: () => this.docs });
@@ -172,6 +182,7 @@ export class Factory {
     };
     this.runtime = new Runtime(this.compiled, this.journal, this.broker, this.workflowPacks.conditions, executors);
     this.runtime.roleResolver = key => this.workflowPacks?.role(key) ?? readRole(key);
+    this.modelCircuits = new ModelCircuits(this);
     this.batch = new BatchSupervisor(this);
     this.recovery = new UnmanagedRecoverySupervisor(this);
     this.runtime.onTick = () => this.maintainRuntime();
@@ -197,8 +208,9 @@ export class Factory {
     }
     this.reconcileFailureAlerts();
     this.batch.restoreModelCircuit();
-    this.broker.modelHold = Object.values(this.state.alerts).find(a => a.kind === 'model')?.message ?? null;
+    this.broker.modelHold = Object.values(this.state.alerts).find(a => a.kind === 'model' && !a.dependency)?.message ?? null;
     this.restore();
+    this.modelCircuits.restore();
     this.reconcileManualStock();
     this.reconcileBusinessStock();
     this.channels = new ChannelSupervisor(this);
@@ -278,7 +290,9 @@ export class Factory {
         piRuntime, dependency: piRuntime.dependency,
       };
     }
-    return {binding, piRuntime: undefined, dependency: closedModelDependency(binding)};
+    const captured = binding.command ? {...binding, command: [...binding.command]}
+      : {...binding, command: resolveNativeCommand(binding.adapter as 'claude-code' | 'opencode' | 'codex')};
+    return {binding: captured, piRuntime: undefined, dependency: closedModelDependency(captured)};
   }
 
   private agentDefault(node: string): {binding?: StationAgentBinding} | undefined {
@@ -481,17 +495,17 @@ export class Factory {
   }
 
   raiseAlert(alert: Alert) {
-    if (alert.kind === "model") this.broker.modelHold = alert.message;
+    if (alert.kind === 'model' && !alert.dependency) this.broker.modelHold = alert.message;
     if (this.state.alerts?.[alert.id]) return;
     this.journal.append({ kind: "alert.raised", alert });
-    if (alert.kind === "model") this.broker.modelHold = alert.message;
+    if (alert.kind === 'model' && !alert.dependency) this.broker.modelHold = alert.message;
   }
 
   clearAlert(id: string, reason: string) {
     const a = this.state.alerts?.[id];
     if (!a) return false;
     this.journal.append({ kind: "alert.cleared", id, reason });
-    if (a.kind === "model" && !Object.values(this.state.alerts ?? {}).some((x) => x.kind === "model")) { this.broker.modelHold = null; this.runtime.schedule(); }
+    if (a.kind === 'model' && !Object.values(this.state.alerts ?? {}).some(x => x.kind === 'model' && !x.dependency)) { this.broker.modelHold = null; this.runtime.schedule(); }
     return true;
   }
 
@@ -623,7 +637,9 @@ export class Factory {
     if (!force && this.state.preflight?.ok && signature === this.lastPreflightSignature &&
         Date.now() - this.lastPreflight < 10 * 60_000) return this.state.preflight;
     const configuration = JSON.stringify([this.state.agentBindings, this.state.pausedScopes, this.compiled.digest]);
-    const r = await preflight(this.project.dir, this.broker, {network, model, browser, agents});
+    const r = await withModelAdmission(() => null,
+      () => preflight(this.project.dir, this.broker, {network, model, browser, agents}),
+      (_dependency, signal) => this.broker.modelRequests.acquire(signal));
     if (configuration !== JSON.stringify([this.state.agentBindings, this.state.pausedScopes, this.compiled.digest])) {
       throw new ControlError(409, 'agent_configuration_changed', '体检期间工位配置或暂停范围已变化，请按当前配置重新体检');
     }
@@ -637,6 +653,12 @@ export class Factory {
     }
     this.clearAlert("preflight", "体检通过");
     if (r.checks.find((c) => c.id === "model")?.ok) for (const a of Object.values(this.state.alerts ?? {})) if (a.kind === "model") {
+      if (a.dependency) {
+        const probe = r.checks.flatMap(check => check.modelProbes ?? []).find(value =>
+          value.dependency.key === a.dependency!.key && value.actuallyProbed && value.ok);
+        if (probe) this.modelCircuits.probed(probe);
+        continue;
+      }
       if (a.id === 'model-transport' && (this.batch.permitModelTrial() || this.recovery?.permitModelTrial())) continue;
       this.clearAlert(a.id, "体检确认模型可用");
     }
@@ -645,12 +667,16 @@ export class Factory {
 
   private wireRecovery() {
     this.runtime.onRecovery = (token, failure) => this.recordRecovery(token, failure);
-    this.runtime.onAlert = (token, node, failure) => {
+    this.runtime.onAlert = (token, node, failure, dependency) => {
       const kind: Alert["kind"] | undefined = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" || failure.tag === "model_transport" ? "model" : failure.tag === "auth_required" ? "auth" : undefined;
       if (!kind) return;
-      this.raiseAlert({ id: failure.tag === 'model_transport' ? 'model-transport' : kind === "model" ? "model" : `${kind}:${token.item}`, level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: kind === 'model' ? undefined : failure.url ?? token.url });
+      const id = failure.tag === 'model_transport' ? 'model-transport' : kind === 'model' ? 'model' : `${kind}:${token.item}`;
+      this.raiseAlert({ id: kind === 'model' && dependency ? `${id}:${dependency.key}` : id,
+        dependency: kind === 'model' ? dependency : undefined,
+        level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: kind === 'model' ? undefined : failure.url ?? token.url });
+      if (kind === 'model' && dependency) this.modelCircuits.failed(dependency, token.id, node.key, failure);
       if (failure.tag === 'model_transport') {
-        this.batch.modelFailed();
+        if (!dependency) this.batch.modelFailed();
         this.recovery?.modelFailed();
       }
     };
@@ -1053,7 +1079,8 @@ export class Factory {
   saveSettings(next: Partial<Settings>) {
     this.settings = { ...this.settings, ...next };
     fs.writeFileSync(path.join(this.project.dir, 'settings.json'), JSON.stringify({ ...this.settings, browserCapV2: true }, null, 2));
-    Object.assign(this.broker.limits, { browser: this.settings.browser, model: this.settings.model, cpu: this.settings.cpu, http: this.settings.http });
+    Object.assign(this.broker.limits, { browser: this.settings.browser, model: this.settings.model, modelWorkers: this.settings.modelWorkers, cpu: this.settings.cpu, http: this.settings.http });
+    this.broker.modelRequests.notifyCapacityChanged();
     this.broker.memoryFloorMB = this.settings.memoryFloorMB;
     this.runtime.schedule();
   }

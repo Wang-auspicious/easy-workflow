@@ -12,6 +12,7 @@ import type { Factory } from "./factory.ts";
 import { FactoryControl } from "./control.ts";
 import { EvidenceStore } from "./evidence.ts";
 import { dispatcherError, dispatcherOperationKey, recoverDispatcherMessages, transientDispatcherError, uncertainToolResult } from "./dispatcher-recovery.ts";
+import {withModelAdmission} from './model-requests.ts';
 
 const SYSTEM = `你是“主调度”，一个多 agent 流水线工厂的总调度，站长（用户）只和你说话。
 - 你只调度：投料、启停、加人撤人、纠错退回、查状态、起草规格补丁、结束本轮。
@@ -111,7 +112,9 @@ export class Dispatcher {
       timer.unref();
       const signal = options?.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
       try {
-        const response = await stream(model, context, { ...options, signal });
+        const response = await withModelAdmission(dependency => this.f.broker?.modelBlocked(dependency) ?? null,
+          async () => stream(model, context, {...options, signal}),
+          this.f.broker ? (_dependency, owner) => this.f.broker.modelRequests.acquire(owner) : undefined);
         void response.result().then(() => clearTimeout(timer), () => clearTimeout(timer));
         return response;
       } catch (error) { clearTimeout(timer); throw error; }

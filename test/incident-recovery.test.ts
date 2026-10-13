@@ -20,6 +20,32 @@ test('provider outages, site timeouts and validation failures retain their own c
   assert.equal(classifyFailure('the quote is not verbatim', {stage:'model'}).tag, 'tool_error');
 });
 
+test('explicit provider service errors use model recovery only at the model boundary', () => {
+  const message = 'server_error: The model failed to generate a response.';
+  for (const error of [message, new Error(message),
+    Object.assign(new Error('Provider could not complete the request'), {code: 'server_error'}),
+    new Error('Provider request failed', {cause: Object.assign(new Error('Internal failure'), {code: 'internal_server_error'})}),
+    'service_unavailable: Model service is unavailable',
+  ]) {
+    const failure = classifyFailure(error, {stage: 'model'});
+    assert.equal(failure.tag, 'model_transport');
+    assert.equal(failure.category, 'system');
+    assert.equal(failure.owner, 'system');
+    assert.equal(failure.retryable, true);
+    assert.match(failure.nextAction!, /冷却/);
+  }
+  assert.equal(classifyFailure('Provider unavailable', {stage: 'model', status: 503}).tag, 'model_transport');
+  assert.equal(classifyFailure(message).tag, 'tool_error', 'an ordinary tool error must not create a model circuit');
+  assert.equal(classifyFailure(message, {stage: 'capture'}).tag, 'browser_capture');
+  assert.equal(classifyFailure('Unknown submit property server_error', {stage: 'model'}).tag, 'tool_error');
+  for (const error of ['server_error: invalid api key', 'server_error: insufficient balance',
+    'server_error: certificate has expired', 'server_error: ERR_TLS_CERT_ALTNAME_INVALID']) {
+    const failure = classifyFailure(error, {stage: 'model'});
+    assert.equal(failure.tag, 'model_unavailable');
+    assert.equal(failure.owner, 'user');
+  }
+});
+
 test('model request slots include helpers and release cancelled waiters without leaking capacity', async () => {
   const slots = new ModelRequests(1), release = await slots.acquire();
   const abort = new AbortController();

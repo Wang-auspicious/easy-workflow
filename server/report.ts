@@ -8,6 +8,7 @@ import { apply, initialState, median, quantile, type FactoryState } from "../sha
 import type { Factory } from "./factory.ts";
 import { fileURLToPath } from 'node:url';
 import { batchSummary } from '../shared/batch.ts';
+import {observedUsage} from '../shared/usage.ts';
 const VAR = process.env.FACTORY_VAR ?? path.join(
   process.env.FACTORY_ROOT ?? fileURLToPath(new URL('..', import.meta.url)), 'var');
 
@@ -90,12 +91,12 @@ const ESTIMATED = ["system", "context", "caseFile", "input", "images", "toolDefs
 type EstimatedTokens = Record<typeof ESTIMATED[number], number>;
 export interface ReportMetrics {
   source: "run-journal";
-  coverage: { attempts: number; finished: number; tokenBreakdowns: number; usageReported: number; usageComplete: number; cacheUsageComplete: number; timeBreakdowns: number; modelTimeReported: number };
+  coverage: { attempts: number; finished: number; tokenBreakdowns: number; usageReported: number; usageComplete: number; costReported: number; costComplete: number; cacheUsageComplete: number; timeBreakdowns: number; modelTimeReported: number };
   tokens: {
     estimated: EstimatedTokens | null;
     estimatedFields: readonly string[];
     estimateBasis: string;
-    actual: { input: number; output: number; cacheRead: number | null; cacheWrite: number | null; cost: number } | null;
+    actual: { input: number; output: number; cacheRead: number | null; cacheWrite: number | null; cost: number | null } | null;
     cacheHitRate: number | null;
     cacheHitRateBasis: string;
   };
@@ -109,14 +110,16 @@ export function aggregateMetrics(attempts: FactoryState["attempts"][string][], e
   const tokenParts = attempts.flatMap(a => a.metrics?.tokens ? [a.metrics.tokens] : []);
   const reported = attempts.flatMap(a => {
     const e = finishes.get(a.id);
-    if (e?.usage && a.metrics?.usageReported !== false) return [{ attempt: a, usage: e.usage }];
-    return [];
+    const usage = e && observedUsage(e.usage, e.metrics ?? a.metrics);
+    return usage ? [{attempt: a, usage}] : [];
   });
   const timed = attempts.filter(a => a.metrics?.time);
   const modelTimed = timed.filter(a => a.metrics?.modelTimeReported !== false);
   const estimated = tokenParts.length ? Object.fromEntries(ESTIMATED.map(k => [k, sum(tokenParts.map(t => t[k]))])) as EstimatedTokens : null;
+  const costs = reported.filter(entry => entry.usage.cost !== null);
+  const completeCosts = costs.filter(entry => entry.attempt.metrics?.costComplete !== false && entry.attempt.metrics?.usageComplete !== false);
   const actual = reported.length ? {
-    input: sum(reported.map(x => x.usage.input)), output: sum(reported.map(x => x.usage.output)), cost: sum(reported.map(x => x.usage.cost)),
+    input: sum(reported.map(x => x.usage.input)), output: sum(reported.map(x => x.usage.output)), cost: costs.length ? sum(costs.map(entry => entry.usage.cost ?? 0)) : null,
     cacheRead: reported.some(x => x.usage.cacheRead !== undefined) ? sum(reported.map(x => x.usage.cacheRead ?? 0)) : null,
     cacheWrite: reported.some(x => x.usage.cacheWrite !== undefined) ? sum(reported.map(x => x.usage.cacheWrite ?? 0)) : null,
   } : null;
@@ -128,7 +131,7 @@ export function aggregateMetrics(attempts: FactoryState["attempts"][string][], e
   const outputMs = sum(speedSamples.map(x => x.attempt.metrics!.time!.outputMs));
   return {
     source: "run-journal",
-    coverage: { attempts: attempts.length, finished: finished.length, tokenBreakdowns: tokenParts.length, usageReported: reported.length, usageComplete: completeUsage.length, cacheUsageComplete: completeCache.length, timeBreakdowns: timed.length, modelTimeReported: modelTimed.length },
+    coverage: { attempts: attempts.length, finished: finished.length, tokenBreakdowns: tokenParts.length, usageReported: reported.length, usageComplete: completeUsage.length, costReported: costs.length, costComplete: completeCosts.length, cacheUsageComplete: completeCache.length, timeBreakdowns: timed.length, modelTimeReported: modelTimed.length },
     tokens: { estimated, estimatedFields: ESTIMATED, estimateBasis: "Character/image-budget estimates of the initial payload plus accumulated tool results, not an allocation of billable totals or repeated model contexts.", actual, cacheHitRate: cacheKnown && cacheTotal > 0 ? (actual!.cacheRead ?? 0) / cacheTotal : null, cacheHitRateBasis: "cacheRead / (uncached input + cacheRead + cacheWrite); null if cache reporting is incomplete" },
     time: {
       aggregation: "sum-of-attempts", attemptMs: sum(finished.map(a => a.ms ?? 0)), queuedMs: sum(finished.map(a => a.queuedMs ?? 0)),
@@ -165,9 +168,13 @@ export function buildReport(f: Factory, runId: string, through = f.journal.seq):
   const tokenIds = new Set(events.flatMap(e=>e.kind==="token.created"||e.kind==="token.queued"?[e.token]:[]));
   const attemptIds = new Set(events.flatMap(e=>e.kind==="attempt.started"?[e.attempt]:[]));
   const tokens = [...new Map(Object.values(s.tokens).filter((t) => tokenIds.has(t.id)).map(t=>[t.item,t])).values()];
-  const recordedUsage = new Map(events.filter(e => e.kind === "attempt.finished").map(e => [e.attempt, e.usage]));
+  const recordedUsage = new Map(events.filter(e => e.kind === 'attempt.finished').map(event => [event.attempt, observedUsage(event.usage, event.metrics)]));
   // A duplicated terminal receipt must not double bill the same attempt through projection counters.
-  const attempts = Object.values(s.attempts).filter((a) => attemptIds.has(a.id)).map(a => ({ ...a, usage: recordedUsage.get(a.id) ?? { input: 0, output: 0, cost: 0 } }));
+  const attempts = Object.values(s.attempts).filter(attempt => attemptIds.has(attempt.id)).map(attempt => {
+    const usage = recordedUsage.get(attempt.id);
+    // Legacy numeric totals remain known subtotals; metrics distinguish unknown cost.
+    return {...attempt, usage: usage ? {...usage, cost: usage.cost ?? 0} : {input: 0, output: 0, cost: 0}};
+  });
   const runMetrics = aggregateMetrics(attempts, events);
 
   /* per-node reasons and slowest items */

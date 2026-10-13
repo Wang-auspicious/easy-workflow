@@ -16,6 +16,8 @@ import {Journal} from '../server/journal.ts';
 import {apply, initialState} from '../shared/project.ts';
 import {applyUiEvent, uiEvent, uiState} from '../shared/client-view.ts';
 import {normalizeContext} from '@earendil-works/pi-ai';
+import {ClosedStationAgent} from '../server/mcp-station.ts';
+import {Type} from 'typebox';
 
 test('model dependency identities are stable, distinguish execution boundaries and reveal no private connection data', async () => {
   const first = piModelDependency({provider: 'provider-a', model: 'small',
@@ -293,6 +295,77 @@ test('Pi admission carries the selected dependency across concurrent contexts an
   }
 });
 
+test('a scoped closed-client tool cannot deadlock its own full model request pool', {timeout: 10000}, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-nested-model-'));
+  const profile = path.join(root, 'profile');
+  fs.mkdirSync(profile);
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = profile;
+  let hits = 0;
+  const server = http.createServer((_request, response) => {hits++; response.end('{}');});
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as {port: number}).port;
+  fs.writeFileSync(path.join(profile, 'auth.json'), JSON.stringify({nested: {type: 'api_key', key: 'local-fixture-only'}}));
+  fs.writeFileSync(path.join(profile, 'models.json'), JSON.stringify({providers: {nested: {
+    api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/v1`, models: [{id: 'helper', input: ['text']}],
+  }}}));
+  const script = `import fs from 'node:fs';
+let raw = ''; for await (const chunk of process.stdin) raw += chunk;
+const request = JSON.parse(raw);
+const connection = JSON.parse(fs.readFileSync(request.mcpServers.h2_station.env.EASY_WORKFLOW_STATION_CONNECTION, 'utf8'));
+const response = await fetch(connection.url + '/call', {method: 'POST', headers: {
+  authorization: 'Bearer ' + connection.token, 'content-type': 'application/json'},
+  body: JSON.stringify({name: 'env_call', arguments: {name: 'program-with-model'}})});
+const result = await response.json();
+const message = JSON.stringify(result);
+if (!message.includes('MODEL_CAPACITY_REENTRANT')) throw new Error('Missing explicit nested-capacity result');
+process.stdout.write(JSON.stringify({model: 'local-closed-model', modelCalls: 1,
+  usage: {input: 1, output: 1, cost: 0}, failure: {tag: 'tool_error', category: 'system',
+    message, code: 'MODEL_CAPACITY_REENTRANT', retryable: false, owner: 'agent'}}));`;
+  const broker = new Broker({model: 1, browser: 1, cpu: 1, http: 1});
+  let failureCode: string | undefined;
+  let toolCalls = 0;
+  let receipts = 0;
+  const agent = new ClosedStationAgent({adapter: 'launcher', command: [process.execPath, '--input-type=module', '-e', script],
+    model: 'local-closed-model', cwd: root, requestTimeoutMs: 5000}, 'Scoped local client fixture', [{
+    name: 'env_call', label: 'Program helper', description: 'Call the local fixture program',
+    parameters: Type.Object({name: Type.Literal('program-with-model')}),
+    execute: async (_id, _args, signal) => {
+      toolCalls++;
+      const selected = models({provider: 'nested', model: 'helper'});
+      try {
+        const response = await selected.stream(selected.model, normalizeContext({messages: []}), {signal});
+        await response.result();
+      } catch (error) {failureCode = (error as {code?: string}).code; throw error;}
+      return {content: [{type: 'text', text: 'unexpected model request'}]};
+    },
+  }], () => {receipts++;});
+  try {
+    const began = Date.now();
+    await assert.rejects(withModelAdmission(() => null, () => agent.prompt('Call env_call for the local program'),
+      (_dependency, signal) => broker.modelRequests.acquire(signal)), error =>
+      (error as {failure?: {code?: string; retryable?: boolean}}).failure?.code === 'MODEL_CAPACITY_REENTRANT' &&
+      (error as {failure: {retryable: boolean}}).failure.retryable === false);
+    assert.ok(Date.now() - began < 3000, 'the rejected nested request is immediate rather than a timeout escape');
+    assert.equal(toolCalls, 1);
+    assert.equal(failureCode, 'MODEL_CAPACITY_REENTRANT');
+    assert.equal(hits, 0, 'no second actual request bypassed the project limit');
+    assert.equal(receipts, 1, 'the completed client receipt remains accounted for');
+    assert.equal(broker.modelRequests.active, 0);
+    assert.equal(broker.modelRequests.queued, 0);
+    const release = await broker.modelRequests.acquire();
+    release();
+  } finally {
+    agent.abort();
+    await closeModelTransport();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
+
 // Local vendor-protocol fixtures exercise the real launcher and scoped MCP server.
 // They prove routing and lifecycle behavior, not the availability of a paid model.
 const healthLauncher = String.raw`
@@ -418,7 +491,8 @@ test('adapter preflight validates a scoped nonce and reclaims only its own proje
       ]));
       assert.equal(results[0].ok, true, results[0].detail);
       assert.equal(results[1].ok, false);
-      assert.equal(seen.filter(dependency => dependency.key === allowedDependency.key).length, 2);
+      assert.ok(seen.filter(dependency => dependency.key === allowedDependency.key).length >= 2,
+        'the allowed executor is checked before and after capacity waits, then immediately before spawn');
       assert.equal(seen.filter(dependency => dependency.key === blockedDependency.key).length, 1);
       assert.equal(fs.existsSync(tracePath('admission-blocked')), false);
       await checkReclaimed('admission-allowed');

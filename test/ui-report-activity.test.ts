@@ -120,6 +120,19 @@ test("unknown usage/cache differs from reported zero and partial coverage cannot
   assert.equal(usageSummary([attempt({ cacheRead: 0, cacheWrite: 0 })]).cacheHitRate, null, "legacy zero fields without completeness metadata do not certify a zero hit rate");
 });
 
+test('native token-only receipts keep tokens visible and monetary cost unknown', () => {
+  const native = attempt({input: 0, output: 0, cost: 0, metrics: {tokenUsage: {input: 100, output: 20}, usageReported: true, usageComplete: true, costReported: false, costComplete: false}});
+  const tokensOnly = usageSummary([native]);
+  assert.equal(tokensOnly.total, 120);
+  assert.equal(tokensOnly.cost, null);
+  assert.equal(tokensOnly.costReported, 0);
+  assert.equal(tokensOnly.costComplete, false);
+  const mixed = usageSummary([native, attempt({metrics: {usageReported: true, costReported: true, costComplete: true}})]);
+  assert.equal(mixed.cost, 0.01);
+  assert.equal(mixed.costReported, 1);
+  assert.equal(mixed.costComplete, false);
+});
+
 test('replay pages freeze the upper sequence and preserve every ordered event', async () => {
   const controller = new AbortController(), progress: number[] = [], calls: URL[] = [];
   const result = await loadReplayEvents('fixture', controller.signal, count => progress.push(count), async input => {

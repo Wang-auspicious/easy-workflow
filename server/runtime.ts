@@ -4,7 +4,7 @@
 // Everything that changes state is journaled first.
 import crypto from "node:crypto";
 import { withModelAdmission } from './model-requests.ts';
-import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, ModelDependency, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
+import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, ModelDependency, ModelResponse, ModelTokenUsage, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
 import { median, type FactoryState } from "../shared/project.ts";
 import { allocateResource } from './allocation.ts';
 import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
@@ -14,7 +14,7 @@ import type { Broker, Lease } from "./broker.ts";
 import type { Journal } from "./journal.ts";
 import { browserAttemptScope, withBrowserAttempt, type BrowserPoolFault } from "./browser.ts";
 import type { SessionRef } from './station-session.ts';
-import type { ClaudeSessionReference } from './claude-code.ts';
+import type { ClosedSessionReference } from './mcp-station.ts';
 
 export interface TokenRun {
   id: string;
@@ -89,7 +89,7 @@ export interface StationResult {
   usage?: Usage;
   metrics?: AttemptMetrics;
   /** Host session metadata survives cancellation; business data never does. */
-  sessionCheckpoint?: { pi?: SessionRef; closed?: ClaudeSessionReference };
+  sessionCheckpoint?: { pi?: SessionRef; closed?: ClosedSessionReference };
   /** Structured notes for the item's case file (Spec §33). */
   caseNotes?: { section: string; text: string }[];
   error?: string;
@@ -109,6 +109,12 @@ export interface PreparedExecutor {
 
 export interface ExecutorRegistration {
   readonly prepare: () => PreparedExecutor;
+}
+
+interface ExecutorPreparation {
+  prepared: PreparedExecutor | null;
+  failed: boolean;
+  error?: unknown;
 }
 
 /** A reviewer's request to the station that owns some fields (Spec §34). `via` lists the
@@ -155,7 +161,7 @@ export class Runtime {
   private attemptTokens = new Map<string,string>();
   onRecovery?: (token:TokenRun,failure:Failure)=>void;
   /** Owner-facing problems (certificate, login, model quota) light the red alert. */
-  onAlert?: (token:TokenRun,node:CompiledNode,failure:Failure)=>void;
+  onAlert?: (token:TokenRun,node:CompiledNode,failure:Failure,dependency?:ModelDependency)=>void;
   onPark?: (token:TokenRun)=>void;
   onTick?: () => void;
   private jobs = new Set<Promise<void>>();
@@ -323,6 +329,43 @@ export class Runtime {
     return seen;
   }
 
+  private prepareExecutor(node: CompiledNode): ExecutorPreparation {
+    try {
+      const executor = this.executors(node);
+      return {prepared: typeof executor === 'function' ? {execute: executor} : executor?.prepare() ?? null, failed: false};
+    } catch (error) { return {prepared: null, failed: true, error}; }
+  }
+
+  private modelWait(t: TokenRun, key: string) {
+    return (t.data.modelWait as Record<string, {dependency?: ModelDependency; reason: string}> | undefined)?.[key];
+  }
+
+  private dispatchHold(t: TokenRun, n: CompiledNode, preparation: ExecutorPreparation): string | null {
+    if (preparation.failed) return null;
+    const waiting = this.modelWait(t, n.key);
+    if (waiting) {
+      const reason = this.broker.modelBlocked(waiting.dependency, t.id);
+      if (reason) return reason;
+    }
+    if (preparation.prepared?.dependency || n.resource === 'model') {
+      return this.broker.modelBlocked(preparation.prepared?.dependency, t.id);
+    }
+    return null;
+  }
+
+  /** Current bindings decide new intake; actual attempts retain their own identity. */
+  intakeHold(entry: string): string | null {
+    for (const key of this.closureOf(entry)) {
+      const node = this.nodes.get(key);
+      if (!node || !this.runnable(node)) continue;
+      const prepared = this.prepareExecutor(node);
+      if (!prepared.prepared?.dependency && node.resource !== 'model') continue;
+      const reason = this.broker.modelBlocked(prepared.prepared?.dependency);
+      if (reason) return reason;
+    }
+    return null;
+  }
+
   /** A local pause releases intake only for work outside its queued frontier.
    * Use the original checkpoint entry when a retry restores parallel branches. */
   occupiesAdmission(token: TokenRun, targetEntry: string): boolean {
@@ -333,9 +376,22 @@ export class Runtime {
       !token.done.has(key) && !token.dead.has(key) && this.queues.get(key)?.includes(token.id));
     // An unfinished task without a queued frontier may be restoring or waiting
     // for repair. Lack of queue evidence must not make its slot free.
-    if (!frontier.length || frontier.some(key => !this.scopePaused(key))) return true;
+    if (!frontier.length) return true;
     const targetClosure = this.closureOf(targetEntry);
-    return frontier.some(key => targetClosure.has(key));
+    const targetDependencies = new Set([...targetClosure].flatMap(key => {
+      const node = this.nodes.get(key);
+      const dependency = node && this.runnable(node) ? this.prepareExecutor(node).prepared?.dependency : undefined;
+      return dependency ? [dependency.key] : [];
+    }));
+    return frontier.some(key => {
+      const node = this.nodes.get(key)!;
+      const prepared = this.prepareExecutor(node);
+      if (!this.scopePaused(key) && !this.dispatchHold(token, node, prepared)) return true;
+      if (targetClosure.has(key)) return true;
+      const dependency = this.modelWait(token, key)?.dependency ?? prepared.prepared?.dependency;
+      // Unknown fault domains retain their global compatibility barrier.
+      return dependency ? targetDependencies.has(dependency.key) : node.resource === 'model';
+    });
   }
 
   /** Rebuild both live and skipped branches before a checkpoint or restart resumes.
@@ -482,28 +538,41 @@ export class Runtime {
     const keys = [...this.queues.keys()].filter((k) => this.queues.get(k)!.length)
       .sort((a, b) => lines.get(this.nodes.get(a)!.line)! - lines.get(this.nodes.get(b)!.line)! || (this.nodes.get(b)!.kind === "review" ? 1 : 0) - (this.nodes.get(a)!.kind === "review" ? 1 : 0));
     const waiting: Record<string, string> = {};
-    const allocation = this.resourceAllocations();
+    const preparations = new Map(keys.map(key => [key, this.prepareExecutor(this.nodes.get(key)!)]));
+    const allocation = this.resourceAllocations(false, preparations);
     for (const key of keys) {
       const n = this.nodes.get(key)!;
       const q = this.queues.get(key)!;
+      let preparation = preparations.get(key)!;
+      let preparedUsed = false;
       if (this.scopePaused(key)) { waiting[key] = this.pausedLines.has(n.line) ? '这条流水线已暂停；在途任务保留结果' : '这个工位已暂停；输入保留排队'; continue; }
       for (const w of this.workers.get(key)!) {
         if (!q.length) break;
         if (w.busy) continue;
-        if (n.resource !== 'none' && this.workers.get(key)!.filter(worker => worker.busy).length >= (allocation.get(key) ?? 0)) { waiting[key] = `按到达率 × 服务时间分配 ${allocation.get(key) ?? 0} 个 ${n.resource} 名额`; continue; }
-        const index = n.resource === 'model' && this.broker.recoveryToken
-          ? q.indexOf(this.broker.recoveryToken) : 0;
-        if (index < 0) { waiting[key] = "模型恢复验证中，其他任务保留检查点等待"; continue; }
+        if (preparedUsed) preparation = this.prepareExecutor(n);
+        const index = q.findIndex(id => {
+          const token = this.tokens.get(id);
+          return token && !token.finished && !this.dispatchHold(token, n, preparation);
+        });
+        if (index < 0) {
+          const token = this.tokens.get(q[0]);
+          waiting[key] = token ? this.dispatchHold(token, n, preparation) ?? '等待原检查点' : '等待任务';
+          continue;
+        }
+        const resource = preparation.failed ? 'none' : n.resource;
+        if (resource !== 'none' && this.workers.get(key)!.filter(worker => worker.busy).length >= (allocation.get(key) ?? 0)) { waiting[key] = `按到达率 × 服务时间分配 ${allocation.get(key) ?? 0} 个 ${n.resource} 名额`; continue; }
         const queuedToken = this.tokens.get(q[index]);
         const capacityWait = queuedToken?.data.capacityWait as Record<string, number> | undefined;
         if ((capacityWait?.[key] ?? 0) > Date.now()) { waiting[key] = '等待共享浏览器释放容量；网站未记为失败'; continue; }
-        const why = this.broker.blocked(n.resource, { review: n.kind === "review" });
+        const options = {review: n.kind === 'review', dependency: preparation.prepared?.dependency, token: queuedToken!.id};
+        const why = this.broker.blocked(resource, options);
         if (why) { waiting[key] = why; break; }
-        const lease = this.broker.tryAcquire(n.resource, { review: n.kind === "review" })!;
+        const lease = this.broker.tryAcquire(resource, options)!;
         const [tid] = q.splice(index, 1);
         const t = this.tokens.get(tid);
         if (!t || t.finished) { lease.release(); continue; }
-        const job = this.run(w, t, n, lease);
+        const job = this.run(w, t, n, lease, preparation);
+        preparedUsed = true;
         this.jobs.add(job);
         void job.finally(() => this.jobs.delete(job)).catch((error) => console.error("worker settlement", error));
       }
@@ -518,18 +587,9 @@ export class Runtime {
     return redo ? `${base}（${redo.byHuman ? "站长纠错" : "被退回"}：${redo.reason}）` : base;
   }
 
-  private async run(w: Worker, t: TokenRun, n: CompiledNode, lease: Lease) {
+  private async run(w: Worker, t: TokenRun, n: CompiledNode, lease: Lease, preparation: ExecutorPreparation) {
     const attempt = `a-${short()}`;
-    let prepared: PreparedExecutor | null = null;
-    let preparationFailed = false;
-    let preparationError: unknown;
-    try {
-      const executor = this.executors(n);
-      prepared = typeof executor === 'function' ? {execute: executor} : executor?.prepare() ?? null;
-    } catch (error) {
-      preparationFailed = true;
-      preparationError = error;
-    }
+    const prepared = preparation.prepared;
     const epoch = t.nodeEpochs?.get(n.key)??0;
     const queuedMs = Date.now() - (t.queuedAt.get(n.key) ?? Date.now());
     const ctrl = new AbortController();
@@ -549,13 +609,59 @@ export class Runtime {
     }
     const t0 = Date.now();
     let res: StationResult;
+    let actualDependency = prepared?.dependency;
+    const responses = new Map<string, ModelResponse>();
+    const modelResponse = (value: ModelResponse) => {
+      const key = JSON.stringify([value.dependency.key, value.model, value.provider]);
+      const prior = responses.get(key);
+      const receivedTokens = value.tokenUsage ?? value.usage;
+      const tokenUsage: ModelTokenUsage | undefined = receivedTokens ? {
+        input: receivedTokens.input, output: receivedTokens.output,
+        ...Object.fromEntries(['cacheRead', 'cacheWrite', 'reasoning'].flatMap(field => {
+          const count = receivedTokens[field as keyof typeof receivedTokens];
+          return typeof count === 'number' ? [[field, count]] : [];
+        })),
+      } : undefined;
+      const costReported = value.costReported ?? Boolean(value.usage);
+      if (!prior) {
+        responses.set(key, structuredClone({...value, tokenUsage,
+          costReported, costComplete: value.costComplete ?? costReported}));
+        return;
+      }
+      prior.modelCalls += value.modelCalls;
+      prior.usageReported = prior.usageReported && value.usageReported;
+      prior.costReported ||= costReported;
+      prior.costComplete = prior.costComplete !== false && (value.costComplete ?? costReported);
+      if (tokenUsage) {
+        prior.tokenUsage ??= {input: 0, output: 0};
+        for (const field of ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning'] as const) {
+          const count = tokenUsage[field as keyof typeof tokenUsage];
+          if (typeof count === 'number') prior.tokenUsage[field] = (prior.tokenUsage[field] ?? 0) + count;
+        }
+      }
+      if (value.usage) {
+        prior.usage ??= {input: 0, output: 0, cost: 0};
+        for (const field of ['input', 'output', 'cost', 'cacheRead', 'cacheWrite'] as const) {
+          if (value.usage[field] !== undefined) prior.usage[field] = (prior.usage[field] ?? 0) + value.usage[field];
+        }
+      }
+    };
+    let blockedModel: {dependency?: ModelDependency; reason: string} | undefined;
+    const modelAdmission = (dependency?: ModelDependency, request = false) => {
+      if (blockedModel) return blockedModel.reason;
+      const actual = dependency ?? prepared?.dependency;
+      if (request) actualDependency = actual;
+      const reason = this.broker.modelBlocked(actual, t.id);
+      if (reason && request) blockedModel = {dependency: actual, reason};
+      return reason;
+    };
     try {
-      if (preparationFailed) throw preparationError;
+      if (preparation.failed) throw preparation.error;
       const exec = prepared?.execute;
       if (!exec) throw new Error(`工位 ${n.key} 没有执行器`);
       const role=this.roleResolver(n.key);
       this.journal.append({kind:"attempt.progress",attempt,text:`按 ${n.name} 的 ROLE.md 执行`,step:{tool:"role",text:`${role.path} @ ${role.revision}`}});
-      res = await withModelAdmission(() => this.broker.modelHold || (this.broker.recoveryToken && this.broker.recoveryToken !== t.id ? '正在用一个工位验证模型恢复' : null), () => withBrowserAttempt(browserScope, () => exec({
+      res = await withModelAdmission(modelAdmission, () => withBrowserAttempt(browserScope, () => exec({
         token: t, node: n, attempt, worker: w, signal: ctrl.signal, redo: t.notes.get(n.key),
         progress: (text, step) => {
           if (!ctrl.signal.aborted && (t.nodeEpochs?.get(n.key)??0) === epoch && !t.finished) this.journal.append({ kind: "attempt.progress", attempt, text, step });
@@ -568,7 +674,7 @@ export class Runtime {
           this.journal.append({ kind: "evidence.added", evidence: full });
           return full;
         },
-      })));
+      })), (_dependency, signal) => this.broker.modelRequests.acquire(signal), modelResponse);
     } catch (err) {
       const failure=(err as {failure?:Failure})?.failure ?? classifyFailure(err,{url:t.url});
       const observed = err as Pick<StationResult, 'usage' | 'metrics' | 'sessionCheckpoint'>;
@@ -578,6 +684,41 @@ export class Runtime {
       this.aborts.delete(attempt);
       this.attemptTokens.delete(attempt);
       w.busy = null; w.idleSince = Date.now();
+    }
+    if (!res.metrics?.dependency && (prepared?.dependency || actualDependency)) {
+      res.metrics = {...res.metrics, dependency: prepared?.dependency ?? actualDependency};
+    }
+    if (responses.size) {
+      const modelResponses = [...responses.values()];
+      const recorded = modelResponses.filter(response => response.usage);
+      const tokenUsage: ModelTokenUsage = {input: 0, output: 0};
+      for (const response of modelResponses) {
+        for (const field of ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning'] as const) {
+          const count = response.tokenUsage?.[field];
+          if (count !== undefined) tokenUsage[field] = (tokenUsage[field] ?? 0) + count;
+        }
+      }
+      if (recorded.length) {
+        const usage: Usage = {input: 0, output: 0, cost: 0};
+        for (const response of recorded) for (const field of ['input', 'output', 'cost', 'cacheRead', 'cacheWrite'] as const) {
+          if (response.usage![field] !== undefined) usage[field] = (usage[field] ?? 0) + response.usage![field]!;
+        }
+        res.usage = usage;
+      }
+      res.metrics = {...res.metrics, modelResponses,
+        tokenUsage: modelResponses.some(response => response.tokenUsage) ? tokenUsage : res.metrics?.tokenUsage,
+        costReported: modelResponses.some(response => response.costReported),
+        costComplete: res.metrics?.costComplete !== false && modelResponses.every(response => response.costComplete),
+        usageReported: res.metrics?.usageReported || modelResponses.some(response => response.usageReported),
+        usageComplete: res.metrics?.usageComplete !== false && modelResponses.every(response => response.usageReported)};
+    }
+    if (res.failure && actualDependency) res.failure = {...res.failure, dependency: res.failure.dependency ?? actualDependency};
+    if (blockedModel) {
+      res = {...res, ok: false, summary: blockedModel.reason, failure: {
+        tag: 'tool_error', category: 'system', owner: 'system', retryable: true,
+        code: 'MODEL_CIRCUIT_OPEN', message: blockedModel.reason,
+        dependency: blockedModel.dependency,
+      }};
     }
     const ms = Date.now() - t0;
     try {
@@ -613,6 +754,25 @@ export class Runtime {
 
   private finishAttempt(t: TokenRun, n: CompiledNode, attempt: string, ctrl: AbortController,
     browserScope: ReturnType<typeof browserAttemptScope>, epoch: number, res: StationResult, ms: number, queuedMs: number) {
+    if (res.failure?.code === 'MODEL_CIRCUIT_OPEN' && !ctrl.signal.aborted && !t.finished &&
+        this.running && !this.ending && (t.nodeEpochs?.get(n.key) ?? 0) === epoch) {
+      const modelWait = {...(t.data.modelWait as object ?? {}), [n.key]: {
+        dependency: res.failure.dependency ?? res.metrics?.dependency, reason: res.failure.message,
+      }};
+      const patch: Record<string, unknown> = {modelWait};
+      // Waiting is not a business result. Keep only host-owned conversations;
+      // evidence and already reported usage have their own durable receipts.
+      for (const key of ['stationSessions', 'closedStationSessions']) {
+        if (res.data?.[key]) patch[key] = res.data[key];
+      }
+      Object.assign(t.data, patch);
+      this.journal.append({kind: 'token.data', token: t.id, patch});
+      this.journal.append({kind: 'attempt.finished', attempt, ok: false, cancelled: true,
+        summary: res.failure.message, ms, queuedMs, error: 'model_wait', usage: res.usage, metrics: res.metrics});
+      t.inflight.delete(n.key);
+      this.enqueue(t, n.key, n.key, true);
+      return;
+    }
     if (res.failure?.code === 'BROWSER_CAPACITY_TIMEOUT' && !ctrl.signal.aborted && !t.finished && this.running && !this.ending && (t.nodeEpochs?.get(n.key) ?? 0) === epoch) {
       this.journal.append({kind:'attempt.finished',attempt,ok:false,cancelled:true,summary:'共享浏览器容量不足，保留本工位排队；网站未记为失败',ms,queuedMs,error:'resource_wait'});
       t.inflight.delete(n.key);
@@ -635,7 +795,7 @@ export class Runtime {
           patch.stationSessions = { ...(t.data.stationSessions as Record<string, SessionRef> ?? {}), [n.key]: res.sessionCheckpoint.pi };
         }
         if (res.sessionCheckpoint.closed) {
-          patch.closedStationSessions = { ...(t.data.closedStationSessions as Record<string, ClaudeSessionReference> ?? {}), [n.key]: res.sessionCheckpoint.closed };
+          patch.closedStationSessions = { ...(t.data.closedStationSessions as Record<string, ClosedSessionReference> ?? {}), [n.key]: res.sessionCheckpoint.closed };
         }
         if (Object.keys(patch).length) {
           Object.assign(t.data, patch);
@@ -648,6 +808,12 @@ export class Runtime {
       return;
     }
     if (res.data && Object.keys(res.data).length) { Object.assign(t.data, res.data); this.journal.append({ kind: "token.data", token: t.id, patch: res.data }); }
+    if (this.modelWait(t, n.key)) {
+      const modelWait = {...t.data.modelWait as Record<string, unknown>};
+      delete modelWait[n.key];
+      t.data.modelWait = modelWait;
+      this.journal.append({kind: 'token.data', token: t.id, patch: {modelWait}});
+    }
     const metrics = res.metrics ?? (n.kind === "agent" || n.kind === "review" ? undefined : { time: { firstTokenMs: 0, outputMs: 0, toolMs: 0, programMs: ms, modelCalls: 0, toolCalls: 0 } });
     this.journal.append({ kind: "attempt.finished", attempt, ok: res.ok, summary: res.summary, ms, queuedMs, usage: res.usage, error: res.error, metrics });
     for (const c of res.ok ? res.caseNotes ?? [] : []) this.journal.append({ kind: "case.noted", caseId: t.item, token: t.id, note: { station: n.key, section: c.section, text: c.text, by: n.key } });
@@ -661,7 +827,7 @@ export class Runtime {
       const failure = candidateFailure(res.failure ?? classifyFailure(res.error ?? res.summary, {
         url: t.url, stage: n.kind === 'agent' || n.kind === 'review' ? 'model' : undefined,
       }), String(t.data.canonical ?? t.url));
-      if (failure.owner === 'user' || failure.tag === 'model_transport') this.onAlert?.(t, n, failure);
+      if (failure.owner === 'user' || failure.tag === 'model_transport') this.onAlert?.(t, n, failure, failure.dependency ?? res.metrics?.dependency);
       t.finished = true;
       t.data.failure = failure;
       this.cancelTokenWork(t);
@@ -1027,18 +1193,22 @@ export class Runtime {
     return { lambda, s, need, samples: ds.length, workers: pool.length, queue: this.queues.get(key)!.length, takt: s / Math.max(1, pool.length), measured: ds.length >= 10 };
   }
 
-  resourceAllocations(recommendation = false) {
+  resourceAllocations(recommendation = false, preparations?: Map<string, ExecutorPreparation>) {
     const result = new Map<string, number>();
-    for (const resource of ['browser', 'model', 'cpu', 'http']) {
+    for (const resource of ['browser', 'model', 'cpu', 'http'] as const) {
       const nodes = this.f.nodes.filter(node => this.runnable(node) && node.resource === resource && !this.scopePaused(node.key)
-        && (resource !== 'model' || !this.broker.recoveryToken || this.queues.get(node.key)?.includes(this.broker.recoveryToken) || this.workers.get(node.key)?.some(worker => worker.busy && this.attemptTokens.get(worker.busy) === this.broker.recoveryToken)));
+        && (recommendation || this.workers.get(node.key)?.some(worker => worker.busy) ||
+          this.queues.get(node.key)?.some(id => {
+            const token = this.tokens.get(id);
+            return token && !this.dispatchHold(token, node, preparations?.get(node.key) ?? this.prepareExecutor(node));
+          })));
       const demands = nodes.map(node => {
         const numbers = this.stationNumbers(node.key), pool = this.workers.get(node.key)!;
         const work = numbers.lambda * numbers.s;
         const demand = recommendation ? numbers.need : Math.min(pool.length, numbers.queue + pool.filter(worker => worker.busy).length);
         return { key: node.key, work, max: demand, review: node.kind === 'review' };
       }).filter(demand => demand.max > 0);
-      const capacity = resource === 'browser' ? this.broker.effectiveBrowser() : this.broker.limits[resource] ?? 1;
+      const capacity = this.broker.capacity(resource);
       for (const [key, value] of allocateResource(capacity, demands, resource === 'model')) result.set(key, value);
     }
     return result;
@@ -1108,11 +1278,13 @@ export class Runtime {
       if (x.queue >= 2 * Math.max(1, pool.length)) { if (!this.backlogSince.has(n.key)) this.backlogSince.set(n.key, now); }
       else this.backlogSince.delete(n.key);
       const backlog = this.backlogSince.get(n.key);
-      const free = n.resource === "none" || (this.broker.used[n.resource] ?? 0) < (this.broker.limits[n.resource] ?? 1) - (n.resource === "model" ? 1 : 0);
+      const capacity = this.broker.capacity(n.resource);
+      const reserve = n.resource === 'model' && n.kind !== 'review' && capacity > 1 ? 1 : 0;
+      const free = n.resource === 'none' || (this.broker.used[n.resource] ?? 0) < capacity - reserve;
       const busyEnough = n.resource !== "browser" || pool.filter((w) => w.busy).length >= pool.length;
       if (backlog && now - backlog >= FORK_BACKLOG_MS && pool.length < x.need && pool.length < (n.resource === 'none' ? n.workers.max : allocated.get(n.key) ?? 0) && free && busyEnough && now - since >= DEBOUNCE_MS) {
         const lt = this.lineTakt(n.line);
-        const res = n.resource === "none" ? "" : `（${n.resource} ${this.broker.used[n.resource]}/${this.broker.limits[n.resource]}）`;
+        const res = n.resource === "none" ? "" : `（${n.resource} ${this.broker.used[n.resource]}/${capacity}）`;
         const w = this.spawn(n, `队列 ${x.queue} ≥ 2×工人数 ${pool.length} 持续 ${Math.round((now - backlog) / 1000)}s；中位耗时 ${x.s.toFixed(1)}s、需要 ${x.need} 人`, true);
         this.lastAdjust.set(n.key, now);
         this.backlogSince.delete(n.key);

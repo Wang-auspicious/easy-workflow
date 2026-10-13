@@ -8,6 +8,7 @@ import { Type } from "typebox";
 import { piStatus, models, closeModelTransport } from "../server/pi.ts";
 import { runAgentStation } from "../server/agent-station.ts";
 import type { StationContext } from "../server/runtime.ts";
+import {ModelRequests} from '../server/model-requests.ts';
 
 test("Pi profile, structured station submission, repair and cancellation", { timeout: 15000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-pi-test-"));
@@ -93,4 +94,42 @@ test("Pi profile, structured station submission, repair and cancellation", { tim
     }
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('model request capacity reacts to increases and queued cancellation without releasing a live request', async () => {
+  let limit = 1;
+  const pool = new ModelRequests(() => limit);
+  const first = await pool.acquire();
+  const order: number[] = [];
+  const second = pool.acquire().then(release => {order.push(2); return release;});
+  assert.equal(pool.queued, 1);
+  limit = 2;
+  pool.notifyCapacityChanged();
+  const releaseSecond = await second;
+  assert.deepEqual(order, [2]);
+  assert.equal(pool.active, 2);
+  const cancelled = new AbortController();
+  const third = pool.acquire(cancelled.signal);
+  const rejected = assert.rejects(third, {name: 'AbortError'});
+  const fourth = pool.acquire().then(release => {order.push(4); return release;});
+  limit = 3;
+  cancelled.abort();
+  await rejected;
+  const releaseFourth = await fourth;
+  assert.deepEqual(order, [2, 4], 'cancel removes only its own FIFO position and wakes available capacity');
+  assert.equal(pool.active, 3);
+  const fifth = pool.acquire();
+  limit = 1;
+  pool.notifyCapacityChanged();
+  first();
+  releaseSecond();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(pool.active, 1);
+  assert.equal(pool.queued, 1, 'lowering a cap waits for live owners to release their own slots');
+  releaseFourth();
+  const releaseFifth = await fifth;
+  releaseFifth();
+  releaseFifth();
+  assert.equal(pool.active, 0);
+  assert.equal(pool.queued, 0);
 });

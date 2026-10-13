@@ -108,6 +108,8 @@ test('unreported and estimated model usage stays unknown; an explicitly reported
   assert.equal(recordedUsage([attempt]).total, null);
   attempt.usage.input = 0; attempt.metrics = { usageReported: true };
   assert.equal(recordedUsage([attempt]).total, 0);
+  attempt.metrics = {usageReported: true, tokenUsage: {input: 84, output: 16}, costReported: false};
+  assert.equal(recordedUsage([attempt]).total, 100, 'a token-only native receipt is not a default projection zero');
 });
 
 test('node execution labels distinguish actual receipts, requested bindings and plain programs', async () => {
@@ -153,6 +155,38 @@ test('runtime recovery summaries preserve only the v1 status metadata through sn
   assert.deepEqual(summary.tokens.recovering.data.__runtimeRecovery, completed);
   applyUiEvent(summary, uiEvent({kind: 'token.data', token: 'recovering', patch: {__runtimeRecovery: null}, seq: summary.seq + 1, at: 201, run: state.run.id}));
   assert.equal(summary.tokens.recovering.data.__runtimeRecovery, null, 'clearing a plan cannot keep a stale automatic recovery label');
+});
+
+test('model recovery follows the matching service circuit without clearing other services', () => {
+  const {state, emit, create} = statusFixture();
+  state.batch = {runId: state.run.id, target: 20, maxInFlight: 4, intakeWindow: 1, maxRecoveries: 2, mode: 'running', startedAt: 101};
+  const serviceA = {key: 'pi:service-a', adapter: 'pi', provider: 'provider-a', model: 'model-a'} as const;
+  const serviceB = {key: 'pi:service-b', adapter: 'pi', provider: 'provider-b', model: 'model-b'} as const;
+  const recovery = (dependency: typeof serviceA | typeof serviceB) => ({version: 1, runId: state.run.id, kind: 'model', state: 'waiting',
+    station: 'curation/reader', nextAt: 4000, networkAttempts: 0, modelFailures: 1, failureAttempt: 'failed-model', dependency});
+  for (const [id, dependency] of [['a', serviceA], ['a2', serviceA], ['b', serviceB]] as const) {
+    create(id);
+    emit({kind: 'token.finished', token: id, node: 'curation/reader', status: 'parked', reason: 'Transport unavailable'});
+    emit({kind: 'token.data', token: id, patch: {__runtimeRecovery: recovery(dependency)}});
+  }
+  emit({kind: 'model.circuit', key: serviceA.key, circuit: {dependency: serviceA, state: 'open', failures: 3, nextAt: 31000, runId: state.run.id, reason: 'A is cooling'}});
+  emit({kind: 'model.circuit', key: serviceB.key, circuit: {dependency: serviceB, state: 'open', failures: 1, nextAt: 5000, runId: state.run.id, reason: 'B is cooling'}});
+  const compact = uiState(state);
+  assert.deepEqual(compact.tokens.a.data.__runtimeRecovery, recovery(serviceA));
+  assert.match(tokenStatus(compact.tokens.a, compact, 1000).detail, /30 秒后.*provider-a \/ model-a.*3 次/);
+  assert.match(tokenStatus(compact.tokens.b, compact, 1000).detail, /4 秒后.*provider-b \/ model-b.*1 次/);
+  const update = (event: unknown) => applyUiEvent(compact, uiEvent({...event as object, seq: compact.seq + 1, at: 1500, run: state.run.id} as Stamped));
+  update({kind: 'model.circuit', key: serviceA.key, circuit: {...compact.modelCircuits[serviceA.key], state: 'trial', trialToken: 'a', nextAt: 0}});
+  assert.equal(tokenStatus(compact.tokens.a2, compact, 2000).label, '等待服务验证');
+  assert.equal(tokenStatus(compact.tokens.b, compact, 2000).label, '模型冷却');
+  update({kind: 'model.circuit', key: serviceA.key, circuit: null});
+  update({kind: 'token.data', token: 'a', patch: {__runtimeRecovery: {...recovery(serviceA), state: 'completed', nextAt: 0}}});
+  assert.equal(compact.modelCircuits[serviceA.key], undefined);
+  assert.ok(compact.modelCircuits[serviceB.key]);
+  assert.equal(tokenStatus(compact.tokens.a, compact, 2000).label, '待重试', 'connection recovery alone is not publication');
+  assert.equal(tokenStatus(compact.tokens.b, compact, 2000).label, '模型冷却');
+  update({kind: 'resource.sample', used: {browser: 0, model: 1, cpu: 1, http: 0}, waiting: {}, freeGB: 3, browserEffective: 2, modelRequests: {active: 1, queued: 2, limit: 1}});
+  assert.deepEqual(compact.resources.modelRequests, {active: 1, queued: 2, limit: 1});
 });
 
 test('network recovery waits, pauses, attempts and completion remain separate from task publication', () => {

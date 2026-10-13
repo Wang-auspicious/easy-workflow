@@ -2,10 +2,11 @@
 // materialized view, the dashboard keeps another fed by SSE, and offline replay feeds
 // a recorded journal through the very same function (Spec §10.11, §11).
 import type {
-  Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, JournalEvent, ModelDependency, PreflightCheck, ProjectAgentDefaults, Stamped, StepDetail, TokenStatus, Usage,
+  Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, JournalEvent, ModelCircuit, ModelDependency, PreflightCheck, ProjectAgentDefaults, Stamped, StepDetail, TokenStatus, Usage,
 } from "./types.ts";
 import { legacyReply, type ConversationEntry } from "./conversation.ts";
 import { mergeActivity } from "./activity.ts";
+import {observedUsage} from './usage.ts';
 
 export interface WorkerState {
   id: string;
@@ -134,13 +135,14 @@ export interface FactoryState {
   activity: ChatMessage[];
   recoveries: Record<string, import("./failures.ts").CandidateRecovery>;
   totals: { usage: Usage; published: number; manual: number; failed: number; rejected: number; merged: number; returned: number; corrections: number };
-  resources: { used: Record<string, number>; limits: Record<string, number>; freeMemMB: number; at: number; waiting: Record<string, string> };
+  resources: { used: Record<string, number>; limits: Record<string, number>; freeMemMB: number; at: number; waiting: Record<string, string>; modelRequests?: {active: number; queued: number; limit: number} };
   /** Ring of the latest edge transfers; the canvas turns new ones into particles. */
   transfers: Transfer[];
   patches: { id: string; summary: string; status: string; at: number }[];
   reportReady: string | null;
   lockedStations: string[];
   alerts: Record<string, Alert & { at: number }>;
+  modelCircuits: Record<string, ModelCircuit>;
   agentDefaults?: ProjectAgentDefaults;
   preflight: { at: number; ok: boolean; checks: PreflightCheck[] } | null;
   /** Case files keyed by item, so retries continue the same dossier (Spec §33). */
@@ -171,7 +173,7 @@ export function initialState(factory?: CompiledFactory): FactoryState {
     totals: { usage: zeroUsage(), published: 0, manual: 0, failed: 0, rejected: 0, merged: 0, returned: 0, corrections: 0 },
     resources: { used: {}, limits: {}, freeMemMB: 0, at: 0, waiting: {} },
     transfers: [], patches: [], reportReady: null, lockedStations: [],
-    alerts: {}, preflight: null, cases: {}, contextNotes: {}, consults: {}, corrections: {}, pausedScopes: { lines: [], stations: [] }, agentBindings: {},
+    alerts: {}, modelCircuits: {}, preflight: null, cases: {}, contextNotes: {}, consults: {}, corrections: {}, pausedScopes: { lines: [], stations: [] }, agentBindings: {},
   };
 }
 
@@ -195,6 +197,11 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
   switch (e.kind) {
     case 'agent.defaults':
       s.agentDefaults = structuredClone(e.defaults);
+      break;
+    case 'model.circuit':
+      s.modelCircuits ??= {};
+      if (e.circuit) s.modelCircuits[e.key] = {...e.circuit, dependency: {...e.circuit.dependency}};
+      else delete s.modelCircuits[e.key];
       break;
     case 'agent.binding': {
       const bindings = s.agentBindings ??= {};
@@ -240,6 +247,9 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
     case "run.ended":
       if (s.run.pausedAt) s.run.pausedMs += e.at - s.run.pausedAt;
       s.run.pausedAt = undefined; s.run.status = "ended"; s.run.endedAt = e.at; s.run.manualEnd = e.manual;
+      for (const [key, circuit] of Object.entries(s.modelCircuits)) {
+        if (circuit.runId === e.runId) s.modelCircuits[key] = {...circuit, runEndedAt: e.at};
+      }
       break;
     case "stock.set": {
       const n = node(e.node);
@@ -314,13 +324,15 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       if (!a.cancelled) for (const correction of Object.values(s.corrections ?? {})) if (correction.token === a.token && correction.status === 'pending') correction.status = 'executed';
       const activity = mergeActivity(a.metrics?.activity, e.metrics?.activity);
       a.endedAt = e.at; a.ok = ok; a.summary = e.summary; a.error = e.error; a.ms = e.ms; a.queuedMs = e.queuedMs; a.output = e.output; a.metrics = activity ? { ...e.metrics, activity } : e.metrics;
-      addUsage(a.usage, e.usage);
+      const observed = observedUsage(e.usage, e.metrics);
+      const recordedUsage = observed ? {...observed, cost: observed.cost ?? 0} : undefined;
+      addUsage(a.usage, recordedUsage);
       const n = node(a.node);
       remove(n.active, a.id);
       const token = s.tokens[a.token];
       if (token && !n.queue.includes(a.token) && !n.active.some(id => s.attempts[id]?.token === a.token)) remove(token.at, a.node);
-      addUsage(n.usage, e.usage);
-      addUsage(s.totals.usage, e.usage);
+      addUsage(n.usage, recordedUsage);
+      addUsage(s.totals.usage, recordedUsage);
       if(ok) pushCap(n.durations, e.ms);
       pushCap(n.waits, e.queuedMs);
       if (ok) { n.processed++; n.lastOkAt = e.at; } else if(!e.cancelled && e.error!=="stale") { n.failed++; n.lastFailAt = e.at; }
@@ -455,7 +467,7 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       break;
     }
     case "resource.sample":
-      s.resources = { used: e.used, limits: e.limits, freeMemMB: e.freeMemMB, at: e.at, waiting: e.waiting ?? {} };
+      s.resources = { used: e.used, limits: e.limits, freeMemMB: e.freeMemMB, at: e.at, waiting: e.waiting ?? {}, modelRequests: e.modelRequests };
       break;
     case "report.ready":
       s.reportReady = e.runId;

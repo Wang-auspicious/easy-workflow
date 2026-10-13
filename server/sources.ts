@@ -6,7 +6,7 @@ import { classifyFailure } from '../shared/failures.ts';
 import { webGetBytes } from './network.ts';
 import { workflowValue } from './workflow-packs.ts';
 import { workflowEntry } from './workflow-entry.ts';
-import { batchSummary, latestBatchTokens } from '../shared/batch.ts';
+import {batchSummary, flowWindow, latestBatchTokens, occupiesIntake, type FlowObservation} from '../shared/batch.ts';
 
 type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'toolbox' | 'settings' | 'broker' | 'batch' | 'channels'>;
 type Poll = { nextAt: number; count: number; duplicates: number; invalid?: number; attention?: string; failure?: ReturnType<typeof classifyFailure> };
@@ -73,7 +73,8 @@ export class SourceSupervisor {
         this.completeCandidate(event.candidate.targetToken);
       }
       if (['source.configured', 'source.candidate', 'run.started', 'run.resumed',
-        'scope.paused', 'factory.loaded', 'batch.configured', 'token.finished'].includes(event.kind)) {
+        'scope.paused', 'factory.loaded', 'batch.configured', 'token.queued', 'token.finished',
+        'worker.forked', 'worker.retired', 'model.circuit', 'alert.cleared'].includes(event.kind)) {
         this.schedule();
       }
     });
@@ -487,21 +488,48 @@ export class SourceSupervisor {
     if (!source.enabled) return '来源已停用；单次采集只保存候选';
     if (!f.runtime.running || f.runtime.paused || f.runtime.ending) return '等待运行中的未暂停轮次';
     if (f.runtime.scopePaused(source.target)) return '来源下游已局部暂停';
-    if (f.broker.modelHold) return f.broker.modelHold;
+    const dependencyHold = f.runtime.intakeHold(source.target);
+    if (dependencyHold) return dependencyHold;
     const goal = f.state.batch?.runId === f.state.run.id ? batchSummary(f.state) : null;
     if (goal && (goal.mode !== 'running' || goal.modelCircuit || goal.remaining <= 0)) return '当前托管目标已暂停、阻塞或已领取足够任务';
     if (goal && (source.target !== 'candidates/tidy' || goal.category || goal.query)) return '保留候选，等待不受当前托管筛选范围限制的轮次';
     if (goal) {
       if (goal.active >= goal.maxInFlight) return `已达到 ${goal.maxInFlight} 件托管在途任务的入场上限`;
-      const upstream = latestBatchTokens(f.state).filter(token => token.status === 'active' &&
-        !f.runtime.tokens.get(token.id)?.done.has('curation/plan')).length;
+      const upstream = latestBatchTokens(f.state).filter(token => {
+        if (token.status !== 'active') return false;
+        const live = f.runtime.tokens.get(token.id);
+        if (!live) return true;
+        return goal.admission ? occupiesIntake(f.compiled, source.target, live) : !live.done.has('curation/plan');
+      }).length;
       if (upstream >= goal.intakeWindow) return `已达到 ${goal.intakeWindow} 件前段任务的入场上限`;
       return;
     }
-    const limit = 1;
-    const inFlight = [...f.runtime.tokens.values()]
-      .filter(token => f.runtime.occupiesAdmission(token, source.target)).length;
-    if (inFlight >= limit) return `已达到 ${limit} 件执行或排队任务的入场上限，等待现有任务让出名额`;
+    const admission = this.unmanagedAdmission(source.target);
+    if (admission.active >= admission.maxInFlight) return `已达到 ${admission.maxInFlight} 件执行或排队任务的入场上限，等待现有任务让出名额`;
+    if (admission.upstream >= admission.intakeWindow) return `入口工位已达到 ${admission.intakeWindow} 件任务，完成后继续补料`;
+  }
+
+  /** Sources and fresh channel children share a bounded automatic intake window. */
+  unmanagedAdmission(entry: string, automaticOnly = false) {
+    const f = this.f;
+    const observations = new Map<string, FlowObservation>();
+    for (const node of f.compiled.nodes) {
+      if (!f.runtime.runnable(node)) continue;
+      const numbers = f.runtime.stationNumbers(node.key);
+      observations.set(node.key, {serviceSeconds: numbers.s, samples: numbers.samples, workers: numbers.workers});
+    }
+    const resources = {...f.broker.limits, browser: f.broker.effectiveBrowser()};
+    const window = flowWindow(f.compiled, entry, resources, observations);
+    for (const target of new Set([...this.definitions.values()].filter(source => source.enabled).map(source => source.target))) {
+      const sourceWindow = flowWindow(f.compiled, target, resources, observations);
+      window.maxInFlight = Math.max(window.maxInFlight, sourceWindow.maxInFlight);
+    }
+    const occupied = [...f.runtime.tokens.values()].filter(token =>
+      (!automaticOnly || token.data.sourceCandidate || token.data.channelDelivery ||
+        token.source.startsWith('source:') || token.source.startsWith('channel:')) &&
+      f.runtime.occupiesAdmission(token, entry));
+    return {...window, active: occupied.length,
+      upstream: occupied.filter(token => occupiesIntake(f.compiled, entry, token)).length};
   }
 
   /** The batch owns managed admission so subscriber order cannot take its slot. */
@@ -545,9 +573,35 @@ export class SourceSupervisor {
     const f = this.f;
     if (this.closed || process.env.FACTORY_READONLY === '1') return 0;
     let admitted = 0;
-    const queued = [...this.candidates.values()]
+    const ranked = [...this.candidates.values()]
       .filter(candidate => ['pending', 'blocked'].includes(candidate.status))
       .sort((a, b) => this.reputation(b) - this.reputation(a) || a.discoveredAt - b.discoveredAt);
+    const grouped = new Map<string, SourceCandidate[]>();
+    for (const candidate of ranked) {
+      const list = grouped.get(candidate.source) ?? [];
+      list.push(candidate);
+      grouped.set(candidate.source, list);
+    }
+    const sourceIds = [...this.definitions.keys()].filter(id => grouped.has(id));
+    const eligible = new Set(sourceIds);
+    let previous: string | undefined;
+    for (let index = f.state.tokenOrder.length - 1; index >= 0; index--) {
+      const source = f.state.tokens[f.state.tokenOrder[index]]?.source;
+      if (source?.startsWith('source:') && eligible.has(source.slice(7))) {
+        previous = source.slice(7);
+        break;
+      }
+    }
+    const next = previous ? (sourceIds.indexOf(previous) + 1) % sourceIds.length : 0;
+    const order = [...sourceIds.slice(next), ...sourceIds.slice(0, next)];
+    const queued: SourceCandidate[] = [];
+    const rounds = Math.max(0, ...[...grouped.values()].map(candidates => candidates.length));
+    for (let index = 0; index < rounds; index++) {
+      for (const id of order) {
+        const candidate = grouped.get(id)?.[index];
+        if (candidate) queued.push(candidate);
+      }
+    }
     for (const candidate of queued) {
       if (admitted >= limit) break;
       const source = this.definitions.get(candidate.source);

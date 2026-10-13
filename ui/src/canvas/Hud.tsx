@@ -119,7 +119,8 @@ function HudCard({ onClose }: { onClose: () => void }) {
     <div className="hud-card hud-detail no-canvas-wheel" onPointerDown={(e) => e.stopPropagation()}>
       <div className="hud-card-title">本轮分工位 <button className="icon-btn" onClick={onClose}>×</button></div>
       <div className="res-row num">
-        {Object.entries(r.limits).map(([k, lim]) => <span key={k} className="chip">{({ browser: "浏览器", model: "模型", cpu: "CPU", http: "HTTP" } as Record<string, string>)[k] ?? k} {r.used[k] ?? 0}/{lim}</span>)}
+        {(['browser', 'model', 'cpu', 'http'] as const).map(key => <span key={key} className="chip">{({browser: '浏览器', model: '模型工位', cpu: 'CPU', http: 'HTTP'})[key]} {r.used[key] ?? 0}/{key === 'model' ? r.limits.modelWorkers ?? r.limits.model : key === 'browser' ? r.limits.browserEffective ?? r.limits.browser : r.limits[key]}</span>)}
+        {r.modelRequests && <span className="chip" title="当前由本应用启动的 Pi 请求或闭源 Agent 调用；等待项尚未占用调用名额。">模型调用 {r.modelRequests.active}/{r.modelRequests.limit}{r.modelRequests.queued ? ` · 等待 ${r.modelRequests.queued}` : ''}</span>}
         {r.freeMemMB > 0 && <span className="chip">空闲内存 {(r.freeMemMB / 1024).toFixed(1)}GB</span>}
       </div>
       <table className="mini-table num">

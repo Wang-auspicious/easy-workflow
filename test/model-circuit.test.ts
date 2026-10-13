@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
+import {Type} from 'typebox';
+import {normalizeContext} from '@earendil-works/pi-ai';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-model-circuit-'));
 process.env.FACTORY_VAR = dir; process.env.FACTORY_PREFLIGHT = '0'; process.env.FACTORY_HTTP_CACHE = '0';
@@ -12,7 +15,11 @@ const { batchSummary } = await import('../shared/batch.ts');
 const { classifyFailure } = await import('../shared/failures.ts');
 const { SourceSupervisor } = await import('../server/sources.ts');
 const { OperationUnknownError } = await import('../server/operations.ts');
+const {runAgentStation} = await import('../server/agent-station.ts');
+const {rememberRead} = await import('../server/network.ts');
 import type { StationResult } from '../server/runtime.ts';
+import {acquireModelRequest, checkModelAdmission, reportModelResponse, withModelAdmission} from '../server/model-requests.ts';
+import {models, closeModelTransport} from '../server/pi.ts';
 
 const close = async (factory: InstanceType<typeof Factory>) => {
   factory.recovery.close(); await factory.sources.close();
@@ -21,7 +28,7 @@ const close = async (factory: InstanceType<typeof Factory>) => {
 const cleanup = () => { assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir())); fs.rmSync(dir, { recursive: true, force: true }); };
 const transport = (): StationResult => ({ ok: false, summary: 'Model request timed out', failure: classifyFailure('Request timed out.', { stage: 'model' }) });
 const ready = async () => {
-  const factory = new Factory(); await factory.boot(); factory.broker.memoryFloorMB = 0;
+  const factory = new Factory(dir); await factory.boot(); factory.broker.memoryFloorMB = 0;
   Object.assign(factory.broker.limits, { model: 1, browser: 2, cpu: 2 });
   for (const key of ['curation/classify', 'curation/classify-review']) factory.runtime.setScopePaused({ scope: 'station', key, paused: true, reason: 'Isolate the fixture model station from parallel business branches' });
   factory.catalog = Array.from({ length: 4 }, (_, i) => ({ id: `site-${i}`, name: `Site ${i}`, canonicalUrl: `https://fixture-${i}.example/` }));
@@ -761,5 +768,550 @@ test('network recovery shares an empty slot only outside the paused task and ful
       await close(factory);
       cleanup();
     }
+  }
+});
+
+test('keyed outages and trials preserve healthy providers and program work in managed and unmanaged runs', {timeout: 30000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const a = {key: 'fixture-provider-a', adapter: 'pi' as const, provider: 'fixture-a', model: 'fixture-a'};
+  const b = {key: 'fixture-provider-b', adapter: 'pi' as const, provider: 'fixture-b', model: 'fixture-b'};
+  for (const managed of [false, true]) {
+    const factory = await ready();
+    factory.catalog = [];
+    factory.broker.limits.model = 3;
+    let callsA = 0;
+    let healthyA = false;
+    let enteredTrial = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => {release = resolve;});
+    factory.runtime.executors = node => ({
+      prepare: () => ({dependency: node.key === 'curation/reader' ? a : node.key === 'skills/provenance' ? b : undefined,
+        execute: async ctx => {
+          if (node.key === 'curation/reader') {
+            callsA++;
+            if (!healthyA) return transport();
+            if (ctx.token.data.retryOf) {enteredTrial = true; await held;}
+            return reportedReply();
+          }
+          if (ctx.token.item === 'b-outage') return transport();
+          return node.key === 'skills/provenance' ? reportedReply()
+            : {ok: true, summary: 'Independent program', finish: {status: 'published', reason: 'fixture'}};
+        },
+      }),
+    });
+    try {
+      factory.runtime.start('Keyed outage ' + managed);
+      const original = factory.runtime.create('curation/reader', {item: 'a-first', url: 'https://a.example/', source: 'manual'});
+      if (managed) factory.batch.configure({target: 1, maxInFlight: 1, intakeWindow: 1});
+      await settleRecovery(factory);
+      assert.equal(factory.state.modelCircuits[a.key].state, 'open');
+      assert.equal(factory.state.modelCircuits[a.key].failures, 1);
+      assert.equal(factory.broker.modelHold, null, 'known faults do not become a global legacy hold');
+      assert.equal(factory.state.batch?.modelCircuit, undefined);
+      const same = factory.runtime.create('curation/reader', {item: 'a-queued', url: 'https://a2.example/', source: 'manual'});
+      const healthy = factory.runtime.create('skills/provenance', {item: 'healthy-b', url: 'https://b.example/', source: 'manual'});
+      const program = factory.runtime.create('skills/fetch-file', {item: 'healthy-program', url: '', source: 'manual'});
+      await settleRecovery(factory);
+      assert.equal(factory.state.tokens[healthy.id].status, 'published');
+      assert.equal(factory.state.tokens[program.id].status, 'published');
+      assert.equal(factory.state.tokens[same.id].attempts.length, 0);
+      healthyA = true;
+      t.mock.timers.tick(factory.state.modelCircuits[a.key].nextAt - Date.now());
+      factory.recovery.pump();
+      for (let i = 0; i < 200 && !enteredTrial; i++) await new Promise(resolve => setTimeout(resolve, 5));
+      assert.ok(enteredTrial, JSON.stringify({managed, circuit: factory.state.modelCircuits[a.key],
+        plans: Object.values(factory.state.tokens).map(token => ({id: token.id, status: token.status, recovery: token.data.__runtimeRecovery})),
+        waiting: factory.runtime.waiting}));
+      assert.equal(factory.state.modelCircuits[a.key].state, 'trial');
+      assert.equal(factory.state.tokens[same.id].attempts.length, 0, 'only the claimed token may verify this key');
+      const trialToken = factory.state.modelCircuits[a.key].trialToken!;
+      assert.equal(factory.state.tokens[trialToken].data.retryOf, original.id);
+      const independent = factory.runtime.create('skills/provenance', {item: 'b-outage', url: 'https://b2.example/', source: 'manual'});
+      for (let i = 0; i < 200 && factory.state.tokens[independent.id].status === 'active'; i++) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      assert.equal(factory.state.modelCircuits[b.key].state, 'open', 'another provider can run during A trial within global capacity');
+      const deadlineB = factory.state.modelCircuits[b.key].nextAt;
+      release();
+      await settleRecovery(factory);
+      assert.equal(factory.state.modelCircuits[a.key], undefined);
+      assert.equal(factory.state.modelCircuits[b.key].nextAt, deadlineB, 'A reply cannot clear or shorten B outage');
+      assert.equal(factory.state.tokens[same.id].status, 'published');
+      assert.equal(callsA, 3);
+      assert.ok(Object.values(factory.state.alerts).some(alert => alert.dependency?.key === b.key));
+      assert.ok(!Object.values(factory.state.alerts).some(alert => alert.dependency?.key === a.key));
+    } finally {
+      release();
+      await close(factory);
+      cleanup();
+    }
+  }
+});
+
+test('an early same-key recovery wakes old deadlines without releasing paused peers or another provider', {timeout: 15000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const factory = await ready();
+  const dependency = {key: 'peer-provider', adapter: 'pi' as const, provider: 'peers', model: 'peer-model'};
+  const other = {...dependency, key: 'other-provider', provider: 'other'};
+  let started = 0;
+  let healthy = false;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => {release = resolve;});
+  factory.runtime.executors = () => ({prepare: () => ({dependency, execute: async () => {
+    if (healthy) return reportedReply();
+    started++;
+    await held;
+    return transport();
+  }})});
+  try {
+    factory.runtime.start('Same dependency peers');
+    const first = factory.runtime.create('curation/reader', {item: 'peer-a', url: '', source: 'manual'});
+    const peer = factory.runtime.create('skills/provenance', {item: 'peer-b', url: '', source: 'manual'});
+    for (let i = 0; i < 200 && started < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(started, 2, 'both original requests were in flight before the outage');
+    release();
+    await settleRecovery(factory);
+    const later = Date.now() + 900000;
+    factory.journal.append({kind: 'model.circuit', key: dependency.key,
+      circuit: {...factory.state.modelCircuits[dependency.key], nextAt: later}});
+    for (const token of [first, peer]) {
+      const plan = {...token.data.__runtimeRecovery as object, nextAt: later};
+      token.data.__runtimeRecovery = plan;
+      factory.journal.append({kind: 'token.data', token: token.id, patch: {__runtimeRecovery: plan}});
+    }
+    factory.modelCircuits.failed(other, 'unrelated', 'skills/review', transport().failure!);
+    const otherDeadline = factory.state.modelCircuits[other.key].nextAt;
+    factory.runtime.setScopePaused({scope: 'station', key: 'skills/provenance', paused: true, reason: 'Inspect one peer'});
+    healthy = true;
+    factory.modelCircuits.probed({dependency, actuallyProbed: true, ok: true});
+    factory.recovery.pump();
+    await settleRecovery(factory);
+    assert.equal(factory.state.modelCircuits[dependency.key], undefined);
+    const waiting = factory.state.tokens[peer.id].data.__runtimeRecovery as {state: string; nextAt: number};
+    assert.equal(waiting.state, 'waiting');
+    assert.equal(waiting.nextAt, Date.now(), 'a validated same-key response removes the obsolete long cooldown');
+    assert.equal(factory.state.tokens[peer.id].data.retriedBy, undefined, 'the scoped pause still blocks claiming this peer');
+    assert.equal(factory.state.modelCircuits[other.key].nextAt, otherDeadline);
+    factory.runtime.setScopePaused({scope: 'station', key: 'skills/provenance', paused: false, reason: 'Continue the peer'});
+    factory.recovery.pump();
+    await settleRecovery(factory);
+    const next = String(factory.state.tokens[peer.id].data.retriedBy);
+    assert.equal(factory.state.tokens[next].status, 'published');
+    assert.equal(factory.runtime.tokens.size, 4, 'each original checkpoint is claimed exactly once');
+  } finally {
+    release();
+    await close(factory);
+    cleanup();
+  }
+});
+
+test('a keyed interrupted trial retains its token and cooldown across restart and both pauses', {timeout: 15000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  let factory = await ready();
+  const dependency = {key: 'restart-provider', adapter: 'pi' as const, provider: 'restart', model: 'saved-model'};
+  let trialEntered = false;
+  factory.runtime.executors = () => ({prepare: () => ({dependency, execute: async ctx => {
+    if (!ctx.token.data.retryOf) return transport();
+    trialEntered = true;
+    await new Promise<void>((_, reject) => ctx.signal.addEventListener('abort', () => reject(ctx.signal.reason), {once: true}));
+    return transport();
+  }})});
+  try {
+    factory.runtime.start('Keyed restart');
+    factory.runtime.create('curation/reader', {item: 'keyed-restart', url: '', source: 'manual', data: {paid: 'saved input'}});
+    await settleRecovery(factory);
+    t.mock.timers.tick(factory.state.modelCircuits[dependency.key].nextAt - Date.now());
+    factory.recovery.pump();
+    for (let i = 0; i < 200 && !trialEntered; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(trialEntered, true);
+    const id = factory.state.modelCircuits[dependency.key].trialToken!;
+    const count = factory.runtime.tokens.size;
+    factory.runtime.pause();
+    await close(factory);
+    factory = await ready();
+    const restored = factory.state.modelCircuits[dependency.key];
+    assert.equal(restored.state, 'open');
+    assert.equal(restored.trialToken, id);
+    assert.equal(factory.runtime.tokens.size, count);
+    let calls = 0;
+    factory.runtime.executors = () => ({prepare: () => ({dependency, execute: async ctx => {
+      calls++;
+      assert.equal(ctx.token.id, id);
+      assert.equal(ctx.token.data.paid, 'saved input');
+      return reportedReply();
+    }})});
+    t.mock.timers.tick(restored.nextAt - Date.now());
+    factory.recovery.pump();
+    await settleRecovery(factory);
+    assert.equal(calls, 0, 'global pause survives restart');
+    factory.runtime.setScopePaused({scope: 'station', key: 'curation/reader', paused: true, reason: 'Inspect checkpoint'});
+    factory.runtime.resume();
+    factory.recovery.pump();
+    await settleRecovery(factory);
+    assert.equal(calls, 0, 'local pause prevents the overdue trial');
+    factory.runtime.setScopePaused({scope: 'station', key: 'curation/reader', paused: false, reason: 'Inspection complete'});
+    factory.recovery.pump();
+    await settleRecovery(factory);
+    assert.equal(calls, 1);
+    assert.equal(factory.runtime.tokens.size, count);
+    assert.equal(factory.state.tokens[id].status, 'published');
+    assert.equal(factory.state.modelCircuits[dependency.key], undefined);
+  } finally {
+    await close(factory);
+    cleanup();
+  }
+});
+
+test('a primary response cannot validate its failed helper and token-only helper receipts retain real usage', {timeout: 15000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const factory = await ready();
+  const a = {key: 'primary-provider', adapter: 'pi' as const, provider: 'primary', model: 'primary-model'};
+  const b = {key: 'helper-provider', adapter: 'pi' as const, provider: 'helper', model: 'helper-model'};
+  let phase: 'outage' | 'tool' | 'healthy' = 'outage';
+  factory.runtime.executors = () => ({prepare: () => ({dependency: a, execute: async () => {
+    checkModelAdmission(a, true);
+    reportModelResponse({dependency: a, model: 'actual-primary', provider: a.provider, modelCalls: 1,
+      usageReported: true, usage: {input: 5, output: 1, cost: 0.01}});
+    checkModelAdmission(b, true);
+    if (phase === 'outage') return transport();
+    if (phase === 'tool') return {ok: false, summary: 'Tool failed before helper response', failure: {
+      tag: 'tool_error', category: 'system', owner: 'system', retryable: true, message: 'Local fixture unavailable',
+    }, metrics: {dependency: a, execution: {adapter: 'pi', model: 'actual-primary'}}};
+    reportModelResponse({dependency: b, model: 'actual-helper', provider: b.provider, modelCalls: 1,
+      usageReported: true, tokenUsage: {input: 7, output: 2, cacheRead: 3, cacheWrite: 0}, costReported: false});
+    return {...reportedReply(), metrics: {dependency: a, usageReported: true,
+      execution: {adapter: 'pi', model: 'actual-primary'}}};
+  }})});
+  try {
+    factory.runtime.start('Helper outage attribution');
+    factory.runtime.create('curation/reader', {item: 'helper-item', url: '', source: 'manual'});
+    await settleRecovery(factory);
+    assert.equal(factory.state.modelCircuits[a.key], undefined);
+    assert.equal(factory.state.modelCircuits[b.key].state, 'open');
+    phase = 'tool';
+    t.mock.timers.tick(factory.state.modelCircuits[b.key].nextAt - Date.now());
+    factory.recovery.pump();
+    await settleRecovery(factory);
+    assert.equal(factory.state.modelCircuits[b.key].state, 'open', 'A receipt is not evidence that B recovered');
+    assert.equal(recoveryPlan(factory).plan.state, 'waiting');
+    assert.equal(recoveryPlan(factory).plan.modelFailures, 1);
+    phase = 'healthy';
+    t.mock.timers.tick(factory.state.modelCircuits[b.key].nextAt - Date.now());
+    factory.recovery.pump();
+    await settleRecovery(factory);
+    const token = recoveryPlan(factory).token;
+    assert.equal(token.status, 'published');
+    assert.equal(factory.state.modelCircuits[b.key], undefined);
+    const attempt = factory.state.attempts[token.attempts.at(-1)!];
+    assert.equal(attempt.metrics?.dependency?.key, a.key);
+    assert.equal(attempt.metrics?.execution?.model, 'actual-primary');
+    assert.equal(attempt.metrics?.modelResponses?.length, 2);
+    assert.deepEqual(attempt.metrics?.tokenUsage, {input: 12, output: 3, cacheRead: 3, cacheWrite: 0});
+    assert.equal(attempt.metrics?.costReported, true);
+    assert.equal(attempt.metrics?.costComplete, false);
+    assert.equal(attempt.usage.input, 12);
+    assert.equal(attempt.usage.cost, 0.01, 'missing helper price never erases the reported primary cost');
+  } finally {
+    await close(factory);
+    cleanup();
+  }
+});
+
+test('a Pi station waiting on another provider preserves paid tool context and resumes only after that dependency recovers', {timeout: 20000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-helper-wait-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = profile;
+  const requests: {provider: string; text: string}[] = [];
+  const server = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const text = Buffer.concat(chunks).toString();
+    const body = JSON.parse(text) as {model: string; messages: {role: string; content: unknown}[]};
+    const provider = request.url!.split('/')[1];
+    requests.push({provider, text});
+    const toolText = body.messages.filter(message => message.role === 'tool').map(message => JSON.stringify(message.content)).join('\n');
+    const call = !toolText.includes('retained-read') ? {name: 'env_call', arguments: JSON.stringify({name: 'fixture_read'})}
+      : !toolText.includes('helper-ready') ? {name: 'env_call', arguments: JSON.stringify({name: 'fixture_helper'})}
+      : {name: 'submit', arguments: JSON.stringify({value: 7})};
+    const delta = provider === 'a' ? {role: 'assistant', tool_calls: [{index: 0, id: `call-${requests.length}`, type: 'function', function: call}]}
+      : {role: 'assistant', content: 'helper-ready'};
+    response.writeHead(200, {'content-type': 'text/event-stream'});
+    for (const part of [
+      {choices: [{index: 0, delta, finish_reason: null}]},
+      {choices: [{index: 0, delta: {}, finish_reason: provider === 'a' ? 'tool_calls' : 'stop'}],
+        usage: {prompt_tokens: 8, completion_tokens: 2, total_tokens: 10}},
+    ]) response.write(`data: ${JSON.stringify({id: 'helper-wait', model: body.model, ...part})}\n\n`);
+    response.end('data: [DONE]\n\n');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as {port: number}).port;
+  fs.writeFileSync(path.join(profile, 'auth.json'), JSON.stringify(Object.fromEntries(['a', 'b'].map(provider =>
+    [provider, {type: 'api_key', key: 'fixture-only'}]))));
+  fs.writeFileSync(path.join(profile, 'models.json'), JSON.stringify({providers: Object.fromEntries(['a', 'b'].map(provider =>
+    [provider, {api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/${provider}/v1`,
+      models: [{id: provider + '-model', input: ['text']}]}]))}));
+  const selectedA = models({provider: 'a', model: 'a-model'});
+  const selectedB = models({provider: 'b', model: 'b-model'});
+  const factory = await ready();
+  let paidReads = 0;
+  let helperCalls = 0;
+  let outage = true;
+  const requestHelper = async (signal: AbortSignal) => {
+    const response = await selectedB.stream(selectedB.model, normalizeContext({messages: []}), {signal});
+    const result = await response.result();
+    assert.equal(result.stopReason, 'stop');
+  };
+  const originalCall = factory.toolbox.call.bind(factory.toolbox);
+  t.mock.method(factory.toolbox, 'call', async (...[allowed, name, args, context]: Parameters<typeof factory.toolbox.call>) => {
+    if (!['fixture_read', 'fixture_helper'].includes(name)) return originalCall(allowed, name, args, context);
+    assert.ok(allowed.includes(name));
+    if (name === 'fixture_read') {
+      paidReads++;
+      rememberRead('https://retained.example/', 'retained-read');
+      return {ok: true, text: 'retained-read'};
+    }
+    helperCalls++;
+    try {await requestHelper(context.signal); return {ok: true, text: 'helper-ready'};}
+    catch (error) {return {ok: false, failure: classifyFailure(error)};}
+  });
+  factory.runtime.executors = node => ({prepare: () => ({
+    dependency: node.key === 'curation/reader' ? selectedA.dependency : selectedB.dependency,
+    execute: async context => {
+      if (node.key === 'skills/provenance') {
+        if (outage) return transport();
+        await requestHelper(context.signal);
+        return reportedReply();
+      }
+      return runAgentStation({agent: {adapter: 'pi', provider: 'a', model: 'a-model'}, piRuntime: selectedA,
+        services: {docs: () => factory.docs, toolbox: () => factory.toolbox},
+        tools: ['fixture_read', 'fixture_helper'], system: 'Read, call the helper, then submit.',
+        schema: Type.Object({value: Type.Integer()}), input: () => ({text: 'Return 7 after both tools.'}),
+        after: () => reportedReply(),
+      }, context);
+    },
+  })});
+  try {
+    factory.runtime.start('Preserve paid context during helper outage');
+    factory.runtime.create('skills/provenance', {item: 'b-outage', url: '', source: 'manual'});
+    await settleRecovery(factory);
+    const token = factory.runtime.create('curation/reader', {item: 'waiting-a', url: '', source: 'manual'});
+    await settleRecovery(factory);
+    assert.equal(factory.state.tokens[token.id].status, 'active');
+    assert.equal(paidReads, 1);
+    assert.equal(helperCalls, 1);
+    assert.equal(requests.filter(request => request.provider === 'a').length, 2);
+    assert.equal(requests.filter(request => request.provider === 'b').length, 0);
+    assert.equal(factory.state.tokens[token.id].attempts.length, 1);
+    const attempt = factory.state.attempts[factory.state.tokens[token.id].attempts[0]];
+    assert.equal(attempt.error, 'model_wait');
+    assert.equal(attempt.metrics?.dependency?.key, selectedA.dependency.key);
+    assert.equal(attempt.metrics?.execution?.model, 'a-model');
+    assert.equal(attempt.usage.input, 16);
+    const sessions = token.data.stationSessions as Record<string, {file: string}>;
+    const saved = JSON.parse(fs.readFileSync(path.join(factory.project.dir, sessions['curation/reader'].file), 'utf8'));
+    assert.deepEqual(saved.evidence, [{url: 'https://retained.example/', text: 'retained-read'}]);
+    for (let i = 0; i < 3; i++) {factory.runtime.schedule(); await settleRecovery(factory);}
+    assert.equal(factory.state.tokens[token.id].attempts.length, 1, 'a held helper does not repeatedly call the healthy primary');
+    outage = false;
+    t.mock.timers.tick(factory.state.modelCircuits[selectedB.dependency.key].nextAt - Date.now());
+    factory.recovery.pump();
+    await settleRecovery(factory);
+    assert.equal(factory.state.tokens[token.id].status, 'published');
+    assert.equal(paidReads, 1, 'completed paid reads are loaded from the same station transcript');
+    assert.equal(helperCalls, 2);
+    assert.equal(requests.filter(request => request.provider === 'a').length, 4);
+    assert.equal(requests.filter(request => request.provider === 'b').length, 2);
+    assert.match(requests.filter(request => request.provider === 'a')[2].text, /retained-read/);
+    assert.equal((token.data.stationSessions as object | undefined) && Object.keys(token.data.stationSessions as object).length, 0);
+    assert.equal((token.data.modelWait as Record<string, unknown>)['curation/reader'], undefined,
+      'a completed wait cannot later block a newly bound provider at this station');
+    assert.equal(factory.broker.modelRequests.active, 0);
+    assert.equal(factory.broker.modelRequests.queued, 0);
+  } finally {
+    await close(factory);
+    await closeModelTransport();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    assert.equal(path.dirname(path.resolve(profile)), path.resolve(os.tmpdir()));
+    fs.rmSync(profile, {recursive: true, force: true});
+    cleanup();
+  }
+});
+
+test('an occupied network retry does not prevent a later independent keyed model trial', {timeout: 15000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const factory = await ready();
+  const dependency = {key: 'independent-trial', adapter: 'pi' as const, provider: 'fixture', model: 'fixture-model'};
+  let modelCalls = 0;
+  let localEntered = false;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => {release = resolve;});
+  factory.runtime.executors = node => ({prepare: () => ({
+    dependency: node.key === 'curation/reader' ? dependency : undefined,
+    execute: async context => {
+      if (context.token.item === 'older-network') return {ok: false, summary: 'Network unavailable', failure: {
+        tag: 'network_timeout', category: 'network', owner: 'system', retryable: true, message: 'Fixture network timeout',
+      }};
+      if (context.token.item === 'active-local') {
+        localEntered = true;
+        await held;
+        return {ok: true, summary: 'Local work complete', finish: {status: 'published', reason: 'fixture'}};
+      }
+      modelCalls++;
+      return modelCalls === 1 ? transport() : reportedReply();
+    },
+  })});
+  try {
+    factory.runtime.start('Independent recovery queues');
+    const network = factory.runtime.create('skills/fetch-file', {item: 'older-network', url: '', source: 'manual'});
+    await settleRecovery(factory);
+    factory.runtime.create('curation/reader', {item: 'later-model', url: '', source: 'manual'});
+    await settleRecovery(factory);
+    const local = factory.runtime.create('candidates/tidy', {item: 'active-local', url: '', source: 'manual'});
+    for (let i = 0; i < 200 && !localEntered; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(localEntered, true);
+    t.mock.timers.tick(factory.state.modelCircuits[dependency.key].nextAt - Date.now());
+    for (let i = 0; i < 3; i++) factory.recovery.pump();
+    for (let i = 0; i < 200 && modelCalls < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(modelCalls, 2, 'the occupied older network plan must not stop scanning independent model plans');
+    assert.equal(local.finished, false);
+    assert.equal(factory.state.modelCircuits[dependency.key], undefined);
+    assert.equal(factory.state.tokens[network.id].data.retriedBy, undefined, 'network admission remains bounded');
+  } finally {
+    release();
+    await close(factory);
+    cleanup();
+  }
+});
+
+test('captured configuration failures are recorded without taking model capacity or blocking another provider', async () => {
+  const factory = await ready();
+  const failed = {key: 'existing-outage', adapter: 'pi' as const, provider: 'unavailable', model: 'fixture'};
+  const healthy = {...failed, key: 'healthy-configuration', provider: 'healthy'};
+  let executed = 0;
+  factory.runtime.executors = node => ({prepare: () => {
+    if (node.key === 'curation/reader') throw new Error('Invalid isolated fixture model configuration');
+    return {dependency: healthy, execute: async () => {executed++; return reportedReply();}};
+  }});
+  try {
+    factory.runtime.start('Record configuration failures');
+    factory.modelCircuits.failed(failed, 'older-token', 'skills/review', transport().failure!);
+    const invalid = factory.runtime.create('curation/reader', {item: 'invalid-config', url: '', source: 'manual'});
+    const valid = factory.runtime.create('skills/provenance', {item: 'valid-config', url: '', source: 'manual'});
+    await settleRecovery(factory);
+    assert.equal(factory.state.tokens[invalid.id].attempts.length, 1);
+    const attempt = factory.state.attempts[factory.state.tokens[invalid.id].attempts[0]];
+    assert.equal(attempt.ok, false);
+    assert.match(attempt.error ?? '', /Invalid isolated fixture/);
+    assert.equal(executed, 1);
+    assert.equal(factory.state.tokens[valid.id].status, 'published');
+    assert.equal(factory.broker.used.model, 0);
+    assert.equal(factory.broker.modelRequests.active, 0);
+  } finally {
+    await close(factory);
+    cleanup();
+  }
+});
+
+test('only an actual same-key probe releases an ended run hold, including after restart', {timeout: 15000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  let factory = await ready();
+  const a = {key: 'old-run-a', adapter: 'pi' as const, provider: 'a', model: 'fixture-a'};
+  const b = {...a, key: 'old-run-b', provider: 'b'};
+  factory.runtime.executors = node => ({prepare: () => ({
+    dependency: node.key === 'curation/reader' ? a : b, execute: async () => transport(),
+  })});
+  try {
+    factory.runtime.start('Old keyed run');
+    const original = factory.runtime.create('curation/reader', {item: 'old-a', url: '', source: 'manual'});
+    factory.runtime.create('skills/provenance', {item: 'old-b', url: '', source: 'manual'});
+    await settleRecovery(factory);
+    factory.runtime.pause();
+    const deadlineA = factory.state.modelCircuits[a.key].nextAt;
+    factory.modelCircuits.probed({dependency: b, actuallyProbed: true, ok: true});
+    assert.equal(factory.state.modelCircuits[a.key].nextAt, deadlineA, 'B connection evidence cannot release or shorten A');
+    assert.equal(factory.state.modelCircuits[b.key].state, 'open', 'paused original runs still require the original work trial');
+    factory.runtime.end();
+    await settleRecovery(factory);
+    const endedAt = factory.state.run.endedAt;
+    await close(factory);
+    factory = await ready();
+    assert.equal(factory.state.modelCircuits[a.key].runEndedAt, endedAt, 'replay proves which run ended without rescanning full event bodies');
+    factory.runtime.executors = () => ({prepare: () => ({dependency: a, execute: async () => reportedReply()})});
+    t.mock.timers.tick(1);
+    factory.runtime.start('New explicit run');
+    const fresh = factory.runtime.create('curation/reader', {item: 'fresh-a', url: '', source: 'manual'});
+    factory.modelCircuits.probed({dependency: a, actuallyProbed: false, ok: true});
+    factory.modelCircuits.probed({dependency: a, actuallyProbed: true, ok: false});
+    factory.modelCircuits.probed({dependency: b, actuallyProbed: true, ok: true});
+    await settleRecovery(factory);
+    assert.equal(factory.state.tokens[fresh.id].attempts.length, 0);
+    assert.ok(factory.state.modelCircuits[a.key]);
+    assert.equal(factory.state.modelCircuits[b.key], undefined);
+    factory.modelCircuits.probed({dependency: a, actuallyProbed: true, ok: true});
+    await settleRecovery(factory);
+    assert.equal(factory.state.tokens[fresh.id].status, 'published');
+    assert.equal(factory.state.modelCircuits[a.key], undefined);
+    assert.equal(factory.state.tokens[original.id].status, 'parked', 'service health does not rewrite an old business result');
+    assert.equal(factory.state.tokens[original.id].data.retriedBy, undefined);
+  } finally {
+    await close(factory);
+    cleanup();
+  }
+});
+
+test('a due keyed recovery joins the request FIFO ahead of later healthy traffic', {timeout: 15000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const factory = await ready();
+  const a = {key: 'waiting-provider', adapter: 'pi' as const, provider: 'waiting', model: 'fixture-a'};
+  const b = {...a, key: 'healthy-provider', provider: 'healthy'};
+  let calls = 0;
+  const order: string[] = [];
+  factory.runtime.executors = () => ({prepare: () => ({dependency: a, execute: async context => {
+    const release = await acquireModelRequest(a, context.signal);
+    try {
+      calls++;
+      if (calls === 1) return transport();
+      order.push('trial-a');
+      reportModelResponse({dependency: a, model: a.model, modelCalls: 1, usageReported: true,
+        tokenUsage: {input: 1, output: 1}, costReported: false});
+      return reportedReply();
+    } finally {release();}
+  }})});
+  const healthyRequest = () => withModelAdmission(dependency => factory.broker.modelBlocked(dependency),
+    () => acquireModelRequest(b), (_dependency, signal) => factory.broker.modelRequests.acquire(signal));
+  let active: (() => void) | undefined;
+  let next: (() => void) | undefined;
+  try {
+    factory.runtime.start('Fair real-request queue');
+    factory.runtime.create('curation/reader', {item: 'waiting-a', url: '', source: 'manual'});
+    await settleRecovery(factory);
+    active = await healthyRequest();
+    t.mock.timers.tick(factory.state.modelCircuits[a.key].nextAt - Date.now());
+    for (let i = 0; i < 3; i++) factory.recovery.pump();
+    for (let i = 0; i < 200 && factory.broker.modelRequests.queued < 1; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(factory.broker.modelRequests.queued, 1);
+    assert.equal(factory.state.modelCircuits[a.key].state, 'trial');
+    assert.equal(factory.broker.modelRequests.active, 1);
+    assert.equal(calls, 1, 'claiming a trial does not bypass the shared capacity');
+    const newcomer = healthyRequest().then(release => {order.push('later-b'); return release;});
+    active();
+    active = undefined;
+    next = await newcomer;
+    await settleRecovery(factory);
+    assert.deepEqual(order, ['trial-a', 'later-b']);
+    assert.equal(calls, 2);
+    assert.equal(factory.runtime.tokens.size, 2, 'repeated pumps create only the one original-checkpoint trial');
+    assert.equal(factory.state.modelCircuits[a.key], undefined);
+    next();
+    next = undefined;
+    assert.equal(factory.broker.modelRequests.active, 0);
+  } finally {
+    active?.();
+    next?.();
+    await close(factory);
+    cleanup();
   }
 });

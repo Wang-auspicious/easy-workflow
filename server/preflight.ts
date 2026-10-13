@@ -6,7 +6,8 @@ import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import path from 'node:path';
 import {Type} from 'typebox';
-import type {PreflightCheck, StationAgentBinding} from '../shared/types.ts';
+import type {ModelDependency, ModelProbeResult, PreflightCheck, StationAgentBinding} from '../shared/types.ts';
+import {observeModelRequests} from './model-requests.ts';
 import {networkFetch, networkRoute} from './network.ts';
 import {openPage, browserCommand} from './browser.ts';
 import {probeModelConnection, type PiModelSelection} from './pi.ts';
@@ -33,6 +34,7 @@ interface AgentHealth {
   ok: boolean;
   detail: string;
   fix?: string;
+  modelProbes?: ModelProbeResult[];
 }
 
 interface AgentPreflightOptions {
@@ -122,7 +124,7 @@ async function checkClosedEndpoint(dir: string, binding: Exclude<StationAgentBin
     if (controller.signal.aborted) agent.abort();
     await pending;
     controller.signal.throwIfAborted();
-    if (!submitted || !actualModel) {
+    if (!submitted || !actualModel || ['unknown', 'unreported'].includes(actualModel.toLowerCase())) {
       return {
         ok: false, detail: '客户端已结束，但没有完成本次 scoped submit 健康回执',
         fix: '确认所选客户端已认证、支持工位 MCP submit，并返回实际模型；版本信息不代表可以执行工位',
@@ -169,10 +171,12 @@ export async function checkAgentEndpoints(dir: string, agents: readonly StationA
       continue;
     }
     try {
-      const result = binding.adapter === 'pi' ?
-        await checkModelEndpoint(timeoutMs, binding, options.signal) :
-        await checkClosedEndpoint(dir, binding, {...options, timeoutMs});
-      results.push({...result, detail: `${label}：${result.detail}`});
+      let dependency: ModelDependency | undefined;
+      const result = await observeModelRequests(actual => {dependency = actual;}, () => binding.adapter === 'pi' ?
+        checkModelEndpoint(timeoutMs, binding, options.signal) :
+        checkClosedEndpoint(dir, binding, {...options, timeoutMs}));
+      results.push({...result, detail: `${label}：${result.detail}`,
+        modelProbes: dependency ? [{dependency, actuallyProbed: true, ok: result.ok}] : []});
     } catch (error) {
       results.push({
         ok: false,
@@ -186,6 +190,7 @@ export async function checkAgentEndpoints(dir: string, agents: readonly StationA
   const secrets = factorySecrets();
   return {
     ok: results.every(result => result.ok),
+    modelProbes: results.flatMap(result => result.modelProbes ?? []),
     detail: redactText(results.map(result => result.detail).join('；'), secrets),
     fix: results.some(result => !result.ok) ?
       redactText([...new Set(results.filter(result => !result.ok).map(result => result.fix ?? '修复所选工位配置后重新体检'))].join('；'), secrets) : undefined,

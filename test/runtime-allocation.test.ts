@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { allocateResource } from '../server/allocation.ts';
 import { Runtime } from '../server/runtime.ts';
 import { Journal } from '../server/journal.ts';
@@ -8,6 +11,7 @@ import { compile } from '../server/spec/compile.ts';
 import { line, station, type Pack } from '../server/spec/dsl.ts';
 import { apply, initialState } from '../shared/project.ts';
 import {checkModelAdmission} from '../server/model-requests.ts';
+import {flowWindow, intakeFrontier} from '../shared/batch.ts';
 
 const pack: Pack = { id: 'test-allocation', name: 'Allocation fixture', blurb: 'Fixture work', version: '1', resources: { browser: 0, model: 0, http: 0, cpu: 4 }, lines: ['fast', 'slow'].map((id, index) => line({ id, name: id, layer: 3, priority: 'mid', wired: true, blurb: 'Fixture work',
   stations: [station({ id: 'work', name: id, role: 'process', kind: 'program', resource: 'cpu', accept: ['Fixture result exists'], estimateSeconds: index ? 3 : 1, workers: { min: 1, max: 4, initial: 4, policy: 'auto' } }), station({ id: 'published', name: 'done', role: 'store', kind: 'store' })], edges: [['work', 'published']] })), channels: [], links: [], conditions: {}, order: ['fast', 'slow'], collapsed: [], hints: {} };
@@ -25,6 +29,144 @@ test('scarce quotas follow lambda times service time, caps, and the review reser
   assert.deepEqual(Object.fromEntries(allocateResource(4, [{ key: 'fast', work: 1, max: 4 }, { key: 'slow', work: 3, max: 4 }])), { fast: 1, slow: 3 });
   assert.deepEqual(Object.fromEntries(allocateResource(4, [{ key: 'capped', work: 100, max: 1 }, { key: 'other', work: 1, max: 4 }])), { capped: 1, other: 3 });
   assert.equal(allocateResource(2, [{ key: 'production', work: 100, max: 2 }, { key: 'review', work: 1, max: 2, review: true }], true).get('review'), 1);
+});
+
+test('model worker capacity is independent of real request capacity and keeps the review reserve', async () => {
+  const broker = new Broker({model: 1, modelWorkers: 3, cpu: 2}, 0);
+  assert.equal(broker.capacity('model'), 3);
+  assert.equal(broker.capacity('cpu'), 2);
+  assert.equal(broker.modelRequests.limit, 1);
+  const first = broker.tryAcquire('model');
+  const second = broker.tryAcquire('model');
+  assert.ok(first);
+  assert.ok(second);
+  assert.equal(broker.tryAcquire('model'), null, 'the third worker remains available to reviewers');
+  const review = broker.tryAcquire('model', {review: true});
+  assert.ok(review);
+  assert.equal(broker.tryAcquire('model', {review: true}), null);
+  const request = await broker.modelRequests.acquire();
+  assert.equal(broker.modelRequests.active, 1);
+  assert.equal(broker.sample().limits.modelWorkers, 3);
+  assert.equal(broker.sample().modelRequests.limit, 1);
+  request();
+  first.release();
+  second.release();
+  review.release();
+  broker.limits.modelWorkers = 1;
+  const explicitSingle = broker.tryAcquire('model');
+  assert.ok(explicitSingle);
+  assert.equal(broker.tryAcquire('model', {review: true}), null, 'an explicit one-worker limit stays one');
+  explicitSingle.release();
+  assert.equal(new Broker({model: 2}, 0).capacity('model'), 2, 'direct legacy Broker callers retain their limit');
+});
+
+test('allocation uses model worker capacity without changing actual request capacity', async () => {
+  const modelPack: Pack = {...pack, lines: pack.lines.map(entry => ({...entry, stations: entry.stations.map(node =>
+    node.kind === 'store' ? node : {...node, kind: 'agent' as const, resource: 'model' as const})}))};
+  const {runtime, broker, journal, state} = setup(modelPack, {model: 1, modelWorkers: 3});
+  const started: string[] = [];
+  const releases: (() => void)[] = [];
+  runtime.executors = node => async () => {
+    started.push(node.key);
+    await new Promise<void>(resolve => releases.push(resolve));
+    return {ok: true, summary: 'independent lifecycle completed'};
+  };
+  try {
+    const first = runtime.create('fast/work', {item: 'first', url: '', source: 'fixture'});
+    const second = runtime.create('slow/work', {item: 'second', url: '', source: 'fixture'});
+    await Promise.resolve();
+    assert.deepEqual(started.sort(), ['fast/work', 'slow/work']);
+    assert.equal(broker.used.model, 2);
+    assert.equal(broker.modelRequests.limit, 1);
+    releases.forEach(release => release());
+    await runtime.settle();
+    assert.deepEqual([state.tokens[first.id].status, state.tokens[second.id].status], ['published', 'published']);
+  } finally {
+    releases.forEach(release => release());
+    await runtime.close();
+    journal.close();
+  }
+});
+
+test('Factory migrates model workers once, preserves explicit limits and never writes a read-only project', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-worker-limits-'));
+  const file = path.join(directory, 'settings.json');
+  const previous = process.env.FACTORY_READONLY;
+  delete process.env.FACTORY_READONLY;
+  const saved = {model: 1, browser: 2, browserCapV2: true, cpu: 2, http: 2, retained: 'unrelated setting'};
+  fs.writeFileSync(file, JSON.stringify(saved));
+  const {Factory} = await import('../server/factory.ts');
+  try {
+    const migrated = new Factory(directory);
+    try {
+      assert.equal(migrated.settings.modelWorkers, 3);
+      assert.equal(migrated.settings.model, 1);
+      assert.equal(migrated.settings.browser, 2);
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), {...saved, modelWorkers: 3});
+    } finally {
+      migrated.journal.close();
+    }
+    fs.writeFileSync(file, JSON.stringify({...saved, model: 6, modelWorkers: 3}));
+    const restarted = new Factory(directory);
+    try {
+      assert.equal(restarted.settings.modelWorkers, 3, 'later request-quota changes do not silently change the worker limit');
+      assert.equal(restarted.settings.model, 6);
+    } finally {
+      restarted.journal.close();
+    }
+    const explicit = JSON.stringify({...saved, modelWorkers: 1});
+    fs.writeFileSync(file, explicit);
+    const single = new Factory(directory);
+    try {
+      assert.equal(single.settings.modelWorkers, 1);
+      assert.equal(fs.readFileSync(file, 'utf8'), explicit);
+    } finally {
+      single.journal.close();
+    }
+    const legacy = JSON.stringify(saved);
+    fs.writeFileSync(file, legacy);
+    process.env.FACTORY_READONLY = '1';
+    const readOnly = new Factory(directory);
+    try {
+      assert.equal(readOnly.settings.modelWorkers, 3);
+      assert.equal(fs.readFileSync(file, 'utf8'), legacy);
+    } finally {
+      readOnly.journal.close();
+    }
+  } finally {
+    if (previous === undefined) delete process.env.FACTORY_READONLY;
+    else process.env.FACTORY_READONLY = previous;
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    fs.rmSync(directory, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+  }
+});
+
+test('flow windows use the graph and observations while respecting zero capacity and explicit ceilings', () => {
+  const compiled = compile([pack]);
+  const estimates = flowWindow(compiled, 'fast/work', {cpu: 4}, new Map());
+  assert.ok(estimates.maxInFlight >= 2 && estimates.maxInFlight <= 6);
+  assert.ok(estimates.intakeWindow >= 1 && estimates.intakeWindow <= 2);
+  assert.deepEqual(intakeFrontier(compiled, 'fast/work'), ['fast/work']);
+  assert.deepEqual(flowWindow(compiled, 'fast/published', {cpu: 4}, new Map()), {maxInFlight: 1, intakeWindow: 1});
+  assert.deepEqual(flowWindow(compiled, 'fast/work', {cpu: 0}, new Map()), {maxInFlight: 1, intakeWindow: 1});
+  assert.deepEqual(flowWindow(compiled, 'fast/work', {cpu: 4}, new Map(),
+    {maxInFlightLimit: 1, intakeWindowLimit: 1}), {maxInFlight: 1, intakeWindow: 1});
+  const observed = new Map([['fast/work', {serviceSeconds: 10, workers: 2, samples: 10}]]);
+  assert.ok(flowWindow(compiled, 'fast/work', {cpu: 2}, observed).maxInFlight <= 6);
+  assert.deepEqual(flowWindow(compiled, 'missing/entry', {cpu: 4}, new Map()), {maxInFlight: 1, intakeWindow: 1});
+  const serial = compile([{...pack, lines: [line({...pack.lines[0], stations: [
+    station({...pack.lines[0].stations[0], workers: {min: 1, max: 1, initial: 1, policy: 'fixed'}}),
+    station({id: 'slow', name: 'Slow', role: 'process', kind: 'program', resource: 'cpu',
+      estimateSeconds: 10, accept: ['Local receipt exists'], workers: {min: 1, max: 3, initial: 2, policy: 'auto'}}),
+    pack.lines[0].stations[1],
+  ], edges: [['work', 'slow'], ['slow', 'published']]})], order: ['fast']}]);
+  assert.deepEqual(serial.issues, []);
+  const samples = new Map([['fast/slow', {serviceSeconds: 0.1, workers: 2, samples: 9}]]);
+  assert.equal(flowWindow(serial, 'fast/work', {cpu: 4}, samples).maxInFlight, 4,
+    'fewer than ten observations retain the declared slow-stage estimate');
+  samples.get('fast/slow')!.samples = 10;
+  assert.equal(flowWindow(serial, 'fast/work', {cpu: 4}, samples).maxInFlight, 3,
+    'the measured bottleneck changes the bounded window without raising CPU quota');
 });
 
 test('the actual scheduler admits one fast and three slow jobs within four shared CPU leases', async () => {

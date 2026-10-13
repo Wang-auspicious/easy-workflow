@@ -296,7 +296,7 @@ const sourceItem = (id: string): SourceCandidate => ({
   title: id, author: 'Fixture author', discoveredAt: Date.now(), status: 'pending',
 });
 
-test('unmanaged source and channel backlogs both progress through the single available slot', async () => {
+test('unmanaged source and channel backlogs share a bounded flow window without starvation', async () => {
   const order: string[] = [];
   let peak = 0;
   let release!: () => void;
@@ -325,16 +325,45 @@ test('unmanaged source and channel backlogs both progress through the single ava
       factory.sources.pump();
       factory.channels!.pump();
     }
-    assert.deepEqual(order, ['source']);
-    assert.equal(children(factory).length, 0, 'a fresh channel cannot take another slot while source work is running');
+    assert.ok(order.includes('source') && order.includes('channel'), 'both feeders may progress in the shared flow window');
+    assert.equal(children(factory).filter(token => token.status === 'active').length, 1,
+      'the channel still has only one live child');
     release();
     await settle(factory);
-    assert.deepEqual(order, ['source', 'channel', 'source', 'channel', 'channel']);
-    assert.equal(peak, 1, 'fairness cannot be achieved by admitting concurrent extra work');
+    assert.equal(order.filter(value => value === 'source').length, 2);
+    assert.equal(order.filter(value => value === 'channel').length, 3);
+    assert.ok(peak > 1 && peak <= 4, 'overlap must stay within the graph-derived shared window');
     assert.equal(factory.sources.list()[0].counts.acknowledged, 2);
     assert.ok(factory.channels!.status().every(delivery => delivery.status === 'acknowledged'));
   } finally {
     release();
+    await close(factory);
+  }
+});
+
+test('continuous sources rotate admissions while keeping reputation order inside each source', async () => {
+  const order: string[] = [];
+  const factory = await boot(async ctx => {
+    order.push(ctx.token.item);
+    return {ok: true, summary: 'Local source fixture', finish: {status: 'published', reason: 'fixture'}};
+  });
+  try {
+    await factory.sources.close();
+    factory.sources = new SourceSupervisor(factory);
+    for (const source of ['source-a', 'source-b', 'source-c']) {
+      factory.sources.configure(sourceSpec({id: source, enabled: true, url: `https://feed.fixture.test/${source}`}));
+      for (const suffix of ['low', 'high']) {
+        factory.journal.append({kind: 'source.candidate', candidate: {
+          ...sourceItem(`${source}-${suffix}`), source, author: suffix,
+        }});
+      }
+    }
+    factory.journal.append({kind: 'source.reputation', platform: 'feed.fixture.test', author: 'high', accepted: 5, rejected: 0});
+    factory.runtime.start('Fair continuous source intake');
+    await settle(factory);
+    assert.deepEqual(order, ['source-a-high', 'source-b-high', 'source-c-high', 'source-a-low', 'source-b-low', 'source-c-low']);
+    assert.ok(factory.sources.list().every(source => source.counts.acknowledged === 2));
+  } finally {
     await close(factory);
   }
 });
@@ -351,24 +380,25 @@ test('source admission bypasses an unrelated paused root but bounds a shared pau
     const paused = parent(factory, 'unrelated-paused-root');
     factory.runtime.setScopePaused({scope: 'station', key: 'source-work/paid', paused: true, reason: 'Inspect shared downstream'});
     factory.sources.configure(sourceSpec({target: 'source-work/inbox', enabled: true}));
-    for (const id of ['isolated-one', 'isolated-two', 'isolated-three']) {
-      factory.journal.append({kind: 'source.candidate', candidate: sourceItem(id)});
+    for (let index = 0; index < 8; index++) {
+      factory.journal.append({kind: 'source.candidate', candidate: sourceItem(`isolated-${index}`)});
     }
     factory.runtime.start('Locally paused intake isolation');
     await settle(factory);
     const admitted = () => Object.values(factory.state.tokens).filter(token => token.data.sourceCandidate);
-    assert.equal(admitted().length, 1, 'an unrelated paused root cannot hold a free source slot');
+    const limit = factory.sources.unmanagedAdmission('source-work/inbox').maxInFlight;
+    assert.equal(admitted().length, limit, 'an unrelated paused root cannot hold the source window');
     assert.equal(factory.runtime.tokens.get(paused.id)?.inflight.size, 0);
-    assert.deepEqual(factory.runtime.queues.get('source-work/paid'), [admitted()[0].id]);
+    assert.equal(factory.runtime.queues.get('source-work/paid')?.length, limit);
     for (let i = 0; i < 25; i++) {
       factory.sources.pump();
       await settle(factory);
     }
-    assert.equal(admitted().length, 1, 'new inputs sharing the paused downstream cannot accumulate at its queue');
-    assert.equal(factory.sources.list()[0].counts.pending, 2);
+    assert.equal(admitted().length, limit, 'a shared paused downstream cannot accumulate beyond the bounded window');
+    assert.equal(factory.sources.list()[0].counts.pending, 8 - limit);
     factory.runtime.setScopePaused({scope: 'station', key: 'source-work/paid', paused: false, reason: 'Continue shared downstream'});
     await settle(factory);
-    assert.equal(factory.sources.list()[0].counts.acknowledged, 3);
+    assert.equal(factory.sources.list()[0].counts.acknowledged, 8);
     assert.ok(admitted().every(token => token.status === 'published'));
     assert.equal(factory.state.tokens[paused.id].status, 'active');
     factory.runtime.setScopePaused({scope: 'line', key: 'parent', paused: false, reason: 'Continue original task'});
@@ -573,11 +603,14 @@ test('source delivery is bounded, respects pauses and rolls back a failed claim 
     sources.pump();
     assert.equal(Object.keys(factory.state.tokens).length, 0);
     factory.runtime.setScopePaused({scope: 'line', key: 'components', paused: false, reason: 'Source fixture resume'});
+    factory.runtime.executors = () => ({prepare: () => ({execute,
+      dependency: {key: 'fixture-model', adapter: 'pi', provider: 'fixture', model: 'fixture'}})});
     factory.broker.modelHold = 'Fixture provider cooldown';
     sources.pump();
     assert.equal(Object.keys(factory.state.tokens).length, 0);
     assert.match(sources.list()[0].deliveryHold ?? '', /cooldown/);
     factory.broker.modelHold = null;
+    factory.runtime.executors = () => execute;
     factory.journal.append({kind: 'batch.configured', batch: {
       runId: factory.state.run.id, target: 1, maxInFlight: 1, intakeWindow: 1,
       maxRecoveries: 2, mode: 'running', startedAt: Date.now(), category: 'scoped-fixture',

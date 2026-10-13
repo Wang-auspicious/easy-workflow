@@ -13,6 +13,7 @@ const { Factory: BaseFactory } = await import('../server/factory.ts');
 const { FactoryControl } = await import('../server/control.ts');
 const { SourceSupervisor } = await import('../server/sources.ts');
 const { batchSummary } = await import('../shared/batch.ts');
+const {apply, initialState} = await import('../shared/project.ts');
 const close = async (factory: InstanceType<typeof Factory>) => {
   factory.recovery?.close();
   await factory.sources?.close(); factory.channels?.close();
@@ -218,6 +219,71 @@ test('a durable 100-site goal replenishes a bounded pipeline without a chat poll
   } finally {
     await factory.runtime.close(); factory.docs.flush(); factory.lessons.close(); factory.journal.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('flow admission can replace a manual single-item policy while paused and refill before the planning gate', async () => {
+  const factory = new Factory();
+  let release!: () => void;
+  const held = new Promise<void>(resolve => {release = resolve;});
+  let hold = true;
+  try {
+    await factory.boot();
+    factory.catalog = catalog(8);
+    let peak = 0;
+    factory.runtime.executors = node => async () => {
+      peak = Math.max(peak, [...factory.runtime.tokens.values()].filter(token => !token.finished).length);
+      if (node.key === 'curation/scout') {
+        if (hold) await held;
+        return {ok: true, summary: 'Local admission fixture completed', finish: {status: 'published', reason: 'fixture'}};
+      }
+      return {ok: true, summary: 'Local entry completed'};
+    };
+    factory.batch.configure({target: 8, maxInFlight: 1, intakeWindow: 1});
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(factory.runtime.tokens.size, 1);
+    const first = [...factory.runtime.tokens.values()][0];
+    assert.ok(first.done.has('candidates/route'));
+    assert.equal(first.done.has('curation/plan'), false);
+    factory.runtime.pause();
+    const run = factory.state.run.id;
+    const before = factory.journal.seq;
+    assert.throws(() => factory.batch.updateAdmission({}), /请指定/);
+    const manual = factory.batch.updateAdmission({maxInFlight: 1, intakeWindow: 1});
+    assert.equal(manual?.admission, undefined);
+    const flow = factory.batch.updateAdmission({flow: true, maxInFlight: 4, intakeWindow: 2});
+    assert.deepEqual(flow?.admission, {mode: 'flow', maxInFlightLimit: 4, intakeWindowLimit: 2});
+    assert.equal(flow?.status, 'paused');
+    assert.equal(factory.runtime.paused, true);
+    assert.equal(factory.state.batch?.mode, 'running', 'the existing goal mode is preserved');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(factory.runtime.tokens.size, 1, 'changing paused admission cannot start work');
+    assert.ok([...factory.journal.read(before)].every(event => event.kind !== 'run.resumed' && event.kind !== 'run.started'));
+    assert.equal(factory.state.run.id, run);
+    const replayed = initialState(factory.compiled);
+    for (const event of factory.journal.read()) apply(replayed, event);
+    assert.deepEqual(replayed.batch?.admission, flow?.admission, 'the flow ceilings survive journal replay');
+    assert.equal(replayed.run.status, 'paused');
+    factory.runtime.resume();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.ok(factory.runtime.tokens.size > 1, 'completed entry work releases intake before curation/plan');
+    assert.ok(factory.runtime.tokens.size <= 4);
+    assert.equal(Object.values(factory.state.tokens).filter(token => token.status === 'published').length, 0);
+    assert.ok([...factory.runtime.tokens.values()].every(token => !token.done.has('curation/plan')));
+    hold = false;
+    release();
+    await factory.runtime.settle();
+    assert.equal(batchSummary(factory.state)?.published, 8);
+    assert.ok(peak <= 4, 'user flow ceiling remains a hard limit');
+    assert.throws(() => factory.batch.updateAdmission({maxInFlight: 0}), /整数/);
+    factory.batch.updateAdmission({maxInFlight: 1, intakeWindow: 1});
+    assert.equal(factory.state.batch?.admission, undefined, 'an explicit fixed choice remains available');
+    assert.equal(factory.state.batch?.maxInFlight, 1);
+  } finally {
+    hold = false;
+    release();
+    await close(factory);
+    fs.rmSync(dir, {recursive: true, force: true});
   }
 });
 

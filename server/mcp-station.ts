@@ -9,13 +9,15 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Check } from "typebox/value";
 import type { TSchema } from "typebox";
-import type { StationAgentBinding, Usage } from "../shared/types.ts";
+import type { ModelTokenUsage, StationAgentBinding, Usage } from "../shared/types.ts";
 import { mcpText, type McpTool } from "./mcp-protocol.ts";
 import { factorySecrets, launcherEnvironment, redactText, redactValue } from "./mcp-security.ts";
 import { ClaudeCodeProtocol, validClaudeSession, type ClaudeSessionReference } from './claude-code.ts';
+import {OpenCodeProtocol, validOpenCodeSession, type OpenCodeSessionReference} from './opencode.ts';
+import {CodexProtocol, validCodexSession, type CodexSessionReference, type CodexToolReply} from './codex.ts';
 import { classifyFailure, type Failure } from '../shared/failures.ts';
-import {checkModelAdmission} from './model-requests.ts';
-import {closedModelDependency} from './agent-bindings.ts';
+import {acquireModelRequest, checkModelAdmission, reportModelResponse, withModelTool} from './model-requests.ts';
+import {closedModelDependency, resolveNativeCommand} from './agent-bindings.ts';
 
 export interface StationTool {
   name: string; label: string; description: string; parameters: TSchema;
@@ -24,42 +26,64 @@ export interface StationTool {
 export interface ClosedSessionScope { projectDirectory: string; workDirectory: string }
 export interface ClosedAgentConfig {
   command: string[];
-  model: string;
+  model?: string;
+  provider?: string;
   cwd: string;
-  adapter?: 'launcher' | 'claude-code';
+  adapter?: 'launcher' | 'claude-code' | 'opencode' | 'codex';
   requestTimeoutMs?: number;
   sessionScope?: ClosedSessionScope;
 }
 export interface ClosedAgentReply {
   model: string;
+  provider?: string;
   usage?: Usage;
+  tokenUsage?: ModelTokenUsage;
+  costReported?: boolean;
+  costComplete?: boolean;
   modelCalls?: number;
   time?: { firstTokenMs: number; outputMs: number; modelCalls: number };
   error?: { type: 'transport' | 'credentials' | 'quota' | 'tls' | 'contract' };
   failure?: Failure;
 }
 type Message = { role: "user" | "assistant"; content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] };
+export type ClosedSessionReference = ClaudeSessionReference | OpenCodeSessionReference | CodexSessionReference;
 
 export function closedAgentConfig(cwd: string, sessionScope?: ClosedSessionScope, binding?: StationAgentBinding): ClosedAgentConfig | null {
   // An explicit Pi station never parses or inherits a global launcher setting.
   if (binding?.adapter === 'pi') return null;
   if (!binding && !process.env.FACTORY_STATION_COMMAND) return null;
+  const adapter = binding?.adapter ?? (process.env.FACTORY_STATION_ADAPTER?.trim() || 'launcher');
+  if (!['launcher', 'claude-code', 'opencode', 'codex'].includes(adapter)) throw new Error('Unsupported station agent adapter.');
   let command: unknown = binding?.command;
   if (!binding) {
     try { command = JSON.parse(process.env.FACTORY_STATION_COMMAND!); }
     catch { throw new Error('FACTORY_STATION_COMMAND must be a JSON argv array.'); }
   }
+  if (command === undefined && adapter !== 'launcher') command = resolveNativeCommand(adapter as 'claude-code' | 'opencode' | 'codex');
   if (!Array.isArray(command) || !command.length || command.some(value => typeof value !== 'string' || !value.trim())) {
     throw new Error('The station launcher command must be a nonempty argv array.');
   }
-  const model = binding?.model ?? process.env.FACTORY_STATION_MODEL;
-  if (!model?.trim()) throw new Error('Set the station launcher requested model.');
-  const adapter = binding?.adapter ?? (process.env.FACTORY_STATION_ADAPTER?.trim() || 'launcher');
-  if (!['launcher', 'claude-code'].includes(adapter)) throw new Error('FACTORY_STATION_ADAPTER must be launcher or claude-code.');
+  const model = binding ? binding.model : process.env.FACTORY_STATION_MODEL;
+  if (adapter === 'launcher' && !model?.trim()) throw new Error('Set the station launcher requested model.');
+  const provider = binding && 'provider' in binding ? binding.provider : undefined;
   const requestTimeoutMs = binding ? binding.requestTimeoutMs ?? 180000 : Number(process.env.FACTORY_STATION_TIMEOUT_MS ?? 180000);
   if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 900000) throw new Error('FACTORY_STATION_TIMEOUT_MS must be an integer from 1 to 900000.');
-  if (factorySecrets().some(secret => command.some(value => value.includes(secret)) || model.includes(secret))) throw new Error("Do not pass Easy Workflow control credentials to a station launcher.");
-  return { command: [...command], model, cwd, adapter: adapter as ClosedAgentConfig['adapter'], requestTimeoutMs, sessionScope };
+  if (factorySecrets().some(secret => command.some(value => value.includes(secret)) || model?.includes(secret) || provider?.includes(secret))) throw new Error("Do not pass Easy Workflow control credentials to a station launcher.");
+  return {command: [...command], ...(model ? {model} : {}), ...(provider ? {provider} : {}), cwd,
+    adapter: adapter as ClosedAgentConfig['adapter'], requestTimeoutMs, sessionScope};
+}
+
+function dependencyOf(config: ClosedAgentConfig) {
+  return closedModelDependency({adapter: config.adapter ?? 'launcher', command: config.command,
+    ...(config.model ? {model: config.model} : {}), ...(config.provider ? {provider: config.provider} : {})});
+}
+
+function validSession(value: unknown, config: ClosedAgentConfig, signature: string): value is ClosedSessionReference {
+  if (config.adapter === 'claude-code') return validClaudeSession(value, config.model, signature);
+  const selection = {model: config.model, provider: config.provider};
+  if (config.adapter === 'opencode') return validOpenCodeSession(value, selection, signature);
+  if (config.adapter === 'codex') return validCodexSession(value, selection, signature);
+  return false;
 }
 
 function inside(parent: string, candidate: string) {
@@ -146,7 +170,20 @@ export async function openStationMcp(tools: StationTool[], signal: AbortSignal) 
     fs.writeFileSync(file, JSON.stringify({ product: "Easy Workflow", protocol: "h2-station/1", url: `http://127.0.0.1:${address.port}`, token: secret }), { mode: 0o600 });
     signal.addEventListener("abort", abort, { once: true });
     signal.throwIfAborted();
-    return { config: { command: process.execPath, args: [fileURLToPath(new URL("./mcp.ts", import.meta.url)), "--station"], env: { EASY_WORKFLOW_STATION_CONNECTION: file, H2_STATION_CONNECTION: file, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}) } }, close,
+    const call = async (name: string, args: unknown, signal: AbortSignal): Promise<CodexToolReply> => {
+      scopeSignal.throwIfAborted();
+      const response = await fetch(`http://127.0.0.1:${address.port}/call`, {method: 'POST',
+        signal: AbortSignal.any([scopeSignal, signal]),
+        headers: {authorization: `Bearer ${secret}`, 'content-type': 'application/json'},
+        body: JSON.stringify({name, arguments: args})});
+      if (!response.ok) throw new Error('The station scope rejected this native tool call');
+      const result: unknown = await response.json();
+      if (!result || typeof result !== 'object' || !Array.isArray((result as CodexToolReply).content)) {
+        throw new Error('The station scope returned an invalid tool receipt');
+      }
+      return result as CodexToolReply;
+    };
+    return { config: { command: process.execPath, args: [fileURLToPath(new URL("./mcp.ts", import.meta.url)), "--station"], env: { EASY_WORKFLOW_STATION_CONNECTION: file, H2_STATION_CONNECTION: file, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}) } }, close, call,
       redact: <T>(value: T) => redactValue(value, secrets) };
   } catch (err) { await close(); throw err; }
 }
@@ -160,7 +197,7 @@ export class ClosedStationAgent {
   private messages: Message[] = [];
   private controller?: AbortController;
   private onReply: (reply: ClosedAgentReply) => void;
-  private session?: ClaudeSessionReference;
+  private session?: ClosedSessionReference;
   private sessionFile?: string;
   private signature = '';
   private readContext?: () => NonNullable<ClaudeSessionReference['context']>;
@@ -174,7 +211,7 @@ export class ClosedStationAgent {
   }
   abort() { this.controller?.abort(); }
   configureSession(station: string, signature: string, saved?: unknown, readContext?: () => NonNullable<ClaudeSessionReference['context']>) {
-    if (this.config.adapter !== 'claude-code') return;
+    if (!['claude-code', 'opencode', 'codex'].includes(this.config.adapter ?? 'launcher')) return;
     this.signature = signature;
     this.readContext = readContext;
     this.session = undefined;
@@ -188,7 +225,7 @@ export class ClosedStationAgent {
       throw new Error('The closed station checkpoint directory must stay inside the project without symbolic links.');
     }
     const restore = (value: unknown, local: boolean) => {
-      if (!validClaudeSession(value, this.config.model, signature)) return false;
+      if (!validSession(value, this.config, signature)) return false;
       let directory = this.config.cwd;
       if (value.workDirectory !== undefined) {
         if (!scope || !value.workDirectory || path.isAbsolute(value.workDirectory)
@@ -224,7 +261,7 @@ export class ClosedStationAgent {
     this.session = undefined;
     if (this.sessionFile) fs.rmSync(this.sessionFile, { force: true });
   }
-  private saveSession(session: ClaudeSessionReference) {
+  private saveSession(session: ClosedSessionReference) {
     const scope = this.config.sessionScope;
     this.session = {
       ...session,
@@ -245,18 +282,18 @@ export class ClosedStationAgent {
     }
   }
   async prompt(text: string, images?: { type: "image"; data: string; mimeType: string }[]) {
-    checkModelAdmission(closedModelDependency({
-      adapter: this.config.adapter ?? 'launcher', command: this.config.command, model: this.config.model,
-    }));
     this.state.errorMessage = undefined;
     const first = this.messages.length === 0;
-    this.messages.push({ role: "user", content: [{ type: "text", text: redactText(first ? `${this.envelope}\n\n---\n# 本次输入\n${text}` : text, factorySecrets()) }, ...(images ?? [])] });
+    const pendingMessages: Message[] = [...this.messages, {role: 'user', content: [{type: 'text',
+      text: redactText(first ? `${this.envelope}\n\n---\n# 本次输入\n${text}` : text, factorySecrets())}, ...(images ?? [])]}];
     this.controller = new AbortController();
+    let releaseCapacity: () => void = () => {};
+    let capacityFailure: Failure | undefined;
     const scopedTools = this.tools.map(tool => ({
       ...tool,
       execute: async (id: string, args: unknown, signal?: AbortSignal) => {
         try {
-          const result = await tool.execute(id, args, signal);
+          const result = await withModelTool(releaseCapacity, () => tool.execute(id, args, signal), failure => {capacityFailure = failure;});
           if (tool.name === 'submit') this.messages.push({ role: 'assistant', content: [{ type: 'text', text: `submit: ${JSON.stringify(args)}` }] });
           return result;
         } finally {
@@ -264,33 +301,196 @@ export class ClosedStationAgent {
         }
       },
     }));
-    const session = await openStationMcp(scopedTools, this.controller.signal);
+    const dependency = dependencyOf(this.config);
+    const release = await acquireModelRequest(dependency, this.controller.signal);
+    releaseCapacity = release;
+    let session: Awaited<ReturnType<typeof openStationMcp>> | undefined;
+    const native = this.config.adapter === 'opencode' || this.config.adapter === 'codex';
+    const timeout = native ? setTimeout(() => this.controller!.abort(new Error('Native station request timed out; its process and scoped tools were cancelled.')),
+      this.config.requestTimeoutMs ?? 180000) : undefined;
+    timeout?.unref();
     try {
-      const request = { product: "Easy Workflow", protocol: "h2-closed-agent/1", model: this.config.model, firstMessage: this.messages[0], messages: this.messages, mcpServers: { h2_station: session.config } };
-      const vendor = this.config.adapter === 'claude-code' ? new ClaudeCodeProtocol(this.config.model, this.signature, this.session, reference => this.saveSession(reference)) : undefined;
+      session = await openStationMcp(scopedTools, this.controller.signal);
+      const request = { product: "Easy Workflow", protocol: "h2-closed-agent/1", model: this.config.model, firstMessage: pendingMessages[0], messages: pendingMessages, mcpServers: { h2_station: session.config } };
+      const vendor = this.config.adapter === 'claude-code' ? new ClaudeCodeProtocol(this.config.model, this.signature,
+        this.session?.adapter === 'claude-code' ? this.session : undefined, reference => this.saveSession(reference)) : undefined;
       const scope = this.config.sessionScope;
       if (scope && !ownedWorkDirectory(scope, this.workingDirectory, !!this.session)) {
         throw new Error('The saved closed station working directory is no longer available inside this project.');
       }
-      const reply = await runLauncher({ ...this.config, cwd: this.workingDirectory }, request, this.controller.signal, vendor);
+      const config = {...this.config, cwd: this.workingDirectory};
+      const started = () => {this.messages = pendingMessages;};
+      let reply: ClosedAgentReply;
+      if (this.config.adapter === 'opencode') {
+        const protocol = new OpenCodeProtocol({model: this.config.model, provider: this.config.provider}, this.signature,
+          this.session?.adapter === 'opencode' ? this.session : undefined, reference => this.saveSession(reference));
+        reply = await runOpenCode(config, request, this.controller.signal, protocol, started);
+      } else if (this.config.adapter === 'codex') {
+        const protocol = new CodexProtocol({selection: {model: this.config.model, provider: this.config.provider},
+          signature: this.signature, previous: this.session?.adapter === 'codex' ? this.session : undefined,
+          checkpoint: reference => this.saveSession(reference), cwd: this.workingDirectory, tools: scopedTools,
+          signal: this.controller.signal});
+        reply = await runCodex(config, request.messages.at(-1)!, this.controller.signal, protocol, session.call, started);
+      } else reply = await runLauncher(config, request, this.controller.signal, vendor, started);
       const safe = session.redact(reply);
-      if (safe.model !== reply.model) throw new Error("Launcher metadata contained credentials; it was not logged.");
+      if (safe.model !== reply.model || safe.provider !== reply.provider) throw new Error("Launcher metadata contained credentials; it was not logged.");
       this.onReply(safe);
+      if (!['unknown', 'unreported'].includes(safe.model) && !['model_transport', 'model_unavailable'].includes(safe.failure?.tag ?? '')) {
+        reportModelResponse({dependency, model: safe.model, modelCalls: safe.modelCalls ?? safe.time?.modelCalls ?? 0,
+          provider: safe.provider, usageReported: Boolean(safe.usage || safe.tokenUsage), usage: safe.usage,
+          tokenUsage: safe.tokenUsage, costReported: safe.costReported ?? !!safe.usage,
+          costComplete: safe.costComplete ?? !!safe.usage});
+      }
+      if (capacityFailure) throw Object.assign(new Error(capacityFailure.message), {failure: capacityFailure});
       if (safe.failure) throw Object.assign(new Error(safe.failure.message), { failure: safe.failure });
     } catch (err) {
       this.state.errorMessage = err instanceof Error ? err.message : "Closed agent launcher failed";
       // A submit alone does not certify a completed launcher or its actual model.
       throw err;
-    } finally { await session.close(); }
+    } finally { clearTimeout(timeout); try { await session?.close(); } finally { release(); } }
   }
 }
 
-async function runLauncher(config: ClosedAgentConfig, request: { messages: Message[]; mcpServers: Record<string, unknown> }, signal: AbortSignal, vendor?: ClaudeCodeProtocol): Promise<ClosedAgentReply> {
+interface NativeProcessOptions {
+  env?: Record<string, string>;
+  maxBufferBytes: number;
+  started?: () => void;
+  input: (write: (line: string) => void, end: () => void) => string;
+  interactive?: boolean;
+  accept?: (line: string) => void | Promise<void>;
+  interrupt?: () => void;
+  modelRequest?: boolean;
+}
+
+/** Every native phase has the same kill-tree/close boundary as the launcher. */
+async function runNativeProcess(config: ClosedAgentConfig, command: string[], signal: AbortSignal,
+  options: NativeProcessOptions): Promise<{code: number | null; output: string}> {
+  signal.throwIfAborted();
+  if (options.modelRequest !== false) checkModelAdmission(dependencyOf(config), true);
+  fs.mkdirSync(config.cwd, {recursive: true});
+  const child = spawn(command[0], command.slice(1), {cwd: config.cwd,
+    env: {...launcherEnvironment(), ...options.env}, shell: false, windowsHide: true,
+    detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']});
+  if (options.started) child.once('spawn', options.started);
+  const processClosed = new Promise<void>(resolve => child.once('close', () => resolve()));
+  return new Promise((resolve, reject) => {
+    let output = '';
+    let size = 0;
+    let done = false;
+    let failure: unknown;
+    let stopping: Promise<void> | undefined;
+    let parsing = Promise.resolve();
+    const finish = (error?: unknown, code?: number | null) => {
+      if (done) return;
+      done = true;
+      signal.removeEventListener('abort', abort);
+      if (error) reject(error); else resolve({code: code ?? null, output});
+    };
+    const stop = (error: unknown) => {
+      failure ??= error;
+      stopping ??= (async () => {
+        try { options.interrupt?.(); } catch { /* The owned process may already have closed. */ }
+        try { await stopLauncher(child); } finally { await processClosed; }
+      })();
+      void stopping.then(() => finish(failure), () => finish(failure));
+    };
+    const abort = () => stop(signal.reason ?? new Error('Native station cancelled'));
+    const parse = (line: string) => {
+      parsing = parsing.then(async () => {
+        if (!failure) await options.accept!(line);
+      }).catch(error => stop(error));
+    };
+    signal.addEventListener('abort', abort, {once: true});
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      if (failure) return;
+      size += Buffer.byteLength(chunk);
+      if (size > options.maxBufferBytes) return stop(new Error('Native station response exceeded its bounded output budget'));
+      output += chunk;
+      if (!options.accept) return;
+      let end: number;
+      while ((end = output.indexOf('\n')) !== -1) {
+        const line = output.slice(0, end);
+        output = output.slice(end + 1);
+        if (Buffer.byteLength(line) > 1024 * 1024) return stop(new Error('Native station stream line exceeded 1 MiB'));
+        parse(line);
+      }
+      if (Buffer.byteLength(output) > 1024 * 1024) stop(new Error('Native station stream line exceeded 1 MiB'));
+    });
+    // Native logs/configuration can contain credentials or prompts. Never echo them.
+    child.stderr.resume();
+    child.once('error', () => stop(new Error('Native agent could not start; check its configured CLI executable.')));
+    child.stdin.on('error', () => {if (!done && !failure) stop(new Error('Native agent did not accept its protocol input.'));});
+    child.once('close', code => {
+      void (async () => {
+        if (failure) return;
+        if (options.accept && output.trim()) { parse(output); output = ''; }
+        await parsing;
+        if (!failure) finish(undefined, code);
+      })().catch(error => stop(error));
+    });
+    try {
+      const input = options.input(line => {
+        if (!failure && !child.stdin.destroyed) child.stdin.write(line);
+      }, () => child.stdin.end());
+      if (options.interactive) child.stdin.write(input); else child.stdin.end(input);
+    } catch (error) { stop(error); }
+    if (signal.aborted) abort();
+  });
+}
+
+async function runOpenCode(config: ClosedAgentConfig, request: {messages: Message[]; mcpServers: Record<string, unknown>},
+  signal: AbortSignal, protocol: OpenCodeProtocol, started: () => void): Promise<ClosedAgentReply> {
+  const localCommand = async (description: ReturnType<OpenCodeProtocol['configurationCommand']>) => {
+    const result = await runNativeProcess(config, description.argv,
+      AbortSignal.any([signal, AbortSignal.timeout(description.timeoutMs)]), {
+        env: description.env, maxBufferBytes: description.maxBufferBytes, input: () => '', modelRequest: false,
+      });
+    if (result.code !== 0) throw new Error('OpenCode could not read its local configuration or session receipt');
+    try { return JSON.parse(result.output) as unknown; }
+    catch { throw new Error('OpenCode returned an invalid local configuration or session receipt'); }
+  };
+  try {
+    protocol.acceptConfiguration(await localCommand(protocol.configurationCommand(config.command)));
+    signal.throwIfAborted();
+    await protocol.prepareInput(request.messages.at(-1)!, config.cwd);
+    const process = await runNativeProcess(config, protocol.argv(config.command), signal, {
+      env: protocol.environment(request.mcpServers), maxBufferBytes: 16 * 1024 * 1024,
+      started, input: () => protocol.input(request.messages.at(-1)!), accept: line => protocol.accept(line),
+    });
+    signal.throwIfAborted();
+    const receipt = protocol.receiptCommand(config.command);
+    if (receipt) protocol.acceptReceipt(await localCommand(receipt));
+    const result = protocol.finish();
+    if (process.code !== 0 && !result.failure) throw new Error(`OpenCode exited (${process.code ?? 'signal'}) without a failure receipt`);
+    return {...result, costReported: !!result.usage};
+  } finally {
+    // All phases settle after child close; only our fresh input files are removed.
+    protocol.disposeInput();
+  }
+}
+
+async function runCodex(config: ClosedAgentConfig, message: Message, signal: AbortSignal,
+  protocol: CodexProtocol, call: (name: string, args: unknown, signal: AbortSignal) => Promise<CodexToolReply>,
+  started: () => void): Promise<ClosedAgentReply> {
+  const process = await runNativeProcess(config, protocol.argv(config.command), signal, {
+    maxBufferBytes: 16 * 1024 * 1024, interactive: true,
+    input: (send, complete) => {
+      protocol.bind({send, complete, call, beforeTurn: () => {checkModelAdmission(dependencyOf(config), true); started();}});
+      return protocol.input(message);
+    },
+    accept: line => protocol.accept(line), interrupt: () => protocol.interrupt(),
+  });
+  signal.throwIfAborted();
+  const result = protocol.finish();
+  if (process.code !== 0 && !result.failure) throw new Error(`Codex app-server exited (${process.code ?? 'signal'})`);
+  return {...result, costReported: false};
+}
+
+async function runLauncher(config: ClosedAgentConfig, request: { messages: Message[]; mcpServers: Record<string, unknown> }, signal: AbortSignal, vendor?: ClaudeCodeProtocol, started?: () => void): Promise<ClosedAgentReply> {
   signal.throwIfAborted();
   // The model hold can change while the attempt-scoped MCP server opens.
-  checkModelAdmission(closedModelDependency({
-    adapter: config.adapter ?? 'launcher', command: config.command, model: config.model,
-  }));
+  checkModelAdmission(dependencyOf(config), true);
   fs.mkdirSync(config.cwd, { recursive: true });
   const command = vendor ? vendor.argv(config.command, request.mcpServers) : config.command;
   const child = spawn(command[0], command.slice(1), { cwd: config.cwd, env: { ...launcherEnvironment(), ...(vendor ? {
@@ -300,6 +500,7 @@ async function runLauncher(config: ClosedAgentConfig, request: { messages: Messa
     MCP_CONNECTION_NONBLOCKING: '0', MCP_CONNECT_TIMEOUT_MS: '10000', MCP_TIMEOUT: '10000',
   } : {}) }, shell: false, windowsHide: true,
     detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
+  if (started) child.once('spawn', started);
   const processClosed = new Promise<void>(resolve => child.once('close', () => resolve()));
   return new Promise<ClosedAgentReply>((resolve, reject) => {
     let output = "", size = 0, done = false, failure: Error | undefined;

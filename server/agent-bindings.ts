@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import type {ModelDependency, StationAgentBinding} from '../shared/types.ts';
 import {ControlError} from './errors.ts';
 import {factorySecrets} from './mcp-security.ts';
@@ -39,16 +41,50 @@ export function piModelDependency(selection: {provider: string; model: string; e
 }
 
 /** Closed clients disclose an executor identity, never an inferred provider or argv. */
-export function closedModelDependency(binding: Exclude<StationAgentBinding, {adapter: 'pi'}>): ModelDependency {
-  if (!['claude-code', 'launcher'].includes(binding.adapter) || !Array.isArray(binding.command) ||
-      !binding.command.length || binding.command.some(value => typeof value !== 'string' || !value.trim())) {
+export function closedModelDependency(binding: {
+  adapter: Exclude<StationAgentBinding, {adapter: 'pi'}>['adapter'];
+  command?: string[];
+  model?: string;
+  provider?: string;
+  requestTimeoutMs?: number;
+}): ModelDependency {
+  const command = binding.command ?? (binding.adapter === 'launcher' ? undefined : [nativeExecutable(binding.adapter)]);
+  if (!['claude-code', 'launcher', 'opencode', 'codex'].includes(binding.adapter) || !Array.isArray(command) ||
+      !command.length || command.some(value => typeof value !== 'string' || !value.trim())) {
     throw new ControlError(422, 'invalid_model_dependency', '闭源模型依赖需要已解析的 adapter 和 argv');
   }
-  const model = dependencyLabel(binding.model, 'model');
+  const model = binding.model === undefined && binding.adapter !== 'launcher' ? 'native-default' : dependencyLabel(binding.model, 'model');
+  const provider = 'provider' in binding && binding.provider !== undefined ? dependencyLabel(binding.provider, 'provider') : undefined;
   return Object.freeze({
-    key: `${binding.adapter}:${identityDigest(['model-dependency/v1', binding.adapter, identityDigest(binding.command), model])}`,
-    adapter: binding.adapter, model,
+    key: `${binding.adapter}:${identityDigest(['model-dependency/v1', binding.adapter, identityDigest(command), model, ...(provider ? [provider] : [])])}`,
+    adapter: binding.adapter, model, ...(provider ? {provider} : {}),
   });
+}
+
+function nativeExecutable(adapter: string) {
+  return adapter === 'claude-code' ? 'claude' : adapter;
+}
+
+/** Resolve files only. Probing a CLI by spawning it can authenticate or spend. */
+export function resolveNativeCommand(adapter: 'claude-code' | 'opencode' | 'codex'): string[] {
+  const executable = nativeExecutable(adapter);
+  const locations = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  const packageEntry = adapter === 'codex' ? ['@openai', 'codex', 'bin', 'codex.js']
+    : adapter === 'claude-code' ? ['@anthropic-ai', 'claude-code', 'cli.js'] : ['opencode-ai', 'bin', 'opencode'];
+  const exists = (file: string) => {
+    try { return fs.statSync(file).isFile(); } catch { return false; }
+  };
+  for (const directory of locations) {
+    const file = path.join(directory.replace(/^"|"$/g, ''), executable + (process.platform === 'win32' ? '.exe' : ''));
+    if (exists(file)) return [file];
+    // Windows npm command shims cannot run with shell:false. Use the known
+    // vendor entrypoint next to the shim, without evaluating shell contents.
+    if (process.platform === 'win32' && exists(path.join(directory, `${executable}.cmd`))) {
+      const script = path.join(directory, 'node_modules', ...packageEntry);
+      if (exists(script)) return [process.execPath, script];
+    }
+  }
+  throw new ControlError(422, 'native_agent_unavailable', `未找到本机 ${executable} CLI；请安装 CLI 或配置启动 argv。桌面应用不等于可调用的 CLI。`);
 }
 
 /** Validate the persisted and manifest boundary without loading a vendor SDK. */
@@ -58,11 +94,11 @@ export function parseAgentBinding(value: unknown): StationAgentBinding {
   }
   const input = value as Record<string, unknown>;
   const adapter = input.adapter;
-  if (!['pi', 'claude-code', 'launcher'].includes(String(adapter))) {
-    return invalid('请选择 Pi、Claude Code 或自定义 launcher');
+  if (!['pi', 'claude-code', 'launcher', 'opencode', 'codex'].includes(String(adapter))) {
+    return invalid('请选择 Pi、OpenCode、Codex、Claude Code 或自定义 launcher');
   }
   const allowed = adapter === 'pi' ? ['adapter', 'provider', 'model'] :
-    ['adapter', 'command', 'model', 'requestTimeoutMs'];
+    ['adapter', 'command', 'model', 'requestTimeoutMs', ...(['opencode', 'codex'].includes(String(adapter)) ? ['provider'] : [])];
   if (Object.keys(input).some(key => !allowed.includes(key))) {
     return invalid('Agent 配置含未支持字段；凭据、工作目录和工具作用域由宿主管理');
   }
@@ -82,8 +118,8 @@ export function parseAgentBinding(value: unknown): StationAgentBinding {
     const model = name('model', false);
     return {adapter, ...(provider ? {provider} : {}), ...(model ? {model} : {})};
   }
-  if (!Array.isArray(input.command) || input.command.length < 1 || input.command.length > 32 ||
-      input.command.some(arg => typeof arg !== 'string' || !arg.trim() || arg.length > 4000 || /[\r\n\0]/.test(arg))) {
+  if ((input.command !== undefined || adapter === 'launcher') && (!Array.isArray(input.command) || input.command.length < 1 || input.command.length > 32 ||
+      input.command.some(arg => typeof arg !== 'string' || !arg.trim() || arg.length > 4000 || /[\r\n\0]/.test(arg)))) {
     return invalid('启动命令必须是 1–32 个非空字符串组成的 argv 数组');
   }
   const requestTimeoutMs = input.requestTimeoutMs;
@@ -92,15 +128,21 @@ export function parseAgentBinding(value: unknown): StationAgentBinding {
         requestTimeoutMs < 1 || requestTimeoutMs > 900000)) {
     return invalid('Agent 请求超时必须是 1–900000 毫秒的整数');
   }
-  return {
-    adapter: adapter as 'claude-code' | 'launcher', command: [...input.command] as string[],
-    model: name('model', true)!, ...(requestTimeoutMs !== undefined ? {requestTimeoutMs} : {}),
-  };
+  const model = name('model', adapter === 'launcher');
+  const provider = ['opencode', 'codex'].includes(String(adapter)) ? name('provider', false) : undefined;
+  if (adapter === 'opencode' && model && !provider && !model.includes('/')) {
+    return invalid('OpenCode 模型覆盖需要 provider/model 或同时指定 provider；留空沿用原生默认');
+  }
+  return {adapter: adapter as 'claude-code' | 'opencode' | 'codex' | 'launcher',
+    ...(input.command !== undefined ? {command: [...input.command as string[]]} : {}),
+    ...(model ? {model} : {}), ...(provider ? {provider} : {}),
+    ...(requestTimeoutMs !== undefined ? {requestTimeoutMs} : {})} as StationAgentBinding;
 }
 
 export function agentCapabilities(binding: StationAgentBinding) {
   return {
     stream: binding.adapter === 'pi', cancel: true,
-    resume: binding.adapter !== 'launcher', usage: binding.adapter === 'launcher' ? 'unknown' as const : 'reported' as const,
+    resume: binding.adapter !== 'launcher', usage: binding.adapter === 'launcher' ? 'unknown' as const
+      : binding.adapter === 'codex' ? 'tokens-only' as const : 'reported' as const,
   };
 }

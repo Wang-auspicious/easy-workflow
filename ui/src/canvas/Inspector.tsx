@@ -357,7 +357,7 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
       <p className="agent-binding-effective">{effective ? `${adapterLabel(effective.adapter)} · ${effective.model || '客户端默认模型'}` : '当前配置不可执行'}<small>来源：{({project: '本节点覆盖', workflow: '工作流包默认', default: '本项目默认'})[entry.source]}</small></p>
       {entry.lastModel && <p className="muted">最近回报模型：{entry.lastModel === 'unreported' ? '未回报' : entry.lastModel}</p>}
       {entry.error && <p className="agent-binding-error" role="alert">{entry.error}</p>}
-      <p className="agent-binding-capabilities">流式 {entry.capabilities.stream ? '支持' : '不支持'} · 取消 {entry.capabilities.cancel ? '支持' : '不支持'} · 续接 {entry.capabilities.resume ? '支持' : '不支持'} · 用量 {entry.capabilities.usage === 'reported' ? '客户端回报' : '未提供'}</p>
+      <p className="agent-binding-capabilities">流式 {entry.capabilities.stream ? '支持' : '不支持'} · 取消 {entry.capabilities.cancel ? '支持' : '不支持'} · 续接 {entry.capabilities.resume ? '支持' : '不支持'} · 用量 {entry.capabilities.usage === 'reported' ? '客户端回报' : entry.capabilities.usage === 'tokens-only' ? '仅 Token 回报，费用未知' : '未提供'}</p>
       <form onSubmit={submit}>
         <AgentBindingFields draft={draft} disabled={disabled} scope="node" change={change} selectAdapter={selectAdapter} />
         <p className="muted">只影响下次尝试。角色、工具权限、输出契约和程序审查保持有效。</p>

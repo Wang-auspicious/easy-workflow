@@ -121,21 +121,31 @@ export function buildTimeView(attempts: ActivityAttempt[], options: { live: bool
   return { intervals, strip: timeStrip(intervals), totals, estimated, coverage };
 }
 
-export const hasReportedUsage = (a: ActivityAttempt) => a.metrics?.usageReported === true || (a.metrics?.usageReported !== false && (a.input > 0 || a.output > 0 || a.cost > 0));
+export const hasReportedUsage = (a: ActivityAttempt) => Boolean(a.metrics?.tokenUsage) || a.metrics?.usageReported === true || (a.metrics?.usageReported !== false && (a.input > 0 || a.output > 0 || a.cost > 0));
 
 /** A default zero in a projection or missing cache field is not a provider report. */
 export function usageSummary(attempts: ActivityAttempt[]) {
-  const reported = attempts.filter(hasReportedUsage), complete = reported.filter(a => a.metrics?.usageComplete === true);
-  const sum = (key: "input" | "output" | "cost") => reported.length ? reported.reduce((total, a) => total + a[key], 0) : null;
+  const reported = attempts.filter(hasReportedUsage).map(attempt => ({...attempt,
+    input: attempt.metrics?.tokenUsage?.input ?? attempt.input,
+    output: attempt.metrics?.tokenUsage?.output ?? attempt.output,
+    cacheRead: attempt.metrics?.tokenUsage ? attempt.metrics.tokenUsage.cacheRead : attempt.cacheRead,
+    cacheWrite: attempt.metrics?.tokenUsage ? attempt.metrics.tokenUsage.cacheWrite : attempt.cacheWrite,
+  }));
+  const complete = reported.filter(attempt => attempt.metrics?.usageComplete === true);
+  const sum = (key: 'input' | 'output') => reported.length ? reported.reduce((total, a) => total + a[key], 0) : null;
+  const costs = reported.filter(attempt => attempt.metrics?.costReported !== false);
+  const costComplete = costs.length > 0 && costs.length === reported.length && costs.every(attempt => attempt.metrics?.costComplete !== false && attempt.metrics?.usageComplete !== false);
   const cacheComplete = reported.length > 0 && reported.every(a => a.metrics?.usageComplete === true && a.metrics?.cacheUsageComplete === true && a.cacheRead !== undefined && a.cacheWrite !== undefined);
   const cacheRead = cacheComplete ? reported.reduce((total, a) => total + a.cacheRead!, 0) : null;
   const cacheWrite = cacheComplete ? reported.reduce((total, a) => total + a.cacheWrite!, 0) : null;
-  const input = sum("input"), output = sum("output"), cost = sum("cost");
+  const input = sum('input'), output = sum('output');
+  const cost = costs.length ? costs.reduce((total, attempt) => total + attempt.cost, 0) : null;
   const denominator = (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0);
   const speedSamples = complete.filter(a => a.metrics?.modelTimeReported !== false && positive(a.metrics?.time?.outputMs) > 0);
   const outputMs = speedSamples.reduce((total, a) => total + a.metrics!.time!.outputMs, 0);
   return { input, output, cost, total: input === null || output === null ? null : input + output,
     reported: reported.length, complete: complete.length, attempts: attempts.length,
+    costReported: costs.length, costComplete,
     cacheHitRate: cacheComplete && denominator > 0 ? cacheRead! / denominator : null,
     outputPerSecond: outputMs > 0 ? speedSamples.reduce((total, a) => total + a.output, 0) * 1000 / outputMs : null };
 }

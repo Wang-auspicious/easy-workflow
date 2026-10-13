@@ -1,9 +1,11 @@
 // Resource broker (Spec §6.3, §30.6): one set of global quotas shared by every line.
 // Browser pages default to 8 and shrink with free memory (≈250MB per page above the
-// floor), then grow back when memory recovers. The last model slot is kept for
-// reviewers so production stations cannot starve review.
+// floor), then grow back when memory recovers. Model workers hold lifecycle
+// leases; ModelRequests independently limits actual calls. The last model worker
+// is kept for reviewers so production stations cannot starve review.
 import os from "node:os";
-import type { ResourceClass } from "../shared/types.ts";
+import type {ModelCircuit, ModelDependency, ResourceClass} from '../shared/types.ts';
+import {ModelRequests} from './model-requests.ts';
 
 export interface Lease { cls: ResourceClass; id: number; release: () => void }
 
@@ -18,6 +20,8 @@ export class Broker {
   modelHold: string | null = null;
   /** A recovering provider gets one real task before normal scheduling resumes. */
   recoveryToken: string | null = null;
+  modelCircuits: Record<string, ModelCircuit> = {};
+  readonly modelRequests: ModelRequests;
   private next = 1;
   private waiters = new Set<() => void>();
   onRelease: () => void = () => {};
@@ -26,6 +30,7 @@ export class Broker {
   constructor(limits: Record<string, number>, memoryFloorMB = 1024) {
     this.limits = { ...limits };
     this.memoryFloorMB = memoryFloorMB;
+    this.modelRequests = new ModelRequests(() => this.limits.model ?? 1);
   }
 
   freeMemMB() { return this.freeMem(); }
@@ -38,11 +43,31 @@ export class Broker {
     return Math.max(1, Math.min(cap, (this.used.browser ?? 0) + Math.floor(spare / PAGE_MB)));
   }
 
+  /** Capacity for station lifecycles, distinct from concurrent model requests. */
+  capacity(resource: ResourceClass): number {
+    if (resource === 'none') return Infinity;
+    if (resource === 'browser') return this.effectiveBrowser();
+    if (resource === 'model') return this.limits.modelWorkers ?? this.limits.model ?? 1;
+    return this.limits[resource] ?? 1;
+  }
+
   /** Why a lease cannot be granted right now, or null when it can. */
-  blocked(cls: ResourceClass, opts: { review?: boolean } = {}): string | null {
+  modelBlocked(dependency?: ModelDependency, token?: string): string | null {
+    if (this.modelHold) return `模型暂停：${this.modelHold}`;
+    if (this.recoveryToken && token !== this.recoveryToken) return '正在用一个工位验证未归属的模型故障';
+    const circuit = dependency ? this.modelCircuits[dependency.key] : Object.values(this.modelCircuits)[0];
+    if (!circuit) return null;
+    if (dependency && circuit.state === 'trial' && circuit.trialToken === token) return null;
+    return `${circuit.dependency.adapter} ${circuit.dependency.model} 暂停：${circuit.reason}`;
+  }
+
+  blocked(cls: ResourceClass, opts: {review?: boolean; dependency?: ModelDependency; token?: string} = {}): string | null {
     if (cls === "none") return null;
-    if (cls === "model" && this.modelHold) return `模型暂停：${this.modelHold}`;
-    const limit = cls === "browser" ? this.effectiveBrowser() : this.limits[cls] ?? 1;
+    if (cls === 'model') {
+      const reason = this.modelBlocked(opts.dependency, opts.token);
+      if (reason) return reason;
+    }
+    const limit = this.capacity(cls);
     const used = this.used[cls] ?? 0;
     if (cls === "browser" && this.freeMemMB() < this.memoryFloorMB) return `空闲内存 ${this.freeMemMB()}MB < ${this.memoryFloorMB}MB`;
     if (used >= limit) return cls === "browser" && limit < (this.limits.browser ?? 1) ? `browser ${used}/${limit}（内存不足，上限暂降自 ${this.limits.browser}）` : `${cls} ${used}/${limit}`;
@@ -50,7 +75,7 @@ export class Broker {
     return null;
   }
 
-  tryAcquire(cls: ResourceClass, opts: { review?: boolean } = {}): Lease | null {
+  tryAcquire(cls: ResourceClass, opts: {review?: boolean; dependency?: ModelDependency; token?: string} = {}): Lease | null {
     if (this.blocked(cls, opts)) return null;
     if (cls !== "none") this.used[cls] = (this.used[cls] ?? 0) + 1;
     const id = this.next++;
@@ -72,7 +97,7 @@ export class Broker {
   /** Wait for capacity without conflating resource saturation with a site error.
    * Null means this bounded wait expired; cancellation rejects immediately. The
    * timer also observes memory recovery, which need not release an existing lease. */
-  async acquire(cls: ResourceClass, opts: { review?: boolean; signal?: AbortSignal; timeoutMs?: number } = {}): Promise<Lease | null> {
+  async acquire(cls: ResourceClass, opts: {review?: boolean; dependency?: ModelDependency; token?: string; signal?: AbortSignal; timeoutMs?: number} = {}): Promise<Lease | null> {
     opts.signal?.throwIfAborted();
     const immediate = this.tryAcquire(cls, opts);
     if (immediate) return immediate;
@@ -105,5 +130,6 @@ export class Broker {
 
   static order(p: keyof typeof PRIORITY) { return PRIORITY[p]; }
 
-  sample() { return { used: { ...this.used }, limits: { ...this.limits, browserEffective: this.effectiveBrowser() }, freeMemMB: this.freeMemMB() }; }
+  sample() { return { used: { ...this.used }, limits: { ...this.limits, browserEffective: this.effectiveBrowser(), modelWorkers: this.capacity('model') }, freeMemMB: this.freeMemMB(),
+    modelRequests: {active: this.modelRequests.active, queued: this.modelRequests.queued, limit: this.modelRequests.limit} }; }
 }

@@ -1,5 +1,6 @@
 import type { Factory } from './factory.ts';
-import { batchSummary, latestBatchTokens, modelRecoveryDelay, type BatchGoal, type BatchRecovery } from '../shared/batch.ts';
+import {batchSummary, flowWindow, latestBatchTokens, modelRecoveryDelay, occupiesIntake,
+  type BatchGoal, type BatchRecovery, type FlowObservation} from '../shared/batch.ts';
 import { ControlError } from './errors.ts';
 import { classifyFailure } from '../shared/failures.ts';
 
@@ -43,7 +44,8 @@ export class BatchSupervisor {
           }
         }
       }
-      if (['batch.configured', 'run.resumed', 'token.finished', 'token.queued', 'candidate.disposition', 'alert.cleared'].includes(event.kind)) this.schedule();
+      if (['batch.configured', 'run.resumed', 'token.finished', 'token.queued', 'candidate.disposition',
+        'alert.cleared', 'model.circuit', 'worker.forked', 'worker.retired'].includes(event.kind)) this.schedule();
     });
   }
 
@@ -96,16 +98,59 @@ export class BatchSupervisor {
     this.schedule();
   }
 
-  configure(options: { target: number; maxInFlight?: number; intakeWindow?: number; category?: string; query?: string }) {
+  private admission(options: {flow?: boolean; maxInFlight?: number; intakeWindow?: number}, previous?: BatchGoal) {
+    if (options.flow !== undefined && typeof options.flow !== 'boolean') throw new ControlError(400, 'invalid_admission', 'flow 必须是布尔值');
+    for (const [key, maximum] of [['maxInFlight', 40], ['intakeWindow', 20]] as const) {
+      const value = options[key];
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > maximum)) {
+        throw new ControlError(400, 'invalid_admission', `${key} 必须是 1–${maximum} 的整数`);
+      }
+    }
+    const explicit = options.maxInFlight !== undefined || options.intakeWindow !== undefined;
+    const flow = options.flow ?? (explicit ? false : !previous || previous.admission?.mode === 'flow');
+    if (!flow) return {maxInFlight: options.maxInFlight ?? previous?.maxInFlight ?? 6,
+      intakeWindow: options.intakeWindow ?? previous?.intakeWindow ?? 2, admission: undefined};
+    const admission = {mode: 'flow' as const,
+      maxInFlightLimit: options.maxInFlight ?? previous?.admission?.maxInFlightLimit ?? 6,
+      intakeWindowLimit: options.intakeWindow ?? previous?.admission?.intakeWindowLimit ?? 2};
+    const f = this.factory;
+    const observations = new Map<string, FlowObservation>();
+    for (const node of f.compiled.nodes) {
+      if (!f.runtime.runnable(node)) continue;
+      const numbers = f.runtime.stationNumbers(node.key);
+      observations.set(node.key, {serviceSeconds: numbers.s, workers: numbers.workers, samples: numbers.samples});
+    }
+    const limits = {...f.broker.limits, browser: f.broker.effectiveBrowser()};
+    return {...flowWindow(f.compiled, 'candidates/route', limits, observations, admission), admission};
+  }
+
+  /** Adjust the existing goal without starting or resuming its run. */
+  updateAdmission(options: {flow?: boolean; maxInFlight?: number; intakeWindow?: number}) {
+    const f = this.factory;
+    const goal = f.state.batch;
+    if (options.flow === undefined && options.maxInFlight === undefined && options.intakeWindow === undefined) {
+      throw new ControlError(400, 'missing_admission', '请指定 flow、maxInFlight 或 intakeWindow');
+    }
+    if (!goal || goal.runId !== f.state.run.id) throw new ControlError(409, 'no_batch', '本轮尚未设置托管目标');
+    if (!f.runtime.running || f.runtime.ending) throw new ControlError(409, 'run_ended', '本轮已结束或正在结束，不能修改其入场策略');
+    const next = {...goal, ...this.admission(options, goal)};
+    f.journal.append({kind: 'batch.configured', batch: next});
+    if (!f.runtime.paused && next.mode === 'running') this.schedule();
+    return batchSummary(f.state);
+  }
+
+  configure(options: { target: number; flow?: boolean; maxInFlight?: number; intakeWindow?: number; category?: string; query?: string }) {
     const f = this.factory;
     if (!f.runtime.nodes.has('candidates/route') || !f.runtime.nodes.has('candidates/pool')) throw new ControlError(409, 'candidate_pack_unavailable', '网站批次需要策展候选包；请从当前项目的工作流入口投料');
     if (f.runtime.ending) throw new ControlError(409, 'run_ending', '正在结束上一轮，请等待报告');
     if (!Number.isSafeInteger(options.target) || options.target < 1 || options.target > 10000) throw new ControlError(400, 'invalid_target', '目标必须是 1–10000 个网站');
     const admitted = f.runtime.running ? latestBatchTokens(f.state).length : 0;
     if (options.target < admitted) throw new ControlError(409, 'target_below_admitted', `本轮已经领取 ${admitted} 个，目标不能少于已领取数`);
+    const previous = f.state.batch?.runId === f.state.run.id && f.runtime.running ? f.state.batch : undefined;
+    const admission = this.admission(options, previous);
     if (!f.runtime.running) f.runtime.start(`候选 × ${options.target}`);
-    const goal: BatchGoal = { runId: f.state.run.id, target: options.target, maxInFlight: options.maxInFlight ?? 12,
-      intakeWindow: options.intakeWindow ?? 6, maxRecoveries: 2, mode: 'running', startedAt: f.state.batch?.runId === f.state.run.id ? f.state.batch.startedAt : Date.now(),
+    const goal: BatchGoal = { runId: f.state.run.id, target: options.target, ...admission,
+      maxRecoveries: 2, mode: 'running', startedAt: f.state.batch?.runId === f.state.run.id ? f.state.batch.startedAt : Date.now(),
       modelCircuit: f.state.batch?.runId === f.state.run.id ? f.state.batch.modelCircuit : undefined,
       category: options.category, query: options.query };
     f.journal.append({ kind: 'batch.configured', batch: goal });
@@ -145,10 +190,18 @@ export class BatchSupervisor {
   }
 
   pump(now = Date.now()) {
-    const f = this.factory, goal = f.state.batch;
+    const f = this.factory;
+    let goal = f.state.batch;
     if (this.pumping || !goal || goal.runId !== f.state.run.id || goal.mode !== 'running' || !f.runtime.running || f.runtime.paused || f.runtime.ending || process.env.FACTORY_READONLY === '1') return;
     this.pumping = true;
     try {
+      if (goal.admission?.mode === 'flow') {
+        const next = this.admission({flow: true}, goal);
+        if (next.maxInFlight !== goal.maxInFlight || next.intakeWindow !== goal.intakeWindow) {
+          goal = {...goal, ...next};
+          f.journal.append({kind: 'batch.configured', batch: goal});
+        }
+      }
       const items = latestBatchTokens(f.state);
       let active = items.filter(t => t.status === 'active').length;
       // Reuse late-stage evidence first instead of filling every recovery slot
@@ -194,6 +247,14 @@ export class BatchSupervisor {
         const failure = candidate.failure;
         if (!failure) continue;
         if (failure.tag === 'model_transport') {
+          const failed = token.attempts.map(id => f.state.attempts[id]).reverse().find(attempt =>
+            attempt && !attempt.cancelled && attempt.ok === false &&
+            (!token.finishedAtNode || attempt.node === token.finishedAtNode));
+          const planned = token.data.__runtimeRecovery as {dependency?: {key?: unknown}} | undefined;
+          const dependency = failure.dependency ?? failed?.metrics?.dependency ?? failed?.dependency ?? planned?.dependency;
+          // A keyed circuit owns its single trial. The legacy batch loop cannot
+          // claim another retry just because the global compatibility hold is clear.
+          if (typeof dependency?.key === 'string' && dependency.key) continue;
           if (active < goal.maxInFlight && !f.broker.modelHold) active += f.retryCandidates({ items: [token.item], count: 1, automatic: true }).length;
           continue;
         }
@@ -218,16 +279,23 @@ export class BatchSupervisor {
       }
       const latest = latestBatchTokens(f.state);
       active = latest.filter(t => t.status === 'active').length;
-      const upstream = latest.filter(t => t.status === 'active' && !f.runtime.tokens.get(t.id)?.done.has('curation/plan')).length;
+      const flowing = goal.admission?.mode === 'flow';
+      const upstream = latest.filter(token => {
+        if (token.status !== 'active') return false;
+        const live = f.runtime.tokens.get(token.id);
+        if (!live) return true;
+        if (!flowing) return !live.done.has('curation/plan');
+        return occupiesIntake(f.compiled, 'candidates/route', live);
+      }).length;
       const want = Math.max(0, Math.min(goal.target - latest.length, goal.maxInFlight - active, goal.intakeWindow - upstream));
-      if (want && !f.broker.modelHold && !f.broker.blocked('browser')) {
+      if (want && (goal.admission || !f.broker.blocked('browser'))) {
         let catalogChecked = false;
         let admittedTotal = 0;
         for (let slot = 0; slot < want; slot++) {
           // Both feeders share this admission decision. Merely reversing their
           // journal subscriptions would starve the catalog instead of sources.
           let admitted = this.sourceHasNextTurn() ? f.sources?.admitManaged(1) ?? 0 : 0;
-          if (!admitted && !f.runtime.scopePaused('candidates/route')) {
+          if (!admitted && !f.runtime.scopePaused('candidates/route') && !f.runtime.intakeHold('candidates/route')) {
             admitted = f.pull(1, {category: goal.category, query: goal.query}).length;
             catalogChecked = true;
           }

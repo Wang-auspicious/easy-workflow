@@ -232,6 +232,10 @@ export class ChannelSupervisor {
   private sourceOccupiesAdmission(targetEntry: string): boolean {
     const f = this.f;
     if (f.state.batch?.runId === f.state.run.id) return false;
+    if (f.sources) {
+      const admission = f.sources.unmanagedAdmission(targetEntry, true);
+      return admission.active >= admission.maxInFlight || admission.upstream >= admission.intakeWindow;
+    }
     return [...f.runtime.tokens.values()].some(token =>
       (token.data.sourceCandidate || token.source.startsWith('source:')) &&
       f.runtime.occupiesAdmission(token, targetEntry));

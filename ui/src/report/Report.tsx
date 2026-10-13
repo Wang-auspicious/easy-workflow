@@ -86,7 +86,7 @@ function Dashboard({report:r,embedded}:{report:RunReport;embedded:boolean}) {
     {replayLoading?.error && <p className="dash-footnote" role="alert">{replayLoading.error}</p>}<div className="dash-kpis">
       <Kpi label="本轮投料" value={fmt(r.totals.created)} sub={`发布 ${r.totals.published} · 合并 ${r.totals.merged}`}/>
       <Kpi label="净运行时长" value={clock(r.netMs)} sub="已扣除暂停时间"/>
-      <Kpi label="模型用量" value={overallUsage.total===null?"—":fmt(overallUsage.total)} sub={overallUsage.total===null?"尚未报告模型用量":`Token 已报小计 · ${overallUsage.reported}/${overallUsage.attempts} 步 · $${overallUsage.cost!.toFixed(4)}`}/>
+      <Kpi label="模型用量" value={overallUsage.total===null?"—":fmt(overallUsage.total)} sub={overallUsage.total===null?"尚未报告模型用量":`Token 已报小计 · ${overallUsage.reported}/${overallUsage.attempts} 步 · ${overallUsage.cost === null ? '费用未回报' : `$${overallUsage.cost.toFixed(4)}${overallUsage.costComplete ? '' : '（已报部分）'}`}`}/>
       <Kpi label="需要处理" value={fmt(r.totals.manual+r.totals.failed+(r.totals.parked??0))} sub={`待重试 ${r.totals.parked??0} · 待人工 ${r.totals.manual} · 失败步骤 ${r.totals.failedAttempts??0}`} warn={r.totals.manual+r.totals.failed+(r.totals.parked??0)>0}/>
     </div>
     {(r.totals.parked??0)>0&&<button className="dash-jump" onClick={()=>setState({view:"candidates"})}>查看退回候选库的任务与原因 <ArrowUpRight size={12}/></button>}

@@ -34,6 +34,7 @@ try {
     dispatcher: {adapter: 'pi', provider: 'dispatcher-provider', model: 'dispatcher-model'},
   };
   const defaultWrites = [];
+  const admissionWrites = [];
   let rejectDefaultSave = false;
   const bindingResult = () => ({bindings: [{
     node: 'curation/review', configured,
@@ -42,12 +43,20 @@ try {
       : configured ? {...configured, requestTimeoutMs: configured.requestTimeoutMs ?? 180000}
         : projectDefaults.station,
     source: configured ? 'project' : 'default',
-    capabilities: {stream: !configured || configured.adapter === 'pi', cancel: true, resume: configured?.adapter !== 'launcher', usage: configured?.adapter === 'launcher' ? 'unknown' : 'reported'},
+    capabilities: {stream: !configured || configured.adapter === 'pi', cancel: true, resume: configured?.adapter !== 'launcher', usage: configured?.adapter === 'launcher' ? 'unknown' : configured?.adapter === 'codex' ? 'tokens-only' : 'reported'},
     lastModel: 'last-actual-fixture-model',
   }]});
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(url.pathname);
+    if (url.pathname === '/api/batch/admission') {
+      const update = route.request().postDataJSON();
+      admissionWrites.push(update);
+      const goal = await page.evaluate(() => window.inspectorFixture.getState().fs.batch);
+      await route.fulfill({json: {ok: true, result: {...goal, maxInFlight: 3, intakeWindow: 1,
+        admission: update.flow ? {mode: 'flow', maxInFlightLimit: update.maxInFlight, intakeWindowLimit: update.intakeWindow} : undefined}}});
+      return;
+    }
     if (url.pathname === '/api/tools/agent_defaults') {
       await route.fulfill({json: {ok: true, result: projectDefaults}});
       return;
@@ -218,6 +227,18 @@ try {
   await page.waitForFunction(() => window.inspectorFixture.getState().agentBindings['curation/review']?.configured === null);
   assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'inherit');
   assert.equal(savedBindings.length, 4);
+  for (const adapter of ['opencode', 'codex', 'claude-code']) {
+    await settings.getByLabel('执行适配器').selectOption(adapter);
+    assert.equal(await settings.getByLabel('Agent 请求模型').inputValue(), '');
+    assert.equal(await settings.getByLabel('Agent 启动命令').inputValue(), '');
+    await settings.getByRole('button', {name: '保存配置'}).click();
+    await settings.getByRole('status').waitFor();
+    assert.deepEqual(savedBindings.at(-1), {adapter}, 'an empty native selection keeps its own client defaults');
+    assert.match(await settings.locator('.agent-binding-effective').innerText(), /客户端默认模型/);
+    if (adapter === 'codex') assert.match(await settings.locator('.agent-binding-capabilities').innerText(), /仅 Token 回报，费用未知/);
+  }
+  await settings.getByRole('button', {name: '恢复继承'}).click();
+  await page.waitForFunction(() => window.inspectorFixture.getState().agentBindings['curation/review']?.configured === null);
   await page.evaluate(() => window.inspectorFixture.setState({view: 'settings'}));
   const stationDefaults = page.getByRole('form', {name: '工位默认配置'});
   const dispatcherDefaults = page.getByRole('form', {name: '主调度配置'});
@@ -242,6 +263,28 @@ try {
   await stationDefaults.getByRole('button', {name: '重新读取', exact: true}).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="工位默认配置"] [aria-label="Agent 请求模型"]').value === 'next-station-model');
   await page.locator('.set-sec').first().screenshot({path: path.join(out, 'project-model-defaults.png')});
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    const current = fixture.getState().fs;
+    fixture.setState({fs: {...current, run: {...current.run, status: 'paused'},
+      batch: {runId: current.run.id, target: 100, maxInFlight: 1, intakeWindow: 1, maxRecoveries: 2, mode: 'paused', startedAt: current.run.startedAt}}});
+  });
+  const flowSettings = page.getByRole('region', {name: '流水线流动'});
+  assert.equal(await flowSettings.getByLabel('入场策略').inputValue(), 'fixed');
+  await flowSettings.getByLabel('入场策略').selectOption('flow');
+  assert.equal(await flowSettings.getByLabel('在途上限').inputValue(), '6');
+  await flowSettings.getByRole('button', {name: '保存入场策略'}).click();
+  await flowSettings.getByRole('status').waitFor();
+  assert.deepEqual(admissionWrites, [{flow: true, maxInFlight: 6, intakeWindow: 2}]);
+  assert.equal(await page.evaluate(() => window.inspectorFixture.getState().fs.run.status), 'paused');
+  assert.equal(await page.evaluate(() => window.inspectorFixture.getState().fs.batch.mode), 'paused');
+  assert.match(await flowSettings.locator('.agent-binding-effective').innerText(), /在途 3 件 · 入口 1 件/);
+  await flowSettings.screenshot({path: path.join(out, 'pipeline-flow-settings.png')});
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    const current = fixture.getState().fs;
+    fixture.setState({fs: {...current, run: {...current.run, status: 'running'}, batch: undefined}});
+  });
   await page.evaluate(() => window.inspectorFixture.setState({view: 'canvas'}));
   await page.evaluate(() => window.inspectorFixture.setState({inspectors: [{key: 'curation/capture', kind: 'node', x: 40, y: 40, pinned: true}]}));
   await page.getByRole('button', {name: '规格', exact: true}).click();

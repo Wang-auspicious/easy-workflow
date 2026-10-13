@@ -31,7 +31,7 @@ export interface NodeAgentBinding {
   configured: StationAgentBinding | null;
   effective: StationAgentBinding | null;
   source: 'project' | 'workflow' | 'default';
-  capabilities: {stream: boolean; cancel: boolean; resume: boolean; usage: 'reported' | 'unknown'};
+  capabilities: {stream: boolean; cancel: boolean; resume: boolean; usage: 'reported' | 'tokens-only' | 'unknown'};
   lastModel?: string;
   error?: string;
 }
@@ -139,7 +139,7 @@ function touched(e: Stamped, fs: FactoryState): string[] {
     case "worker.spawned": case "worker.forked": case "worker.retired": case "review.verdict": return [e.node];
     case "stock.set": case 'agent.binding': return [e.node];
     case "token.created": return [e.source];
-    case "run.started": case "run.paused": case "run.resumed": case "resource.sample": case "run.ended": case "batch.configured": case "correction.reverted": return Object.keys(fs.nodes);
+    case "run.started": case "run.paused": case "run.resumed": case "resource.sample": case "run.ended": case "batch.configured": case "correction.reverted": case 'model.circuit': return Object.keys(fs.nodes);
     case 'scope.paused': return e.scope === 'station' ? [e.key] : Object.keys(fs.nodes).filter(key => key.startsWith(`${e.key}/`));
     case 'consult.opened': return [e.reviewer, e.owner];
     default: return [];

@@ -146,6 +146,44 @@ test('UI snapshot and SSE opt-in preserve raw APIs and expose exact attempt deta
   }
 });
 
+test('paused batch admission changes through HTTP without starting work and survives restart', {timeout: 30000}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-admission-http-'));
+  const journal = new Journal(path.join(dir, 'journal.db'));
+  journal.append({kind: 'run.started', runId: 'flow-http', title: 'Paused admission'});
+  journal.append({kind: 'batch.configured', batch: {runId: 'flow-http', target: 100,
+    maxInFlight: 1, intakeWindow: 1, maxRecoveries: 2, mode: 'paused', startedAt: Date.now()}});
+  journal.append({kind: 'run.paused', runId: 'flow-http'});
+  journal.close();
+  let server: Awaited<ReturnType<typeof start>> | undefined;
+  try {
+    server = await start(dir);
+    const before = (await server.request('/api/state')).body as FactoryState;
+    const update = {flow: true, maxInFlight: 6, intakeWindow: 2};
+    assert.equal((await server.tool('run_batch', {...update, action: 'configure'})).status, 403);
+    assert.equal((await server.request('/api/batch/admission', {})).status, 400);
+    assert.equal((await server.request('/api/batch/admission', {...update, maxInFlight: 99})).status, 400);
+    const saved = await server.request('/api/batch/admission', update);
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    const after = (await server.request('/api/state')).body as FactoryState;
+    assert.deepEqual(after.batch?.admission, {mode: 'flow', maxInFlightLimit: 6, intakeWindowLimit: 2});
+    assert.equal(after.batch?.mode, 'paused');
+    assert.deepEqual(after.run, before.run);
+    assert.deepEqual(after.tokens, before.tokens);
+    assert.deepEqual(after.attempts, before.attempts);
+    await stop(server.child);
+    server = await start(dir, true);
+    const restored = (await server.request('/api/state')).body as FactoryState;
+    assert.deepEqual(restored.batch, after.batch);
+    assert.equal(restored.run.status, 'paused');
+    assert.equal((await server.request('/api/batch/admission', {flow: false})).status, 403);
+    assert.equal((await server.request('/api/state')).body.seq, restored.seq);
+  } finally {
+    if (server) await stop(server.child);
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
+
 test("headless service: real HTTP capability discovery, control, validation, activation and restart", { timeout: 60000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-control-"));
   let server: Awaited<ReturnType<typeof start>> | undefined;
@@ -321,6 +359,15 @@ test("headless service: real HTTP capability discovery, control, validation, act
       assert.equal(partial.status, 200);
       assert.deepEqual(partial.body.result.bindings[0].effective, {...stationDefault, model: 'node-only-model'});
       await request('/api/agents/binding', {node: 'curation/classify', binding: null});
+      for (const adapter of ['opencode', 'codex', 'claude-code']) {
+        const native = await request('/api/agents/binding', {node: 'curation/facts', binding: {adapter}});
+        assert.equal(native.status, 200, JSON.stringify(native.body));
+        assert.deepEqual(native.body.result.bindings[0].configured, {adapter});
+        assert.equal(native.body.result.bindings[0].effective.model, undefined, 'native defaults never borrow the Pi model');
+        assert.equal(native.body.result.bindings[0].effective.provider, undefined);
+        assert.equal(native.body.result.bindings[0].lastModel, undefined, 'saving a binding never launches a native client');
+      }
+      await request('/api/agents/binding', {node: 'curation/facts', binding: null});
     });
     await stop(server.child);
     server = await start(dir);

@@ -39,7 +39,7 @@ test("report aggregates recorded token/time parts, preserves estimates and isola
   assert.equal(m.time.attemptMs, 1100); assert.equal(m.time.queuedMs, 114); assert.equal(m.time.otherMs, 200);
   assert.equal(m.time.firstTokenMs, 100); assert.equal(m.time.outputMs, 500); assert.equal(m.time.programMs, 100);
   assert.equal(m.time.outputTokensPerSecond, 40); assert.equal(m.time.modelCalls, 2);
-  assert.deepEqual(m.coverage, { attempts: 3, finished: 3, tokenBreakdowns: 1, usageReported: 1, usageComplete: 1, cacheUsageComplete: 1, timeBreakdowns: 2, modelTimeReported: 2 });
+  assert.deepEqual(m.coverage, { attempts: 3, finished: 3, tokenBreakdowns: 1, usageReported: 1, usageComplete: 1, costReported: 1, costComplete: 1, cacheUsageComplete: 1, timeBreakdowns: 2, modelTimeReported: 2 });
   assert.deepEqual(report.attempts[0].metrics, metrics);
   assert.equal(report.attempts[0].cacheRead, 30);
   assert.equal(report.layers.flatMap(l => l.nodes).find(n => n.key === "curation/classify")?.metrics.tokens.actual?.input, 100);
@@ -62,6 +62,37 @@ test("partial usage remains an observed subtotal without a fabricated cache rate
   assert.equal(result.tokens.actual?.input, 100); assert.equal(result.tokens.actual?.cacheRead, 5);
   assert.equal(result.coverage.usageReported, 1); assert.equal(result.coverage.usageComplete, 0); assert.equal(result.coverage.cacheUsageComplete, 0);
   assert.equal(result.tokens.cacheHitRate, null); assert.equal(result.time.outputTokensPerSecond, null);
+});
+
+test('reported tokens do not certify a missing native-client monetary cost', () => {
+  const usage = {input: 120, output: 24, cost: 0};
+  const attempt = {id: 'tokens-only', token: 't', node: 'native/client', worker: 'w', input: '', startedAt: 0, endedAt: 10,
+    ms: 10, usage: {input: 0, output: 0, cost: 0}, steps: [], metrics: {tokenUsage: {input: 120, output: 24}, usageReported: true, usageComplete: true, costReported: false, costComplete: false}};
+  const event = {kind: 'attempt.finished', attempt: attempt.id, metrics: attempt.metrics, ok: true, summary: 'reported tokens only', ms: 10, queuedMs: 0,
+    seq: 1, at: 10, run: 'native-cost'} as const;
+  const result = aggregateMetrics([attempt], [event]);
+  assert.equal(result.tokens.actual?.input, 120);
+  assert.equal(result.tokens.actual?.output, 24);
+  assert.equal(result.tokens.actual?.cost, null);
+  assert.equal(result.coverage.usageReported, 1);
+  assert.equal(result.coverage.costReported, 0);
+  const known = {...attempt, id: 'known-zero', usage, metrics: {...attempt.metrics, costReported: true, costComplete: true}};
+  const mixed = aggregateMetrics([attempt, known], [event, {...event, seq: 2, attempt: known.id, metrics: known.metrics, usage}]);
+  assert.equal(mixed.tokens.actual?.cost, 0, 'an explicitly reported zero remains a known subtotal');
+  assert.equal(mixed.coverage.costReported, 1);
+  assert.equal(mixed.coverage.usageReported, 2);
+  assert.equal(mixed.tokens.actual?.input, 240);
+  const events: Stamped[] = [
+    {kind: 'run.started', runId: 'native-cost', title: 'native cost', seq: 1, at: 1, run: 'native-cost'},
+    {kind: 'token.created', token: 't', item: 'native', line: 'curation', source: 'fixture', url: '', seq: 2, at: 2, run: 'native-cost'},
+    {kind: 'attempt.started', attempt: attempt.id, token: 't', node: 'curation/reader', worker: 'w', input: 'native', seq: 3, at: 3, run: 'native-cost'},
+    {...event, seq: 4},
+  ];
+  const compiled = compile([pack]);
+  const report = buildReport({compiled, journal: {seq: 4, lastSequence: () => 4, read: () => events}} as unknown as Factory, 'native-cost');
+  assert.equal(report.attempts[0].input, 120, 'full report rows use the explicit token receipt when legacy usage is absent');
+  assert.equal(report.totals.usage.output, 24);
+  assert.equal(report.metrics?.tokens.actual?.cost, null);
 });
 
 test("historical waiting statistics survive a removed station without inventing a worker configuration suggestion", () => {

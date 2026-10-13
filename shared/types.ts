@@ -169,18 +169,24 @@ export interface AttemptActivity {
 export interface AttemptMetrics {
   /** Dependency captured for this execution; separate from the reported actual model. */
   dependency?: ModelDependency;
+  modelResponses?: ModelResponse[];
+  /** Actual token receipts, including clients that disclose no monetary cost. */
+  tokenUsage?: ModelTokenUsage;
+  costReported?: boolean;
+  costComplete?: boolean;
   usageReported?: boolean;
   modelTimeReported?: boolean;
   usageComplete?: boolean;
   cacheUsageComplete?: boolean;
-  execution?: { adapter: string; model: string };
+  execution?: { adapter: string; model: string; provider?: string };
   activity?: AttemptActivity;
   tokens?: { system: number; context: number; caseFile: number; input: number; images: number; toolDefs: number; toolResults: number; output: number; actualInput: number; actualOutput: number; cacheRead: number; cacheWrite: number };
   time?: { firstTokenMs: number; outputMs: number; toolMs: number; programMs: number; modelCalls: number; toolCalls: number };
 }
 
-export interface Alert { id: string; level: "red"; kind: "tls" | "auth" | "model" | "preflight" | "browser"; message: string; nextAction?: string; token?: string; item?: string; node?: string; url?: string; tab?: string }
-export interface PreflightCheck { id: string; label: string; ok: boolean; detail: string; fix?: string; ms: number }
+export interface Alert { id: string; level: "red"; kind: "tls" | "auth" | "model" | "preflight" | "browser"; message: string; nextAction?: string; token?: string; item?: string; node?: string; url?: string; tab?: string; dependency?: ModelDependency }
+export interface ModelProbeResult { dependency: ModelDependency; actuallyProbed: boolean; ok: boolean }
+export interface PreflightCheck { id: string; label: string; ok: boolean; detail: string; fix?: string; ms: number; modelProbes?: ModelProbeResult[] }
 export interface CaseNote { station: string; section: string; text: string; by: string }
 
 export interface ChannelDelivery {
@@ -224,7 +230,8 @@ export interface OperationReceipt {
 /** Host-selected executor settings. Credentials remain in the vendor profile. */
 export type StationAgentBinding =
   | {adapter: 'pi'; provider?: string; model?: string}
-  | {adapter: 'claude-code' | 'launcher'; command: string[]; model: string; requestTimeoutMs?: number};
+  | {adapter: 'launcher'; command: string[]; model: string; requestTimeoutMs?: number}
+  | {adapter: 'claude-code' | 'opencode' | 'codex'; command?: string[]; provider?: string; model?: string; requestTimeoutMs?: number};
 
 export interface ProjectAgentDefaults {
   station: StationAgentBinding;
@@ -234,9 +241,42 @@ export interface ProjectAgentDefaults {
 /** Public fault-domain identity. Endpoints, command arguments and credentials are private. */
 export interface ModelDependency {
   readonly key: string;
-  readonly adapter: 'pi' | 'claude-code' | 'launcher';
+  readonly adapter: 'pi' | 'claude-code' | 'launcher' | 'opencode' | 'codex';
   readonly provider?: string;
   readonly model: string;
+}
+
+export interface ModelResponse {
+  dependency: ModelDependency;
+  model: string;
+  provider?: string;
+  modelCalls: number;
+  usageReported: boolean;
+  usage?: Usage;
+  tokenUsage?: ModelTokenUsage;
+  costReported?: boolean;
+  costComplete?: boolean;
+}
+
+export interface ModelTokenUsage {
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  reasoning?: number;
+}
+
+export interface ModelCircuit {
+  dependency: ModelDependency;
+  state: 'open' | 'trial' | 'blocked';
+  failures: number;
+  nextAt: number;
+  runId: string;
+  /** Derived from the owning run.ended event during journal replay. */
+  runEndedAt?: number;
+  trialToken?: string;
+  station?: string;
+  reason: string;
 }
 
 export type JournalEvent =
@@ -244,6 +284,7 @@ export type JournalEvent =
   | { kind: "factory.loaded"; digest: string; specVersion: string }
   | { kind: 'agent.binding'; node: string; binding: StationAgentBinding | null }
   | { kind: 'agent.defaults'; defaults: ProjectAgentDefaults }
+  | { kind: 'model.circuit'; key: string; circuit: ModelCircuit | null }
   | { kind: "run.started"; runId: string; title: string }
   | { kind: "run.paused"; runId: string }
   | { kind: "run.resumed"; runId: string }
@@ -286,7 +327,7 @@ export type JournalEvent =
   | { kind: "chat.message"; id: string; turn: string; message: import("./conversation.ts").PiMessage }
   | { kind: "chat.checkpoint"; checkpoint: import("./conversation.ts").DispatcherCheckpoint }
   | { kind: "spec.patched"; patch: string; summary: string; status: "proposed" | "accepted" | "rejected" }
-  | { kind: "resource.sample"; used: Record<string, number>; limits: Record<string, number>; freeMemMB: number; waiting?: Record<string, string> }
+  | { kind: "resource.sample"; used: Record<string, number>; limits: Record<string, number>; freeMemMB: number; waiting?: Record<string, string>; modelRequests?: {active: number; queued: number; limit: number} }
   | { kind: "report.ready"; runId: string }
   | { kind: "alert.raised"; alert: Alert }
   | { kind: "alert.cleared"; id: string; reason: string }

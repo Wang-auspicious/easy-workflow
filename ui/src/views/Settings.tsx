@@ -6,10 +6,12 @@ import { getState, setState, useStore } from "../store.ts";
 import {actions, refreshSpec, saveLayout} from '../api.ts';
 import { toast } from "../shell/Toasts.tsx";
 import {AgentBindingFields, adapterLabel, agentBindingDraft, parseBindingDraft, selectBindingAdapter, type AgentBindingDraft} from '../canvas/AgentBindingFields.tsx';
+import {FlowSettings} from './FlowSettings.tsx';
 
 const FIELDS: { k: string; label: string; hint: string; min: number; max: number; step?: number }[] = [
   { k: "browser", label: "采集并发", hint: "采集页的总上限；可用名额会随内存余量收缩。", min: 1, max: 16 },
-  { k: "model", label: "模型并发", hint: "模型工位同时执行的总上限。", min: 1, max: 64 },
+  { k: 'model', label: '模型调用并发', hint: 'Pi 请求、程序中的模型请求和原生客户端调用共享名额。', min: 1, max: 64 },
+  { k: 'modelWorkers', label: '模型工位并发', hint: '工位等待工具时可让其他工位前进；实际模型调用仍受上一项限制。多于 1 个名额时保留 1 个给审查。', min: 1, max: 64 },
   { k: "cpu", label: "CPU 重活", hint: "转码、图像处理等计算任务的总并发。", min: 1, max: 32 },
   { k: "http", label: "HTTP 并发", hint: "只发请求不开浏览器的工位。", min: 1, max: 64 },
   { k: "memoryFloorMB", label: "内存守护 (MB)", hint: "空闲内存低于它时，不再发新的浏览器页面。", min: 0, max: 4096, step: 128 },
@@ -33,6 +35,7 @@ export function Settings() {
           <AgentDefaultEditor scope="dispatcher" />
           <div className="set-row"><span>主调度凭据</span><b className={key ? 'ok-c' : 'bad-c'}>{key ? '已找到对应 Provider 的本机凭据' : '未就绪，请检查所选 Provider 的模型与本机凭据'}</b></div>
         </section>
+        <FlowSettings />
         <section className="set-sec">
           <h3>资源配额</h3>
           {FIELDS.map((f) => (

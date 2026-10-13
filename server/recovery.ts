@@ -1,7 +1,7 @@
 import type {Factory} from './factory.ts';
 import type {TokenRun} from './runtime.ts';
 import type {TokenState} from '../shared/project.ts';
-import type {Stamped} from '../shared/types.ts';
+import type {ModelDependency, Stamped} from '../shared/types.ts';
 import {latestRunTokens} from '../shared/project.ts';
 import {classifyFailure, type Failure} from '../shared/failures.ts';
 import {modelRecoveryDelay} from '../shared/batch.ts';
@@ -28,6 +28,7 @@ interface RecoveryPlan {
   modelStation?: string;
   networkRetry?: boolean;
   reason?: string;
+  dependency?: ModelDependency;
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -54,14 +55,16 @@ export class UnmanagedRecoverySupervisor {
     this.started = true;
     // A crashed trial already owns a task and its saved conversation. Cool down
     // that same task before releasing its restored queue, without cloning it.
-    if (!this.managed()) {
+    {
       for (const token of this.tokens()) {
         const plan = this.plan(token);
         if (plan?.kind !== 'model' || plan.state !== 'trial') continue;
+        if (this.managed() && !plan.dependency) continue;
         if (token.status === 'active') {
           this.save(token.id, {...plan, state: 'waiting',
-            nextAt: Math.max(plan.nextAt, Date.now() + modelRecoveryDelay(plan.modelFailures))});
-          this.factory.broker.modelHold = '模型恢复验证被中断，冷却后从原检查点继续';
+            nextAt: plan.dependency ? this.factory.modelCircuits.get(plan.dependency)?.nextAt ?? plan.nextAt
+              : Math.max(plan.nextAt, Date.now() + modelRecoveryDelay(plan.modelFailures))});
+          if (!plan.dependency) this.factory.broker.modelHold = '模型恢复验证被中断，冷却后从原检查点继续';
         }
       }
     }
@@ -76,12 +79,13 @@ export class UnmanagedRecoverySupervisor {
   }
 
   private writable() {
-    return this.started && !this.closed && process.env.FACTORY_READONLY !== '1' && !this.managed();
+    return this.started && !this.closed && process.env.FACTORY_READONLY !== '1';
   }
 
   private running() {
     const runtime = this.factory.runtime;
-    return this.writable() && runtime.running && !runtime.paused && !runtime.ending;
+    return this.writable() && runtime.running && !runtime.paused && !runtime.ending &&
+      (!this.managed() || this.factory.state.batch?.mode === 'running');
   }
 
   private tokens() {
@@ -141,25 +145,30 @@ export class UnmanagedRecoverySupervisor {
     for (const token of this.tokens()) {
       if (token.status !== 'parked') continue;
       const failure = this.failure(token);
-      if (!failure?.retryable || failure.owner === 'user') continue;
-      const model = failure.tag === 'model_transport' &&
-        classifyFailure(failure.message, {stage: 'model', status: failure.status}).tag === 'model_transport';
-      const localTool = failure.tag === 'tool_error' && failure.category === 'system' && failure.owner === 'system';
-      if (!model && !TRANSIENT.has(failure.tag) && !localTool) continue;
+      if (!failure?.retryable) continue;
       const attempt = token.attempts.map(id => f.state.attempts[id]).findLast(value =>
         value && value.node === token.finishedAtNode && value.ok === false && !value.cancelled &&
         !['stale', 'restart'].includes(value.error ?? ''));
       if (!attempt) continue;
       const old = this.plan(token);
+      const dependency = failure.dependency ?? attempt.metrics?.dependency ?? attempt.dependency ?? old?.dependency;
+      const circuit = dependency && f.modelCircuits.get(dependency);
+      const model = failure.tag === 'model_transport' &&
+        classifyFailure(failure.message, {stage: 'model', status: failure.status}).tag === 'model_transport' ||
+        failure.tag === 'model_unavailable' && circuit?.state === 'open';
+      const localTool = failure.tag === 'tool_error' && failure.category === 'system' && failure.owner === 'system';
+      if (failure.owner === 'user' && !model || !model && !TRANSIENT.has(failure.tag) && !localTool) continue;
+      if (this.managed() && !(dependency && (model || old?.kind === 'model'))) continue;
       if (old?.failureAttempt === attempt.id && old.state !== 'trial') continue;
       const station = this.checkpoint(token);
       const verifying = old?.kind === 'model' && old.state === 'trial' &&
-        Boolean(f.state.alerts['model-transport'] || f.broker.modelHold);
+        Boolean(old.dependency ? f.modelCircuits.get(old.dependency) : f.state.alerts['model-transport'] || f.broker.modelHold);
       const plan: RecoveryPlan = {
         version: 1, runId: f.state.run.id, kind: model || verifying ? 'model' : 'network',
         state: station ? 'waiting' : 'blocked', station: station ?? token.finishedAtNode ?? '',
         nextAt: 0, networkAttempts: old?.networkAttempts ?? 0,
-        modelFailures: (old?.modelFailures ?? 0) + Number(model), failureAttempt: attempt.id,
+        modelFailures: circuit?.failures ?? (old?.modelFailures ?? 0) + Number(model), failureAttempt: attempt.id,
+        dependency: model ? dependency : verifying ? old.dependency : undefined,
         modelStation: model ? station : verifying ? old.modelStation ?? old.station : undefined,
         networkRetry: !model,
       };
@@ -171,9 +180,12 @@ export class UnmanagedRecoverySupervisor {
       if (plan.state === 'waiting') {
         const delay = model ? modelRecoveryDelay(plan.modelFailures)
           : (failure.tag === 'http_rate_limit' ? 60000 : 15000) * 2 ** plan.networkAttempts;
-        plan.nextAt = now + delay;
+        plan.nextAt = model && circuit ? circuit.nextAt : now + delay;
       }
       plan.reason = reason;
+      if (plan.dependency && !model && verifying) {
+        f.modelCircuits.defer(plan.dependency, plan.nextAt, reason ?? '验证模型之前的工具尚未恢复，按原预算等待', plan.state !== 'waiting');
+      }
       this.save(token.id, plan, `${token.title || token.item}：${reason ?? (model
         ? '模型暂态故障已保存；到期只放行一个真实工位验证恢复'
         : `已安排从 ${plan.station} 恢复，最多两次；其他任务继续`)}`);
@@ -198,9 +210,23 @@ export class UnmanagedRecoverySupervisor {
   requestedRetry(previous: TokenState | undefined, token: TokenRun) {
     const f = this.factory;
     if (!previous || !this.writable() || token.data.retryOf !== previous.id) return;
-    const old = this.plan(previous, true);
+    let old = this.plan(previous, true);
+    if (!old) {
+      const attempt = previous.attempts.map(id => f.state.attempts[id]).findLast(value =>
+        value?.node === previous.finishedAtNode && value.ok === false && !value.cancelled);
+      const dependency = this.failure(previous)?.dependency ?? attempt?.metrics?.dependency ?? attempt?.dependency;
+      const circuit = dependency && f.modelCircuits.get(dependency);
+      if (attempt && dependency && circuit) old = {
+        version: 1, runId: f.state.run.id, kind: 'model', state: 'waiting', station: attempt.node,
+        nextAt: circuit.nextAt, networkAttempts: 0, modelFailures: circuit.failures,
+        failureAttempt: attempt.id, dependency,
+      };
+    }
     if (!old) return;
-    const verifying = old.kind === 'model' && Boolean(f.state.alerts['model-transport'] || f.broker.modelHold);
+    if (this.managed() && !old.dependency) return;
+    const verifying = old.kind === 'model' && Boolean(old.dependency
+      ? f.modelCircuits.get(old.dependency) : f.state.alerts['model-transport'] || f.broker.modelHold);
+    if (verifying && old.dependency) f.modelCircuits.requested(old.dependency);
     const station = typeof token.data.recoveryStation === 'string' ? token.data.recoveryStation : old.station;
     this.save(token.id, {
       ...old, runId: f.state.run.id, kind: verifying ? 'model' : 'network',
@@ -235,6 +261,7 @@ export class UnmanagedRecoverySupervisor {
       const attempt = f.state.attempts[event.attempt];
       const token = attempt && f.state.tokens[attempt.token];
       const plan = token && this.plan(token);
+      if (this.managed() && !plan?.dependency) return;
       if (token && plan?.state === 'trial' &&
           [plan.station, plan.modelStation].includes(attempt.node) &&
           !event.cancelled && !['stale', 'restart'].includes(event.error ?? '')) {
@@ -244,19 +271,37 @@ export class UnmanagedRecoverySupervisor {
             if (event.ok) this.save(token.id, {...plan, station: plan.modelStation!, networkRetry: false});
             return;
           }
-          if (!['model_transport', 'model_unavailable'].includes(failure?.tag ?? '') &&
-              event.metrics?.usageReported && (event.metrics.time?.modelCalls ?? 0) > 0) {
+          const failedDependency = failure?.dependency ?? event.metrics?.dependency ?? attempt.dependency;
+          const failedThisModel = ['model_transport', 'model_unavailable'].includes(failure?.tag ?? '') &&
+            (!plan.dependency || failedDependency?.key === plan.dependency.key);
+          const responded = event.metrics?.modelResponses ? event.metrics.modelResponses.some(response =>
+            response.usageReported && response.modelCalls > 0 && (!plan.dependency || response.dependency.key === plan.dependency.key))
+            : event.metrics?.usageReported && (event.metrics.time?.modelCalls ?? 0) > 0 &&
+              (!plan.dependency || event.metrics.dependency?.key === plan.dependency.key);
+          if (!failedThisModel && responded) {
             this.save(token.id, {...plan, state: 'completed', nextAt: 0});
-            f.broker.recoveryToken = null;
-            f.clearAlert('model-transport', '原检查点工位已返回可核验的真实模型响应，恢复排队任务');
-            f.broker.modelHold = Object.values(f.state.alerts).find(alert => alert.kind === 'model')?.message ?? null;
+            if (plan.dependency) {
+              if (f.modelCircuits.recovered(plan.dependency, token.id, attempt.node)) {
+                for (const peer of this.tokens()) {
+                  const waiting = this.plan(peer);
+                  if (waiting?.dependency?.key === plan.dependency.key && waiting.state === 'waiting') {
+                    this.save(peer.id, {...waiting, nextAt: Date.now()});
+                  }
+                }
+              }
+            }
+            else {
+              f.broker.recoveryToken = null;
+              f.clearAlert('model-transport', '原检查点工位已返回可核验的真实模型响应，恢复排队任务');
+              f.broker.modelHold = Object.values(f.state.alerts).find(alert => alert.kind === 'model' && !alert.dependency)?.message ?? null;
+            }
             f.runtime.schedule();
           } else if (event.ok) {
             this.save(token.id, {...plan, state: 'blocked', nextAt: 0,
               reason: '恢复工位没有真实模型响应回执；保留模型暂停，不能将程序完成当成模型已恢复'},
             '恢复工位没有真实模型响应回执；保留模型暂停，等待核查');
-            f.broker.recoveryToken = null;
-            f.broker.modelHold = '恢复工位没有真实模型响应回执';
+            if (plan.dependency) f.modelCircuits.defer(plan.dependency, 0, '恢复工位没有同一模型的真实响应回执', true);
+            else {f.broker.recoveryToken = null; f.broker.modelHold = '恢复工位没有真实模型响应回执';}
           }
         } else if (event.ok) {
           this.save(token.id, {...plan, state: 'completed', nextAt: 0});
@@ -267,21 +312,25 @@ export class UnmanagedRecoverySupervisor {
       const token = f.state.tokens[event.token];
       const plan = token && this.plan(token);
       if (plan?.state === 'trial' && plan.kind === 'model') {
-        f.broker.recoveryToken = null;
-        f.broker.modelHold ??= '模型恢复验证尚未通过，已保留检查点';
+        if (this.managed() && !plan.dependency) return;
+        if (!plan.dependency) {
+          f.broker.recoveryToken = null;
+          f.broker.modelHold ??= '模型恢复验证尚未通过，已保留检查点';
+        }
         const failure = this.failure(token);
         if (!failure || failure.owner === 'user' || failure.tag === 'run_ended' || !failure.retryable) {
           this.save(token.id, {...plan, state: 'blocked', nextAt: 0,
             reason: failure?.message ?? token.reason ?? '验证未完成；保留实际结果'});
+          if (plan.dependency) f.modelCircuits.defer(plan.dependency, 0, failure?.message ?? '验证未完成，保留实际结果', true);
         }
       }
     }
     if (event.kind === 'run.ended') f.broker.recoveryToken = null;
     if (['run.started', 'run.resumed', 'run.ended', 'scope.paused', 'token.finished',
-      'attempt.finished', 'alert.cleared', 'candidate.disposition', 'channel.delivery'].includes(event.kind)) this.schedule();
+      'attempt.finished', 'alert.cleared', 'candidate.disposition', 'channel.delivery', 'model.circuit'].includes(event.kind)) this.schedule();
   }
 
-  private resume(token: TokenState, plan: RecoveryPlan): TokenRun | null {
+  private resume(token: TokenState, plan: RecoveryPlan, now: number): TokenRun | null {
     const f = this.factory;
     const channel = token.data.channelDelivery;
     const candidate = f.state.recoveries[token.item];
@@ -295,6 +344,7 @@ export class UnmanagedRecoverySupervisor {
       if (next.data.retryOf !== token.id) throw new ControlError(409, 'recovery_claim_mismatch', '恢复认领的任务与原检查点不一致');
       this.save(next.id, {...plan, state: 'trial', nextAt: 0,
         networkAttempts: plan.networkAttempts + Number(plan.kind === 'network' || plan.networkRetry)});
+      if (plan.dependency) f.modelCircuits.claim(plan.dependency, next.id, plan.modelStation ?? plan.station, now);
     };
     try {
       return typeof channel === 'string' ? f.channels?.resumeFailed(channel, onClaim) ?? null
@@ -316,33 +366,38 @@ export class UnmanagedRecoverySupervisor {
     try {
       this.prepare(now);
       const tokens = this.tokens();
-      if (tokens.some(token => this.plan(token)?.state === 'trial' && token.status === 'active')) return;
+      if (tokens.some(token => this.plan(token)?.state === 'trial' && !this.plan(token)?.dependency && token.status === 'active')) return;
       const modelHold = Boolean(f.state.alerts['model-transport'] || f.broker.modelHold);
-      if (Object.values(f.state.alerts).some(alert => alert.kind === 'model' && alert.id !== 'model-transport')) return;
+      if (Object.values(f.state.alerts).some(alert => alert.kind === 'model' && !alert.dependency && alert.id !== 'model-transport')) return;
       const waiting = tokens.filter(token => {
         const plan = this.plan(token);
-        return plan?.state === 'waiting' && plan.nextAt <= now &&
-          (!modelHold || plan.kind === 'model') && !f.runtime.scopePaused(plan.station) &&
+        const circuit = plan?.dependency && f.modelCircuits.get(plan.dependency);
+        return plan?.state === 'waiting' && (!this.managed() || plan.dependency) &&
+          (circuit ? circuit.state === 'open' && circuit.nextAt <= now && (!circuit.trialToken || circuit.trialToken === token.id) : plan.nextAt <= now) &&
+          (!modelHold || plan.kind === 'model' && !plan.dependency) && !f.runtime.scopePaused(plan.station) &&
           (token.status === 'active' || this.sourceEnabled(token));
       }).sort((a, b) => this.plan(a)!.nextAt - this.plan(b)!.nextAt);
       for (const token of waiting) {
         const plan = this.plan(token)!;
-        if (plan.kind === 'model' && f.broker.used.model > 0) return;
+        if (plan.kind === 'model' && !plan.dependency && f.broker.used.model > 0) continue;
         const saved = token.data.runtimeCheckpoint;
         const entry = this.checkpoint(token) && record(saved) && typeof saved.entry === 'string' ? saved.entry : undefined;
         if (plan.kind === 'network' && !token.data.channelDelivery &&
             [...f.runtime.tokens.values()].some(value => entry
-              ? f.runtime.occupiesAdmission(value, entry) : !value.finished)) return;
+              ? f.runtime.occupiesAdmission(value, entry) : !value.finished)) continue;
         const hold = f.broker.modelHold;
-        if (plan.kind === 'model') {
+        if (plan.kind === 'model' && !plan.dependency) {
           f.broker.recoveryToken = 'pending-unmanaged-trial';
           f.broker.modelHold = null;
         }
         try {
-          const next = token.status === 'active' ? f.runtime.tokens.get(token.id) ?? null : this.resume(token, plan);
+          const next = token.status === 'active' ? f.runtime.tokens.get(token.id) ?? null : this.resume(token, plan, now);
           if (!next) continue;
-          if (token.status === 'active') this.save(token.id, {...plan, state: 'trial', nextAt: 0});
-          if (plan.kind === 'model') f.broker.recoveryToken = next.id;
+          if (token.status === 'active') {
+            this.save(token.id, {...plan, state: 'trial', nextAt: 0});
+            if (plan.dependency) f.modelCircuits.claim(plan.dependency, next.id, plan.modelStation ?? plan.station, now);
+          }
+          if (plan.kind === 'model' && !plan.dependency) f.broker.recoveryToken = next.id;
           f.runtime.schedule();
           return;
         } finally {

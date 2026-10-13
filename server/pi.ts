@@ -13,7 +13,7 @@ import { EnvHttpProxyAgent, fetch as proxyFetch } from "undici";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { classifyFailure } from "../shared/failures.ts";
 import { redactText } from "./mcp-security.ts";
-import { ModelRequests, checkModelAdmission } from './model-requests.ts';
+import {ModelRequests, acquireModelRequest, reportModelResponse} from './model-requests.ts';
 import {piModelDependency} from './agent-bindings.ts';
 
 export const MODEL_REQUEST_DEADLINE = Symbol('model-request-deadline');
@@ -110,14 +110,12 @@ export function models(requested?: PiModelSelection) {
     const requestModel = {...model};
     const selected = {provider: requestModel.provider, model: requestModel.id};
     const requestDependency = piModelDependency({...selected, endpoint: requestModel.baseUrl});
-    checkModelAdmission(requestDependency);
-    const release = await requests.acquire(options?.signal);
+    const release = await acquireModelRequest(requestDependency, options?.signal, () => requests.acquire(options?.signal));
     const deadline = (options as typeof options & { [MODEL_REQUEST_DEADLINE]?: { ms: number; expired: () => void } })?.[MODEL_REQUEST_DEADLINE];
     const timeout = deadline ? AbortSignal.timeout(deadline.ms) : undefined;
     if (timeout) timeout.addEventListener('abort', deadline!.expired, { once: true });
     const cleanup = () => { if (timeout) timeout.removeEventListener('abort', deadline!.expired); release(); };
     try {
-      checkModelAdmission(requestDependency);
       const signal = timeout ? AbortSignal.any([timeout, ...(options?.signal ? [options.signal] : [])]) : options?.signal;
       // Recovery belongs to the station transcript/circuit, not three nested SDK
       // attempts multiplied by station continuation and per-site batch retries.
@@ -134,11 +132,21 @@ export function models(requested?: PiModelSelection) {
       };
       const response = m.streamSimple(requestModel, context, { ...options, signal, maxRetries: 0, fetch: observedFetch });
       void response.result().then(result => {
-        if (result.stopReason === 'error') {
-          const message = redactModelError(result.errorMessage ?? '模型连接失败', selected);
-          result.errorMessage = transportDetail ? `${message}（模型出口：${transportDetail}）` : message;
+        try {
+          if (!['error', 'aborted'].includes(result.stopReason)) {
+            reportModelResponse({dependency: requestDependency, model: result.model, provider: result.provider,
+              modelCalls: 1, usageReported: Boolean(result.usage), usage: result.usage ? {
+                input: result.usage.input, output: result.usage.output, cost: result.usage.cost.total,
+                cacheRead: result.usage.cacheRead, cacheWrite: result.usage.cacheWrite,
+              } : undefined});
+          }
+          if (result.stopReason === 'error') {
+            const message = redactModelError(result.errorMessage ?? '模型连接失败', selected);
+            result.errorMessage = transportDetail ? `${message}（模型出口：${transportDetail}）` : message;
+          }
+        } finally {
+          cleanup();
         }
-        cleanup();
       }, cleanup);
       return response;
     } catch (error) { cleanup(); throw error; }

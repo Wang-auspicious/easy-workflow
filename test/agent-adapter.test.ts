@@ -16,7 +16,7 @@ import { compile } from '../server/spec/compile.ts';
 import { line, station, type Pack } from '../server/spec/dsl.ts';
 import { apply, initialState } from '../shared/project.ts';
 import { closeNetwork, readEvidence, rememberRead } from "../server/network.ts";
-import { ClosedStationAgent, closedAgentConfig } from '../server/mcp-station.ts';
+import { ClosedStationAgent, closedAgentConfig, openStationMcp } from '../server/mcp-station.ts';
 import { ClaudeCodeProtocol, type ClaudeSessionReference } from '../server/claude-code.ts';
 import { EvidenceStore, type ImageProcessOptions } from '../server/evidence.ts';
 import { closeModelTransport, models, piStatus, probeModelConnection, redactModelError } from '../server/pi.ts';
@@ -25,6 +25,9 @@ import { sessionSignature, type SessionRef } from '../server/station-session.ts'
 import {withModelAdmission} from '../server/model-requests.ts';
 import {closedModelDependency} from '../server/agent-bindings.ts';
 import {installWorkflowPack, type WorkflowManifest} from '../server/workflow-packs.ts';
+import {OpenCodeProtocol, validOpenCodeSession, type OpenCodeSessionReference} from '../server/opencode.ts';
+import {CodexProtocol, validCodexSession, type CodexSessionReference} from '../server/codex.ts';
+import {setTimeout as delay} from 'node:timers/promises';
 
 test("closed launcher receives envelope first, calls scoped MCP, repairs and reports real usage", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-closed-agent-test-"));
@@ -146,7 +149,7 @@ const nativeContext = (id: string, data: Record<string, unknown> = {}) => ({
 }) as unknown as StationContext;
 
 test('explicit station bindings override compatibility defaults without sharing mutable commands', () => {
-  const keys = ['FACTORY_STATION_COMMAND', 'FACTORY_STATION_MODEL', 'FACTORY_STATION_ADAPTER', 'FACTORY_STATION_TIMEOUT_MS'];
+  const keys = ['FACTORY_STATION_COMMAND', 'FACTORY_STATION_MODEL', 'FACTORY_STATION_ADAPTER', 'FACTORY_STATION_TIMEOUT_MS', 'PATH'];
   const before = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   try {
     process.env.FACTORY_STATION_COMMAND = 'invalid default JSON';
@@ -160,6 +163,14 @@ test('explicit station bindings override compatibility defaults without sharing 
       binding.command.push('changed-after-selection');
       assert.equal(config.adapter, adapter); assert.equal(config.model, 'selected-model');
       assert.equal(config.requestTimeoutMs, 180000); assert.deepEqual(config.command, ['fixture', '--bounded']);
+    }
+    for (const adapter of ['claude-code', 'opencode', 'codex'] as const) {
+      const config = closedAgentConfig('unused', undefined, {adapter, command: ['fixture-only-no-native-process']})!;
+      assert.equal(config.model, undefined, 'native defaults never inherit FACTORY_STATION_MODEL');
+    }
+    process.env.PATH = '';
+    for (const adapter of ['claude-code', 'opencode', 'codex'] as const) {
+      assert.throws(() => closedAgentConfig('unused', undefined, {adapter}), /未找到本机/);
     }
     assert.equal(process.env.FACTORY_STATION_COMMAND, 'invalid default JSON');
   } finally {
@@ -248,7 +259,7 @@ test('Pi and Claude bindings run concurrently, cancel independently and isolate 
       assert.ok(checkpoint?.pi, 'cancelled Pi work retains its own transcript reference');
       const recovered = await runAgentStation({ ...definition, agent: { adapter: 'pi', ...selected } }, nativeContext('pi-other-provider', { stationSessions: { 'curation/reader': checkpoint.pi } }));
       assert.equal(recovered.ok, true, recovered.error ?? 'Selected Pi station failed');
-      assert.deepEqual(recovered.metrics?.execution, { adapter: 'pi', model: 'shared-model' });
+      assert.deepEqual(recovered.metrics?.execution, { adapter: 'pi', model: 'shared-model', provider: 'b' });
       assert.equal(recovered.usage?.input, 20); assert.equal(recovered.usage?.output, 8);
       const last = requests.at(-1)!;
       assert.equal(last.provider, 'b'); assert.equal(last.body.model, 'shared-model');
@@ -281,7 +292,7 @@ test('Pi and Claude bindings run concurrently, cancel independently and isolate 
 
 test('closed station references are isolated by the selected model, command and adapter', { timeout: 15000 }, async () => {
   await nativeFixture(async (_dir, reads) => {
-    const binding: StationAgentBinding = { adapter: 'claude-code', command: [process.execPath, '-e', claudeFixture, '--'], model: 'binding-model', requestTimeoutMs: 10000 };
+    const binding = { adapter: 'claude-code', command: [process.execPath, '-e', claudeFixture, '--'], model: 'binding-model', requestTimeoutMs: 10000 } satisfies StationAgentBinding;
     const definition: AgentStationDef<{ score: number }> = { agent: binding, system: 'Configuration signature fixture', schema: Type.Object({ score: Type.Integer() }), tools: ['fetch_text'],
       input: () => ({ text: 'native-restart' }), after: output => ({ ok: true, summary: 'done', data: output }) };
     const first = await runAgentStation(definition, nativeContext('binding-original'));
@@ -440,7 +451,7 @@ test('cancelling image preparation preserves a restored Claude checkpoint withou
     const definition = { system: 'Fixture image contract', schema: Type.Object({ score: Type.Integer() }), tools: ['fetch_text'],
       input: () => ({ text: 'native-restart', images: [{ file: image, label: 'fixture image' }] }), after: () => ({ ok: true, summary: 'done' }) };
     const first = await runAgentStation(definition, nativeContext('image-original'));
-    assert.equal(first.failure?.tag, 'model_transport');
+    assert.equal(first.failure?.tag, 'model_transport', first.error ?? 'Expected the fixture provider interruption');
     const reference = (first.data!.closedStationSessions as Record<string, ClaudeSessionReference>)['curation/reader'];
     let entered!: () => void;
     const preparing = new Promise<void>(resolve => { entered = resolve; });
@@ -503,7 +514,7 @@ test('closed session working directories require explicit project ownership and 
   }
 });
 
-test('Claude stream rejects foreign capabilities and never subtracts another CLI process cost', () => {
+test('Claude stream rejects foreign capabilities and never subtracts another CLI process cost', async () => {
   let saved!: ClaudeSessionReference;
   const protocol = new ClaudeCodeProtocol('requested', 'signature', undefined, reference => { saved = reference; });
   const init = { type: 'system', subtype: 'init', session_id: protocol.id, model: 'actual', tools: ['mcp__h2_station__submit'], mcp_servers: [{ name: 'h2_station', status: 'connected' }] };
@@ -521,7 +532,30 @@ test('Claude stream rejects foreign capabilities and never subtracts another CLI
   failed.accept(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: failed.id, errors: ['ECONNRESET'], total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0 } }));
   const failure = failed.finish();
   assert.equal(failure.failure?.tag, 'model_transport'); assert.equal(failure.usage?.cost, 0);
+  assert.equal(failure.failure?.code, 'CLAUDE_ERROR_DURING_EXECUTION');
   assert.equal('totalCostUsd' in saved, false, 'a session reference is not a cost baseline');
+  const canary = 'CLAUDE_PRIVATE_CANARY';
+  const unknown = new ClaudeCodeProtocol('requested', 'signature', undefined, () => {});
+  unknown.accept(JSON.stringify({...init, session_id: unknown.id}));
+  unknown.accept(JSON.stringify({type: 'result', subtype: canary, is_error: true, session_id: unknown.id, errors: [canary]}));
+  assert.equal(unknown.finish().failure?.code, 'CLAUDE_EXECUTION_ERROR');
+  assert.equal(JSON.stringify(unknown.finish()).includes(canary), false);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-claude-invalid-tail-'));
+  try {
+    // The local Node fixture deliberately closes stdout without a newline. This
+    // exercises the close handler, not its separately protected streaming path.
+    const malformed = new ClosedStationAgent({adapter: 'claude-code', model: 'fixture', cwd: dir,
+      command: [process.execPath, '-e', `process.stdout.write('${canary}')`, '--'], requestTimeoutMs: 1000},
+    'Fixture only', [], () => {throw new Error('Malformed output must never produce a receipt');});
+    await assert.rejects(malformed.prompt('Fixture'), error => {
+      assert.match(String(error), /invalid JSON stream message/);
+      assert.equal(String(error).includes(canary.slice(0, 8)), false);
+      return true;
+    });
+  } finally {
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
 });
 
 test('recorded native CLI receipts sum to the measured cost of two resumed processes', () => {
@@ -698,6 +732,378 @@ test('structured launcher failures preserve category and timeout stops a silent 
   } finally { assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir())); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('OpenCode native receipts preserve harness defaults, scoped MCP and resumed tool results', {timeout: 15000}, async () => {
+  const {spawn, execFile} = await import('node:child_process');
+  const {promisify} = await import('node:util');
+  const executeFile = promisify(execFile);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-opencode-protocol-'));
+  const file = path.join(dir, 'opencode-fixture.mjs');
+  fs.writeFileSync(file, String.raw`import fs from 'node:fs'; import assert from 'node:assert/strict';
+const args = process.argv.slice(2);
+const value = flag => args[args.indexOf(flag) + 1];
+const stored = './native-session.json';
+if (args[0] === 'debug') {
+  console.log(JSON.stringify({model:'native-provider/default-model',small_model:'native-provider/small',provider:{'native-provider':{options:{baseURL:'https://fixture.invalid'}}},
+    mcp:{foreign:{type:'local',command:['must-not-launch']}},plugin:['must-not-load']}));
+} else if (args[0] === 'export') {
+  assert.equal(args[1], 'ses_fixtureOwned'); assert.ok(args.includes('--sanitize'));
+  console.log(fs.readFileSync(stored,'utf8'));
+} else {
+  assert.equal(args[0],'run'); assert.equal(value('--format'),'json'); assert.ok(args.includes('--pure'));
+  assert.equal(args.includes('--model'), false, 'native model selection must not inherit Pi defaults');
+  const config=JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
+  const selected=config.enabled_providers?.[0]??'native-provider';
+  if(selected==='provider-b'){
+    const merged={model:'native-provider/default-model',small_model:'native-provider/small',...config};
+    assert.equal(merged.model,'');assert.equal(merged.small_model,'');
+    assert.ok(Object.hasOwn(merged.provider,'provider-b'));
+    assert.equal(merged.provider['native-provider'].options.baseURL,'https://fixture.invalid');
+  }else assert.equal(config.model,'native-provider/default-model');
+  assert.equal(config.mcp.foreign.enabled,false);
+  assert.equal(config.permission['*'],'deny');
+  assert.equal(config.permission.h2_station_submit,'allow');
+  assert.equal(process.env.OPENCODE_PURE,'1');
+  let text='';for await(const chunk of process.stdin)text+=chunk;
+  assert.match(text,/fixture station/);
+  const old=fs.existsSync(stored)?JSON.parse(fs.readFileSync(stored,'utf8')):{info:{id:'ses_fixtureOwned'},messages:[]};
+  const turn=old.messages.length+1;
+  assert.equal(args.includes('--session'),turn>1);
+  if(turn>1)assert.equal(value('--session'),'ses_fixtureOwned');
+  const sessionID='ses_fixtureOwned',messageID='msg_turn'+turn;
+  const emit=(type,part)=>console.log(JSON.stringify({type,sessionID,...(part?{part}:{} )}));
+  emit('step_start',{id:'prt_start'+turn,sessionID,messageID,type:'step-start'});
+  if(text.includes('fixture stall')){fs.writeFileSync('./native-pid.txt',String(process.pid));await new Promise(()=>setInterval(()=>{},1000));}
+  const connection=JSON.parse(fs.readFileSync(config.mcp.h2_station.environment.EASY_WORKFLOW_STATION_CONNECTION,'utf8'));
+  const call=async(name,arguments_)=>fetch(connection.url+'/call',{method:'POST',headers:{authorization:'Bearer '+connection.token,'content-type':'application/json'},body:JSON.stringify({name,arguments:arguments_})});
+  assert.equal((await call('set_caps',{})).status,403);
+  const tool=turn===1?'env_call':'submit';
+  const response=await call(tool,turn===1?{name:'fixture_read'}:{score:7});assert.equal(response.status,200);await response.text();
+  emit('tool_use',{id:'prt_tool'+turn,sessionID,messageID,type:'tool',tool:'h2_station_'+tool,state:{status:'completed'}});
+  const step={id:'prt_step'+turn,sessionID,messageID,type:'step-finish',reason:turn===1?'tool-calls':'stop',
+    cost:turn*.001,tokens:{input:turn*10,output:5,reasoning:2,cache:{read:turn,write:0}}};
+  old.messages.push({info:{id:messageID,sessionID,role:'assistant',providerID:selected,modelID:selected==='provider-b'?'provider-b-native-default':'actual-native-model'},parts:[step]});
+  fs.writeFileSync(stored,JSON.stringify(old));emit('step_finish',step);
+  if(turn===1){console.log(JSON.stringify({type:'error',sessionID,error:{name:'APIError',data:{message:'ECONNRESET fixture'}}}));process.exitCode=1;}
+}`);
+  const command = [process.execPath, file];
+  let reads = 0;
+  let submitted = 0;
+  let reference: OpenCodeSessionReference | undefined;
+  const request = {role: 'user' as const, content: [{type: 'text' as const, text: 'Complete this fixture station.'}]};
+  const executeCommand = async (description: NonNullable<ReturnType<OpenCodeProtocol['receiptCommand']>>) => {
+    const result = await executeFile(description.argv[0], description.argv.slice(1), {cwd: dir,
+      env: {...process.env, ...description.env}, windowsHide: true, encoding: 'utf8',
+      timeout: description.timeoutMs, maxBuffer: description.maxBufferBytes});
+    return JSON.parse(result.stdout) as unknown;
+  };
+  try {
+    for (const turn of [1, 2]) {
+      const protocol = new OpenCodeProtocol({}, 'station-signature', reference, saved => { reference = saved; });
+      protocol.acceptConfiguration(await executeCommand(protocol.configurationCommand(command)));
+      const owner = new AbortController();
+      const scope = await openStationMcp([
+        {name: 'env_call', label: 'Read fixture', description: 'Read fixture evidence', parameters: Type.Object({name: Type.Literal('fixture_read')}),
+          execute: async () => { reads++; return {content: [{type: 'text', text: 'Previously paid-for fixture observation'}]}; }},
+        {name: 'submit', label: 'Submit', description: 'Submit fixture', parameters: Type.Object({score: Type.Integer()}),
+          execute: async (_id, output) => { assert.equal(output.score, 7); submitted++; return {content: [{type: 'text', text: 'received'}]}; }},
+      ], owner.signal);
+      try {
+        await protocol.prepareInput(request, dir);
+        const argv = protocol.argv(command);
+        const child = spawn(argv[0], argv.slice(1), {cwd: dir, env: {...process.env,
+          ...protocol.environment({h2_station: scope.config})}, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
+        let output = '';
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', chunk => { output += chunk; });
+        child.stderr.resume();
+        child.stdin.end(protocol.input(request));
+        const code = await new Promise(resolve => child.once('close', resolve));
+        assert.equal(code, turn === 1 ? 1 : 0);
+        for (const event of output.trim().split(/\r?\n/)) protocol.accept(event);
+        assert.ok(reference);
+        assert.equal(validOpenCodeSession(reference, {}, 'station-signature'), true);
+        protocol.acceptReceipt(await executeCommand(protocol.receiptCommand(command)!));
+        const result = protocol.finish();
+        assert.equal(result.provider, 'native-provider');
+        assert.equal(result.model, 'actual-native-model');
+        assert.equal(result.modelCalls, 1);
+        assert.equal(result.usage?.input, turn * 10);
+        assert.equal(result.usage?.cost, turn * .001, 'resuming must not charge the old step a second time');
+        assert.equal(result.failure?.tag, turn === 1 ? 'model_transport' : undefined);
+        assert.throws(() => process.kill(child.pid!, 0), {code: 'ESRCH'});
+      } finally {
+        await scope.close();
+        protocol.disposeInput();
+        assert.equal(fs.existsSync(scope.config.env.EASY_WORKFLOW_STATION_CONNECTION), false);
+      }
+    }
+    assert.equal(reads, 1, 'the native resumed session reuses its completed observation');
+    assert.equal(submitted, 1);
+    const unknown = new OpenCodeProtocol({}, 'unknown', undefined, () => {});
+    assert.throws(() => unknown.finish(), /verified actual model receipt/);
+    assert.throws(() => unknown.accept('malformed private-credential-fragment'), error => {
+      assert.doesNotMatch(String(error), /private-credential-fragment/);
+      return true;
+    });
+    assert.throws(() => unknown.environment({}), /configuration must be inspected/);
+    assert.throws(() => unknown.accept(JSON.stringify({type: 'tool_use', sessionID: 'ses_scope', part: {
+      sessionID: 'ses_scope', messageID: 'msg_scope', tool: 'bash',
+    }})), /outside this station scope/);
+    assert.equal(validOpenCodeSession(reference, {provider: 'different'}, 'station-signature'), false);
+    assert.throws(() => new OpenCodeProtocol({model: 'providerless'}, 'fixture', undefined, () => {}), /provider\/model/);
+    const selected = new OpenCodeProtocol({provider: 'native-provider', model: 'override'}, 'selected', undefined, () => {});
+    assert.ok(selected.argv(command).includes('native-provider/override'));
+    await selected.prepareInput({role: 'user', content: [{type: 'image', data: Buffer.from('fixture image bytes').toString('base64'), mimeType: 'image/jpeg'}]}, dir);
+    const selectedArgv = selected.argv(command);
+    const image = selectedArgv[selectedArgv.indexOf('--file') + 1];
+    assert.equal(fs.existsSync(image), true);
+    selected.disposeInput();
+    assert.equal(fs.existsSync(image), false);
+    reads = 0;
+    submitted = 0;
+    let reply: import('../server/mcp-station.ts').ClosedAgentReply | undefined;
+    const work = path.join(dir, 'work');
+    const tools = [
+      {name: 'env_call', label: 'Read fixture', description: 'Read fixture evidence', parameters: Type.Object({name: Type.Literal('fixture_read')}),
+        execute: async () => {reads++; return {content: [{type: 'text' as const, text: 'retained observation'}]};}},
+      {name: 'submit', label: 'Submit', description: 'Submit fixture', parameters: Type.Object({score: Type.Integer()}),
+        execute: async () => {submitted++; return {content: [{type: 'text' as const, text: 'received'}]};}},
+    ];
+    const native = (token: string, requestTimeoutMs = 5000) => new ClosedStationAgent({adapter: 'opencode', command,
+      cwd: path.join(work, token), sessionScope: {projectDirectory: dir, workDirectory: work}, requestTimeoutMs},
+    'Complete only this fixture station.', tools, result => {reply = result;});
+    const first = native('first');
+    first.configureSession('fixture/reader', 'native-runner', undefined, () => ({calls: reads, evidence: []}));
+    await assert.rejects(first.prompt('Complete the fixture station.'), /provider connection failed/);
+    const checkpoint = first.sessionReference();
+    assert.ok(checkpoint);
+    assert.equal(checkpoint.adapter, 'opencode');
+    assert.equal(checkpoint.context?.calls, 1);
+    const resumed = native('next-token');
+    resumed.configureSession('fixture/reader', 'native-runner', checkpoint, () => ({calls: reads, evidence: []}));
+    await resumed.prompt('Complete the fixture station.');
+    assert.equal(reads, 1);
+    assert.equal(submitted, 1);
+    assert.equal(reply?.model, 'actual-native-model');
+    assert.equal(reply?.provider, 'native-provider');
+    assert.equal(reply?.usage?.cost, .002);
+    assert.equal(reply?.costReported, true);
+    assert.equal(resumed.sessionReference()?.id, checkpoint.id);
+    const providerOnly = new ClosedStationAgent({adapter: 'opencode', command, provider: 'provider-b',
+      cwd: path.join(work, 'provider-only'), sessionScope: {projectDirectory: dir, workDirectory: work}, requestTimeoutMs: 5000},
+    'Complete only this fixture station.', tools, result => {reply = result;});
+    providerOnly.configureSession('fixture/reader', 'native-provider-only');
+    await assert.rejects(providerOnly.prompt('Complete the fixture station.'), /provider connection failed/);
+    assert.equal(reply?.provider, 'provider-b');
+    assert.equal(reply?.model, 'provider-b-native-default');
+    const stalled = native('cancelled');
+    stalled.configureSession('fixture/reader', 'native-cancel');
+    const aborted = assert.rejects(stalled.prompt('fixture station; fixture stall'), /abort/i);
+    const pidFile = path.join(work, 'cancelled', 'native-pid.txt');
+    while (!fs.existsSync(pidFile)) await new Promise(resolve => setTimeout(resolve, 10));
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    stalled.abort();
+    await aborted;
+    assert.throws(() => process.kill(pid, 0), {code: 'ESRCH'}, 'OpenCode cancellation waits for the actual child exit');
+    assert.equal(fs.existsSync(path.join(work, 'cancelled', 'native-session.json')), false, 'cancelled runs do not launch receipt export');
+    const timed = native('timed-out', 1200);
+    timed.configureSession('fixture/reader', 'native-timeout');
+    await assert.rejects(timed.prompt('fixture station; fixture stall'), /timed out/);
+    const timedPid = Number(fs.readFileSync(path.join(work, 'timed-out', 'native-pid.txt'), 'utf8'));
+    assert.throws(() => process.kill(timedPid, 0), {code: 'ESRCH'}, 'the whole native deadline waits for child exit');
+  } finally {
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+  }
+});
+
+test('Codex app-server preserves native defaults and scoped tool observations across resumed turns', {timeout: 15000}, async () => {
+  const {spawn} = await import('node:child_process');
+  const {createInterface} = await import('node:readline');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-codex-protocol-'));
+  const file = path.join(dir, 'codex-fixture.mjs');
+  fs.writeFileSync(file, String.raw`import fs from 'node:fs';import assert from 'node:assert/strict';import {createInterface} from 'node:readline';
+assert.deepEqual(process.argv.slice(2),['app-server','--listen','stdio://']);
+const send=value=>console.log(JSON.stringify(value));
+const stateFile='./native-thread.json';
+let state,turn;
+const done=status=>{
+  state.total+=21;fs.writeFileSync(stateFile,JSON.stringify(state));
+  send({method:'thread/tokenUsage/updated',params:{threadId:state.id,turnId:turn,tokenUsage:{total:{inputTokens:state.total,outputTokens:state.turn*3,cachedInputTokens:state.turn*2,cacheWriteInputTokens:0,reasoningOutputTokens:state.turn},last:{}}}});
+  send({method:'turn/completed',params:{threadId:state.id,turn:{id:turn,status,...(status==='failed'?{error:{message:'ECONNRESET fixture'}}:{})}}});
+};
+for await(const line of createInterface({input:process.stdin})){
+  const event=JSON.parse(line),p=event.params;
+  if(event.method==='initialize'){
+    assert.equal(p.capabilities.experimentalApi,true);send({id:event.id,result:{userAgent:'fixture'}});
+  }else if(event.method==='initialized'){
+  }else if(event.method==='config/read'){
+    assert.equal(p.cwd,process.cwd());send({id:event.id,result:{config:{model:'native-only',mcp_servers:{'foreign.with.dot':{}},plugins:{foreign:{enabled:true}}}}});
+  }else if(event.method==='thread/start'||event.method==='thread/resume'){
+    assert.equal(Object.hasOwn(p,'model'),false);assert.equal(Object.hasOwn(p,'modelProvider'),false);
+    assert.equal(p.approvalPolicy,'never');assert.equal(p.sandbox,'read-only');
+    assert.equal(p.config.web_search,'disabled');assert.equal(p.config['features.shell_tool'],false);
+    assert.equal(p.config['features.unified_exec'],false);assert.equal(p.config['features.code_mode'],false);
+    assert.equal(p.config['mcp_servers."foreign.with.dot".enabled'],false);
+    assert.equal(p.config['plugins."foreign".enabled'],false);
+    assert.equal(p.config['features.plugins'],false);assert.equal(p.config['features.skip_host_skill_discovery'],true);
+    if(event.method==='thread/start'){
+      state={id:'thread_fixture',turn:0,total:0,read:false,tools:p.dynamicTools};
+      assert.deepEqual(p.dynamicTools.map(t=>t.name),['env_call','submit']);
+      assert.ok(p.dynamicTools.every(t=>t.type==='function'&&t.inputSchema.type==='object'));
+    }else{
+      state=JSON.parse(fs.readFileSync(stateFile,'utf8'));assert.equal(p.threadId,state.id);
+      assert.equal(p.excludeTurns,true);assert.equal(p.dynamicTools,undefined);assert.equal(state.read,true);
+    }
+    send({id:event.id,result:{thread:{id:state.id},cwd:process.cwd(),model:'actual-native-codex',modelProvider:'actual-native-provider',approvalPolicy:'never',sandbox:{type:'readOnly',networkAccess:false}}});
+  }else if(event.method==='turn/start'){
+    state.turn++;turn='turn_'+state.turn;
+    assert.equal(p.threadId,state.id);assert.deepEqual(p.sandboxPolicy,{type:'readOnly',networkAccess:false});
+    assert.match(p.input[0].text,/fixture station/);assert.deepEqual(p.input[0].text_elements,[]);
+    send({id:event.id,result:{turn:{id:turn,status:'inProgress'}}});
+    send({method:'turn/started',params:{threadId:state.id,turn:{id:turn,status:'inProgress'}}});
+    if(p.input[0].text.includes('fixture stall')){fs.writeFileSync('./native-pid.txt',String(process.pid));continue;}
+    send({id:state.read?'server-submit':'server-read',method:'item/tool/call',params:{threadId:state.id,turnId:turn,callId:state.read?'call_submit':'call_read',namespace:null,tool:state.read?'submit':'env_call',arguments:state.read?{score:7}:{name:'fixture_read'}}});
+  }else if(event.id==='server-read'){
+    assert.equal(event.result.success,true);assert.match(event.result.contentItems[0].text,/retained observation/);
+    send({id:'server-read-again',method:'item/tool/call',params:{threadId:state.id,turnId:turn,callId:'call_read',namespace:null,tool:'env_call',arguments:{name:'fixture_read'}}});
+  }else if(event.id==='server-read-again'){
+    state.read=true;done('failed');
+  }else if(event.id==='server-submit'){
+    assert.equal(event.result.success,true);done('completed');
+  }else if(event.method==='turn/interrupt'){
+    assert.equal(p.threadId,state.id);assert.equal(p.turnId,turn);send({id:event.id,result:{}});done('interrupted');
+  }else throw new Error('Unexpected fixture message');
+}`);
+  let reads = 0;
+  let submissions = 0;
+  let saved: CodexSessionReference | undefined;
+  const definitions = [
+    {name: 'env_call', label: 'Read fixture', description: 'Read fixture evidence', parameters: Type.Object({name: Type.Literal('fixture_read')}),
+      execute: async () => { reads++; return {content: [{type: 'text' as const, text: 'retained observation'}]}; }},
+    {name: 'submit', label: 'Submit', description: 'Submit fixture result', parameters: Type.Object({score: Type.Integer()}),
+      execute: async (_id: string, value: {score: number}) => { assert.equal(value.score, 7); submissions++; return {content: [{type: 'text' as const, text: 'received'}]}; }},
+  ];
+  try {
+    for (const turn of [1, 2]) {
+      const controller = new AbortController();
+      const scope = await openStationMcp(definitions, controller.signal);
+      const connection = JSON.parse(fs.readFileSync(scope.config.env.EASY_WORKFLOW_STATION_CONNECTION, 'utf8'));
+      const protocol = new CodexProtocol({selection: {}, signature: 'fixture-contract', previous: saved,
+        checkpoint: reference => {saved = reference;}, cwd: dir, tools: definitions, signal: controller.signal});
+      const command = protocol.argv([process.execPath, file]);
+      const child = spawn(command[0], command.slice(1), {cwd: dir, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe']});
+      let failure: unknown;
+      let pending = Promise.resolve();
+      const lines = createInterface({input: child.stdout});
+      const deadline = setTimeout(() => child.kill(), 5000);
+      child.stderr.resume();
+      const close = new Promise<number | null>(resolve => child.once('close', resolve));
+      protocol.bind({send: line => {child.stdin.write(line);}, complete: () => child.stdin.end(),
+        call: async (name, args, signal) => {
+          const response = await fetch(connection.url + '/call', {method: 'POST', signal,
+            headers: {authorization: `Bearer ${connection.token}`, 'content-type': 'application/json'},
+            body: JSON.stringify({name, arguments: args})});
+          assert.equal(response.status, 200);
+          return await response.json();
+        }});
+      lines.on('line', line => {
+        pending = pending.then(() => protocol.accept(line)).catch(error => {failure = error; child.kill();});
+      });
+      try {
+        child.stdin.write(protocol.input({role: 'user', content: [{type: 'text', text: 'Complete the fixture station.'}]}));
+        assert.equal(await close, 0);
+        await pending;
+        if (failure) throw failure;
+        assert.ok(saved);
+        assert.equal(validCodexSession(saved, {}, 'fixture-contract'), true);
+        const receipt = protocol.finish();
+        assert.equal(receipt.model, 'actual-native-codex');
+        assert.equal(receipt.provider, 'actual-native-provider');
+        assert.deepEqual(receipt.tokenUsage, {input: 21, output: 3, cacheRead: 2, cacheWrite: 0, reasoning: 1});
+        assert.equal('usage' in receipt, false, 'native token receipts contain no dollar cost');
+        assert.equal(receipt.failure?.tag, turn === 1 ? 'model_transport' : undefined);
+        assert.throws(() => process.kill(child.pid!, 0), {code: 'ESRCH'});
+        await assert.rejects(protocol.accept(JSON.stringify({id: 'foreign', method: 'item/tool/call', params: {
+          threadId: saved.id, turnId: saved.turn, callId: 'foreign_call', tool: 'set_caps', namespace: null, arguments: {},
+        }})), /outside this station scope/);
+      } finally {
+        clearTimeout(deadline);
+        lines.close();
+        child.kill();
+        await close;
+        await scope.close();
+      }
+    }
+    assert.equal(reads, 1, 'a retransmitted call and a resumed native turn must not repeat completed tool work');
+    assert.equal(submissions, 1);
+    reads = 0;
+    submissions = 0;
+    const work = path.join(dir, 'work');
+    let lastReply: import('../server/mcp-station.ts').ClosedAgentReply | undefined;
+    const native = (token: string) => new ClosedStationAgent({adapter: 'codex', command: [process.execPath, file],
+      cwd: path.join(work, token), sessionScope: {projectDirectory: dir, workDirectory: work}, requestTimeoutMs: 5000},
+    'Execute only the fixture station.', definitions, reply => {lastReply = reply;});
+    const first = native('first');
+    first.configureSession('fixture/reader', 'runner-contract', undefined, () => ({calls: reads, evidence: []}));
+    await assert.rejects(first.prompt('Complete the fixture station.'), /could not complete/);
+    const checkpoint = first.sessionReference();
+    assert.ok(checkpoint);
+    assert.equal(checkpoint.adapter, 'codex');
+    assert.equal(checkpoint.context?.calls, 1);
+    const resumed = native('next-token');
+    resumed.configureSession('fixture/reader', 'runner-contract', checkpoint, () => ({calls: reads, evidence: []}));
+    await resumed.prompt('Complete the fixture station.');
+    assert.equal(reads, 1);
+    assert.equal(submissions, 1);
+    assert.equal(lastReply?.model, 'actual-native-codex');
+    assert.equal(lastReply?.provider, 'actual-native-provider');
+    assert.equal(lastReply?.tokenUsage?.input, 21);
+    assert.equal(lastReply?.usage, undefined);
+    assert.equal(lastReply?.costReported, false);
+    assert.equal(resumed.sessionReference()?.id, checkpoint.id);
+    const stalled = native('cancelled');
+    stalled.configureSession('fixture/reader', 'runner-cancel');
+    const aborted = assert.rejects(stalled.prompt('fixture station; fixture stall'), /abort/i);
+    const pidFile = path.join(work, 'cancelled', 'native-pid.txt');
+    while (!fs.existsSync(pidFile)) await new Promise(resolve => setTimeout(resolve, 10));
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    stalled.abort();
+    await aborted;
+    assert.throws(() => process.kill(pid, 0), {code: 'ESRCH'}, 'Codex cancellation waits for the actual fixture process');
+    assert.equal(validCodexSession(saved, {model: 'different'}, 'fixture-contract'), false);
+    assert.equal(validCodexSession(saved, {}, 'different-role-or-tools'), false);
+    const output: string[] = [];
+    const owner = new AbortController();
+    const unknown = new CodexProtocol({selection: {}, signature: 'unknown', cwd: dir, tools: definitions,
+      signal: owner.signal, checkpoint: () => {}});
+    unknown.bind({send: line => output.push(line), complete: () => {}, call: async () => {throw new Error('unexpected call');}});
+    await assert.rejects(unknown.accept('malformed private-credential-fragment'), error => {
+      assert.doesNotMatch(String(error), /private-credential-fragment/);
+      return true;
+    });
+    const initialize = JSON.parse(unknown.input({role: 'user', content: [{type: 'text', text: 'fixture'}]}));
+    await unknown.accept(JSON.stringify({id: initialize.id, result: {}}));
+    await unknown.accept(JSON.stringify({id: JSON.parse(output.at(-1)!).id, result: {config: {}}}));
+    await unknown.accept(JSON.stringify({id: JSON.parse(output.at(-1)!).id, result: {thread: {id: 'unknown_thread'}, cwd: dir,
+      approvalPolicy: 'never', sandbox: {type: 'readOnly', networkAccess: false}}}));
+    await unknown.accept(JSON.stringify({id: JSON.parse(output.at(-1)!).id, result: {turn: {id: 'unknown_turn'}}}));
+    unknown.interrupt();
+    assert.deepEqual(JSON.parse(output.at(-1)!).params, {threadId: 'unknown_thread', turnId: 'unknown_turn'});
+    await unknown.accept(JSON.stringify({method: 'turn/completed', params: {threadId: 'unknown_thread', turn: {id: 'unknown_turn', status: 'completed'}}}));
+    assert.deepEqual(unknown.finish(), {model: 'unknown'});
+    owner.abort(new Error('owner cancelled'));
+    await assert.rejects(unknown.accept('{}'), /owner cancelled/);
+    const claude = new ClaudeCodeProtocol(undefined, 'native-default', undefined, () => {});
+    const args = claude.argv(['fixture-only-no-native-process'], {h2_station: {}});
+    assert.equal(args.includes('--model'), false);
+    assert.equal(args[args.indexOf('--setting-sources') + 1], 'user');
+  } finally {
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+  }
+});
+
 test('Factory captures installed Agent execution before start observers rebind the next item', {timeout: 30000}, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-factory-binding-'));
   const keys = ['FACTORY_VAR', 'FACTORY_PREFLIGHT', 'FACTORY_START_PAUSED', 'FACTORY_RESUME_MANAGED',
@@ -825,6 +1231,41 @@ process.stdout.write(JSON.stringify({model: 'reported-' + request.model, modelCa
       [{command: 'a', model: 'requested-a'}, {command: 'b', model: 'requested-b'}]);
     assert.deepEqual(requests, [{path: '/a/v1/chat/completions', model: 'shared-model'},
       {path: '/b/v1/chat/completions', model: 'shared-model'}]);
+    await t.test('native defaults resolve once before observers can change PATH', async () => {
+      const previousPath = process.env.PATH;
+      const first = path.join(dir, 'first-native-bin');
+      const later = path.join(dir, 'later-native-bin');
+      fs.mkdirSync(first);
+      fs.mkdirSync(later);
+      const host = factory as unknown as {captureAgent: (node: string, declared?: StationAgentBinding) => {
+        binding: StationAgentBinding; dependency: ModelDependency;
+      }};
+      try {
+        for (const adapter of ['claude-code', 'opencode', 'codex'] as const) {
+          const executable = (adapter === 'claude-code' ? 'claude' : adapter) + (process.platform === 'win32' ? '.exe' : '');
+          // File lookup only: these are deliberately non-executable placeholders.
+          // Never start a real vendor CLI while checking configuration capture.
+          for (const directory of [first, later]) fs.writeFileSync(path.join(directory, executable), 'isolated resolution fixture');
+          process.env.PATH = first;
+          factory.setAgentBinding('captured/work', {adapter});
+          assert.deepEqual(factory.state.agentBindings?.['captured/work'], {adapter}, 'persisted defaults remain declarative');
+          const captured = host.captureAgent('captured/work');
+          assert.notEqual(captured.binding.adapter, 'pi');
+          if (captured.binding.adapter === 'pi') throw new Error('Native capture unexpectedly selected Pi');
+          assert.deepEqual(captured.binding.command, [path.join(first, executable)]);
+          process.env.PATH = later;
+          const config = closedAgentConfig(path.join(dir, 'work', adapter),
+            {projectDirectory: dir, workDirectory: path.join(dir, 'work')}, captured.binding)!;
+          const actual = closedModelDependency({adapter, command: config.command, model: config.model, provider: config.provider});
+          assert.deepEqual(actual, captured.dependency, 'scheduler capture and actual request guard share one resolved key');
+          assert.deepEqual(config.command, captured.binding.command, 'later PATH changes do not redirect an in-flight attempt');
+          assert.notEqual(host.captureAgent('captured/work').dependency.key, captured.dependency.key,
+            'only a future capture can select the changed native executable');
+        }
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+      }
+    });
     await t.test('deterministic skip survives an invalid captured model without reopening configuration', async () => {
       const {pack} = await import('../packs/vislexicon/pack.ts');
       const node = compile([pack]).nodes.find(node => node.key === 'curation/style')!;
@@ -1041,6 +1482,201 @@ test('project defaults, dispatcher turns and concurrent station contexts remain 
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    fs.rmSync(directory, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+  }
+});
+test('Pi tools retain a worker but release the real request slot for an independent station', {timeout: 20000}, async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-pi-tool-slots-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = directory;
+  const calls: {node: string; attempt: string; at: number}[] = [];
+  const requestCounts = new Map<string, number>();
+  const errors: unknown[] = [];
+  let active = 0;
+  let peak = 0;
+  const server = http.createServer(async (request, response) => {
+    try {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString()) as {
+        messages: {content: unknown}[];
+      };
+      const input = body.messages.map(message => typeof message.content === 'string'
+        ? message.content : JSON.stringify(message.content)).join('\n');
+      const node = /station=([^;]+)/.exec(input)?.[1];
+      const attempt = /attempt=([^;]+)/.exec(input)?.[1];
+      assert.ok(node === 'first/work' || node === 'second/work');
+      assert.ok(attempt);
+      const count = (requestCounts.get(attempt) ?? 0) + 1;
+      requestCounts.set(attempt, count);
+      active++;
+      peak = Math.max(peak, active);
+      calls.push({node, attempt, at: Date.now()});
+      const name = node === 'first/work' && count === 1 ? 'env_call' : 'submit';
+      const args = name === 'env_call' ? {name: 'fixture_wait', arguments: {}} : {ok: true};
+      response.writeHead(200, {'content-type': 'text/event-stream'});
+      await delay(20);
+      for (const part of [
+        {choices: [{index: 0, delta: {role: 'assistant', tool_calls: [{index: 0,
+          id: `${attempt}-${count}`, type: 'function', function: {name, arguments: JSON.stringify(args)}}]}, finish_reason: null}]},
+        {choices: [{index: 0, delta: {}, finish_reason: 'tool_calls'}],
+          usage: {prompt_tokens: 5, completion_tokens: 2, total_tokens: 7}},
+      ]) response.write(`data: ${JSON.stringify({id: attempt, model: 'fixture-model', ...part})}\n\n`);
+      response.end('data: [DONE]\n\n');
+      active--;
+    } catch (error) {
+      errors.push(error);
+      response.writeHead(500);
+      response.end('fixture protocol failure');
+    }
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as {port: number}).port;
+  fs.writeFileSync(path.join(directory, 'auth.json'), JSON.stringify({fixture: {type: 'api_key', key: 'local-fixture-only'}}));
+  fs.writeFileSync(path.join(directory, 'models.json'), JSON.stringify({providers: {fixture: {
+    api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/v1`,
+    models: [{id: 'fixture-model', input: ['text']}],
+  }}}));
+  const fixturePack: Pack = {
+    id: 'pi-tool-slots', name: 'Pi tool slots', version: '1', blurb: 'Local protocol fixture',
+    resources: {model: 1, browser: 1, cpu: 1, http: 1},
+    lines: ['first', 'second'].map(id => line({id, name: id, layer: 3, priority: 'mid', wired: true,
+      blurb: 'Independent context', stations: [
+        station({id: 'work', name: 'Work', role: 'process', kind: 'agent', resource: 'model',
+          accept: ['The local result is submitted'], estimateSeconds: 1,
+          workers: {min: 1, max: 1, initial: 1, policy: 'fixed'}}),
+        station({id: 'published', name: 'Done', role: 'store', kind: 'store'}),
+      ], edges: [['work', 'published']]})),
+    channels: [], links: [], conditions: {}, order: ['first', 'second'], collapsed: [], hints: {},
+  };
+  const compiled = compile([fixturePack]);
+  assert.deepEqual(compiled.issues, []);
+  const waitFor = async (condition: () => boolean, message: string) => {
+    const deadline = Date.now() + 4000;
+    while (!condition() && Date.now() < deadline) await delay(5);
+    assert.deepEqual(errors, []);
+    assert.ok(condition(), message);
+  };
+  try {
+    for (const modelWorkers of [1, 3]) await t.test(`${modelWorkers} model workers with one real request`, async () => {
+      const journal = new Journal(':memory:');
+      const state = initialState(compiled);
+      journal.subscribeProjection(event => apply(state, event));
+      const broker = new Broker({...fixturePack.resources, modelWorkers}, 0);
+      const selected = models({provider: 'fixture', model: 'fixture-model'});
+      const sessions: {id: string; input: string}[] = [];
+      const piRuntime: ReturnType<typeof models> = {...selected, stream: async (model, context, options) => {
+        sessions.push({id: options?.sessionId ?? '', input: JSON.stringify(context)});
+        return selected.stream(model, context, options);
+      }};
+      const gates = new Map<string, () => void>();
+      const toolSignals = new Map<string, AbortSignal>();
+      const toolFinished = new Set<string>();
+      const docs = {dir: directory, envelope: () => ({text: 'Only this station and case.',
+        sizes: {role: 27, project: 0, context: 0, caseFile: 0}})} as unknown as Docs;
+      const toolbox = {
+        help: () => ({ok: true, tools: [{name: 'fixture_wait'}]}),
+        call: async (allowed: string[], name: string, _args: unknown, context: Parameters<Toolbox['call']>[3]) => {
+          assert.equal(name, 'fixture_wait');
+          assert.ok(allowed.includes(name));
+          const token = context.token;
+          assert.ok(token);
+          const lease = await broker.acquire('browser', {signal: context.signal, timeoutMs: 1000});
+          assert.ok(lease);
+          toolSignals.set(token, context.signal);
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const abort = () => reject(context.signal.reason);
+              gates.set(token, () => {
+                context.signal.removeEventListener('abort', abort);
+                resolve();
+              });
+              context.signal.addEventListener('abort', abort, {once: true});
+              if (context.signal.aborted) abort();
+            });
+            toolFinished.add(token);
+            return {ok: true, content: 'Controlled asynchronous tool completed'};
+          } finally {
+            gates.delete(token);
+            lease.release();
+          }
+        },
+      } as unknown as Toolbox;
+      const role = (key: string) => ({station: key, path: `fixture/${key}/ROLE.md`,
+        revision: key, content: `Complete only ${key}.`});
+      const definition = (key: string): AgentStationDef => ({
+        agent: {adapter: 'pi', provider: 'fixture', model: 'fixture-model'}, piRuntime,
+        role: role(key), system: 'Call the indicated local tool, then submit ok:true.', tools: ['fixture_wait'],
+        schema: Type.Object({ok: Type.Boolean()}), input: context => ({text: `Own case ${context.token.item}`}),
+        after: () => ({ok: true, summary: 'Pi fixture accepted'}), timeoutMs: 8000, requestTimeoutMs: 2000,
+        services: {docs: () => docs, toolbox: () => toolbox},
+      });
+      const runtime = new Runtime(compiled, journal, broker, {}, node => ({prepare: () => ({
+        dependency: selected.dependency, execute: context => runAgentStation(definition(node.key), context),
+      })}));
+      runtime.roleResolver = role;
+      runtime.ensureWorkers([]);
+      runtime.start('Pi lifecycle fixture');
+      try {
+        const first = runtime.create('first/work', {item: 'FIRST_PRIVATE_CASE', url: '', source: 'fixture'});
+        await waitFor(() => gates.has(first.id), 'the actual Pi agent must reach its asynchronous tool');
+        assert.equal(broker.used.model, 1);
+        assert.equal(broker.modelRequests.active, 0, 'the completed HTTP call no longer occupies the request pool');
+        const beforeSecond = calls.length;
+        const second = runtime.create('second/work', {item: 'SECOND_PRIVATE_CASE', url: '', source: 'fixture'});
+        if (modelWorkers === 1) {
+          await delay(60);
+          assert.equal(calls.length, beforeSecond, 'an explicit single worker preserves serial station execution');
+          assert.equal(state.tokens[second.id].attempts.length, 0);
+        } else {
+          await waitFor(() => second.finished, 'the second station must finish before the first tool is released');
+          assert.equal(state.tokens[second.id].status, 'published');
+          assert.ok(calls.slice(beforeSecond).some(call => call.node === 'second/work'));
+          assert.equal(toolFinished.has(first.id), false);
+          assert.equal(broker.used.browser, 1);
+          runtime.pause();
+          const paused = runtime.create('second/work', {item: 'PAUSED_PRIVATE_CASE', url: '', source: 'fixture'});
+          await delay(30);
+          assert.equal(state.tokens[paused.id].attempts.length, 0, 'extra worker capacity does not bypass global pause');
+          runtime.resume();
+          await waitFor(() => paused.finished, 'resume dispatches the preserved queued task');
+          assert.equal(state.tokens[paused.id].status, 'published');
+        }
+        gates.get(first.id)!();
+        await runtime.settle();
+        assert.deepEqual([state.tokens[first.id].status, state.tokens[second.id].status], ['published', 'published']);
+        const firstSession = sessions.find(value => value.input.includes('FIRST_PRIVATE_CASE'))!;
+        const secondSession = sessions.find(value => value.input.includes('SECOND_PRIVATE_CASE'))!;
+        assert.ok(firstSession.id && secondSession.id);
+        assert.notEqual(firstSession.id, secondSession.id);
+        assert.ok(!firstSession.input.includes('SECOND_PRIVATE_CASE'));
+        assert.ok(!secondSession.input.includes('FIRST_PRIVATE_CASE'));
+        if (modelWorkers === 3) {
+          const cancelled = runtime.create('first/work', {item: 'CANCEL_PRIVATE_CASE', url: '', source: 'fixture'});
+          await waitFor(() => gates.has(cancelled.id), 'the next attempt must own a new cancellable tool');
+          runtime.end();
+          await runtime.settle();
+          assert.equal(toolSignals.get(cancelled.id)?.aborted, true);
+          assert.equal(toolFinished.has(cancelled.id), false);
+          assert.equal(state.tokens[second.id].status, 'published', 'cancellation cannot erase another completed receipt');
+        }
+        assert.equal(peak, 1, 'actual model HTTP concurrency never exceeds the configured request quota');
+        assert.equal(broker.used.model, 0);
+        assert.equal(broker.used.browser, 0);
+        assert.equal(broker.modelRequests.active, 0);
+        assert.equal(broker.modelRequests.queued, 0);
+      } finally {
+        await runtime.close();
+        journal.close();
+      }
+    });
+  } finally {
+    await closeModelTransport();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
     assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
     fs.rmSync(directory, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
   }

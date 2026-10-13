@@ -23,7 +23,9 @@ const choice = (...values: string[]) => Type.Union(values.map((x) => Type.Litera
 const object = (properties: Parameters<typeof Type.Object>[0]) => Type.Object(properties, { additionalProperties: false });
 const agentBinding = () => Type.Union([
   object({adapter: Type.Literal('pi'), provider: Type.Optional(name()), model: Type.Optional(name())}),
-  object({adapter: choice('claude-code', 'launcher'), command: Type.Array(Type.String({minLength: 1, maxLength: 4000}), {minItems: 1, maxItems: 32}), model: name(), requestTimeoutMs: Type.Optional(Type.Integer({minimum: 1, maximum: 900000}))}),
+  object({adapter: Type.Literal('launcher'), command: Type.Array(Type.String({minLength: 1, maxLength: 4000}), {minItems: 1, maxItems: 32}), model: name(), requestTimeoutMs: Type.Optional(Type.Integer({minimum: 1, maximum: 900000}))}),
+  object({adapter: Type.Literal('claude-code'), command: Type.Optional(Type.Array(Type.String({minLength: 1, maxLength: 4000}), {minItems: 1, maxItems: 32})), model: Type.Optional(name()), requestTimeoutMs: Type.Optional(Type.Integer({minimum: 1, maximum: 900000}))}),
+  object({adapter: choice('opencode', 'codex'), command: Type.Optional(Type.Array(Type.String({minLength: 1, maxLength: 4000}), {minItems: 1, maxItems: 32})), provider: Type.Optional(name()), model: Type.Optional(name()), requestTimeoutMs: Type.Optional(Type.Integer({minimum: 1, maximum: 900000}))}),
 ]);
 const patchOp = Type.Union([
   object({ op: Type.Literal("set"), station: name(), field: choice("workers.min", "workers.max", "workers.initial", "workers.policy", "estimateSeconds", "dormant", "name", "blurb"), value: Type.Unknown() }),
@@ -230,9 +232,13 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'run_batch', label: '持续托管本轮目标', description: 'Persist a total unique-site target for this run. The backend refills idle intake stages with bounded in-flight work and retries transient failures from checkpoints, without a chat polling loop. Existing sites in the run count toward target. Pause/resume preserve progress; stop disables further admission and automatic retries, leaving current work running.',
-        parameters: object({ action: choice('start','status','pause','resume','stop'), target: Type.Optional(Type.Integer({minimum:1,maximum:10000})), maxInFlight: Type.Optional(Type.Integer({minimum:1,maximum:40})), intakeWindow: Type.Optional(Type.Integer({minimum:1,maximum:20})), category: Type.Optional(name()), query: Type.Optional(name()) }),
-        execute: async (_id, p) => {
+        parameters: object({ action: choice('start','configure','status','pause','resume','stop'), target: Type.Optional(Type.Integer({minimum:1,maximum:10000})), flow: Type.Optional(Type.Boolean()), maxInFlight: Type.Optional(Type.Integer({minimum:1,maximum:40})), intakeWindow: Type.Optional(Type.Integer({minimum:1,maximum:20})), category: Type.Optional(name()), query: Type.Optional(name()) }),
+        execute: async (_id, p, actor) => {
           if (p.action === 'status') return ok(batchSummary(f.state), '读取持久任务目标');
+          if (p.action === 'configure') {
+            if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '流水线入场上限由用户选择，自动调度在该上限内调整');
+            return ok(f.batch.updateAdmission({flow: p.flow, maxInFlight: p.maxInFlight, intakeWindow: p.intakeWindow}), '已保存流水线入场策略，保持当前运行或暂停状态');
+          }
           if (p.action === 'start') {
             if (!p.target) throw new ControlError(400, 'missing_target', '请提供本轮总目标数量');
             await f.ensureReady();
@@ -384,8 +390,8 @@ function definitions(f: Factory): Tool[] {
         execute: async (_id, p) => { f.decidePatch(p.id, p.accept); return ok({ id: p.id, status: p.accept ? "accepted" : "rejected", digest: f.compiled.digest }, p.accept ? "补丁已生效" : "补丁已拒绝"); },
       },
       {
-        name: "settings", label: "读取 / 更新资源设置", description: "Read settings, or update supplied resource limits. Browser pages default to 8 (max 16) and shrink automatically while free memory is short.",
-        parameters: object({ values: Type.Optional(object({ browser: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })), model: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })), cpu: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })), http: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })), memoryFloorMB: Type.Optional(Type.Integer({ minimum: 0 })), socialPerMinute: Type.Optional(Type.Integer({ minimum: 1, maximum: 6 })), socialPerDay: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })) })) }),
+        name: "settings", label: "读取 / 更新资源设置", description: "Read settings, or update supplied resource limits. model limits Pi requests and native client calls; modelWorkers independently limits model-class station lifetimes, including tool waits. Browser pages shrink automatically while free memory is short.",
+        parameters: object({ values: Type.Optional(object({ browser: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })), model: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })), modelWorkers: Type.Optional(Type.Integer({minimum: 1, maximum: 64})), cpu: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })), http: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })), memoryFloorMB: Type.Optional(Type.Integer({ minimum: 0 })), socialPerMinute: Type.Optional(Type.Integer({ minimum: 1, maximum: 6 })), socialPerDay: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })) })) }),
         execute: async (_id, p) => { if (p.values) f.saveSettings(p.values); return ok(f.settings, "读取 / 更新资源设置"); },
       },
       {

@@ -1,6 +1,6 @@
 import { batchSummary, type BatchRecovery } from '../../../shared/batch.ts';
 import { latestRunTokens, type AttemptState, type FactoryState, type Light, type TokenState } from '../../../shared/project.ts';
-import type { CompiledNode, StationAgentBinding } from '../../../shared/types.ts';
+import type { CompiledNode, ModelDependency, StationAgentBinding } from '../../../shared/types.ts';
 
 export interface NodeExecution {
   readonly adapter: string;
@@ -26,6 +26,8 @@ export function executionIndex(state: FactoryState) {
 const adapterNames: Record<string, string> = {
   pi: 'Pi',
   'claude-code': 'Claude Code',
+  opencode: 'OpenCode',
+  codex: 'Codex',
   launcher: 'launcher',
   'closed-command': 'launcher',
 };
@@ -75,6 +77,7 @@ interface RuntimeRecovery {
   networkAttempts: number;
   modelFailures: number;
   failureAttempt: string;
+  dependency?: ModelDependency;
   reason?: string;
 }
 
@@ -82,10 +85,15 @@ function runtimeRecovery(token: TokenState, state: FactoryState): RuntimeRecover
   const value = token.data.__runtimeRecovery;
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
       (token.touchedAt ?? token.createdAt) < state.run.startedAt ||
-      state.batch?.runId === state.run.id ||
       typeof token.data.retriedBy === 'string' && state.tokens[token.data.retriedBy]?.item === token.item ||
       ['published', 'merged', 'rejected'].includes(token.status)) return;
   const plan = value as Record<string, unknown>;
+  const dependency = plan.dependency as Partial<ModelDependency> | undefined;
+  if (dependency !== undefined && (!dependency || typeof dependency !== 'object' ||
+      typeof dependency.key !== 'string' || typeof dependency.model !== 'string' ||
+      !['pi', 'claude-code', 'opencode', 'codex', 'launcher'].includes(String(dependency.adapter)) ||
+      dependency.provider !== undefined && typeof dependency.provider !== 'string')) return;
+  if (state.batch?.runId === state.run.id && !dependency) return;
   if (plan.version !== 1 || plan.runId !== state.run.id ||
       !['network', 'model'].includes(String(plan.kind)) ||
       !['waiting', 'trial', 'completed', 'exhausted', 'blocked'].includes(String(plan.state)) ||
@@ -111,10 +119,12 @@ export function runtimeRecoveryIndex(state: FactoryState): Record<string, string
 function runtimeRecoveryStatus(token: TokenState, state: FactoryState, now: number): StatusPresentation | undefined {
   const plan = runtimeRecovery(token, state);
   if (!plan) return;
-  const reason = plan.reason || token.reason || '已保留原工位检查点与已有成果。';
+  const circuit = plan.dependency ? state.modelCircuits?.[plan.dependency.key] : undefined;
+  const reason = plan.reason || circuit?.reason || token.reason || '已保留原工位检查点与已有成果。';
+  const service = plan.dependency ? `${plan.dependency.provider ?? adapterNames[plan.dependency.adapter]} / ${plan.dependency.model}。` : '';
   const attempts = plan.kind === 'network' ? `网络恢复已尝试 ${plan.networkAttempts}/2 次。`
-    : `已记录 ${plan.modelFailures} 次模型暂态失败；每次只放行一个工位验证。`;
-  const detail = `${plan.station}：${reason} ${attempts}`;
+    : `已记录 ${circuit?.failures ?? plan.modelFailures} 次模型暂态失败；每次只放行一个工位验证。`;
+  const detail = `${service}${plan.station}：${reason} ${attempts}`;
   if (plan.state === 'exhausted') return {label: '自动恢复次数耗尽', detail, light: 'red'};
   if (plan.state === 'blocked') return {label: '自动恢复受阻', detail, light: 'red'};
   if (state.run.status === 'ended' || state.run.status === 'idle') {
@@ -123,8 +133,12 @@ function runtimeRecoveryStatus(token: TokenState, state: FactoryState, now: numb
   const paused = state.run.status === 'paused' || state.pausedScopes?.stations.includes(plan.station) ||
     state.pausedScopes?.lines.includes(plan.station.split('/')[0]);
   if (paused) return {label: '恢复已暂停', detail: `领取已暂停，恢复计划和检查点保留；继续后仍需资源空位。${detail}`, light: 'yellow'};
+  if (circuit?.state === 'blocked') return {label: '模型服务待处理', detail, light: 'red'};
+  if (circuit?.state === 'trial' && circuit.trialToken !== token.id) {
+    return {label: '等待服务验证', detail: `同一模型服务正由另一件任务验证，当前任务保留检查点等待。${detail}`, light: 'yellow'};
+  }
   if (plan.state === 'waiting') {
-    const seconds = Math.max(0, Math.ceil((plan.nextAt - now) / 1000));
+    const seconds = Math.max(0, Math.ceil((Math.max(plan.nextAt, circuit?.nextAt ?? 0) - now) / 1000));
     return {
       label: seconds ? plan.kind === 'model' ? '模型冷却' : '等待自动恢复' : '等待恢复条件',
       detail: `${seconds ? `最早 ${seconds} 秒后具备恢复时间条件；仍需等待调度放行。` : '恢复时间已到，等待调度条件放行，尚未开始执行。'}${detail}`,
@@ -248,6 +262,9 @@ export function tokenStatus(token: TokenState, state: FactoryState, now: number)
 
 /** An unreported model response is unknown, even if initialized usage fields are zero. */
 export function recordedUsage(attempts: AttemptState[]) {
-  const reported = attempts.filter(attempt => attempt.metrics?.usageReported === true || attempt.metrics?.usageReported !== false && (attempt.usage.input > 0 || attempt.usage.output > 0));
-  return { total: reported.length || !attempts.length ? reported.reduce((sum, attempt) => sum + attempt.usage.input + attempt.usage.output, 0) : null, reported: reported.length, samples: attempts.length, partial: reported.length > 0 && reported.length < attempts.length };
+  const reported = attempts.filter(attempt => attempt.metrics?.tokenUsage || attempt.metrics?.usageReported === true || attempt.metrics?.usageReported !== false && (attempt.usage.input > 0 || attempt.usage.output > 0));
+  return {total: reported.length || !attempts.length ? reported.reduce((sum, attempt) => {
+    const usage = attempt.metrics?.tokenUsage ?? attempt.usage;
+    return sum + usage.input + usage.output;
+  }, 0) : null, reported: reported.length, samples: attempts.length, partial: reported.length > 0 && reported.length < attempts.length};
 }

@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import { Type, type TSchema } from "typebox";
 import { Check, Errors } from 'typebox/value';
-import type { AttemptMetrics, StationAgentBinding, Usage } from "../shared/types.ts";
+import type { AttemptMetrics, ModelTokenUsage, StationAgentBinding, Usage } from "../shared/types.ts";
 import type { Docs } from "./docs.ts";
 import { BASE_TOOLS, type Toolbox } from "./toolbox.ts";
 import type { StationContext, StationResult } from "./runtime.ts";
@@ -21,6 +21,7 @@ import { classifyFailure, type Failure } from "../shared/failures.ts";
 import { loadStationSession, saveStationSession, sessionSignature, type SessionRef } from './station-session.ts';
 import { EvidenceStore } from './evidence.ts';
 import {closedModelDependency} from './agent-bindings.ts';
+import {modelRequestWait} from './model-requests.ts';
 export { models, MODEL_ID, apiKeyPresent } from "./pi.ts";
 
 export async function promptAgent(agent: Pick<Agent, "prompt" | "abort"> | ClosedStationAgent, text: string, images?: { type: "image"; data: string; mimeType: string }[], signal?: AbortSignal, timeoutMs = 120_000) {
@@ -124,6 +125,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     } };
   }
   const usage: Usage = { input: 0, output: 0, cost: 0 };
+  const tokenUsage: ModelTokenUsage = {input: 0, output: 0};
+  let costReported = false;
+  let costMissing = false;
   const caseId = ctx.token.item;
   const allowed = [...BASE_TOOLS, ...(def.tools ?? [])];
   const services = def.services ?? wired;
@@ -151,10 +155,12 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   const selection = external ? null : def.piRuntime ?? models(def.agent?.adapter === 'pi' ? def.agent : undefined);
   const dependency = external ? closedModelDependency({
     adapter: external.adapter ?? 'launcher', command: external.command, model: external.model,
+    ...('provider' in external && external.provider ? {provider: external.provider} : {}),
   }) : selection!.dependency;
   const selectedPi = selection ? { provider: selection.model.provider, model: selection.model.id } : undefined;
   const activity = new StationActivity(ctx.activity);
-  let modelId = external?.model ?? selection!.model.id;
+  let modelId = external ? external.model ?? 'unreported' : selection!.model.id;
+  let actualProvider: string | undefined;
   let usageReported = false;
   let usageResponses = 0, usageMissing = false, cacheUsageMissing = false, promptCalls = 0;
   let modelTimeReported = !external;
@@ -206,15 +212,27 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   let firstTokenMs = 0, outputMs = 0, modelCalls = 0;
   const agent = external ? new ClosedStationAgent(external, `${env.text}\n\n${contract}`, tools, reply => {
     modelId = reply.model;
-    if (reply.usage) {
+    actualProvider = reply.provider;
+    const receivedTokens = reply.tokenUsage ?? reply.usage;
+    if (receivedTokens) {
       usageReported = true; usageResponses++;
-      for (const key of ["input", "output", "cost", "cacheRead", "cacheWrite"] as const) if (reply.usage[key] !== undefined) usage[key] = (usage[key] ?? 0) + reply.usage[key];
+      for (const key of ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning'] as const) {
+        const value = receivedTokens[key as keyof typeof receivedTokens];
+        if (typeof value === 'number') tokenUsage[key] = (tokenUsage[key] ?? 0) + value;
+      }
     } else usageMissing = true;
-    if (reply.usage?.cacheRead === undefined || reply.usage.cacheWrite === undefined) cacheUsageMissing = true;
+    if (reply.usage && reply.costReported !== false) {
+      costReported = true;
+      for (const key of ["input", "output", "cost", "cacheRead", "cacheWrite"] as const) if (reply.usage[key] !== undefined) usage[key] = (usage[key] ?? 0) + reply.usage[key];
+    } else costMissing = true;
+    costMissing ||= reply.costComplete === false;
+    if (receivedTokens?.cacheRead === undefined || receivedTokens.cacheWrite === undefined) cacheUsageMissing = true;
     modelTimeReported = (externalReplies++ === 0 || modelTimeReported) && !!reply.time;
     if (reply.time) { firstTokenMs += reply.time.firstTokenMs; outputMs += reply.time.outputMs; }
     modelCalls += reply.modelCalls ?? reply.time?.modelCalls ?? 0;
-    ctx.progress(`闭源 Agent 返回；实际模型 ${reply.model}`, { tool: "model", text: reply.usage ? "已接收接口用量" : "客户端未报告用量；保持未知" });
+    ctx.progress(`闭源 Agent 返回；实际模型 ${reply.model}`, {tool: 'model', text: receivedTokens
+      ? reply.costReported !== false && reply.usage ? '已接收接口用量和费用' : '已接收实际 token；费用未知'
+      : '客户端未报告用量；保持未知'});
   }) : new Agent({
     initialState: { systemPrompt: `${env.text}\n\n${contract}`, model: selection!.model, thinkingLevel: "off", tools },
     streamFn: boundRequest(activity.wrapStream(selection!.stream)),
@@ -230,12 +248,23 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     } else if (e.type === "message_end" && (e.message as { role?: string }).role === "assistant") {
       narration.flush();
     } else if (e.type === "turn_end") {
-      const message = e.message as { stopReason?: string; usage?: { input: number; output: number; cacheRead?: number; cacheWrite?: number; cost?: { total: number } } };
+      const message = e.message as { provider?: string; model?: string; stopReason?: string; usage?: { input: number; output: number; cacheRead?: number; cacheWrite?: number; cost?: { total: number } } };
+      if (!['error', 'aborted'].includes(message.stopReason ?? '')) {
+        actualProvider = message.provider;
+        modelId = message.model ?? modelId;
+      }
       const u = message.usage;
       if (u && (!["error", "aborted"].includes(message.stopReason ?? "") || [u.input, u.output, u.cacheRead, u.cacheWrite, u.cost?.total].some(v => (v ?? 0) > 0))) {
         usageReported = true; usageResponses++; usage.input += u.input; usage.output += u.output; usage.cost += u.cost?.total ?? 0;
+        costReported ||= u.cost?.total !== undefined;
+        costMissing ||= u.cost?.total === undefined;
+        tokenUsage.input += u.input; tokenUsage.output += u.output;
+        for (const key of ['cacheRead', 'cacheWrite'] as const) if (u[key] !== undefined) tokenUsage[key] = (tokenUsage[key] ?? 0) + u[key];
         for (const key of ["cacheRead", "cacheWrite"] as const) if (u[key] !== undefined) usage[key] = (usage[key] ?? 0) + u[key];
-      } else usageMissing = true;
+      } else {
+        usageMissing = true;
+        costMissing = true;
+      }
       if (u?.cacheRead === undefined || u.cacheWrite === undefined) cacheUsageMissing = true;
     } else if (e.type === "tool_execution_start") {
       narration.flush();
@@ -253,7 +282,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   };
   const signature = sessionSignature({
     ...sessionIdentity,
-    execution: { adapter: external?.adapter ?? (external ? 'launcher' : 'pi'), provider: selectedPi?.provider,
+    execution: { adapter: external?.adapter ?? (external ? 'launcher' : 'pi'), provider: external?.provider ?? selectedPi?.provider,
       ...(external ? { command: sessionSignature(external.command) } : {}) },
     ...(external ? { policy: 'sessionPolicy' in env ? env.sessionPolicy : env.text, tools: [...allowed].sort() } : {}),
   });
@@ -301,7 +330,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     ctx.progress('恢复本工位已经完成的工具读取与对话，从中断的模型请求继续', {tool:'recover',text:'不重复打开页面或重做已完成的工具调用'});
   }
   const metrics = (): AttemptMetrics => ({
-    dependency, usageReported, modelTimeReported: modelTimeReported && (!external || externalReplies === promptCalls), execution: { adapter: external ? external.adapter === 'claude-code' ? 'claude-code' : "closed-command" : "pi", model: (external ? externalReplies : usageResponses) ? modelId : 'unreported' },
+    dependency, usageReported, tokenUsage: usageReported ? {...tokenUsage} : undefined,
+    costReported, costComplete: costReported && !costMissing && usageResponses === (external ? promptCalls : activity.count('model_request')),
+    modelTimeReported: modelTimeReported && (!external || externalReplies === promptCalls), execution: { adapter: external ? external.adapter === 'launcher' ? 'closed-command' : external.adapter ?? 'closed-command' : 'pi', model: (external ? externalReplies : usageResponses) ? modelId : 'unreported', ...(actualProvider ? {provider: actualProvider} : {}) },
     usageComplete: usageReported && !usageMissing && usageResponses === (external ? promptCalls : activity.count("model_request")),
     cacheUsageComplete: usageReported && !usageMissing && !cacheUsageMissing && usageResponses === (external ? promptCalls : activity.count("model_request")),
     activity: activity.snapshot(),
@@ -309,18 +340,18 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
       system: Math.max(0, estimateTokens(env.text) - Math.round((env.sizes.context + env.sizes.caseFile) / 2.2)), context: Math.round(env.sizes.context / 2.2), caseFile: Math.round(env.sizes.caseFile / 2.2),
       input: estimateTokens(input.text + redo + contract), images: (input.images?.length ?? 0) * 1100,
       toolDefs: estimateTokens(JSON.stringify(tools.map((t) => ({ n: t.name, d: t.description, p: t.parameters })))), toolResults: Math.round(toolResultChars / 3),
-      output: usage.output, actualInput: usage.input, actualOutput: usage.output, cacheRead: usage.cacheRead ?? 0, cacheWrite: usage.cacheWrite ?? 0,
+      output: tokenUsage.output, actualInput: tokenUsage.input, actualOutput: tokenUsage.output, cacheRead: tokenUsage.cacheRead ?? 0, cacheWrite: tokenUsage.cacheWrite ?? 0,
     },
     time: { firstTokenMs: external ? firstTokenMs : activity.duration("first_token"), outputMs: external ? outputMs : activity.duration("model_output"),
       toolMs: activity.duration("tool"), programMs: 0, modelCalls: external ? modelCalls : activity.count("model_request"), toolCalls: activity.count("tool") },
   });
   let continued = false;
-  const modelError = () => requestTimedOut ? `模型单次请求超时（${requestTimeoutMs}ms）${continued ? "；本工位的原地续答次数已用完" : ""}` : agent.state.errorMessage && redactModelError(agent.state.errorMessage, selectedPi);
+  const modelError = () => modelRequestWait() ? `MODEL_CIRCUIT_OPEN: ${modelRequestWait()!.reason}` : requestTimedOut ? `模型单次请求超时（${requestTimeoutMs}ms）${continued ? "；本工位的原地续答次数已用完" : ""}` : agent.state.errorMessage && redactModelError(agent.state.errorMessage, selectedPi);
   const modelFailure = (error: string, summary: string): StationResult => {
     let data: Record<string, unknown> | undefined = closedCheckpoint();
     const checkpoint = sessionCheckpoint();
     if (checkpoint?.pi) data = { stationSessions: { ...sessions, [ctx.node.key]: checkpoint.pi } };
-    return {ok:false,summary,error:error.slice(0,240),failure:classifyFailure(error,{stage:'model'}),data,usage:usageReported?usage:undefined,metrics:metrics()};
+    return {ok:false,summary,error:error.slice(0,240),failure:classifyFailure(error,{stage:'model'}),data,usage:costReported?usage:undefined,metrics:metrics()};
   };
   const invoke = async (run: () => Promise<void>) => {
     sessionSignal.throwIfAborted();
@@ -365,8 +396,8 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     await ask("You did not call submit. Call submit now with your answer.");
   }
   const error = modelError();
-  if (error && !submitted) return modelFailure(error, "模型调用失败");
-  if (!submitted) return { ok: false, summary: "模型没有提交结果", error: "no submit", data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics() };
+  if (error && (!submitted || modelRequestWait())) return modelFailure(error, "模型调用失败");
+  if (!submitted) return { ok: false, summary: "模型没有提交结果", error: "no submit", data: closedCheckpoint(), usage: costReported ? usage : undefined, metrics: metrics() };
   let out = submitted as T;
   if (def.describe) ctx.progress(def.describe(out), { tool: "submit", text: "", ok: true });
   let issues = def.check?.(out, ctx) ?? [];
@@ -376,7 +407,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     submitted = null;
     await ask(`Your submission failed these program checks:\n- ${issues.join("\n- ")}\nFix them and call submit again.`);
     const repairError = modelError();
-    if (repairError && !submitted) return modelFailure(repairError, "模型重答失败");
+    if (repairError && (!submitted || modelRequestWait())) return modelFailure(repairError, "模型重答失败");
     rounds++;
     if (submitted) {
       out = submitted as T;
@@ -389,7 +420,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     if (!saved) {
       return {
         ok: false, summary: `重答后仍不合格：${issues[0]}`,
-        error: issues.join('; '), data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics(),
+        error: issues.join('; '), data: closedCheckpoint(), usage: costReported ? usage : undefined, metrics: metrics(),
       };
     }
     // Salvage is a deterministic correction, never an exemption from the
@@ -399,7 +430,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     if (remaining.length) {
       return {
         ok: false, summary: `修剪后仍不合格：${remaining[0]}`,
-        error: remaining.join('; '), data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics(),
+        error: remaining.join('; '), data: closedCheckpoint(), usage: costReported ? usage : undefined, metrics: metrics(),
       };
     }
     ctx.progress(`逐项修剪后保留可用部分（丢弃：${issues.slice(0, 3).join('；')}）`, {
@@ -412,17 +443,18 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   sessionSignal.throwIfAborted();
   const res = await def.after(out, { ...ctx, signal: sessionSignal }, { rounds, issues });
   sessionSignal.throwIfAborted();
+  if (modelRequestWait()) return modelFailure(modelError()!, '工具所需模型暂不可用，保留当前会话等待');
   const remainingSessions = {...sessions}; delete remainingSessions[ctx.node.key];
   const closedData = res.ok && agent instanceof ClosedStationAgent ? (() => {
     agent.clearSession();
     const remaining = { ...closedSessions }; delete remaining[ctx.node.key];
     return closedSessions[ctx.node.key] ? { closedStationSessions: remaining } : undefined;
   })() : closedCheckpoint();
-  return { ...res, data: {...res.data,...(sessions[ctx.node.key] ? {stationSessions:remainingSessions} : {}), ...closedData}, usage: usageReported ? usage : undefined, metrics: metrics() };
+  return { ...res, data: {...res.data,...(sessions[ctx.node.key] ? {stationSessions:remainingSessions} : {}), ...closedData}, usage: costReported ? usage : undefined, metrics: metrics() };
   } catch (err) {
     const awaitingModel = activity.snapshot().spans.some(span => span.kind === 'model_request' && span.status === 'running');
     activity.close(ctx.signal.aborted || ["AbortError", "TimeoutError"].includes((err as Error)?.name) ? "cancelled" : "failed");
-    if (ctx.signal.aborted) throwStationAbort(ctx.signal, { ok: false, summary: "模型调用已取消", usage: usageReported ? usage : undefined, metrics: metrics(), sessionCheckpoint: sessionCheckpoint() });
+    if (ctx.signal.aborted) throwStationAbort(ctx.signal, { ok: false, summary: "模型调用已取消", usage: costReported ? usage : undefined, metrics: metrics(), sessionCheckpoint: sessionCheckpoint() });
     if (sessionSignal.aborted && awaitingModel) return modelFailure(`工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留`, '工位工作预算已用完');
     const failure = sessionSignal.aborted ? sessionSignal.reason : err;
     const imageFailure: Failure | undefined = preparingImages ? {
@@ -431,7 +463,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
       message: sessionSignal.aborted ? '图像输入准备超出工位总工作预算' : failure instanceof Error ? failure.message : String(failure),
       nextAction: '检查本地图像转换和共享处理容量，从当前工位恢复；保留已有证据与会话，不重复模型请求。',
     } : undefined;
-    return { ok: false, summary: sessionSignal.aborted ? "工位工作预算已用完" : preparingImages ? '图像输入准备失败' : "模型调用失败", error: sessionSignal.aborted ? `工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留` : failure instanceof Error ? failure.message : String(failure), failure: (failure as { failure?: Failure })?.failure ?? imageFailure ?? classifyFailure(failure, { stage: 'model' }), data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics() };
+    const checkpoint = sessionCheckpoint();
+    const data = checkpoint?.pi ? {stationSessions: {...sessions, [ctx.node.key]: checkpoint.pi}} : closedCheckpoint();
+    return { ok: false, summary: sessionSignal.aborted ? "工位工作预算已用完" : preparingImages ? '图像输入准备失败' : "模型调用失败", error: sessionSignal.aborted ? `工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留` : failure instanceof Error ? failure.message : String(failure), failure: (failure as { failure?: Failure })?.failure ?? imageFailure ?? classifyFailure(failure, { stage: 'model' }), data, usage: costReported ? usage : undefined, metrics: metrics() };
   } finally { activity.close("failed"); narration.flush(); }
 }
 

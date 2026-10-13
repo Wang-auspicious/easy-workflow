@@ -2,6 +2,7 @@ export type FailureTag = "invalid_url" | "http_not_found" | "page_unavailable" |
 export interface Failure { tag:FailureTag; category:"invalid"|"network"|"auth"|"system"; message:string; url?:string; requestedUrl?:string; code?:string; status?:number; retryable:boolean;
   /** What to do next, written for the agent or person who owns the fix (Spec §30.4). */
   nextAction?:string;
+  dependency?: import('./types.ts').ModelDependency;
   /** Who can fix it: the agent itself, the owner (login, certificate, credentials) or the system (bug / environment). */
   owner?:"agent"|"user"|"system";
   /** Methods already tried, so nobody repeats them. */
@@ -49,10 +50,24 @@ export function classifyFailure(error:unknown, context:{url?:string;requestedUrl
   const message=(String(e?.message??error??"未知错误")+(detail?` (${detail})`:"")).replace(/\u001b\[[0-9;]*m/g,"").slice(0,1200);
   const text=`${code??""} ${message} ${e?.cause?.message??""}`;
   const status=context.status??(Number(text.match(/(?:HTTP|httpError:)[ :]*(\d{3})/i)?.[1]??0)||undefined);
+  // Provider error codes need no HTTP status in streamed SDK failures. Match
+  // explicit codes/prefixes, not a validation message merely naming a field.
+  const providerServiceFailure = ['server_error', 'internal_server_error', 'service_unavailable', 'overloaded_error']
+    .includes(typeof code === 'string' ? code.toLowerCase() : '') ||
+    /^(?:server_error|internal_server_error|service_unavailable|overloaded_error)\s*:/i.test(message.trim()) ||
+    (status !== undefined && status >= 500 && status <= 599);
   let tag:FailureTag="tool_error",category:Failure["category"]="system";
+  if (/MODEL_CAPACITY_REENTRANT/.test(text)) return {
+    tag: 'tool_error', category: 'system', code: 'MODEL_CAPACITY_REENTRANT', message,
+    retryable: false, owner: 'agent', nextAction: '该客户端等待的工具又申请同一模型名额；请把嵌套模型步骤拆成独立工位，或显式配置足够容量。不会自动付费重试。',
+  };
+  if (/MODEL_CIRCUIT_OPEN|MODEL_CAPACITY_TIMEOUT/.test(text)) return {
+    tag: 'tool_error', category: 'system', code: text.includes('MODEL_CIRCUIT_OPEN') ? 'MODEL_CIRCUIT_OPEN' : 'MODEL_CAPACITY_TIMEOUT',
+    message, retryable: true, owner: 'system', nextAction: '共享模型尚未放行；保留原工位与会话等待，不记为新的供应商故障。',
+  };
   if (context.stage === 'model' && isTlsFailure(error)) return withAdvice({ tag: 'model_unavailable', category: 'auth', message, url: context.url, requestedUrl: context.requestedUrl, code, status, retryable: true, owner: 'user', nextAction: '模型连接的 TLS / 证书校验失败：已暂停模型任务；先修复证书或代理配置，再确认恢复。不会忽略证书校验或自动重复请求。' });
   if(context.stage==="model"&&([401,402,403].includes(status??0)||/401|403|quota|insufficient|credit|balance|unauthori[sz]ed|api key|余额|额度/i.test(text))){tag="model_unavailable";category="auth";}
-  else if(context.stage==="model"&&/MODEL_CIRCUIT_OPEN|timeout|timed?[ _]?out|超时|ECONN|ENOTFOUND|EAI_AGAIN|CERT_|ERR_(?:SSL|TLS)_|fetch failed|connection error|socket|terminated|overloaded|temporarily|rate.?limit|\b429\b|\b50[0-9]\b/i.test(text)){tag="model_transport";category="system";}
+  else if(context.stage==="model"&&(providerServiceFailure||/MODEL_CIRCUIT_OPEN|timeout|timed?[ _]?out|超时|ECONN|ENOTFOUND|EAI_AGAIN|CERT_|ERR_(?:SSL|TLS)_|fetch failed|connection error|socket|terminated|overloaded|temporarily|rate.?limit|\b429\b|\b50[0-9]\b/i.test(text))){tag="model_transport";category="system";}
   else if(context.stage==="url"||/invalid url|无法解析.*网址/i.test(text)){tag="invalid_url";category="invalid";}
   else if(status===404||status===410){tag="http_not_found";category="invalid";}
   // Error codes identify the failed operation before words in its URL or context.
