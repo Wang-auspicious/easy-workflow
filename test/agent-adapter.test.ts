@@ -22,6 +22,7 @@ import { EvidenceStore, type ImageProcessOptions } from '../server/evidence.ts';
 import { closeModelTransport, models, piStatus, probeModelConnection, redactModelError } from '../server/pi.ts';
 import type { StationAgentBinding } from '../shared/types.ts';
 import { sessionSignature, type SessionRef } from '../server/station-session.ts';
+import {withModelAdmission} from '../server/model-requests.ts';
 
 test("closed launcher receives envelope first, calls scoped MCP, repairs and reports real usage", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-closed-agent-test-"));
@@ -640,6 +641,33 @@ test('runtime cancellation journals only host session metadata and resumes it in
       }
     } finally { await runtime.close(); journal.close(); }
   });
+});
+
+test('closed agents obey model admission before opening a scope or launching a vendor process', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-launcher-admission-'));
+  const receipt = path.join(dir, 'request.json');
+  const code = `let input='';process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{require('node:fs').writeFileSync(${JSON.stringify(receipt)},input);process.stdout.write(JSON.stringify({model:'actual-fixture-model',modelCalls:1}));});`;
+  try {
+    for (const adapter of ['launcher', 'claude-code'] as const) {
+      const agent = new ClosedStationAgent({adapter, command: [process.execPath, '-e', code, '--'],
+        model: 'fixture-requested', cwd: dir}, 'Fixture envelope', [], () => {});
+      await assert.rejects(withModelAdmission(() => 'Another task owns the model trial',
+        () => agent.prompt('Blocked input')), /MODEL_CIRCUIT_OPEN/);
+      assert.equal(fs.existsSync(receipt), false, 'blocked work must never start the vendor process');
+      if (adapter === 'launcher') {
+        await withModelAdmission(() => null, () => agent.prompt('Allowed input'));
+        const request = JSON.parse(fs.readFileSync(receipt, 'utf8'));
+        assert.equal(request.messages.length, 1, 'a refused request must not enter the resumed conversation');
+        assert.match(request.firstMessage.content[0].text, /Allowed input/);
+        assert.doesNotMatch(request.firstMessage.content[0].text, /Blocked input/);
+        fs.unlinkSync(receipt);
+      }
+    }
+  } finally {
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(dir).startsWith('easy-workflow-launcher-admission-'));
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
 });
 
 test('structured launcher failures preserve category and timeout stops a silent vendor process', { timeout: 15000 }, async () => {
