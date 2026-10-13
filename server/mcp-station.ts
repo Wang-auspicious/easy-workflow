@@ -15,6 +15,7 @@ import { factorySecrets, launcherEnvironment, redactText, redactValue } from "./
 import { ClaudeCodeProtocol, validClaudeSession, type ClaudeSessionReference } from './claude-code.ts';
 import { classifyFailure, type Failure } from '../shared/failures.ts';
 import {checkModelAdmission} from './model-requests.ts';
+import {closedModelDependency} from './agent-bindings.ts';
 
 export interface StationTool {
   name: string; label: string; description: string; parameters: TSchema;
@@ -244,7 +245,9 @@ export class ClosedStationAgent {
     }
   }
   async prompt(text: string, images?: { type: "image"; data: string; mimeType: string }[]) {
-    checkModelAdmission();
+    checkModelAdmission(closedModelDependency({
+      adapter: this.config.adapter ?? 'launcher', command: this.config.command, model: this.config.model,
+    }));
     this.state.errorMessage = undefined;
     const first = this.messages.length === 0;
     this.messages.push({ role: "user", content: [{ type: "text", text: redactText(first ? `${this.envelope}\n\n---\n# 本次输入\n${text}` : text, factorySecrets()) }, ...(images ?? [])] });
@@ -285,7 +288,9 @@ export class ClosedStationAgent {
 async function runLauncher(config: ClosedAgentConfig, request: { messages: Message[]; mcpServers: Record<string, unknown> }, signal: AbortSignal, vendor?: ClaudeCodeProtocol): Promise<ClosedAgentReply> {
   signal.throwIfAborted();
   // The model hold can change while the attempt-scoped MCP server opens.
-  checkModelAdmission();
+  checkModelAdmission(closedModelDependency({
+    adapter: config.adapter ?? 'launcher', command: config.command, model: config.model,
+  }));
   fs.mkdirSync(config.cwd, { recursive: true });
   const command = vendor ? vendor.argv(config.command, request.mcpServers) : config.command;
   const child = spawn(command[0], command.slice(1), { cwd: config.cwd, env: { ...launcherEnvironment(), ...(vendor ? {

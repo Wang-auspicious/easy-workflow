@@ -14,6 +14,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { classifyFailure } from "../shared/failures.ts";
 import { redactText } from "./mcp-security.ts";
 import { ModelRequests, checkModelAdmission } from './model-requests.ts';
+import {piModelDependency} from './agent-bindings.ts';
 
 export const MODEL_REQUEST_DEADLINE = Symbol('model-request-deadline');
 const requests = new ModelRequests(Math.max(1, Math.min(8, Number(process.env.FACTORY_MODEL_REQUESTS) || 2)));
@@ -71,7 +72,6 @@ const credentials: CredentialStore = {
 
 export function models(requested?: PiModelSelection) {
   const selection = piSelection(requested);
-  const selected = { provider: selection.provider, model: selection.id };
   const m = createModels({ credentials });
   const builtin = opencodeGoProvider();
   m.setProvider(builtin);
@@ -104,15 +104,20 @@ export function models(requested?: PiModelSelection) {
   }
   const model = m.getModel(selection.provider, selection.id);
   if (!model) throw new Error(`Pi 模型未配置：${selection.provider}/${selection.id}；请检查 Pi settings.json / models.json。`);
+  const dependency = piModelDependency({provider: model.provider, model: model.id, endpoint: model.baseUrl});
   const stream: StreamFn = async (model, context, options) => {
-    checkModelAdmission();
+    // Capture the actual request model before it waits for shared capacity.
+    const requestModel = {...model};
+    const selected = {provider: requestModel.provider, model: requestModel.id};
+    const requestDependency = piModelDependency({...selected, endpoint: requestModel.baseUrl});
+    checkModelAdmission(requestDependency);
     const release = await requests.acquire(options?.signal);
     const deadline = (options as typeof options & { [MODEL_REQUEST_DEADLINE]?: { ms: number; expired: () => void } })?.[MODEL_REQUEST_DEADLINE];
     const timeout = deadline ? AbortSignal.timeout(deadline.ms) : undefined;
     if (timeout) timeout.addEventListener('abort', deadline!.expired, { once: true });
     const cleanup = () => { if (timeout) timeout.removeEventListener('abort', deadline!.expired); release(); };
     try {
-      checkModelAdmission();
+      checkModelAdmission(requestDependency);
       const signal = timeout ? AbortSignal.any([timeout, ...(options?.signal ? [options.signal] : [])]) : options?.signal;
       // Recovery belongs to the station transcript/circuit, not three nested SDK
       // attempts multiplied by station continuation and per-site batch retries.
@@ -121,13 +126,13 @@ export function models(requested?: PiModelSelection) {
         try { return await modelFetch(input, init); }
         catch (error) {
           const e = error as {message?:string;code?:string;cause?:{code?:string;message?:string}};
-          let endpoint = model.provider;
+          let endpoint = requestModel.provider;
           try { endpoint = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url).host; } catch {}
           transportDetail = redactModelError([endpoint,e.cause?.code??e.code,e.cause?.message??e.message].filter(Boolean).join(' · '), selected).slice(0,400);
           throw error;
         }
       };
-      const response = m.streamSimple(model, context, { ...options, signal, maxRetries: 0, fetch: observedFetch });
+      const response = m.streamSimple(requestModel, context, { ...options, signal, maxRetries: 0, fetch: observedFetch });
       void response.result().then(result => {
         if (result.stopReason === 'error') {
           const message = redactModelError(result.errorMessage ?? '模型连接失败', selected);
@@ -138,7 +143,7 @@ export function models(requested?: PiModelSelection) {
       return response;
     } catch (error) { cleanup(); throw error; }
   };
-  return { models: m, model: model as Model<Api>, stream };
+  return { models: m, model: model as Model<Api>, stream, dependency };
 }
 
 export function piStatus(requested?: PiModelSelection) {

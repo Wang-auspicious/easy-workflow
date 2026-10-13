@@ -13,6 +13,7 @@ import { EvidenceStore, type ImageProcessOptions } from "../server/evidence.ts";
 import { legacyReply, type ConversationEntry } from "../shared/conversation.ts";
 import type { Factory } from "../server/factory.ts";
 import type { FactoryControl } from "../server/control.ts";
+import {piModelDependency} from '../server/agent-bindings.ts';
 
 const answer = (text = "继续完成了") => legacyReply(text, Date.now());
 const failure = (text = "The operation was aborted due to timeout") => ({ ...answer(""), stopReason: "error" as const, errorMessage: text });
@@ -35,7 +36,8 @@ function fixture(handler: (count: number, context: TranscriptContext, signal: Ab
     agentTools: () => [{ name: "easy_workflow_call", label: "Call", description: "Call", parameters: { type: "object", properties: { name: { type: "string" }, arguments: { type: "object" } }, required: ["name", "arguments"] },
       execute: async () => { writes++; await execute?.(); return { content: [{ type: "text", text: "created t-fixture" }], details: { summary: "created t-fixture", result: { task: "t-fixture" } } }; } }] } as unknown as FactoryControl;
   const opts: DispatcherOptions = { requestTimeoutMs: 1000, retryDelaysMs: [1, 1], ...options, modelFactory: () => ({
-    models: {} as never, model: { id: "fixture", provider: "fixture", api: "openai-completions", baseUrl: "", name: "fixture", reasoning: false, input: ["text"], contextWindow: 32000, maxTokens: 4000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    dependency: piModelDependency({provider: 'fixture', model: 'fixture', endpoint: 'https://model.fixture.invalid/v1'}),
+    models: {} as never, model: { id: "fixture", provider: "fixture", api: "openai-completions", baseUrl: "https://model.fixture.invalid/v1", name: "fixture", reasoning: false, input: ["text"], contextWindow: 32000, maxTokens: 4000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
     stream: (_model, context, options) => {
       const stream = createAssistantMessageEventStream(); const count = ++calls;
       queueMicrotask(async () => {

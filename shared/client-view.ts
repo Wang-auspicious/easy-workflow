@@ -53,7 +53,7 @@ function tokenData(data: Record<string, unknown>) {
 function attemptMetrics(metrics: AttemptMetrics | undefined): AttemptMetrics | undefined {
   if (!metrics) return undefined;
   const summary = pick(metrics, [
-    'execution', 'usageReported', 'usageComplete', 'cacheUsageComplete', 'modelTimeReported',
+    'execution', 'dependency', 'usageReported', 'usageComplete', 'cacheUsageComplete', 'modelTimeReported',
   ]);
   return Object.keys(summary).length ? summary : undefined;
 }

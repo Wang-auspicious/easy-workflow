@@ -167,6 +167,8 @@ export interface AttemptActivity {
 
 /** Token and time breakdown of one attempt (Spec §37). Estimated parts are char-based. */
 export interface AttemptMetrics {
+  /** Dependency captured for this execution; separate from the reported actual model. */
+  dependency?: ModelDependency;
   usageReported?: boolean;
   modelTimeReported?: boolean;
   usageComplete?: boolean;
@@ -224,6 +226,14 @@ export type StationAgentBinding =
   | {adapter: 'pi'; provider?: string; model?: string}
   | {adapter: 'claude-code' | 'launcher'; command: string[]; model: string; requestTimeoutMs?: number};
 
+/** Public fault-domain identity. Endpoints, command arguments and credentials are private. */
+export interface ModelDependency {
+  readonly key: string;
+  readonly adapter: 'pi' | 'claude-code' | 'launcher';
+  readonly provider?: string;
+  readonly model: string;
+}
+
 export type JournalEvent =
   | import("./lessons.ts").LessonEvent
   | { kind: "factory.loaded"; digest: string; specVersion: string }
@@ -239,7 +249,7 @@ export type JournalEvent =
   | { kind: "stock.set"; node: string; stock: number; note?: string }
   | { kind: "token.created"; token: string; line: string; item: string; url: string; title?: string; source: string; category?: string }
   | { kind: "token.queued"; token: string; node: string; from?: string; returned?: boolean }
-  | { kind: "attempt.started"; attempt: string; token: string; node: string; worker: string; input: string }
+  | { kind: "attempt.started"; attempt: string; token: string; node: string; worker: string; input: string; dependency?: ModelDependency }
   | { kind: "attempt.progress"; attempt: string; text: string; step?: StepDetail }
   | { kind: "attempt.activity"; attempt: string; activity: ActivitySpan }
   | { kind: "attempt.finished"; attempt: string; ok: boolean; summary: string; ms: number; queuedMs: number; usage?: Usage; error?: string; output?: Record<string, unknown>; cancelled?:boolean; metrics?: AttemptMetrics }

@@ -6,10 +6,79 @@ import os from 'node:os';
 import http from 'node:http';
 import {setTimeout as delay} from 'node:timers/promises';
 import {checkAgentEndpoints, checkModelEndpoint, preflight} from '../server/preflight.ts';
-import { closeModelTransport } from '../server/pi.ts';
+import {closeModelTransport, models} from '../server/pi.ts';
 import { closeNetwork } from '../server/network.ts';
 import {Broker} from '../server/broker.ts';
-import type {StationAgentBinding} from '../shared/types.ts';
+import type {ModelDependency, StationAgentBinding} from '../shared/types.ts';
+import {closedModelDependency, piModelDependency} from '../server/agent-bindings.ts';
+import {checkModelAdmission, withModelAdmission} from '../server/model-requests.ts';
+import {Journal} from '../server/journal.ts';
+import {apply, initialState} from '../shared/project.ts';
+import {applyUiEvent, uiEvent, uiState} from '../shared/client-view.ts';
+import {normalizeContext} from '@earendil-works/pi-ai';
+
+test('model dependency identities are stable, distinguish execution boundaries and reveal no private connection data', async () => {
+  const first = piModelDependency({provider: 'provider-a', model: 'small',
+    endpoint: 'https://user:private-password@MODEL.fixture.invalid:443/v1/?api_key=private-query#private-fragment'});
+  const same = piModelDependency({provider: 'provider-a', model: 'large', endpoint: 'https://model.fixture.invalid/v1'});
+  assert.equal(first.key, same.key, 'models sharing one provider endpoint share its failure domain');
+  assert.notEqual(first.key, piModelDependency({provider: 'provider-b', model: 'small', endpoint: 'https://model.fixture.invalid/v1'}).key);
+  assert.notEqual(first.key, piModelDependency({provider: 'provider-a', model: 'small', endpoint: 'https://other.fixture.invalid/v1'}).key);
+  const command = ['private-launcher', '--credential', 'private-argv-secret'];
+  const binding = {adapter: 'launcher' as const, command, model: 'requested'};
+  const closed = closedModelDependency(binding);
+  assert.equal(closed.key, closedModelDependency({...binding, command: [...command], requestTimeoutMs: 1000}).key);
+  assert.notEqual(closed.key, closedModelDependency({...binding, model: 'other-model'}).key);
+  assert.notEqual(closed.key, closedModelDependency({...binding, adapter: 'claude-code'}).key);
+  assert.notEqual(closed.key, closedModelDependency({...binding, command: ['private-launcher', '--profile', 'another']}).key);
+  assert.equal(closed.provider, undefined, 'a closed executor does not identify its provider');
+  assert.doesNotMatch(JSON.stringify([first, same, closed]), /private-|model\.fixture|--credential/);
+  assert.throws(() => piModelDependency({provider: 'a', model: 'small', endpoint: 'private-invalid-endpoint'}),
+    error => error instanceof Error && !error.message.includes('private-invalid-endpoint'));
+  assert.doesNotThrow(() => checkModelAdmission(), 'no admission context allows ordinary calls');
+  await assert.rejects(withModelAdmission(() => 'legacy global hold', async () => checkModelAdmission(first)), /MODEL_CIRCUIT_OPEN/);
+  await assert.rejects(withModelAdmission(() => 'legacy global hold', async () => checkModelAdmission()), /MODEL_CIRCUIT_OPEN/);
+
+  const journal = new Journal(':memory:');
+  const raw = initialState();
+  const liveUi = uiState(initialState());
+  journal.subscribeProjection(event => apply(raw, event));
+  journal.subscribe(event => applyUiEvent(liveUi, uiEvent(event)));
+  try {
+    const laterBinding: StationAgentBinding = {adapter: 'pi', provider: 'provider-b', model: 'other-model'};
+    journal.append({kind: 'run.started', runId: 'dependency-fixture', title: 'Dependency history'});
+    journal.append({kind: 'agent.binding', node: 'fixture/reader',
+      binding: {adapter: 'pi', provider: first.provider, model: first.model}});
+    journal.append({kind: 'token.created', token: 'item', item: 'fixture', line: 'fixture',
+      url: 'https://input.fixture.invalid', source: 'test'});
+    journal.append({kind: 'attempt.started', attempt: 'started-with-a', token: 'item',
+      node: 'fixture/reader', worker: 'reader', input: 'Fixture input', dependency: first});
+    journal.append({kind: 'agent.binding', node: 'fixture/reader', binding: laterBinding});
+    journal.append({kind: 'attempt.finished', attempt: 'started-with-a', ok: true,
+      summary: 'Fixture response', ms: 1, queuedMs: 0, metrics: {
+        dependency: first, execution: {adapter: 'pi', model: 'reported-model'},
+      }});
+    const replayed = initialState();
+    const replayedUi = uiState(initialState());
+    for (const event of journal.read()) {
+      apply(replayed, event);
+      applyUiEvent(replayedUi, uiEvent(event));
+    }
+    for (const state of [raw, replayed, liveUi, replayedUi, uiState(raw)]) {
+      assert.deepEqual(state.agentBindings?.['fixture/reader'], laterBinding);
+      assert.deepEqual(state.attempts['started-with-a'].dependency, first,
+        'rebinding the station must not rewrite the dependency captured by an existing attempt');
+      assert.deepEqual(state.attempts['started-with-a'].metrics?.dependency, first);
+      assert.equal(state.attempts['started-with-a'].metrics?.execution?.model, 'reported-model',
+        'the reported actual model remains separate from the requested dependency');
+      assert.equal(state.seq, journal.seq);
+    }
+    assert.notStrictEqual(raw.attempts['started-with-a'].dependency, first,
+      'attempt projections own their captured identity');
+  } finally {
+    journal.close();
+  }
+});
 
 test('model preflight tests authenticated inference, not a healthy public base URL', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-model-check-'));
@@ -107,6 +176,120 @@ test('model preflight tests authenticated inference, not a healthy public base U
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
     for (const key of keys) if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Pi admission carries the selected dependency across concurrent contexts and rechecks after capacity waits', {timeout: 15000}, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-model-dependency-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const requests: {path: string; model: string; held: boolean}[] = [];
+  const controllers: AbortController[] = [];
+  const pending: Promise<unknown>[] = [];
+  const server = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString()) as {model: string; messages: {content: unknown}[]};
+    const provider = request.url?.startsWith('/a/') ? 'a' : 'b';
+    assert.equal(request.headers.authorization, `Bearer fixture-${provider}-private-key`);
+    const held = body.messages.some(message => message.content === 'HOLD');
+    requests.push({path: request.url!, model: body.model, held});
+    if (held) return;
+    response.writeHead(200, {'content-type': 'text/event-stream'});
+    for (const part of [
+      {choices: [{index: 0, delta: {role: 'assistant', content: 'OK'}, finish_reason: null}]},
+      {choices: [{index: 0, delta: {}, finish_reason: 'stop'}], usage: {prompt_tokens: 2, completion_tokens: 1, total_tokens: 3}},
+    ]) response.write(`data: ${JSON.stringify({id: 'dependency-fixture', model: body.model, ...part})}\n\n`);
+    response.end('data: [DONE]\n\n');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as {port: number}).port}`;
+  process.env.PI_CODING_AGENT_DIR = root;
+  fs.writeFileSync(path.join(root, 'auth.json'), JSON.stringify(Object.fromEntries(['a', 'b'].map(provider =>
+    [provider, {type: 'api_key', key: `fixture-${provider}-private-key`}]))));
+  fs.writeFileSync(path.join(root, 'models.json'), JSON.stringify({providers: Object.fromEntries(['a', 'b'].map(provider =>
+    [provider, {api: 'openai-completions', baseUrl: `${origin}/${provider}/v1`, models: [
+      {id: 'shared', input: ['text']}, {id: 'another-model', input: ['text']},
+      {id: 'another-endpoint', input: ['text'], baseUrl: `${origin}/${provider}/alternate/v1`},
+    ]}]))}));
+  const invoke = async (selected: ReturnType<typeof models>, content = 'OK', signal?: AbortSignal) => {
+    const context = normalizeContext({messages: [{role: 'user', content, timestamp: Date.now()}]});
+    const response = await selected.stream(selected.model, context, {signal, maxTokens: 8});
+    return response.result();
+  };
+  try {
+    const a = models({provider: 'a', model: 'shared'});
+    const b = models({provider: 'b', model: 'shared'});
+    assert.notEqual(a.dependency.key, b.dependency.key);
+    assert.equal(a.dependency.key, models({provider: 'a', model: 'another-model'}).dependency.key);
+    assert.notEqual(a.dependency.key, models({provider: 'a', model: 'another-endpoint'}).dependency.key,
+      'the actual per-model endpoint override participates in dependency identity');
+    assert.doesNotMatch(JSON.stringify([a.dependency, b.dependency]), /private-key|127\.0\.0\.1/);
+    await assert.rejects(withModelAdmission(dependency => {
+      assert.equal(dependency?.key, b.dependency.key);
+      return 'Actual stream argument is held';
+    }, () => Promise.resolve(a.stream(b.model, normalizeContext({messages: []}), {}))), /Actual stream argument is held/);
+    const seenA: ModelDependency[] = [];
+    const seenB: ModelDependency[] = [];
+    const guard = (selected: typeof a, seen: ModelDependency[]) => (dependency?: ModelDependency) => {
+      assert.ok(dependency);
+      seen.push(dependency);
+      return dependency.key === selected.dependency.key ? null : 'Wrong concurrent dependency';
+    };
+    const results = await Promise.all([
+      withModelAdmission(guard(a, seenA), () => invoke(a)),
+      withModelAdmission(guard(b, seenB), () => invoke(b)),
+    ]);
+    assert.ok(results.every(result => result.stopReason === 'stop'));
+    assert.deepEqual(seenA.map(dependency => dependency.provider), ['a', 'a']);
+    assert.deepEqual(seenB.map(dependency => dependency.provider), ['b', 'b']);
+    const before = requests.length;
+    await withModelAdmission(dependency => dependency?.key === a.dependency.key ? 'Provider A held' : null, async () => {
+      await Promise.all([assert.rejects(invoke(a), /MODEL_CIRCUIT_OPEN/), invoke(b)]);
+    });
+    assert.equal(requests.length, before + 1);
+    assert.ok(requests.at(-1)!.path.startsWith('/b/'), 'healthy selection is not rejected by another dependency guard');
+    const captured = models({provider: 'b', model: 'shared'});
+    const capturedReply = invoke(captured);
+    captured.model.baseUrl = `${origin}/must-not-be-used`;
+    captured.model.id = 'must-not-be-used';
+    assert.equal((await capturedReply).stopReason, 'stop');
+    assert.equal(requests.at(-1)!.model, 'shared');
+    assert.ok(requests.at(-1)!.path.startsWith('/b/'), 'the queued request retains its captured endpoint and model');
+
+    const capacity = Math.max(1, Math.min(8, Number(process.env.FACTORY_MODEL_REQUESTS) || 2));
+    for (let index = 0; index < capacity; index++) {
+      const controller = new AbortController();
+      controllers.push(controller);
+      pending.push(invoke(a, 'HOLD', controller.signal));
+    }
+    const readyBy = Date.now() + 4000;
+    while (requests.filter(request => request.held).length < capacity && Date.now() < readyBy) await delay(10);
+    assert.equal(requests.filter(request => request.held).length, capacity);
+    let held = false;
+    const checks: string[] = [];
+    const queued = withModelAdmission(dependency => {
+      assert.equal(dependency?.key, b.dependency.key);
+      checks.push(dependency!.key);
+      return held ? 'Dependency opened while queued' : null;
+    }, () => invoke(b));
+    const rejected = assert.rejects(queued, /Dependency opened while queued/);
+    assert.equal(checks.length, 1);
+    const requestsBeforeHold = requests.length;
+    held = true;
+    controllers[0].abort();
+    await rejected;
+    assert.equal(checks.length, 2, 'a queued request must recheck its own dependency after admission');
+    assert.equal(requests.length, requestsBeforeHold, 'the held request never reaches the provider');
+  } finally {
+    for (const controller of controllers) controller.abort();
+    await Promise.allSettled(pending);
+    await closeModelTransport();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
+    fs.rmSync(root, {recursive: true, force: true});
   }
 });
 
@@ -218,6 +401,38 @@ test('adapter preflight validates a scoped nonce and reclaims only its own proje
       assert.match(result.detail, /fixture-actual-launcher/);
       assert.equal(result.detail.split('健康回执').length - 1, 1);
       await checkReclaimed('launcher');
+    });
+    await t.test('closed admission checks the actual executor before scope creation and again before spawn', async () => {
+      const allowed = binding('admission-allowed', 'success', 'launcher');
+      const blocked = binding('admission-blocked', 'success', 'claude-code');
+      const allowedDependency = closedModelDependency(allowed);
+      const blockedDependency = closedModelDependency(blocked);
+      const seen: ModelDependency[] = [];
+      const results = await withModelAdmission(dependency => {
+        assert.ok(dependency);
+        seen.push(dependency);
+        return dependency.key === blockedDependency.key ? 'This executor is held' : null;
+      }, () => Promise.all([
+        checkAgentEndpoints(root, [allowed], {timeoutMs: 5000}),
+        checkAgentEndpoints(root, [blocked], {timeoutMs: 5000}),
+      ]));
+      assert.equal(results[0].ok, true, results[0].detail);
+      assert.equal(results[1].ok, false);
+      assert.equal(seen.filter(dependency => dependency.key === allowedDependency.key).length, 2);
+      assert.equal(seen.filter(dependency => dependency.key === blockedDependency.key).length, 1);
+      assert.equal(fs.existsSync(tracePath('admission-blocked')), false);
+      await checkReclaimed('admission-allowed');
+      let calls = 0;
+      const late = binding('admission-late', 'success', 'launcher');
+      const lateDependency = closedModelDependency(late);
+      const result = await withModelAdmission(dependency => {
+        assert.equal(dependency?.key, lateDependency.key);
+        return ++calls === 1 ? null : 'Executor held while scope was opening';
+      }, () => checkAgentEndpoints(root, [late], {timeoutMs: 5000}));
+      assert.equal(result.ok, false);
+      assert.equal(calls, 2);
+      assert.equal(fs.existsSync(tracePath('admission-late')), false);
+      assert.deepEqual(fs.readdirSync(work), [path.basename(retained)]);
     });
     await t.test('metadata without a valid nonce and authentication failures cannot mark the model healthy', async () => {
       for (const mode of ['no-submit', 'wrong-nonce', 'credentials']) {

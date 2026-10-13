@@ -1,8 +1,15 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-const admission = new AsyncLocalStorage<() => string | null>();
-export const withModelAdmission = <T>(blocked: () => string | null, run: () => Promise<T>) => admission.run(blocked, run);
-export function checkModelAdmission() {
-  const reason = admission.getStore()?.();
+import type {ModelDependency} from '../shared/types.ts';
+
+export type ModelAdmission = (dependency?: ModelDependency) => string | null;
+const admission = new AsyncLocalStorage<ModelAdmission>();
+
+export function withModelAdmission<T>(blocked: ModelAdmission, run: () => Promise<T>): Promise<T> {
+  return admission.run(blocked, run);
+}
+
+export function checkModelAdmission(dependency?: ModelDependency) {
+  const reason = admission.getStore()?.(dependency);
   if (reason) throw new Error(`MODEL_CIRCUIT_OPEN: ${reason}`);
 }
 

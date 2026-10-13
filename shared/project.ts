@@ -2,7 +2,7 @@
 // materialized view, the dashboard keeps another fed by SSE, and offline replay feeds
 // a recorded journal through the very same function (Spec §10.11, §11).
 import type {
-  Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, JournalEvent, PreflightCheck, Stamped, StepDetail, TokenStatus, Usage,
+  Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, JournalEvent, ModelDependency, PreflightCheck, Stamped, StepDetail, TokenStatus, Usage,
 } from "./types.ts";
 import { legacyReply, type ConversationEntry } from "./conversation.ts";
 import { mergeActivity } from "./activity.ts";
@@ -27,6 +27,8 @@ export interface AttemptState {
   node: string;
   worker: string;
   input: string;
+  /** Captured for this attempt; changing a station binding never rewrites it. */
+  dependency?: ModelDependency;
   startedAt: number;
   endedAt?: number;
   ok?: boolean;
@@ -274,7 +276,11 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       const n = node(e.node);
       remove(n.queue, e.token);
       n.active.push(e.attempt);
-      s.attempts[e.attempt] = { id: e.attempt, token: e.token, node: e.node, worker: e.worker, input: e.input, startedAt: e.at, steps: [], usage: zeroUsage() };
+      s.attempts[e.attempt] = {
+        id: e.attempt, token: e.token, node: e.node, worker: e.worker, input: e.input,
+        dependency: e.dependency ? {...e.dependency} : undefined,
+        startedAt: e.at, steps: [], usage: zeroUsage(),
+      };
       s.tokens[e.token]?.attempts.push(e.attempt);
       const w = s.workers[e.worker];
       if (w) { w.busy = e.attempt; w.spans.push([e.at, null, e.token]); if (w.spans.length > 400) w.spans.shift(); }
