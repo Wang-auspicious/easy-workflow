@@ -22,19 +22,52 @@ test("launcher filtering handles Windows environment casing and nested credentia
   assert.ok(!JSON.stringify(safe).includes("test-credential"));
 });
 
-test("closing a station scope aborts active calls and waits for credential cleanup", async () => {
-  let started!: () => void, cancelled = false;
-  const began = new Promise<void>(resolve => started = resolve);
-  const session = await openStationMcp([{ name: "env_call", label: "Wait", description: "test", parameters: Type.Object({}), execute: async (_id, _args, signal) => {
-    started(); await new Promise<void>(resolve => signal!.addEventListener("abort", () => { cancelled = true; resolve(); }, { once: true })); return mcpText("stopped");
-  } }], new AbortController().signal);
-  const file = session.config.env.H2_STATION_CONNECTION;
-  const request = mcpRequest(file, "h2-station/1", "/call", { name: "env_call", arguments: {} }).catch(() => null);
-  await began;
-  const first = session.close(), second = session.close(); assert.equal(first, second);
-  await first; await request;
-  assert.equal(cancelled, true); assert.equal(fs.existsSync(file), false);
-});
+for (const rejectedBeforeStart of [false, true]) {
+  const name = rejectedBeforeStart
+    ? 'HTTP failure before tool startup propagates and closes the station scope'
+    : 'closing a station scope aborts active calls and waits for credential cleanup';
+  test(name, {timeout: 10000}, async context => {
+    let started!: () => void;
+    let entered = false;
+    let cancelled = false;
+    const began = new Promise<void>(resolve => { started = resolve; });
+    const session = await openStationMcp([{
+      name: 'env_call', label: 'Wait', description: 'test', parameters: Type.Object({}),
+      execute: async (_id, _args, signal) => {
+        entered = true;
+        started();
+        await new Promise<void>(resolve => signal!.addEventListener('abort', () => {
+          cancelled = true;
+          resolve();
+        }, {once: true}));
+        return mcpText('stopped');
+      },
+    }], context.signal);
+    const file = session.config.env.H2_STATION_CONNECTION;
+    const request = mcpRequest(file, 'h2-station/1', rejectedBeforeStart ? '/missing-fixture-route' : '/call',
+      {name: 'env_call', arguments: {}}, context.signal);
+    try {
+      const startup = Promise.race([began, request.then(() => {
+        throw new Error('Station request ended before the tool started');
+      })]);
+      if (rejectedBeforeStart) {
+        await assert.rejects(startup, /404: Unknown station endpoint/);
+        assert.equal(entered, false);
+      } else {
+        await startup;
+        const first = session.close();
+        assert.equal(first, session.close());
+        await first;
+        assert.equal(cancelled, true);
+      }
+    } finally {
+      await session.close();
+      // Connection termination is expected only after the startup outcome was checked.
+      await request.catch(() => undefined);
+    }
+    assert.equal(fs.existsSync(file), false);
+  });
+}
 
 test("scope redacts accidental tool credential output and rejects credential-bearing arguments", async () => {
   const previous = process.env.FACTORY_TOKEN; process.env.FACTORY_TOKEN = "global-test-secret";
