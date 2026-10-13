@@ -22,6 +22,7 @@ import { toggleInspector } from "./Canvas.tsx";
 import { useNow } from "../util/useNow.ts";
 import { toast } from "../shell/Toasts.tsx";
 import { inspectPart, partTone } from "../../../shared/parts.ts";
+import { recordedUsage, stationStatus, tokenStatus } from './status.ts';
 import { CrewStrip, CrewTimeline, WorkerTrace } from "./CrewTrace.tsx";
 
 export function Inspectors({ geo, cam }: { geo: Geometry; cam: Camera }) {
@@ -108,12 +109,13 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
   const onDuty = n?.workers?.length ?? 0;
   const attempts = Object.values(s.fs.attempts).filter((a) => a.node === insp.key);
   const recent = attempts.slice(-10).reverse();
-  const worker = workers.find((w) => w.id === insp.worker) ?? workers.find((w) => w.busy) ?? workers[0];
+  const worker = workers.find((w) => w.id === insp.worker) ?? workers.find((w) => w.busy) ?? workers.find(w => !w.retiredAt) ?? workers[0];
   const current = attemptSel ? s.fs.attempts[attemptSel] : worker ? (worker.busy ? s.fs.attempts[worker.busy] : [...attempts].reverse().find((a) => a.worker === worker.id)) : recent[0];
   const durations = n?.durations ?? [];
   const locked = useStore((s) => s.fs.lockedStations.includes(insp.key));
   const lineWired = s.factory!.lines.find((l) => l.id === node.line)?.wired;
-  const linePaused = s.fs.pausedScopes?.lines.includes(node.line) ?? false;
+  const currentStatus = stationStatus(node, s.fs, s.replay?.at ?? now, Boolean(node.dormant) || (!lineWired && node.kind !== 'store'));
+  const usage = recordedUsage(attempts.filter(attempt => attempt.startedAt >= s.fs.run.startedAt));
   const togglePause = async () => {
     setScopeBusy(true);
     try { await workflowCall('run_control', { action: stationPaused ? 'resume' : 'pause', station: node.key, reason: '用户在工位详情调整领取状态' }); await boot(); }
@@ -133,11 +135,10 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
         <Stat k="队列" v={`${n?.queue.length ?? 0}`} />
         <Stat k="中位" v={durations.length ? secs(median(durations)) : "—"} />
         <Stat k="P90" v={durations.length ? secs(quantile(durations, 0.9)) : "—"} />
-        <Stat k="节拍" v={durations.length ? secs(median(durations) / Math.max(1, workers.length)) : "—"} />
-        <Stat k="token" v={fmt((n?.usage.input ?? 0) + (n?.usage.output ?? 0))} />
+        <Stat k="节拍" v={durations.length && onDuty ? secs(median(durations) / onDuty) : "—"} />
+        <Stat k="已报 token" v={usage.total === null ? '—' : fmt(usage.total)} />
       </div>
-      {s.fs.resources.waiting?.[node.key] && <div className="insp-wait"><Loader2 size={12} className="spin-i" /> 等待：{s.fs.resources.waiting[node.key]}</div>}
-      {(stationPaused || linePaused) && <div className="scope-notice">{stationPaused ? '此工位已暂停领取新任务。' : '所属流水线已暂停领取新任务。'}已开始的处理继续，其他工位保持原状态。</div>}
+      <div className="scope-notice" data-station-status={currentStatus.label}><i className={`light light--${currentStatus.light}`} /> {currentStatus.label} · {currentStatus.detail}</div>
       <div className="insp-actions">
         {node.kind !== "store" && node.kind !== "source" && <>
           <button className="btn btn--sm" disabled={scopeBusy || Boolean(s.replay) || !s.connected || !lineWired} onClick={() => void togglePause()}>{scopeBusy ? <Loader2 size={12} className="spin-i" /> : stationPaused ? <Play size={12} /> : <Pause size={12} />}{stationPaused ? '恢复此工位' : '暂停此工位'}</button>
@@ -189,7 +190,8 @@ const Stat = ({ k, v }: { k: string; v: string }) => <div className="stat"><span
 
 function NodeMetrics({attempts,onSelect}:{attempts:AttemptState[];onSelect:(id:string)=>void}) {
   const done=attempts.filter(a=>a.endedAt),work=done.reduce((n,a)=>n+(a.ms??0),0),wait=done.reduce((n,a)=>n+(a.queuedMs??0),0),input=done.reduce((n,a)=>n+a.usage.input,0),output=done.reduce((n,a)=>n+a.usage.output,0),recent=done.slice(-20),max=Math.max(1,...recent.map(a=>a.ms??0));
-  return <div className="insp-body node-metrics"><div className="node-metrics-row"><span>执行 <b>{secs(work)}</b></span><span>排队 <b>{secs(wait)}</b></span><span>失败 <b>{done.filter(a=>!a.ok&&!a.cancelled).length}</b></span></div><div className="node-time-share"><i style={{width:`${work/Math.max(1,work+wait)*100}%`}}/></div><div className="node-metrics-row"><span>输入 <b>{fmt(input)} tok</b></span><span>输出 <b>{fmt(output)} tok</b></span></div><div className="node-duration-chart">{recent.map(a=><button key={a.id} title={`${a.summary || a.input} · ${secs(a.ms??0)}`} onClick={()=>onSelect(a.id)}><i className={a.ok?"":"is-failed"} style={{height:`${(a.ms??0)/max*100}%`}}/></button>)}</div><div className="node-metrics-caption">{done.length?"最近 20 次处理耗时 · 点击查看对应过程":"本轮尚无处理记录"}</div></div>;
+  const usage = recordedUsage(attempts);
+  return <div className="insp-body node-metrics"><div className="node-metrics-caption">本轮尝试 {attempts.length} 次 · 成功返回 {done.filter(a=>a.ok&&!a.cancelled).length} 次 · 取消 {done.filter(a=>a.cancelled).length} 次</div><div className="node-metrics-row"><span>执行 <b>{secs(work)}</b></span><span>排队 <b>{secs(wait)}</b></span><span>异常 <b>{done.filter(a=>!a.ok&&!a.cancelled).length}</b></span></div><div className="node-time-share"><i style={{width:`${work/Math.max(1,work+wait)*100}%`}}/></div><div className="node-metrics-row"><span>已报输入 <b>{usage.total === null ? '—' : fmt(input)} tok</b></span><span>已报输出 <b>{usage.total === null ? '—' : fmt(output)} tok</b></span></div><div className="node-duration-chart">{recent.map(a=><button key={a.id} title={`${a.summary || a.input} · ${secs(a.ms??0)}`} onClick={()=>onSelect(a.id)}><i className={a.ok||a.cancelled?"":"is-failed"} style={{height:`${(a.ms??0)/max*100}%`}}/></button>)}</div><div className="node-metrics-caption">{done.length?"最近 20 次处理耗时 · 点击查看对应过程":"本轮尚无结束的尝试"}</div></div>;
 }
 
 function PartInspector({ insp, geo, onDrag, onClose, onPin }: { insp: Inspector; geo: Geometry; onDrag: (e: React.PointerEvent) => void; onClose: () => void; onPin: () => void }) {
@@ -355,13 +357,13 @@ function EvThumbBody({ ev, tok, small }: { ev: EvidenceRef; tok?: TokenState; sm
 
 /* ------------------------------------------------------------------ token: evidence chain */
 
-const STATUS_ZH: Record<string, string> = { active: "在线上", published: "已发布", merged: "已合并", rejected: "拒收出线", manual: "待人工", failed: "失败", parked: "停放" };
-
 function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onDrag: (e: React.PointerEvent) => void; onClose: () => void; onPin: () => void }) {
   useStore((s) => s.version);
+  const now = useNow(1000);
   const s = getState();
   const t = s.fs.tokens[insp.key];
   if (!t) return null;
+  const currentStatus = tokenStatus(t, s.fs, s.replay?.at ?? now);
   const d = t.data as Record<string, any>;
   const steps: { node: string; a: AttemptState; ev: EvidenceRef[] }[] = [];
   for (const id of t.attempts) {
@@ -378,8 +380,9 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
           <b>{d.title || t.title || t.item}</b>
           <span className="muted">{t.url.replace(/^https?:\/\//, "")}</span>
         </div>
-        <span className={`chip st-${t.status}`}>{STATUS_ZH[t.status]}</span>
+        <span className={`chip st-${t.status}`} title={currentStatus.detail}>{currentStatus.label}</span>
       </Head>
+      <div className="scope-notice" data-token-status={currentStatus.label}>{currentStatus.detail}</div>
       <div className="chain-facts">
         {d.kind && <span className="chip">分类 {d.kind}{d.kindAgreed ? " ✓" : d.kindAgreed === false ? " · 仲裁" : ""}</span>}
         {d.mode && <span className="chip">{d.mode === "video" ? "录屏路线" : "三张图"}</span>}

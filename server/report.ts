@@ -5,8 +5,11 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ActivitySpan, AttemptMetrics, Stamped, Usage } from "../shared/types.ts";
 import { apply, initialState, median, quantile, type FactoryState } from "../shared/project.ts";
-import { VAR, type Factory } from "./factory.ts";
+import type { Factory } from "./factory.ts";
+import { fileURLToPath } from 'node:url';
 import { batchSummary } from '../shared/batch.ts';
+const VAR = process.env.FACTORY_VAR ?? path.join(
+  process.env.FACTORY_ROOT ?? fileURLToPath(new URL('..', import.meta.url)), 'var');
 
 export interface Insight { id: string; title: string; value: string; detail: string; spark?: number[]; tone: "good" | "warn" | "info"; node?: string; token?: string; score: number }
 export interface Suggestion { title: string; why: string; prompt: string; node?: string }
@@ -141,15 +144,18 @@ export function aggregateMetrics(attempts: FactoryState["attempts"][string][], e
   };
 }
 
-export function buildReport(f: Factory, runId: string): RunReport {
-  const events: Stamped[] = [...f.journal.read(0, runId)];
-  const start = events.find((e) => e.kind === "run.started");
-  const end = [...events].reverse().find((e) => e.kind === "run.ended");
+export function buildReport(f: Factory, runId: string, through = f.journal.seq): RunReport {
+  const events: Stamped[] = [];
   // Reconstruct the requested run, including its initial stock and worker pools.
   // Current in-memory counters may already belong to a completely different run.
   const s = initialState(f.compiled);
-  const last = events.at(-1)?.seq ?? 0;
-  for (const event of f.journal.read()) { if (event.seq > last) break; apply(s,event); }
+  const last = f.journal.lastSequence(runId, through);
+  for (const event of f.journal.read(0, undefined, last)) {
+    apply(s, event);
+    if (event.run === runId) events.push(event);
+  }
+  const start = events.find((e) => e.kind === "run.started");
+  const end = [...events].reverse().find((e) => e.kind === "run.ended");
   const startedAt = start?.at ?? s.run.startedAt, endedAt = end?.at ?? Date.now();
   let pausedMs = 0, pauseAt = 0;
   for (const e of events) { if (e.kind === "run.paused") pauseAt = e.at; if (e.kind === "run.resumed" && pauseAt) { pausedMs += e.at - pauseAt; pauseAt = 0; } }
@@ -396,7 +402,9 @@ async function finishRun(f: Factory) {
   if (!runId) return null;
   await f.runtime.settle();
   const existing=readReport(runId);if(existing)return existing;
-  const report = buildReport(f, runId);
+  const {readReportJson} = await import('./report-reader.ts');
+  const result = await readReportJson(f, runId, undefined, f.journal.seq);
+  const report: RunReport = JSON.parse(result.body.toString('utf8'));
   const dir = path.join(VAR, "runs", runId);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "report.json"), JSON.stringify(report, null, 2));

@@ -1,6 +1,8 @@
+import { loadReplayEvents } from '../ui/src/canvas/replay-load.ts';
+import { timelineDisplay } from '../ui/src/report/timeline-display.ts';
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildTimeView, usageSummary, type ActivityAttempt } from "../ui/src/report/activity.ts";
+import { buildTimeView, usageSummary, timeStrip, type DisplayInterval, type ActivityAttempt } from "../ui/src/report/activity.ts";
 import type { ActivitySpan } from "../shared/types.ts";
 
 const recorded = (id: string, kind: ActivitySpan["kind"], startedAt: number, endedAt?: number, requestId?: string): ActivitySpan => ({
@@ -115,4 +117,38 @@ test("unknown usage/cache differs from reported zero and partial coverage cannot
   assert.equal(usageSummary([projected]).total, null);
   assert.equal(usageSummary([attempt()]).total, 120, "legacy positive observations remain usable without inventing known zero");
   assert.equal(usageSummary([attempt({ cacheRead: 0, cacheWrite: 0 })]).cacheHitRate, null, "legacy zero fields without completeness metadata do not certify a zero hit rate");
+});
+
+test('replay pages freeze the upper sequence and preserve every ordered event', async () => {
+  const controller = new AbortController(), progress: number[] = [], calls: URL[] = [];
+  const result = await loadReplayEvents('fixture', controller.signal, count => progress.push(count), async input => {
+    const url = new URL(String(input), 'http://fixture.test'); calls.push(url);
+    const since = Number(url.searchParams.get('since'));
+    assert.equal(url.searchParams.get('limit'), '200');
+    if (since) assert.equal(url.searchParams.get('through'), '401');
+    const events = Array.from({ length: Math.min(200, 401 - since) }, (_, index) => ({ seq: since + index + 1, at: 1, kind: 'dispatch.note', text: 'fixture' }));
+    return new Response(JSON.stringify({ events, through: 401, nextSeq: events.at(-1)!.seq, done: since >= 400 }));
+  });
+  assert.equal(result.length, 401); assert.equal(calls.length, 3); assert.deepEqual(progress, [200, 400, 401]);
+});
+
+test('cancelled replay stops between pages and non-advancing/error pages reject instead of loading forever', async () => {
+  const controller = new AbortController(); let calls = 0;
+  await assert.rejects(loadReplayEvents('fixture', controller.signal, () => controller.abort(new Error('owner cancelled')), async () => {
+    calls++; return new Response(JSON.stringify({ events: [{ seq: 1, at: 1 }], through: 2, nextSeq: 1, done: false }));
+  }), /owner cancelled/);
+  assert.equal(calls, 1);
+  await assert.rejects(loadReplayEvents('fixture', new AbortController().signal, () => {}, async () => new Response(JSON.stringify({ events: [], through: 5, nextSeq: 0, done: false }))), /没有前进/);
+  await assert.rejects(loadReplayEvents('fixture', new AbortController().signal, () => {}, async () => new Response('failed', { status: 500 })), /HTTP 500/);
+});
+
+test('a dense timeline renders at bounded resolution while retaining original intervals and all activity categories', () => {
+  const intervals: DisplayInterval[] = Array.from({ length: 30000 }, (_, index) => ({ id: `span-${index}`, attempt: `attempt-${index % 20}`, from: index, to: index + 8, key: index % 2 ? 'tool' : 'output', quality: 'observed', state: 'ended' }));
+  const strip = timeStrip(intervals)!;
+  const display = timelineDisplay(strip);
+  assert.equal(display.length, 480);
+  assert.ok(display.every(segment => segment.intervals.length <= 6 && segment.aggregated));
+  assert.ok(display.every(segment => segment.keys.includes('tool') && segment.keys.includes('output')));
+  assert.equal(strip.segments.length, 30007, 'display aggregation cannot replace the original exact timeline');
+  assert.equal(display[0].from, strip.start); assert.equal(display.at(-1)!.to, strip.end);
 });

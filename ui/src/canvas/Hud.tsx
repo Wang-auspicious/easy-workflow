@@ -2,7 +2,7 @@
 // It floats on the canvas, top-left; clicking it opens the per-station breakdown.
 import { useState } from "react";
 import { Play, Pause, Square, PackagePlus, ChevronDown } from "lucide-react";
-import { elapsed, median, latestRunTokens, type TokenState } from "../../../shared/project.ts";
+import { elapsed, median } from "../../../shared/project.ts";
 import { getState, setState, useStore } from "../store.ts";
 import { actions } from "../api.ts";
 import { useNow } from "../util/useNow.ts";
@@ -10,6 +10,7 @@ import { fmt, secs } from "./Node.tsx";
 import { toggleInspector } from "./Canvas.tsx";
 import { toast } from "../shell/Toasts.tsx";
 import { AllocationShortcut } from '../views/AllocationProposal.tsx';
+import { recordedUsage, runStatus } from './status.ts';
 
 const CATEGORIES = ["UI 组件与设计系统", "灵感与案例", "视觉素材与字体", "设计创作与原型", "前端开发与动效", "AI 设计工具", "UX 研究与学习", "协作与效率", "品牌与营销"];
 
@@ -18,8 +19,6 @@ export function clock(ms: number) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
   return h ? `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}` : `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
 }
-
-const lightOf = (t: TokenState) => (t.status === "published" ? "done" : t.status === "active" ? (t.corrections || Object.keys(t.rounds).length ? "warn" : "run") : t.status === "manual" ? "warn" : t.status === "failed" ? "bad" : "out");
 
 export function Hud() {
   useStore((s) => s.version);
@@ -33,23 +32,19 @@ export function Hud() {
   const s = getState();
   const run = s.fs.run;
   const t = replay ? replay.at : now;
-  const tokens = latestRunTokens(s.fs);
-  const done = tokens.filter((x) => x.status !== "active").length;
-  const deferred = tokens.filter(x => x.status === "parked").length;
-  const invalid = tokens.filter(x => x.status === "rejected" && x.data.failure).length;
-  const u = s.fs.totals.usage;
+  const progress = runStatus(s.fs, t);
+  const { counts } = progress;
+  const usage = recordedUsage(Object.values(s.fs.attempts).filter(attempt => attempt.startedAt >= run.startedAt));
   const status = run.status;
   const isIdle = status === "idle";
-  const displayTok = fmt(u.input + u.output);
+  const displayTok = usage.total === null ? '—' : fmt(usage.total);
   const displayTime = clock(elapsed(run, t));
-  const displayDone = done;
-  const displayTotal = tokens.length;
 
   return (
     <>
       <div className="hud-wrap">
         <div className="hud">
-          <div className="canvas-title"><span>工作区</span><i>/</i><b>{isIdle ? "网站入库" : run.title || "网站入库"}</b><span className="hud-badge">{status === "running" && !displayTotal ? "等待投料" : status==="running"&&displayDone===displayTotal?(deferred?"有待处理项":"本批已完成"):({ idle: "尚未运行", running: "运行中", paused: "已暂停", ended: "已结束" })[status]}</span></div>
+          <div className="canvas-title"><span>工作区</span><i>/</i><b>{isIdle ? "网站入库" : run.title || "网站入库"}</b><span className="hud-badge" data-tip={progress.detail}>{progress.label}</span></div>
           {!replay && (
             <div className="hud-actions">
               <button className="btn" onClick={() => setPull((p) => !p)}><PackagePlus size={15} />投料</button>
@@ -69,9 +64,9 @@ export function Hud() {
             <option value="" disabled>定位工段</option>
             {s.defaultLayout?.bays?.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
           </select>
-          <button className="run-metrics num" onClick={() => setOpen((o) => !o)} data-tip="查看完整运行统计">
-            <span className={`light light--${status === "running" ? "green" : status === "paused" ? "yellow" : "idle"}`} />
-            <span className="hud-done">处理结束 <b>{displayDone}/{displayTotal}</b></span>{deferred>0&&<span className="has-failures">待重试 {deferred}</span>}{invalid>0&&<span className="has-failures">无效 {invalid}</span>}<span className="metric-dot">·</span><span className="hud-clock">{displayTime}</span><span className="metric-dot">·</span><span>{displayTok} tok</span><ChevronDown size={12} />
+          <button className="run-metrics num" onClick={() => setOpen((o) => !o)} data-tip={progress.detail}>
+            <span className={`light light--${progress.light}`} />
+            <span className="hud-done">已发布 <b>{counts.published}/{counts.total}</b></span>{counts.active>0&&<span>在途 {counts.active}</span>}{counts.parked>0&&<span className="has-failures">待重试 {counts.parked}</span>}{counts.manual>0&&<span className="has-failures">待人工 {counts.manual}</span>}{counts.failed>0&&<span className="has-failures">失败 {counts.failed}</span>}<span className="metric-dot">·</span><span className="hud-clock">{displayTime}</span><span className="metric-dot">·</span><span data-tip={`模型用量 ${usage.reported}/${usage.samples} 次有报告，未报告的用量不视为零。`}>{usage.partial ? '已报 ' : ''}{displayTok} tok</span><ChevronDown size={12} />
           </button>
           {selected.length > 0 && <button className="inspect-selection" onClick={() => toggleInspector(selected[0])}>查看所选</button>}
           <AllocationShortcut />
@@ -81,19 +76,6 @@ export function Hud() {
       {endConfirm && <div className="end-run-card" role="dialog" aria-label="结束本轮确认"><b>结束本轮并生成报告</b><p>未完成的任务会退回候选库，保留原因与已有证据。</p>{endError&&<p role="alert" className="end-error">{endError}</p>}<div><button className="btn btn--sm" disabled={ending} onClick={()=>setEndConfirm(false)}>取消</button><button className="btn btn--sm btn--primary" disabled={ending} onClick={()=>void finishRun()}>{ending?"正在回收任务并生成报告…":"结束并生成报告"}</button></div></div>}
       {open && <HudCard onClose={() => setOpen(false)} />}
     </>
-  );
-}
-
-function Lights({ tokens }: { tokens: TokenState[] }) {
-  if (tokens.length <= 40) {
-    return <span className="hud-lights">{tokens.map((x) => <i key={x.id} className={`hl hl--${lightOf(x)}`} />)}</span>;
-  }
-  const c = { done: 0, run: 0, warn: 0, bad: 0, out: 0 };
-  for (const x of tokens) c[lightOf(x) as keyof typeof c]++;
-  return (
-    <span className="hud-bar">
-      {(Object.keys(c) as (keyof typeof c)[]).map((k) => c[k] ? <i key={k} className={`hb hl--${k}`} style={{ flex: c[k] }} /> : null)}
-    </span>
   );
 }
 
@@ -125,10 +107,12 @@ function PullCard({ onClose }: { onClose: () => void }) {
 function HudCard({ onClose }: { onClose: () => void }) {
   useStore((s) => s.version);
   const s = getState();
-  const rows = s.factory!.nodes.filter((n) => s.fs.nodes[n.key]?.processed || s.fs.nodes[n.key]?.active.length).map((n) => {
+  const attempts = Object.values(s.fs.attempts).filter(attempt => attempt.startedAt >= s.fs.run.startedAt);
+  const rows = s.factory!.nodes.map((n) => {
     const st = s.fs.nodes[n.key];
-    return { n, st, med: median(st.durations), tok: st.usage.input + st.usage.output };
-  });
+    const work = attempts.filter(attempt => attempt.node === n.key), usage = recordedUsage(work);
+    return { n, st, work, med: median(st?.durations ?? []), tok: usage.total };
+  }).filter(row => row.st && (row.work.length || row.st.queue.length || row.st.active.length));
   const maxMed = Math.max(1, ...rows.map((r) => r.med));
   const r = s.fs.resources;
   return (
@@ -139,13 +123,13 @@ function HudCard({ onClose }: { onClose: () => void }) {
         {r.freeMemMB > 0 && <span className="chip">空闲内存 {(r.freeMemMB / 1024).toFixed(1)}GB</span>}
       </div>
       <table className="mini-table num">
-        <thead><tr><th>工位</th><th>完成</th><th>中位耗时</th><th /><th>token</th><th>人</th></tr></thead>
+        <thead><tr><th>工位</th><th>尝试次数</th><th>成功中位</th><th /><th>已报 token</th><th>人</th></tr></thead>
         <tbody>
-          {rows.map(({ n, st, med, tok }) => (
+          {rows.map(({ n, st, work, med, tok }) => (
             <tr key={n.key} onClick={() => setState({ inspectors: [...getState().inspectors.filter((i) => i.pinned), { key: n.key, kind: "node", x: 0, y: 0, pinned: false }] })}>
-              <td>{n.num} {n.name}</td><td>{st.processed}</td><td>{med ? secs(med) : "—"}</td>
+              <td>{n.num} {n.name}</td><td title={`成功返回 ${st.processed} 次 · 执行异常 ${st.failed} 次 · 取消 ${work.filter(attempt => attempt.cancelled).length} 次`}>{work.length}</td><td>{st.durations.length ? secs(med) : "—"}</td>
               <td className="bar-cell"><i style={{ width: `${(med / maxMed) * 100}%` }} /></td>
-              <td>{tok ? fmt(tok) : "—"}</td><td>{st.workers.length}</td>
+              <td>{tok === null ? '—' : fmt(tok)}</td><td>{st.workers.length}</td>
             </tr>
           ))}
           {!rows.length && <tr><td colSpan={6} className="muted">还没有工位处理过货</td></tr>}

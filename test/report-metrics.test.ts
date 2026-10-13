@@ -29,7 +29,7 @@ test("report aggregates recorded token/time parts, preserves estimates and isola
   emit(3100, { kind: "attempt.started", attempt: "a4", token: "t2", node: "curation/classify", worker: "w1", input: "new" });
   emit(4000, { kind: "attempt.finished", attempt: "a4", ok: true, summary: "new", ms: 900, queuedMs: 99, usage: { input: 999, output: 999, cost: 9 }, metrics });
   const state = initialState(compiled); for (const event of events) apply(state, event);
-  const f = { compiled, state, journal: { read: (since = 0, id?: string) => events.filter(e => e.seq > since && (!id || e.run === id)) } } as unknown as Factory;
+  const f = { compiled, state, journal: { seq: events.length, lastSequence: (id:string, through=events.length) => events.findLast(e=>e.run===id&&e.seq<=through)?.seq??0, read: (since = 0, id?: string, through=events.length) => events.filter(e => e.seq > since && e.seq<=through && (!id || e.run === id)) } } as unknown as Factory;
   const report = buildReport(f, "run-metrics-old"), m = report.metrics!;
   assert.equal(report.runId, "run-metrics-old"); assert.equal(state.run.id, "run-metrics-current");
   assert.deepEqual(m.tokens.actual, { input: 100, output: 20, cost: .01, cacheRead: 30, cacheWrite: 5 });

@@ -9,7 +9,8 @@ import { Dispatcher, MODEL_ID } from "./dispatcher.ts";
 import { apiKeyPresent } from "./agent-station.ts";
 import { piStatus, closeModelTransport } from "./pi.ts";
 import { publishConnection } from "./discovery.ts";
-import { buildReport, readReport } from "./report.ts";
+import { readReportJson, closeReportReaders } from './report-reader.ts';
+import { setImmediate as yieldLoop } from 'node:timers/promises';
 import { closeBrowser, browserCommand, browserEvents } from "./browser.ts";
 import { closeNetwork } from "./network.ts";
 import { layoutFactory } from "../shared/layout.ts";
@@ -153,8 +154,44 @@ const server = http.createServer(async (req, res) => {
       const run = url.searchParams.get("run") ?? undefined;
       const since = Number(url.searchParams.get("since") ?? 0);
       if (!Number.isSafeInteger(since) || since < 0) throw new ControlError(400, "invalid_cursor", "since 必须是非负整数");
+      const through = Number(url.searchParams.get('through') ?? factory.journal.seq);
+      if (!Number.isSafeInteger(through) || through < since) {
+        throw new ControlError(400, 'invalid_cursor', 'through 必须是大于或等于 since 的整数');
+      }
+      if (url.searchParams.has('limit')) {
+        const limit = Number(url.searchParams.get('limit'));
+        try {
+          return send(res, 200, factory.journal.readPage({since, run, through, limit}));
+        } catch (error) {
+          if (error instanceof RangeError) {
+            throw new ControlError(400, 'invalid_cursor', 'limit 必须是1–500的整数');
+          }
+          throw error;
+        }
+      }
       res.writeHead(200, { "Content-Type": "application/x-ndjson; charset=utf-8", "Access-Control-Allow-Origin": "*" });
-      for (const e of factory.journal.read(since, run)) res.write(JSON.stringify(e) + "\n");
+      let cursor = since;
+      while (!res.destroyed) {
+        const page = factory.journal.readPage({since: cursor, run, through, limit: 200});
+        for (const event of page.events) {
+          if (res.destroyed) break;
+          if (!res.write(JSON.stringify(event) + '\n')) {
+            await new Promise<void>(resolve => {
+              const done = () => {
+                res.off('drain', done);
+                res.off('close', done);
+                resolve();
+              };
+              res.once('drain', done);
+              res.once('close', done);
+            });
+          }
+        }
+        if (page.done) break;
+        cursor = page.nextSeq;
+        await yieldLoop();
+      }
+      if (res.destroyed) return;
       res.end();
       return;
     }
@@ -162,8 +199,28 @@ const server = http.createServer(async (req, res) => {
     if (p.startsWith("/api/report/")) {
       const id = decodeURIComponent(p.slice("/api/report/".length));
       if (!/^run-[a-zA-Z0-9-]+$/.test(id)) throw new ControlError(400, "invalid_run_id", "无效运行编号");
-      const r = readReport(id) ?? (factory.journal.runs().some(r=>r.run===id) ? buildReport(factory, id) : null);
-      return r ? send(res, 200, r) : send(res, 404, { error: "no report" });
+      if (!factory.journal.lastSequence(id)) return send(res, 404, {error: 'no report'});
+      const controller = new AbortController();
+      const disconnected = () => {
+        if (!res.writableEnded) controller.abort();
+      };
+      res.once('close', disconnected);
+      try {
+        const result = await readReportJson(factory, id, controller.signal);
+        if (res.destroyed) return;
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Report-Sequence': String(result.seq),
+        });
+        res.end(result.body);
+        return;
+      } catch (error) {
+        if (controller.signal.aborted || res.destroyed) return;
+        throw error;
+      } finally {
+        res.off('close', disconnected);
+      }
     }
     if (req.method === "POST") {
       const b = await body(req);
@@ -252,6 +309,7 @@ const shutdown = async () => {
   removeConnection();
   clearInterval(ping);
   factory.channels?.close();
+  closeReportReaders();
   factory.runtime.paused = true;
   dispatcher.interrupt();
   for (const c of clients) c.end();

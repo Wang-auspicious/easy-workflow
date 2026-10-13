@@ -57,7 +57,7 @@ test("historical reports isolate runs and deduct an unfinished pause",()=>{
   add(3000,{kind:"run.started",runId:"run-second",title:"Second"});
   add(3100,{kind:"token.created",token:"t2",line:"curation",item:"two",url:"https://example.test/2",source:"sources/watch"});
   const state=initialState(compiled);for(const e of events)apply(state,e);
-  const f={compiled,state,journal:{read:(since=0,id?:string)=>events.filter(e=>e.seq>since&&(!id||e.run===id))}} as unknown as Factory;
+  const f={compiled,state,journal:{seq:events.length,lastSequence:(id:string,through=events.length)=>events.findLast(e=>e.run===id&&e.seq<=through)?.seq??0,read:(since=0,id?:string,through=events.length)=>events.filter(e=>e.seq>since&&e.seq<=through&&(!id||e.run===id))}} as unknown as Factory;
   const report=buildReport(f,"run-first");
   assert.equal(report.netMs,300);assert.equal(report.status,"ended");assert.equal(report.totals.created,1);assert.equal(report.totals.published,1);assert.deepEqual(report.totals.usage,{input:5,output:2,cost:.01});assert.equal(report.attempts[0].item,"one");
   assert.equal(state.run.id,"run-second");

@@ -94,12 +94,41 @@ export class Journal {
 
   subscribe(l: Listener) { this.listeners.add(l); return () => this.listeners.delete(l); }
 
-  *read(since = 0, run?: string): Generator<Stamped> {
+  *read(since = 0, run?: string, through = Number.MAX_SAFE_INTEGER): Generator<Stamped> {
     const stmt = run
-      ? this.db.prepare("SELECT seq, at, run, body FROM events WHERE seq > ? AND run = ? ORDER BY seq")
-      : this.db.prepare("SELECT seq, at, run, body FROM events WHERE seq > ? ORDER BY seq");
-    const rows = (run ? stmt.iterate(since, run) : stmt.iterate(since)) as Iterable<{ seq: number; at: number; run: string; body: string }>;
+      ? this.db.prepare("SELECT seq, at, run, body FROM events WHERE seq > ? AND seq <= ? AND run = ? ORDER BY seq")
+      : this.db.prepare("SELECT seq, at, run, body FROM events WHERE seq > ? AND seq <= ? ORDER BY seq");
+    const rows = (run ? stmt.iterate(since, through, run) : stmt.iterate(since, through)) as Iterable<{ seq: number; at: number; run: string; body: string }>;
     for (const r of rows) yield { ...JSON.parse(r.body), seq: r.seq, at: r.at, run: r.run } as Stamped;
+  }
+
+  lastSequence(run: string, through = this.seq): number {
+    const row = this.db.prepare(
+      'SELECT MAX(seq) seq FROM events WHERE run = ? AND seq <= ?'
+    ).get(run, through) as {seq: number | null};
+    return row.seq ?? 0;
+  }
+
+  /** A bounded immutable cursor for replay. New events never extend an in-flight export. */
+  readPage(options: {since?: number; run?: string; limit?: number; through?: number} = {}) {
+    const since = options.since ?? 0;
+    const limit = options.limit ?? 200;
+    const through = options.through ?? this.seq;
+    if (!Number.isSafeInteger(since) || since < 0 ||
+        !Number.isSafeInteger(through) || through < since ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      throw new RangeError('Invalid journal cursor or page size');
+    }
+    const stmt = options.run
+      ? this.db.prepare('SELECT seq,at,run,body FROM events WHERE seq > ? AND seq <= ? AND run = ? ORDER BY seq LIMIT ?')
+      : this.db.prepare('SELECT seq,at,run,body FROM events WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?');
+    const rows = (options.run
+      ? stmt.all(since, through, options.run, limit + 1)
+      : stmt.all(since, through, limit + 1)) as {seq: number; at: number; run: string; body: string}[];
+    const events = rows.slice(0, limit).map(row => ({
+      ...JSON.parse(row.body), seq: row.seq, at: row.at, run: row.run,
+    }) as Stamped);
+    return {events, nextSeq: events.at(-1)?.seq ?? since, through, done: rows.length <= limit};
   }
 
   runs(): { run: string; first: number; last: number; events: number }[] {

@@ -2,7 +2,7 @@
 import { memo } from "react";
 import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
 import type { CompiledNode, EvidenceRef } from "../../../shared/types.ts";
-import { nodeLight, type NodeState } from "../../../shared/project.ts";
+import { type NodeState } from "../../../shared/project.ts";
 import { roleColors } from "../../../shared/palette.ts";
 import { shapeOf, type Placed } from "../../../shared/layout.ts";
 import { attach, getState, setState, useStore } from "../store.ts";
@@ -13,6 +13,7 @@ import { toggleInspector } from "./Canvas.tsx";
 import { useNow } from "../util/useNow.ts";
 import { bottleneck, trailOf } from "./stats.ts";
 import { nodeCountPresentation } from './node-counts.ts';
+import { stationStatus } from './status.ts';
 
 export const fmt = (n: number) => (n >= 10000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : n.toLocaleString("en-US"));
 export const secs = (ms: number) => (ms >= 60000 ? `${(ms / 60000).toFixed(1)}m` : ms >= 10000 ? `${Math.round(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`);
@@ -20,9 +21,9 @@ export const secs = (ms: number) => (ms >= 60000 ? `${(ms / 60000).toFixed(1)}m`
 export function botState(n: NodeState | undefined, dormant: boolean, now: number, waiting?: string): BotState {
   if (dormant) return "sleep";
   if (!n) return "idle";
-  if (n.lastFailAt > n.lastOkAt && now - n.lastFailAt < 60_000) return "fail";
   if (n.active.length) return "work";
   if (n.queue.length && waiting) return "wait";
+  if (n.lastFailAt > n.lastOkAt && now - n.lastFailAt < 60_000) return "fail";
   if (n.returned && now - n.lastAt < 20_000) return "returned";
   return "idle";
 }
@@ -39,16 +40,14 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const open = useStore((s) => s.inspectors.some((i) => i.key === node.key));
   const trail = useStore((s) => s.trail);
   const now = useNow(5000);
-  const scopePaused = useStore(s => Boolean(s.fs.pausedScopes?.stations.includes(node.key) || s.fs.pausedScopes?.lines.includes(node.line)));
   const s = getState();
   const n = s.fs.nodes[node.key];
-  const waiting = s.fs.resources.waiting?.[node.key];
   const lineWired = s.factory?.lines.find((l) => l.id === node.line)?.wired;
   const dormant = Boolean(node.dormant) || (!lineWired && node.kind !== "store");
   const shape = shapeOf(node);
   const displayName = node.name;
   const c = roleColors(node.role, colorOverride !== undefined ? { h: colorOverride } : undefined);
-  const light = nodeLight(n, dormant, now);
+  const status = stationStatus(node, s.fs, s.replay?.at ?? now, dormant);
   const strip = dormant ? [] : (n?.strip ?? []).map((id) => s.fs.evidence[id]).filter(Boolean) as EvidenceRef[];
   const visualEvidence = strip.filter((ev) => ev.kind === "image" || ev.kind === "video");
   const workers = n?.workers.length ?? 0;
@@ -90,17 +89,12 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         <div className="node-metric"><span>{shape === "store" ? "本轮流入" : "进行中"}</span><b>{fmt(shape === "store" ? n?.plus ?? 0 : n?.active.length ?? 0)}<small> 件</small></b></div>
       </div>}
       <div className="node-footer">
-        <span className="node-status" data-tip={counts.resource ? counts.detail : scopePaused ? '已暂停领取新任务，已开始的处理继续。' : n?.summary || waiting || lightTip(light, waiting)}><i className={`light light--${scopePaused && !counts.resource ? 'yellow' : light} ${n?.active.length ? "is-pulse" : ""}`} />{dormant ? "待接入" : counts.resource ? '资源库' : n?.active.length ? "处理中" : scopePaused ? '已暂停' : n?.queue.length ? "排队中" : light === "red" ? "需要检查" : n?.failed ? "有异常" : n?.processed ? "已完成" : "待命"}</span>
+        <span className="node-status" data-tip={counts.resource ? counts.detail : status.detail}><i className={`light light--${status.light} ${status.pulse ? 'is-pulse' : ''}`} />{status.label}</span>
         <span className={`node-staff num ${!counts.resource && n?.failed ? 'has-failures' : ''}`} data-tip={`${counts.resource ? '' : `${workers} 位工人 · `}${counts.detail}`}>{counts.footer}</span>
       </div>
     </div>
   );
 });
-
-function lightTip(l: string, waiting?: string) {
-  return l === "green" ? "正常运行" : l === "yellow" ? (waiting ? `等待：${waiting}` : "积压 / 有退回") : l === "red" ? "最近失败" : l === "gray" ? "休眠：不占资源" : "空闲";
-}
-
 
 function Strip({ items }: { items: EvidenceRef[] }) {
   useStore((s) => s.flashes);

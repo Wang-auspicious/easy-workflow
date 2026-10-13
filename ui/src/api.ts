@@ -7,7 +7,7 @@ import { legacyReply } from "../../shared/conversation.ts";
 import { idleDispatcher, reconcileChatLive, reduceChatLive, type ChatEvent, type DispatcherStatus } from "./chat/live.ts";
 
 export const api = {
-  async get<T>(path: string): Promise<T> { const r = await fetch(path); if (!r.ok) throw new Error(`${path} ${r.status}`); return r.json(); },
+  async get<T>(path: string, options?: { signal?: AbortSignal }): Promise<T> { const r = await fetch(path, options); if (!r.ok) throw new Error(`${path} ${r.status}`); return r.json(); },
   async post<T = unknown>(path: string, body: unknown): Promise<T> {
     try {
       const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });

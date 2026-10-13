@@ -9,7 +9,10 @@ export function Capsule({ line, place }: { line: string; place: Placed }) {
   const s = getState();
   const l = s.factory!.lines.find((x) => x.id === line)!;
   const nodes = s.factory!.nodes.filter((n) => n.line === line);
-  const inflight = nodes.reduce((acc, n) => acc + (s.fs.nodes[n.key]?.queue.length ?? 0) + (s.fs.nodes[n.key]?.active.length ?? 0), 0);
+  const inFlightItems = new Set(nodes.flatMap(node => [...(s.fs.nodes[node.key]?.queue ?? []), ...(s.fs.nodes[node.key]?.active ?? []).map(id => s.fs.attempts[id]?.token).filter(Boolean)]));
+  const inflight = inFlightItems.size;
+  const active = nodes.some(node => s.fs.nodes[node.key]?.active.length);
+  const paused = s.fs.run.status === 'paused' || s.fs.pausedScopes?.lines.includes(line) || nodes.filter(node => s.fs.nodes[node.key]?.queue.length).length > 0 && nodes.filter(node => s.fs.nodes[node.key]?.queue.length).every(node => s.fs.pausedScopes?.stations.includes(node.key));
   const inbox = s.fs.nodes[`${line}/inbox`]?.stock ?? 0;
   const c = roleColors(nodes[1]?.role ?? "process");
   return (
@@ -21,7 +24,7 @@ export function Capsule({ line, place }: { line: string; place: Placed }) {
         <span className="capsule-dots" aria-hidden>{nodes.map((n) => <i key={n.key} style={{ background: roleColors(n.role).border }} className={s.fs.nodes[n.key]?.active.length ? "is-busy" : ""} />)}</span>
         {inbox || inflight ? <span className="capsule-meta num">{inbox ? `收件箱 ${fmt(inbox)}` : ""}{inbox && inflight ? " · " : ""}{inflight ? `在途 ${inflight}` : ""}</span> : null}
       </span>
-      <i className={`light ${l.wired ? (inflight ? "light--green is-pulse" : "light--idle") : "light--gray"}`} />
+      <i className={`light ${!l.wired ? 'light--gray' : paused ? 'light--yellow' : active ? 'light--green is-pulse' : inflight ? 'light--yellow' : 'light--idle'}`} />
     </div>
   );
 }

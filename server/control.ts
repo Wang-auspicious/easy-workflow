@@ -347,14 +347,14 @@ function definitions(f: Factory): Tool[] {
         name: "read_report", label: "读取本轮报告", description: "Read a historical or current run report, including observed activity intervals. Optional station returns only that station's attempts, metrics and timeline; missing interval boundaries remain unknown.",
         parameters: object({ runId: Type.Optional(Type.String({ pattern: "^run-[a-zA-Z0-9-]+$" })), station: Type.Optional(name()) }),
         execute: async (_id, p) => {
-          const { readReport, buildReport, stationReport } = await import("./report.ts");
+          const { stationReport } = await import("./report.ts");
+          const { readReportJson } = await import('./report-reader.ts');
           const id = p.runId ?? f.state.run.id;
-          const cached = readReport(id);
-          // Older caches lack activity. Reconstruct only their own journal, including
-          // open spans, rather than using the current run's state or duration ratios.
-          const fresh = !cached?.metrics || !cached?.activity || p.station || (id === f.state.run.id && f.state.run.status !== "ended");
-          const report = fresh && id && f.journal.runs().some(r=>r.run===id) ? buildReport(f, id) : cached;
-          if (!report) throw new ControlError(404, "report_not_found", "没有这轮报告");
+          if (!id || !f.journal.lastSequence(id)) {
+            throw new ControlError(404, 'report_not_found', '没有这轮报告');
+          }
+          const result = await readReportJson(f, id);
+          const report: import('./report.ts').RunReport = JSON.parse(result.body.toString('utf8'));
           if (p.station && !f.compiled.nodes.some(n => n.key === p.station) && !report.attempts.some(a => a.node === p.station)) throw new ControlError(404, "station_not_found", "没有这个工位");
           return ok(p.station ? stationReport(report, p.station) : report, p.station ? `读取 ${p.station} 的工作报告` : "读取工作报告");
         },
@@ -413,7 +413,11 @@ export class FactoryControl {
       authentication: process.env.FACTORY_TOKEN ? "Bearer token or desktop session cookie" : "none (loopback only)",
       resources: { bootstrap: "/api/agent/bootstrap", toolSchema: "/api/agent/tools/{name}", snapshot: "/api/state", spec: "/api/factory", events: "/api/events", journal: "/api/journal", runs: "/api/runs" },
       tools: this.tools.map((t) => ({ name: t.name, title: t.label, description: t.description, inputSchema: t.parameters, readOnly: READS.has(t.name), method: "POST", path: `/api/tools/${t.name}` })),
-      limitations: ["Single workspace, local service; no multi-tenant hosting. MCP uses a local stdio bridge and the same private connection file.", "Mutations are not guaranteed idempotent. Inspect the returned token ids and journal sequence before retrying.", "Only wired lines execute. Template creation, cross-line consumption and arbitrary executor registration are not implemented."],
+      limitations: [
+        'Single workspace, local service; no multi-tenant hosting. MCP uses a local stdio bridge and the same private connection file.',
+        'Mutations are not guaranteed idempotent. Inspect the returned token ids and journal sequence before retrying.',
+        'Only wired lines execute. Validated packs, templates and declared cross-line channels are supported; structural changes require an idle runtime and user authorization. Arbitrary executor code cannot be registered through a model tool call.',
+      ],
     };
   }
 

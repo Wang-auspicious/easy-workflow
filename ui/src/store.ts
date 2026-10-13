@@ -54,6 +54,7 @@ export interface Store {
   model: string;
   keyPresent: boolean;
   replay: { run: string; speed: number; playing: boolean; at: number; start: number; end: number; events: Stamped[]; cursor: number } | null;
+  replayLoading: { run: string; count: number; error?: string } | null;
   focus: { x: number; y: number; k?: number; area?: { w: number; h: number }; at: number } | null;
   draft: string;
   boardFocus: string | null;
@@ -72,7 +73,7 @@ const LS = (k: string, v?: unknown) => {
 };
 
 let state: Store = {
-  ready: false, connected: false, factory: null, defaultLayout: null,
+  ready: false, connected: false, factory: null, defaultLayout: null, replayLoading: null,
   layout: { pos: {}, open: {}, colors: {}, bots: {}, capsules: {} },
   fs: initialState(), version: 0, nodeRev: {},
   view: (LS("view") as View) ?? "canvas", layer: "pipeline", reportRun: null,
@@ -115,19 +116,26 @@ function touched(e: Stamped, fs: FactoryState): string[] {
     case "attempt.started": return [e.node];
     case "attempt.progress": case "attempt.finished": { const a = fs.attempts[e.attempt]; return a ? [a.node] : []; }
     case "evidence.added": return [e.evidence.station];
-    case "token.finished": return [e.node];
+    case "token.finished": return [e.node, ...(fs.tokens[e.token]?.at ?? [])];
     case "token.returned": return [e.from, e.to, ...(e.reset ?? [])];
     case "worker.spawned": case "worker.forked": case "worker.retired": case "review.verdict": return [e.node];
     case "stock.set": return [e.node];
     case "token.created": return [e.source];
-    case "run.started": case "resource.sample": case "run.ended": return Object.keys(fs.nodes);
+    case "run.started": case "run.paused": case "run.resumed": case "resource.sample": case "run.ended": case "batch.configured": case "correction.reverted": return Object.keys(fs.nodes);
+    case 'scope.paused': return e.scope === 'station' ? [e.key] : Object.keys(fs.nodes).filter(key => key.startsWith(`${e.key}/`));
+    case 'consult.opened': return [e.reviewer, e.owner];
     default: return [];
   }
 }
 
 export function ingest(events: Stamped[]) {
-  pending.push(...events);
+  for (const event of events) pending.push(event);
   if (!raf) raf = requestAnimationFrame(flush);
+}
+
+export function clearPendingEvents() {
+  if (raf) cancelAnimationFrame(raf);
+  raf = 0; pending = [];
 }
 
 function flush() {
@@ -139,15 +147,21 @@ function flush() {
   const rev = { ...state.nodeRev };
   const flashes = { ...state.flashes };
   let unread = state.unread;
-  for (const e of batch) {
+  const started = performance.now();
+  let cursor = 0;
+  for (; cursor < batch.length && cursor < 200 && performance.now() - started < 8; cursor++) {
+    const e = batch[cursor];
     if (e.seq <= fs.seq) continue;
+    const changed = touched(e, fs);
     apply(fs, e);
-    for (const k of touched(e, fs)) rev[k] = (rev[k] ?? 0) + 1;
+    for (const k of new Set([...changed, ...touched(e, fs)])) rev[k] = (rev[k] ?? 0) + 1;
     if (e.kind === "evidence.added") flashes[e.evidence.id] = e.at;
     if (e.kind === "chat.assistant" && !state.chatOpen) unread++;
     for (const t of eventTaps) t(e);
   }
+  if (cursor < batch.length) pending = batch.slice(cursor).concat(pending);
   setState({ version: state.version + 1, nodeRev: rev, flashes, unread });
+  if (pending.length && !raf) raf = requestAnimationFrame(flush);
 }
 
 export function resetProjection(factory: CompiledFactory) {

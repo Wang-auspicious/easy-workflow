@@ -17,7 +17,7 @@ export function nodeCountPresentation(node: Pick<CompiledNode, 'key' | 'kind'>, 
   return {
     resource, footer: `尝试 ${attempts.length.toLocaleString('en-US')} 次`,
     detail: [
-      `本轮尝试 ${attempts.length} 次（含重试）`, `返回结果 ${completed} 次`,
+      `本轮尝试 ${attempts.length} 次（含重试）`, `成功返回 ${completed} 次`,
       ...(node.kind === 'review' ? [`审核通过 ${passed} 次`] : []),
       `退回 ${returned} 次`, ...(changes ? [`要求修改 ${changes} 项`] : []), `执行异常 ${failed} 次`,
       ...(cancelled ? [`取消 ${cancelled} 次`] : []), `当前排队 ${state?.queue.length ?? 0} 件`, `进行中 ${state?.active.length ?? 0} 次`,

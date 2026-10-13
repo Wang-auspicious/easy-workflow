@@ -4,26 +4,41 @@ import { useEffect } from "react";
 import { Pause, Play, X } from "lucide-react";
 import type { Stamped } from "../../../shared/types.ts";
 import { initialState } from "../../../shared/project.ts";
-import { getState, ingest, setState, useStore } from "../store.ts";
-import { boot, connect, disconnect } from "../api.ts";
+import { clearPendingEvents, getState, ingest, setState, useStore } from "../store.ts";
+import { boot, disconnect } from "../api.ts";
 import { clock } from "./Hud.tsx";
+import { loadReplayEvents } from './replay-load.ts';
+import { toast } from '../shell/Toasts.tsx';
 
 let timer = 0;
+let loading: { run: string; controller: AbortController } | null = null;
+
+export function cancelReplayLoad(run?: string) {
+  if (loading && (!run || loading.run === run)) { loading.controller.abort(); loading = null; setState({ replayLoading: null }); }
+}
 
 export async function startReplay(run: string, events?: Stamped[]) {
-  const evs = events ?? (await (await fetch(`/api/journal?run=${encodeURIComponent(run)}`)).text()).split("\n").filter(Boolean).map((l) => JSON.parse(l) as Stamped);
-  if (!evs.length) return;
-  disconnect();
-  const f = getState().factory!;
-  const fs = initialState(f);
-  // Stock values before the run so counters start where they were.
-  setState({ fs, nodeRev: {}, view: "canvas", inspectors: [], replay: { run, speed: 2, playing: true, at: evs[0].at, start: evs[0].at, end: evs[evs.length - 1].at, events: evs, cursor: 0 } });
+  cancelReplayLoad();
+  const controller = new AbortController(); loading = { run, controller };
+  setState({ replayLoading: { run, count: 0 } });
+  const timeout = setTimeout(() => controller.abort(new Error('回放加载超时，请重试或选择其他轮次。')), 60000);
+  try {
+    const evs = events ?? await loadReplayEvents(run, controller.signal, count => setState({ replayLoading: { run, count } }));
+    controller.signal.throwIfAborted();
+    if (!evs.length) throw new Error('这一轮没有可回放的事件。');
+    disconnect(); clearPendingEvents(); loading = null;
+    const fs = initialState(getState().factory!);
+    setState({ fs, nodeRev: {}, view: 'canvas', inspectors: [], replayLoading: null, replay: { run, speed: 2, playing: true, at: evs[0].at, start: evs[0].at, end: evs[evs.length - 1].at, events: evs, cursor: 0 } });
+  } catch (error) {
+    if (loading?.controller === controller) setState({ replayLoading: { run, count: getState().replayLoading?.count ?? 0, error: (controller.signal.reason ?? error).message } });
+  } finally { clearTimeout(timeout); if (loading?.controller === controller) loading = null; }
 }
 
 export function stopReplay() {
   clearInterval(timer);
+  cancelReplayLoad(); clearPendingEvents();
   setState({ replay: null });
-  boot().catch(() => connect(0));
+  boot().catch(error => { setState({ connected: false }); toast(`实时状态读取失败：${error.message}；请刷新页面重试。`); });
 }
 
 export function ReplayBar() {
@@ -43,7 +58,8 @@ export function ReplayBar() {
       if (next && next.at - st.at > 4000) at = next.at;
       const batch: Stamped[] = [];
       let i = st.cursor;
-      while (i < st.events.length && st.events[i].at <= at) batch.push(st.events[i++]);
+      while (i < st.events.length && st.events[i].at <= at && batch.length < 200) batch.push(st.events[i++]);
+      if (i < st.events.length && st.events[i].at <= at) at = batch.at(-1)?.at ?? st.at;
       if (batch.length) ingest(batch);
       const done = i >= st.events.length;
       setState({ replay: { ...st, at: done ? st.end : at, cursor: i, playing: !done } });
