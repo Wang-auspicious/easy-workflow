@@ -8,6 +8,71 @@ import type { Pack } from "./dsl.ts";
 
 export const SPEC_VERSION = "2026-10-09.1";
 
+/**
+ * Flow branches share a token's top-level data map; channels create separate work.
+ * Conditions are arbitrary predicates, so an edge label cannot prove exclusivity.
+ * Ordered replacement is supported, but parallel writers have no reducer contract.
+ */
+function checkOutputWriters(
+  packs: readonly Pack[],
+  nodes: readonly CompiledNode[],
+  flow: readonly CompiledEdge[],
+  issues: CompiledFactory['issues'],
+) {
+  const wiredLines = new Set(packs.flatMap(pack =>
+    pack.lines.filter(line => line.wired).map(line => line.id)));
+  const executable = new Set(nodes.filter(node =>
+    wiredLines.has(node.line) && !node.dormant &&
+    node.kind !== 'source' && node.kind !== 'store').map(node => node.key));
+  const writers = new Map<string, string[]>();
+  for (const pack of packs) {
+    for (const [key, contract] of Object.entries(pack.contracts ?? {})) {
+      if (!contract.outputKey || !executable.has(key)) continue;
+      const group = writers.get(contract.outputKey) ?? [];
+      group.push(key);
+      writers.set(contract.outputKey, group);
+    }
+  }
+
+  const parents = new Map<string, string[]>();
+  for (const edge of flow) {
+    const incoming = parents.get(edge.to) ?? [];
+    incoming.push(edge.from);
+    parents.set(edge.to, incoming);
+  }
+  const ancestorCache = new Map<string, Set<string>>();
+  const ancestors = (key: string) => {
+    const cached = ancestorCache.get(key);
+    if (cached) return cached;
+    const found = new Set<string>([key]);
+    const pending = [key];
+    while (pending.length) {
+      for (const parent of parents.get(pending.pop()!) ?? []) {
+        if (found.has(parent)) continue;
+        found.add(parent);
+        pending.push(parent);
+      }
+    }
+    ancestorCache.set(key, found);
+    return found;
+  };
+  for (const [outputKey, group] of writers) {
+    for (let leftIndex = 0; leftIndex < group.length; leftIndex++) {
+      const left = group[leftIndex];
+      const leftAncestors = ancestors(left);
+      for (const right of group.slice(leftIndex + 1)) {
+        const rightAncestors = ancestors(right);
+        if (leftAncestors.has(right) || rightAncestors.has(left)) continue;
+        if (![...leftAncestors].some(key => rightAncestors.has(key))) continue;
+        issues.push({
+          at: `${left}, ${right}`,
+          message: `并行工位可能覆盖同一任务的 outputKey "${outputKey}"；请使用不同输出键，再由汇总工位显式合并`,
+        });
+      }
+    }
+  }
+}
+
 /** A patch is a small, ordered, reversible edit of the default spec (Spec §9.4). */
 export type PatchOp =
   | { op: "set"; station: string; field: "workers.min" | "workers.max" | "workers.initial" | "workers.policy" | "estimateSeconds" | "dormant" | "name" | "blurb"; value: unknown }
@@ -153,6 +218,7 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
     const owner = packs.find(pack => pack.lines.some(line => line.id === n.line));
     if (runnable && !n.dormant && lines.find(line => line.id === n.line)?.wired && owner?.contracts && !owner.contracts[n.key]) issues.push({ at: n.key, message: 'installed runnable station requires role, schemas and executor binding' });
   }
+  checkOutputWriters(packs, nodes, flow, issues);
 
   const runtimeGraph = {
     nodes: nodes.map(({ bot, ...rest }) => ({ ...rest, bot: { shape: bot.shape, hue: bot.hue, eyes: bot.eyes } })),

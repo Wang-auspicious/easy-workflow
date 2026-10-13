@@ -21,6 +21,100 @@ const { closeNetwork } = await import('../server/network.ts');
 const idle = { running: false };
 after(async () => { await closeNetwork(); assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir())); fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
 
+function outputWriterFixture(id: string) {
+  const textSchema = { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false };
+  const files: Record<string, string> = {};
+  const bindings: WorkflowManifest['bindings'] = {};
+  const nodes = ['entry', 'left', 'right', 'publish'].map(key => {
+    const role = `roles/${key}/ROLE.md`;
+    files[role] = `# ${key} fixture contract\n\nProcess only the supplied input and return the declared output schema. Preserve the actual result and reject missing input instead of inventing a successful handoff.`;
+    bindings[`${id}/${key}`] = key === 'publish'
+      ? { role, inputSchema: 'publication', outputSchema: 'artifact', input: { result: { path: 'result' } }, outputKey: 'artifact', execute: { kind: 'builtin', name: 'publish-json' } }
+      : { role, inputSchema: 'text', outputSchema: 'text', input: { text: key === 'entry' ? { path: 'input.text' } : { value: `${key} branch` } }, outputKey: key === 'entry' ? 'normalized' : 'result', execute: { kind: 'builtin', name: 'normalize-text' } };
+    return station({ id: key, name: key, role: 'process', kind: 'program', resource: 'none', input: 'text', output: 'text', accept: ['Return the supplied text under the declared output key'] });
+  });
+  nodes.push(station({ id: 'published', name: 'Published', role: 'store', kind: 'store', input: 'text', output: 'text' }));
+  const manifest: WorkflowManifest = { format: 1, id, name: id, version: '1', blurb: 'Output collision fixture', entry: `${id}/entry`, inputSchema: 'text',
+    lines: [line({ id, name: id, layer: 3, priority: 'mid', wired: true, blurb: 'Parallel data writers', stations: nodes, edges: [['entry', 'left'], ['entry', 'right'], ['left', 'publish'], ['right', 'publish'], ['publish', 'published']] })],
+    links: [], channels: [], conditions: {}, resources: { browser: 0, model: 0, cpu: 0, http: 0 }, bindings,
+    schemas: { text: textSchema, publication: { type: 'object', properties: { result: textSchema }, required: ['result'], additionalProperties: false }, artifact: { type: 'object', properties: { path: { type: 'string' }, sha256: { type: 'string' }, bytes: { type: 'number' } }, required: ['path', 'sha256', 'bytes'], additionalProperties: false } } };
+  return { manifest, files };
+}
+
+test('parallel workflow writers are rejected before replacing the installed index and on reload', async () => {
+  const dir = path.join(root, 'output-collision'), request = outputWriterFixture('collision');
+  const valid = structuredClone(request);
+  valid.manifest.bindings['collision/right'].outputKey = 'rightResult';
+  await installWorkflowPack(dir, valid, idle);
+  const indexFile = path.join(dir, 'packs/installed.json'), before = fs.readFileSync(indexFile, 'utf8');
+  // Before this guard, both writers started before either committed and the token
+  // published successfully with only {text:'right branch'} left under result.
+  await assert.rejects(installWorkflowPack(dir, { ...request, replace: true }, idle), /collision\/left, collision\/right.*outputKey "result"/);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
+  const invalidKey = structuredClone(valid);
+  invalidKey.manifest.bindings['collision/right'].outputKey = ['result'] as unknown as string;
+  await assert.rejects(installWorkflowPack(dir, { ...invalidKey, replace: true }, idle), /工位绑定 collision\/right 无效/);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
+
+  const installed = readWorkflowIndex(dir).packages[0], file = path.join(dir, 'packs', installed.id, 'versions', installed.revision, 'pack.json');
+  const original = fs.readFileSync(file, 'utf8');
+  try {
+    fs.writeFileSync(file, JSON.stringify(request.manifest));
+    await assert.rejects(loadWorkflowPacks(dir), /并行工位.*outputKey "result"/);
+  } finally { fs.writeFileSync(file, original); }
+});
+
+test('ordered replacement and independent token entries keep their actual data semantics', async () => {
+  for (const variant of ['ordered', 'independent']) {
+    const dir = path.join(root, `output-${variant}`), request = outputWriterFixture(variant);
+    request.manifest.lines[0].edges = variant === 'ordered'
+      ? [{ from: 'entry', to: 'left' }, { from: 'left', to: 'right' }, { from: 'right', to: 'publish' }, { from: 'publish', to: 'published' }]
+      : request.manifest.lines[0].edges.filter(edge => !(edge.from === 'entry' && edge.to === 'right'));
+    if (variant === 'independent') request.manifest.channels = [{ id: 'deliver-independent', from: { line: variant, station: 'left' }, to: { line: variant, station: 'right' }, label: 'A separate consumer token' }];
+    await installWorkflowPack(dir, request, idle);
+    const loaded = await loadWorkflowPacks(dir), compiled = compile(loaded.packs);
+    assert.deepEqual(compiled.issues, []);
+    const journal = new Journal(':memory:'), state = initialState(compiled), broker = new Broker({ model: 0, browser: 0, cpu: 0, http: 0 }, 0);
+    journal.subscribeProjection(event => apply(state, event));
+    const runtime = new Runtime(compiled, journal, broker, loaded.conditions, loaded.executor);
+    runtime.roleResolver = key => loaded.role(key)!;
+    try {
+      runtime.ensureWorkers([]); runtime.start(variant);
+      const entries = variant === 'ordered' ? [request.manifest.entry] : [request.manifest.entry, `${variant}/right`];
+      const tokens = entries.map((entry, index) => runtime.create(entry, { item: `${variant}-${index}`, url: '', source: 'manual', data: { input: { text: 'original' } } }));
+      await runtime.settle();
+      assert.deepEqual(tokens.map(token => state.tokens[token.id].status), tokens.map(() => 'published'));
+      assert.deepEqual(tokens.map(token => token.data.result), variant === 'ordered' ? [{ text: 'right branch' }] : [{ text: 'left branch' }, { text: 'right branch' }]);
+      for (const token of tokens) {
+        const artifact = token.data.artifact as { path: string };
+        assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, artifact.path), 'utf8')).result, token.data.result);
+      }
+      if (tokens.length > 1) assert.notEqual(tokens[0].data, tokens[1].data);
+    } finally { await runtime.close(); journal.close(); }
+  }
+});
+
+test('accepted graph patches and cross-pack flow links cannot introduce output races', async () => {
+  const dir = path.join(root, 'output-patches'), request = outputWriterFixture('ordered-patch');
+  request.manifest.lines[0].edges = [{ from: 'entry', to: 'left' }, { from: 'left', to: 'right' }, { from: 'right', to: 'publish' }, { from: 'publish', to: 'published' }];
+  await installWorkflowPack(dir, request, idle);
+  const loaded = await loadWorkflowPacks(dir);
+  const changed = compile(loaded.packs, [{ id: 'parallelize', summary: 'Parallelize the two writers', author: 'user', at: 'fixture', status: 'accepted', ops: [
+    { op: 'remove-edge', from: 'ordered-patch/left', to: 'ordered-patch/right' },
+    { op: 'add-edge', from: 'ordered-patch/entry', to: 'ordered-patch/right' },
+    { op: 'add-edge', from: 'ordered-patch/left', to: 'ordered-patch/publish' },
+  ] }]);
+  assert.ok(changed.issues.some(issue => issue.message.includes('outputKey "result"')));
+
+  const extra = outputWriterFixture('other-pack');
+  extra.manifest.lines[0].edges = structuredClone(request.manifest.lines[0].edges);
+  await installWorkflowPack(dir, extra, idle);
+  const before = fs.readFileSync(path.join(dir, 'packs/installed.json'), 'utf8');
+  extra.manifest.links = [{ from: 'ordered-patch/entry', to: 'other-pack/entry' }];
+  await assert.rejects(installWorkflowPack(dir, { ...extra, replace: true }, idle), /并行工位.*outputKey "result"/);
+  assert.equal(fs.readFileSync(path.join(dir, 'packs/installed.json'), 'utf8'), before);
+});
+
 test('all four templates compile and execute their concrete programs, review returns and selected branches', async () => {
   const dir = path.join(root, 'templates');
   for (const template of listWorkflowTemplates()) await instantiateWorkflowTemplate(dir, { templateId: template.id, id: template.id, name: template.name, includeBuiltins: false }, idle);
@@ -90,7 +184,11 @@ test('external CLI, HTTP, Node and MCP adapters execute declared contracts; MCP 
   const dir = path.join(root, 'external'), packDir = path.join(dir, 'pack'), workDir = path.join(dir, 'work'); fs.mkdirSync(packDir, { recursive: true });
   fs.writeFileSync(path.join(packDir, 'cli.mjs'), "let s='';for await(const c of process.stdin)s+=c;const i=JSON.parse(s);process.stdout.write(JSON.stringify({value:i.value*2}));");
   fs.writeFileSync(path.join(packDir, 'mcp.mjs'), "import readline from 'node:readline';for await(const s of readline.createInterface({input:process.stdin})){const m=JSON.parse(s);if(!m.id)continue;let result=m.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}}}:m.method==='tools/list'?{tools:[{name:'double',inputSchema:{type:'object',properties:{value:{type:'number'}},required:['value'],additionalProperties:false}}]}:{structuredContent:{value:m.params.arguments.value*2}};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');}");
-  const controller = new AbortController(), context = { signal: controller.signal, workDir, packDir };
+  const journal = new Journal(path.join(dir, 'journal.db'));
+  const controller = new AbortController(), context = { signal: controller.signal, workDir, packDir,
+    operation: {journal, token: {id: 'external-fixture', data: {}}, node: 'external/execute', revision: 'fixture-1'},
+  };
+  try {
   assert.deepEqual(await invokeWorkflowTool({ kind: 'cli', command: '$node', args: ['$pack/cli.mjs'] }, { value: 7 }, context), { value: 14 });
   const mcp = { kind: 'mcp' as const, command: '$node', args: ['$pack/mcp.mjs'], tool: 'double' };
   assert.equal((await describeWorkflowTool(mcp, context) as { name: string }).name, 'double');
@@ -104,6 +202,7 @@ test('external CLI, HTTP, Node and MCP adapters execute declared contracts; MCP 
   const cancelled = invokeWorkflowTool({ kind: 'cli', command: '$node', args: ['$pack/hang.mjs'] }, {}, context);
   await delay(50); controller.abort(new Error('fixture owner cancellation'));
   await assert.rejects(cancelled, /fixture owner cancellation/);
+  } finally { journal.close(); }
 });
 
 test('Node exports, accepted patches and live-idle guards are checked before changing the installed index', async () => {
@@ -130,4 +229,306 @@ test('Node exports, accepted patches and live-idle guards are checked before cha
   const concurrent = path.join(root, 'concurrent-install');
   await Promise.all(['first', 'second'].map(id => instantiateWorkflowTemplate(concurrent, { templateId: 'fanout', id, name: id, includeBuiltins: false }, idle)));
   assert.deepEqual(readWorkflowIndex(concurrent).packages.map(pack => pack.id), ['first', 'second']);
+});
+
+test('external POST with a lost response is not repeated after a new journal and retry token', async () => {
+  const dir = path.join(root, 'effect-unknown');
+  let journal = new Journal(path.join(dir, 'journal.db'));
+  let writes = 0;
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    writes++;
+    response.destroy();
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as {port: number}).port;
+  const tool = {kind: 'http' as const, url: `http://127.0.0.1:${port}/effect`};
+  const context = () => ({
+    signal: new AbortController().signal,
+    workDir: path.join(dir, 'work'),
+    packDir: dir,
+    operation: {journal, token: {id: 'original', data: {}}, node: 'fixture/publish', revision: 'version-1'},
+  });
+  try {
+    await assert.rejects(invokeWorkflowTool(tool, {value: 7}, context()));
+    journal.close(); journal = new Journal(path.join(dir, 'journal.db'));
+    const retry = context();
+    retry.operation.token = {id: 'retry', data: {retryOf: 'original'}};
+    await assert.rejects(invokeWorkflowTool(tool, {value: 7}, retry));
+    assert.equal(writes, 1, 'a transport error cannot prove that the remote write did not occur');
+    const receipts = [...journal.read()].filter(event => event.kind === 'operation.recorded');
+    assert.equal(receipts.at(-1)?.operation.phase, 'uncertain');
+  } finally {
+    journal.close(); server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('completed external results survive restart and are reused for the same version and canonical input', async t => {
+  const dir = path.join(root, 'effect-completed');
+  let journal = new Journal(path.join(dir, 'journal.db'));
+  let writes = 0;
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    writes++;
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({receipt: writes}));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as {port: number}).port;
+  const tool = {kind: 'http' as const, url: `http://127.0.0.1:${port}/effect`};
+  const context = () => ({
+    signal: new AbortController().signal, workDir: path.join(dir, 'work'), packDir: dir,
+    operation: {journal, token: {id: 'original', data: {}}, node: 'fixture/publish', revision: 'version-1'},
+  });
+  try {
+    assert.deepEqual(await invokeWorkflowTool(tool, {a: 1, b: 2}, context()), {receipt: 1});
+    journal.close(); journal = new Journal(path.join(dir, 'journal.db'));
+    t.mock.method(String.prototype, 'localeCompare', () => 0);
+    const retry = context();
+    retry.operation.token = {id: 'retry', data: {retryOf: 'original'}};
+    assert.deepEqual(await invokeWorkflowTool(tool, {b: 2, a: 1}, retry), {receipt: 1});
+    assert.equal(writes, 1);
+  } finally {
+    journal.close(); server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('CLI side effects with invalid output stay uncertain and cannot spawn again on retry', async () => {
+  const dir = path.join(root, 'effect-cli');
+  fs.mkdirSync(dir, {recursive: true});
+  const countFile = path.join(dir, 'effects.txt');
+  fs.writeFileSync(path.join(dir, 'effect.mjs'), "import fs from 'node:fs';for await(const c of process.stdin){}fs.appendFileSync(process.argv[2],'effect\\n');process.stdout.write('lost-json-result');");
+  const tool = {kind: 'cli' as const, command: '$node', args: ['$pack/effect.mjs', countFile]};
+  let journal = new Journal(path.join(dir, 'journal.db'));
+  const context = () => ({
+    signal: new AbortController().signal, workDir: path.join(dir, 'work'), packDir: dir,
+    operation: {journal, token: {id: 'original', data: {}}, node: 'fixture/cli', revision: 'v1'},
+  });
+  try {
+    await assert.rejects(invokeWorkflowTool(tool, {}, context()), {code: 'EXTERNAL_OPERATION_UNKNOWN'});
+    journal.close(); journal = new Journal(path.join(dir, 'journal.db'));
+    const retry = context();
+    retry.operation.token = {id: 'retry', data: {retryOf: 'original'}};
+    await assert.rejects(invokeWorkflowTool(tool, {}, retry), {code: 'EXTERNAL_OPERATION_UNKNOWN'});
+    assert.equal(fs.readFileSync(countFile, 'utf8'), 'effect\n');
+    assert.equal([...journal.read()].filter(event => event.kind === 'operation.recorded').at(-1)?.operation.phase, 'uncertain');
+  } finally { journal.close(); }
+});
+
+test('local CLI preflight errors do not create an uncertain effect or launch a child', async () => {
+  const dir = path.join(root, 'effect-cli-preflight');
+  const journal = new Journal(path.join(dir, 'journal.db'));
+  const context = {
+    signal: new AbortController().signal, workDir: path.join(dir, 'work'), packDir: dir,
+    operation: {journal, token: {id: 'preflight-work', data: {}}, node: 'fixture/cli', revision: 'v1'},
+  };
+  const command = {kind: 'cli' as const, command: '$node', args: ['-e', "throw new Error('child must not launch')"]};
+  try {
+    assert.equal(process.env.EASY_WORKFLOW_FIXTURE_MISSING_ENV_950F2B, undefined);
+    await assert.rejects(invokeWorkflowTool({...command, envFrom: {REQUIRED: 'EASY_WORKFLOW_FIXTURE_MISSING_ENV_950F2B'}}, {}, context), /缺少环境变量/);
+    const invalidDirectory = path.join(dir, 'file-instead-of-directory');
+    fs.writeFileSync(invalidDirectory, 'fixture file');
+    await assert.rejects(invokeWorkflowTool(command, {}, {...context, workDir: invalidDirectory}));
+    const cyclic: {self?: unknown} = {};
+    cyclic.self = cyclic;
+    await assert.rejects(invokeWorkflowTool(command, cyclic, context), {code: 'workflow_input_invalid'});
+    assert.equal([...journal.read()].filter(event => event.kind === 'operation.recorded').length, 0);
+  } finally { journal.close(); }
+});
+
+test('a receipt write failure leaves durable intent that prevents re-execution after restart', async () => {
+  const dir = path.join(root, 'effect-receipt-fault');
+  let journal = new Journal(path.join(dir, 'journal.db'));
+  let writes = 0;
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    writes++;
+    response.end(JSON.stringify({receipt: writes}));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const tool = {kind: 'http' as const, url: `http://127.0.0.1:${(server.address() as {port: number}).port}/effect`};
+  const context = () => ({
+    signal: new AbortController().signal, workDir: dir, packDir: dir,
+    operation: {journal, token: {id: 'original', data: {}}, node: 'fixture/publish', revision: 'v1'},
+  });
+  try {
+    const append = journal.append.bind(journal);
+    journal.append = event => {
+      if (event.kind === 'operation.recorded' && event.operation.phase !== 'started') throw new Error('Fixture storage unavailable after external effect');
+      return append(event);
+    };
+    await assert.rejects(invokeWorkflowTool(tool, {value: 1}, context()), {code: 'EXTERNAL_OPERATION_UNKNOWN'});
+    assert.equal(writes, 1);
+    assert.deepEqual([...journal.read()].filter(event => event.kind === 'operation.recorded').map(event => event.operation.phase), ['started']);
+    journal.close(); journal = new Journal(path.join(dir, 'journal.db'));
+    await assert.rejects(invokeWorkflowTool(tool, {value: 1}, context()), {code: 'EXTERNAL_OPERATION_UNKNOWN'});
+    assert.equal(writes, 1);
+    assert.equal([...journal.read()].filter(event => event.kind === 'operation.recorded').at(-1)?.operation.reason, 'interrupted');
+  } finally {
+    journal.close(); server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('intent must commit before I/O, while changed input, version and independent work get distinct effects', async () => {
+  const dir = path.join(root, 'effect-identity');
+  let journal = new Journal(path.join(dir, 'journal.db'));
+  let writes = 0;
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    writes++;
+    response.end(JSON.stringify({receipt: writes}));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const tool = {kind: 'http' as const, url: `http://127.0.0.1:${(server.address() as {port: number}).port}/effect`};
+  const context = (id = 'original', data: Record<string, unknown> = {}, revision = 'v1') => ({
+    signal: new AbortController().signal, workDir: dir, packDir: dir,
+    operation: {journal, token: {id, data}, node: 'fixture/publish', revision},
+  });
+  try {
+    const append = journal.append.bind(journal);
+    journal.append = event => {
+      if (event.kind === 'operation.recorded') throw new Error('Fixture intent write failed');
+      return append(event);
+    };
+    await assert.rejects(invokeWorkflowTool(tool, {value: 1}, context()), /intent write failed/);
+    assert.equal(writes, 0); journal.append = append;
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 1}, context()), {receipt: 1});
+    journal.append({kind: 'token.data', token: 'retry-1', patch: {retryOf: 'original'}});
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 1, omitted: undefined}, context('retry-1', {retryOf: 'original'})), {receipt: 1});
+    journal.close(); journal = new Journal(path.join(dir, 'journal.db'));
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 1}, context('retry-2', {retryOf: 'retry-1'})), {receipt: 1});
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 2}, context('retry-2', {retryOf: 'retry-1'})), {receipt: 2});
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 2}, context('retry-2', {retryOf: 'retry-1'}, 'v2')), {receipt: 3});
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 1}, context('fresh-work')), {receipt: 4});
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 1}, context('child-1', {channelDelivery: 'delivery-1'})), {receipt: 5});
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 1}, context('child-retry', {channelDelivery: 'delivery-1'})), {receipt: 5});
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 1}, context('child-2', {channelDelivery: 'delivery-2'})), {receipt: 6});
+    assert.equal(writes, 6);
+  } finally {
+    journal.close(); server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('HTTP GET and explicitly read-only MCP remain callable without a mutation ledger', async () => {
+  const dir = path.join(root, 'effect-readonly');
+  fs.mkdirSync(dir, {recursive: true});
+  let reads = 0;
+  const server = http.createServer((_request, response) => { reads++; response.end(JSON.stringify({read: reads})); });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const context = {signal: new AbortController().signal, workDir: path.join(dir, 'work'), packDir: dir};
+  try {
+    const tool = {kind: 'http' as const, method: 'GET' as const, url: `http://127.0.0.1:${(server.address() as {port: number}).port}/read`};
+    assert.deepEqual(await invokeWorkflowTool(tool, {}, context), {read: 1});
+    assert.deepEqual(await invokeWorkflowTool(tool, {}, context), {read: 2});
+    await assert.rejects(invokeWorkflowTool({...tool, method: 'POST'}, {}, context), {code: 'operation_context_required'});
+    assert.equal(reads, 2);
+    fs.writeFileSync(path.join(dir, 'readonly.mjs'), "import readline from 'node:readline';for await(const s of readline.createInterface({input:process.stdin})){const m=JSON.parse(s);if(!m.id)continue;const result=m.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}}}:m.method==='tools/list'?{tools:[{name:'read',annotations:{readOnlyHint:true},inputSchema:{type:'object'}}]}:{structuredContent:{read:true}};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');}");
+    const mcp = {kind: 'mcp' as const, command: '$node', args: ['$pack/readonly.mjs'], tool: 'read'};
+    assert.deepEqual(await invokeWorkflowTool(mcp, {}, context), {read: true});
+    assert.deepEqual(await invokeWorkflowTool(mcp, {}, context), {read: true});
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('a shared in-flight effect executes once and a cancelled waiter does not cancel its owner', async () => {
+  const dir = path.join(root, 'effect-concurrent');
+  const journal = new Journal(path.join(dir, 'journal.db'));
+  let writes = 0;
+  let release!: () => void;
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const ready = new Promise<void>(resolve => { release = resolve; });
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    writes++;
+    entered();
+    await ready;
+    response.end(JSON.stringify({receipt: writes}));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const tool = {kind: 'http' as const, url: `http://127.0.0.1:${(server.address() as {port: number}).port}/effect`};
+  const context = {
+    signal: new AbortController().signal, workDir: dir, packDir: dir,
+    operation: {journal, token: {id: 'shared-work', data: {}}, node: 'fixture/publish', revision: 'v1'},
+  };
+  let first: Promise<unknown> | undefined;
+  try {
+    first = invokeWorkflowTool(tool, {value: 1}, context);
+    await started;
+    const controller = new AbortController();
+    const second = invokeWorkflowTool(tool, {value: 1}, {...context, signal: controller.signal});
+    controller.abort(new Error('Fixture cancelled duplicate waiter'));
+    await assert.rejects(second, /cancelled duplicate waiter/);
+    assert.equal(writes, 1);
+    release();
+    assert.deepEqual(await first, {receipt: 1});
+    assert.deepEqual(await invokeWorkflowTool(tool, {value: 1}, context), {receipt: 1});
+    assert.equal(writes, 1);
+  } finally {
+    release(); await first?.catch(() => {});
+    journal.close(); server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('Factory keeps an uncertain external write manual across restart and cancels sibling work', async () => {
+  process.env.FACTORY_PREFLIGHT = '0';
+  process.env.FACTORY_START_PAUSED = '1';
+  process.env.FACTORY_RESUME_MANAGED = '0';
+  process.env.VISLEXICON_ROOT = path.join(root, 'unconnected');
+  const {Factory} = await import('../server/factory.ts');
+  let writes = 0;
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    writes++;
+    response.destroy();
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const request = outputWriterFixture('effect-runtime');
+  request.manifest.bindings['effect-runtime/right'].outputKey = 'rightResult';
+  request.manifest.bindings['effect-runtime/left'].execute = {kind: 'tool', tool: 'remote-write'};
+  request.manifest.tools = {'remote-write': {kind: 'http', url: `http://127.0.0.1:${(server.address() as {port: number}).port}/effect`}};
+  await installWorkflowPack(root, {...request, builtins: []}, idle);
+  let factory = new Factory();
+  let closed = false;
+  let cancelledSibling = false;
+  let recoveries = 0;
+  const shutdown = async () => {
+    factory.channels?.close(); await factory.runtime.close(); factory.docs.flush(); factory.lessons.close(); factory.journal.close(); closed = true;
+  };
+  try {
+    await factory.boot(); factory.broker.memoryFloorMB = 0;
+    const executor = factory.runtime.executors;
+    factory.runtime.executors = node => node.key !== 'effect-runtime/right' ? executor(node) : async ctx => {
+      await new Promise<void>(resolve => ctx.signal.addEventListener('abort', () => { cancelledSibling = true; resolve(); }, {once: true}));
+      return {ok: true, summary: 'Cancelled sibling must not commit', data: {rightResult: 'must not publish'}};
+    };
+    factory.runtime.onRecovery = () => { recoveries++; };
+    factory.runtime.start('External receipt recovery');
+    const token = factory.runtime.create(request.manifest.entry, {item: 'effect-case', url: 'https://fixture.test', source: 'manual', data: {workflowPack: request.manifest.id, input: {text: 'fixture'}}});
+    await factory.runtime.settle();
+    assert.equal(factory.state.tokens[token.id].status, 'manual');
+    assert.equal((factory.state.tokens[token.id].data.failure as {code: string}).code, 'EXTERNAL_OPERATION_UNKNOWN');
+    assert.equal(cancelledSibling, true); assert.equal(recoveries, 0); assert.equal(writes, 1);
+    assert.equal(factory.state.tokens[token.id].data.rightResult, undefined);
+    await shutdown(); factory = new Factory(); closed = false;
+    await factory.boot(); factory.broker.memoryFloorMB = 0;
+    factory.runtime.resume(); await factory.runtime.settle();
+    assert.equal(factory.state.tokens[token.id].status, 'manual'); assert.equal(writes, 1);
+    assert.equal(Object.keys(factory.state.recoveries).length, 0);
+    factory.runtime.correct({token: token.id, node: 'effect-runtime/left'}, 'Verify that an unresolved effect cannot be repeated');
+    await factory.runtime.settle();
+    assert.equal(factory.state.tokens[token.id].status, 'manual'); assert.equal(writes, 1);
+    assert.equal(factory.state.nodes['effect-runtime/published'].stock, 0);
+  } finally {
+    if (!closed) await shutdown();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 });

@@ -601,15 +601,29 @@ export class Runtime {
 
     if (!res.ok) {
       this.closeConsult(t, "manual", res.error ?? res.summary);
-      const failure=candidateFailure(res.failure ?? classifyFailure(res.error??res.summary,{url:t.url,stage:n.kind==="agent"||n.kind==="review"?"model":undefined}),String(t.data.canonical??t.url));
-      if(failure.owner==="user"||failure.tag==="model_transport")this.onAlert?.(t,n,failure);
-      t.finished=true;t.data.failure=failure;
+      const failure = candidateFailure(res.failure ?? classifyFailure(res.error ?? res.summary, {
+        url: t.url, stage: n.kind === 'agent' || n.kind === 'review' ? 'model' : undefined,
+      }), String(t.data.canonical ?? t.url));
+      if (failure.owner === 'user' || failure.tag === 'model_transport') this.onAlert?.(t, n, failure);
+      t.finished = true;
+      t.data.failure = failure;
       this.cancelTokenWork(t);
-      this.journal.append({kind:"token.data",token:t.id,patch:{failure}});
-      const reason=failure.retryable?`已退回候选库，等待按标签重试：${failure.message}`:`已移出候选库：${failure.message}`;
-      this.journal.append({kind:"token.finished",token:t.id,node:n.key,status:failure.retryable?"parked":"rejected",reason});
-      this.onRecovery?.(t,failure);
-      this.journal.append({kind:"dispatch.note",node:n.key,tone:"warn",text:`[${n.name}] ${t.title||t.item}：${failureLabels[failure.tag]}，${failure.retryable?"已退回候选库，可按原因重试":"已移除无效网址"}`});
+      this.journal.append({kind: 'token.data', token: t.id, patch: {failure}});
+      // Non-retryable system outcomes can be uncertain external writes. Preserve
+      // them for reconciliation; they are neither invalid URLs nor fresh intake.
+      const needsReconciliation = !failure.retryable && failure.category !== 'invalid';
+      const action = needsReconciliation ? '已保留，等待核查结果，不自动重发'
+        : failure.retryable ? '已退回候选库，等待按标签重试' : '已移除无效网址';
+      this.journal.append({
+        kind: 'token.finished', token: t.id, node: n.key,
+        status: needsReconciliation ? 'manual' : failure.retryable ? 'parked' : 'rejected',
+        reason: `${action}：${failure.message}`,
+      });
+      if (!needsReconciliation) this.onRecovery?.(t, failure);
+      this.journal.append({
+        kind: 'dispatch.note', node: n.key, tone: 'warn',
+        text: `[${n.name}] ${t.title || t.item}：${failureLabels[failure.tag]}，${action}`,
+      });
     } else if (res.finish) {
       this.closeConsult(t, "manual", res.finish.reason);
       t.finished = true;

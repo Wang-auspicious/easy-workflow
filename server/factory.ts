@@ -162,6 +162,7 @@ export class Factory {
 
   private loadWorkflowPacks() {
     return loadWorkflowPacks(VAR, { builtins: [pack], services: {
+      journal: this.journal,
       runAgent: (definition, context) => runAgentStation(definition, context),
       callCapability: (name, args, context) => this.toolbox.call([name], name, args, { node: context.node.key, token: context.token.id, caseId: context.token.item, signal: context.signal, progress: context.progress }),
     } });

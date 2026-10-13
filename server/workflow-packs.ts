@@ -11,6 +11,7 @@ import type { Pack } from './spec/dsl.ts';
 import { compile, type Patch } from './spec/compile.ts';
 import { ControlError } from './errors.ts';
 import { invokeWorkflowTool, type WorkflowTool } from './workflow-tools.ts';
+import type { Journal } from './journal.ts';
 export type { WorkflowTool } from './workflow-tools.ts';
 
 export type JsonSchema = Record<string, unknown>;
@@ -44,6 +45,7 @@ export interface WorkflowManifest extends PackSpec {
   tools?: Record<string, WorkflowTool>;
 }
 export interface WorkflowServices {
+  journal?: Journal;
   runAgent?: (def: AgentStationDef & { role: WorkflowRole }, ctx: StationContext) => Promise<StationResult>;
   callCapability?: (name: string, args: Record<string, unknown>, ctx: StationContext) => Promise<any>;
 }
@@ -130,7 +132,7 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
   if (!keys.has(manifest.entry) && (manifest.entry !== '' || manifest.lines.some(line => line.wired))) bad('入口工位不存在');
   const roles = new Map<string, WorkflowRole>(), contracts: NonNullable<Pack['contracts']> = {};
   for (const [key, binding] of Object.entries(manifest.bindings)) {
-    if (!keys.has(key) || !record(binding) || !record(binding.input) || !safeKey(binding.outputKey) || !record(binding.execute)) bad(`工位绑定 ${key} 无效`);
+    if (!keys.has(key) || !record(binding) || !record(binding.input) || typeof binding.outputKey !== 'string' || !safeKey(binding.outputKey) || !record(binding.execute)) bad(`工位绑定 ${key} 无效`);
     if (!manifest.schemas[binding.inputSchema] || !manifest.schemas[binding.outputSchema]) bad(`${key} 缺少输入或输出 schema`);
     for (const [field, selector] of Object.entries(binding.input)) {
       if (!safeKey(field) || !record(selector) || (!('value' in selector) && (!('path' in selector) || typeof selector.path !== 'string'))) bad(`${key} 的输入映射无效`);
@@ -153,7 +155,7 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
     } else if (binding.execute.kind !== 'builtin' || !['normalize-text', 'text-statistics', 'keywords', 'aggregate', 'page-text', 'prepare-source', 'route', 'publish-json'].includes(binding.execute.name)) bad(`${key} 没有已实现的执行器`);
     const revision = digest(content + code + JSON.stringify([binding, manifest.schemas[binding.inputSchema], manifest.schemas[binding.outputSchema]])).slice(0, 16);
     roles.set(key, { station: key, path: path.relative(projectDir, contained(directory, binding.role)).split(path.sep).join('/'), revision, content });
-    contracts[key] = { role: binding.role, inputSchema: binding.inputSchema, outputSchema: binding.outputSchema, executor: binding.execute.kind, revision };
+    contracts[key] = { role: binding.role, inputSchema: binding.inputSchema, outputSchema: binding.outputSchema, executor: binding.execute.kind, revision, outputKey: binding.outputKey };
   }
   for (const [key, def] of Object.entries(manifest.conditions)) {
     if (!safeKey(key) || !record(def) || typeof def.path !== 'string' || !['equals', 'exists', 'in', 'truthy'].includes(def.op)) bad(`条件 ${key} 无效`);
@@ -217,7 +219,13 @@ export async function loadWorkflowPacks(projectDir: string, options: { builtins?
           return run(def, ctx);
         }
         const output = binding.execute.kind === 'node' ? await moduleExecute!(input, { signal: ctx.signal, workDir, projectDir, node: ctx.node.key, item: ctx.token.item, progress: ctx.progress })
-          : binding.execute.kind === 'tool' ? await invokeWorkflowTool(manifest.tools![binding.execute.tool], input, { signal: ctx.signal, workDir, packDir: directory })
+          : binding.execute.kind === 'tool' ? await invokeWorkflowTool(manifest.tools![binding.execute.tool], input, {
+            signal: ctx.signal, workDir, packDir: directory,
+            operation: options.services?.journal ? {
+              journal: options.services.journal, token: ctx.token, node: ctx.node.key,
+              revision: `${installed.revision}:${loaded.pack.contracts?.[key]?.revision ?? ''}`,
+            } : undefined,
+          })
           : await builtin(binding.execute.name, input, ctx, projectDir, manifest.id, options.services ?? {});
         return finish(output);
       });

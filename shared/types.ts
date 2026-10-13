@@ -200,6 +200,23 @@ export interface SourceCandidate {
   author?: string; publishedAt?: string; excerpt?: string; images?: string[];
   discoveredAt: number; status: 'pending' | 'delivered' | 'acknowledged' | 'blocked' | 'failed';
   targetToken?: string; reason?: string;
+  origins?: Array<Pick<SourceCandidate, 'source' | 'sourceUrl' | 'platform' | 'author' | 'publishedAt' | 'excerpt' | 'images'>>;
+}
+
+/** Durable intent and receipt for an external effect. Unknown outcomes use the
+ * same `uncertain` phase as dispatcher tool operations. Inputs and credentials
+ * are represented only by hashes, never copied into the audit event. */
+export interface OperationReceipt {
+  key: string;
+  scope: string;
+  token: string;
+  node: string;
+  revision: string;
+  name: string;
+  inputHash: string;
+  phase: import('./conversation.ts').DispatcherCheckpoint['operations'][number]['phase'];
+  result?: unknown;
+  reason?: 'interrupted' | 'execution_failed' | 'receipt_failed';
 }
 
 export type JournalEvent =
@@ -237,9 +254,10 @@ export type JournalEvent =
   | { kind: 'channel.delivery'; delivery: ChannelDelivery }
   | { kind: 'source.configured'; source: SourceSpec }
   | { kind: 'source.requested'; source: string; platform: string; requestedAt: number; nextRequestAt?: number }
-  | { kind: 'source.polled'; source: string; nextAt: number; count: number; duplicates: number; attention?: string; failure?: import('./failures.ts').Failure }
+  | { kind: 'source.polled'; source: string; nextAt: number; count: number; duplicates: number; invalid?: number; attention?: string; failure?: import('./failures.ts').Failure }
   | { kind: 'source.candidate'; candidate: SourceCandidate }
   | { kind: 'source.reputation'; platform: string; author: string; accepted: number; rejected: number }
+  | { kind: 'operation.recorded'; operation: OperationReceipt }
   | { kind: "dispatch.note"; text: string; node?: string; tone?: "info" | "fork" | "warn" }
   | { kind: "chat.user"; id: string; text: string; attachments: Attachment[] }
   | { kind: "chat.assistant"; id: string; text: string; tools: { name: string; summary: string }[]; usage?: Usage }
