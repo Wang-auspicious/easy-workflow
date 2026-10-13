@@ -44,6 +44,29 @@ export function Chat() {
   const width = useStore((s) => s.chatWidth);
   const unread = useStore((s) => s.unread);
   const [drag, setDrag] = useState(false);
+  const composer = useRef<HTMLTextAreaElement>(null);
+  const pendingFocus = useRef(false);
+  useLayoutEffect(() => {
+    if (open && pendingFocus.current && composer.current) {
+      composer.current.focus(); pendingFocus.current = false;
+    }
+  }, [open]);
+  useEffect(() => {
+    const focus = () => {
+      pendingFocus.current = true;
+      const wasOpen = getState().chatOpen;
+      setState({ chatOpen: true, unread: 0 });
+      if (wasOpen && composer.current) { composer.current.focus(); pendingFocus.current = false; }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() === "k" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault(); focus();
+      }
+    };
+    window.addEventListener("easy:focus-composer", focus);
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("easy:focus-composer", focus); window.removeEventListener("keydown", onKey); };
+  }, []);
   const startResize = (e: React.PointerEvent) => {
     e.preventDefault();
     setDrag(true);
@@ -53,9 +76,9 @@ export function Chat() {
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   };
-  if (!open) {
-    return (
-      <aside className="chat is-collapsed">
+  return (
+    <aside className={`chat${open ? "" : " is-collapsed"}`}>
+      {!open && <>
         <div className="chat-head" />
         <div className="chat-collapsed">
           <button className="chat-avatar-btn" onClick={() => setState({ chatOpen: true, unread: 0 })} data-tip="展开主调度  Ctrl \" data-tip-side="right">
@@ -64,16 +87,15 @@ export function Chat() {
           </button>
           <button className="icon-btn" onClick={() => setState({ chatOpen: true, unread: 0 })} data-tip="展开" data-tip-side="right"><PanelRightOpen size={16} /></button>
         </div>
-        <CorrectionPopover />
-      </aside>
-    );
-  }
-  return (
-    <aside className="chat">
-      <div className={`chat-resize ${drag ? "is-drag" : ""}`} onPointerDown={startResize} />
-      <ChatHead />
-      <Log />
-      <Composer />
+      </>}
+      {/* Collapsing is a view change. Keep the pending request ID and send mode
+          alive so reopening cannot resend an unconfirmed operation as new. */}
+      <div style={{ display: open ? "contents" : "none" }}>
+        <div className={`chat-resize ${drag ? "is-drag" : ""}`} onPointerDown={startResize} />
+        <ChatHead />
+        <Log />
+        <Composer inputRef={composer} />
+      </div>
       <CorrectionPopover />
     </aside>
   );
@@ -192,7 +214,7 @@ export function AttChip({ a, onRemove }: { a: Attachment; onRemove?: () => void 
   );
 }
 
-function Composer() {
+function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement | null> }) {
   const atts = useStore((s) => s.attachments);
   const draft = useStore((s) => s.draft);
   const history = useStore((s) => s.history);
@@ -208,22 +230,8 @@ function Composer() {
   const [cursor, setCursor] = useState(0);
   const [walk, setWalk] = useState<number | null>(null);
   const pendingSend = useRef<{ requestId: string; text: string; attachments: string } | null>(null);
-  const ta = useRef<HTMLTextAreaElement>(null);
+  const ta = inputRef;
   useEffect(() => { if (draft && ta.current) ta.current.focus(); }, [draft]);
-  useEffect(() => {
-    const focus = () => ta.current?.focus();
-    // Ctrl/Cmd+K 直接跳进输入框；对话收着时先展开。
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.key === "k" || e.key === "K") && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        setState({ chatOpen: true, unread: 0 });
-        requestAnimationFrame(focus);
-      }
-    };
-    window.addEventListener("easy:focus-composer", focus);
-    window.addEventListener("keydown", onKey);
-    return () => { window.removeEventListener("easy:focus-composer", focus); window.removeEventListener("keydown", onKey); };
-  }, []);
   useLayoutEffect(() => {
     const el = ta.current;
     if (!el) return;

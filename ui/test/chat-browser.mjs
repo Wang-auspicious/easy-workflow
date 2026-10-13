@@ -120,7 +120,13 @@ try {
   await page.waitForFunction(() => !document.querySelector(".composer .send[aria-label='停止当前回答']")?.disabled);
   assert.equal(posts.at(-1).path, "/api/chat/abort");
   await page.keyboard.press("Control+k");
+  await page.waitForFunction(() => document.activeElement?.tagName === "TEXTAREA");
   assert.equal(await page.evaluate(() => document.activeElement?.tagName), "TEXTAREA", "Ctrl+K 要把光标送进输入框");
+  await page.locator('.chat-head button[data-tip^="收起到右侧"]').click();
+  await page.locator('.chat.is-collapsed').waitFor();
+  await page.keyboard.press("Control+k");
+  await page.waitForFunction(() => !document.querySelector('.chat.is-collapsed') && document.activeElement?.tagName === "TEXTAREA", undefined, { timeout: 1500 });
+  assert.equal(await input.inputValue(), "", "收起后快捷键重新展开并聚焦，不产生消息");
 
   await page.evaluate(() => window.fixtureEvents.onerror({}));
   await page.getByText("正在重新连接工厂", { exact: true }).waitFor();
@@ -148,6 +154,11 @@ try {
   await page.getByText(/消息未确认送达/).waitFor();
   const firstAttempt = posts.at(-1);
   assert.equal(await input.inputValue(), firstAttempt.body.text);
+  await page.locator('.chat-head button[data-tip^="收起到右侧"]').click();
+  await page.locator('.chat.is-collapsed').waitFor();
+  await page.keyboard.press("Control+k");
+  await page.waitForFunction(() => document.activeElement?.tagName === "TEXTAREA");
+  assert.equal(await input.inputValue(), firstAttempt.body.text, "收起对话保留未确认消息及其重试身份");
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
   await page.waitForFunction(() => !document.querySelector(".composer textarea").value && !document.querySelector(".composer-feedback"));
   assert.equal(posts.at(-1).body.requestId, firstAttempt.body.requestId);
