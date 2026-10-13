@@ -17,7 +17,7 @@ import { TOOLS, canonical, type Services } from "../packs/vislexicon/tools.ts";
 import { agentDefs, warmStyleLib } from "../packs/vislexicon/agents.ts";
 import { loadCatalog, loadPublished, type CatalogEntry } from "../packs/vislexicon/env.ts";
 import { ControlError } from "./errors.ts";
-import { classifyFailure, type Failure } from "../shared/failures.ts";
+import { classifyFailure, type CandidateRecovery, type Failure } from "../shared/failures.ts";
 import { readRole } from "./roles.ts";
 import { ensureProject, projectPaths, synchronizeProjectPacks, type ProjectInfo } from "./workspace.ts";
 import { configureNetwork } from "./network.ts";
@@ -37,6 +37,7 @@ import { SourceSupervisor } from './sources.ts';
 import {agentCapabilities, parseAgentBinding} from './agent-bindings.ts';
 import {closedAgentConfig} from './mcp-station.ts';
 import {piSelection} from './pi.ts';
+import {UnmanagedRecoverySupervisor} from './recovery.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -64,6 +65,7 @@ export class Factory {
   workflowPacks?: LoadedWorkflowPacks;
   channels?: ChannelSupervisor;
   sources!: SourceSupervisor;
+  recovery!: UnmanagedRecoverySupervisor;
   private services!: Services;
   private stationAgents: Record<string, AgentStationDef> = {};
 
@@ -116,6 +118,7 @@ export class Factory {
     this.runtime = new Runtime(this.compiled, this.journal, this.broker, this.workflowPacks.conditions, executors);
     this.runtime.roleResolver = key => this.workflowPacks?.role(key) ?? readRole(key);
     this.batch = new BatchSupervisor(this);
+    this.recovery = new UnmanagedRecoverySupervisor(this);
     this.runtime.onTick = () => this.maintainRuntime();
     this.wireRecovery();
     if (process.env.FACTORY_READONLY === "1") {
@@ -145,6 +148,7 @@ export class Factory {
     this.reconcileBusinessStock();
     this.channels = new ChannelSupervisor(this);
     this.sources = new SourceSupervisor(this);
+    this.recovery.start();
     this.sources.start();
     this.runtime.tick();
     this.batch.schedule();
@@ -528,7 +532,7 @@ export class Factory {
     }
     this.clearAlert("preflight", "体检通过");
     if (r.checks.find((c) => c.id === "model")?.ok) for (const a of Object.values(this.state.alerts ?? {})) if (a.kind === "model") {
-      if (a.id === 'model-transport' && this.batch.permitModelTrial()) continue;
+      if (a.id === 'model-transport' && (this.batch.permitModelTrial() || this.recovery?.permitModelTrial())) continue;
       this.clearAlert(a.id, "体检确认模型可用");
     }
     return r;
@@ -540,7 +544,10 @@ export class Factory {
       const kind: Alert["kind"] | undefined = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" || failure.tag === "model_transport" ? "model" : failure.tag === "auth_required" ? "auth" : undefined;
       if (!kind) return;
       this.raiseAlert({ id: failure.tag === 'model_transport' ? 'model-transport' : kind === "model" ? "model" : `${kind}:${token.item}`, level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: kind === 'model' ? undefined : failure.url ?? token.url });
-      if (failure.tag === 'model_transport') this.batch.modelFailed();
+      if (failure.tag === 'model_transport') {
+        this.batch.modelFailed();
+        this.recovery?.modelFailed();
+      }
     };
     this.runtime.onPark = token => this.recordRecovery(token, {tag:"run_ended",category:"system",message:"本轮结束，工作尚未完成",url:token.url,retryable:true});
   }
@@ -596,11 +603,44 @@ export class Factory {
     return this.retryCandidates({items:[item],count:1,preview:{role,url:selected.href}})[0];
   }
 
-  retryCandidates(filter:{tag?:string;items?:string[];count:number;preview?:{role:"breadth"|"proof";url:string};automatic?:boolean;replan?:boolean}) {
-    if(this.runtime.paused&&this.runtime.running)throw new ControlError(409,"run_paused","请先继续或结束当前暂停的轮次");
-    const selected=this.candidateFailures({tag:filter.tag,disposition:"retry"}).filter(c=>!filter.items||filter.items.includes(c.item)).slice(0,filter.count);
-    if(!selected.length)return [];
-    for(const c of selected)for(const k of ["tls","auth","browser"])this.clearAlert(`${k}:${c.item}`,"站长已处理，按原因重试");
+  retryCandidates(filter: {
+    tag?: string;
+    items?: string[];
+    count: number;
+    preview?: {role: 'breadth' | 'proof'; url: string};
+    automatic?: boolean;
+    replan?: boolean;
+    checkpointOnly?: boolean;
+    onClaim?: (token: TokenRun) => void;
+  }) {
+    if (this.runtime.paused && this.runtime.running) {
+      throw new ControlError(409, 'run_paused', '请先继续或结束当前暂停的轮次');
+    }
+    const selected = this.candidateFailures({tag: filter.tag, disposition: 'retry'})
+      .filter(candidate => !filter.items || filter.items.includes(candidate.item)).slice(0, filter.count);
+    if (!selected.length) return [];
+    if (filter.checkpointOnly) {
+      if (!this.runtime.running || this.runtime.ending) throw new ControlError(409, 'run_inactive', '自动恢复只在当前运行中继续已有检查点');
+      // Expected validation failures must occur before a journal transaction;
+      // transaction failure deliberately stops the runtime to protect storage.
+      const checkpoints = selected.map(candidate => this.candidateCheckpoint(candidate));
+      const resumed: TokenRun[] = [];
+      this.runtime.atomicTransition(() => {
+        for (const [index, candidate] of selected.entries()) {
+          const token = this.resumeCandidateCheckpoint(candidate, checkpoints[index]);
+          filter.onClaim?.(token);
+          resumed.push(token);
+        }
+      });
+      return resumed;
+    }
+    if (!filter.automatic) {
+      for (const candidate of selected) {
+        for (const kind of ['tls', 'auth', 'browser']) {
+          this.clearAlert(`${kind}:${candidate.item}`, '站长已处理，按原因重试');
+        }
+      }
+    }
     if(!this.runtime.running)this.runtime.start(`失败重试 × ${selected.length}`);
     return selected.map(c=>{
       const previous=this.state.tokens[c.token];
@@ -645,6 +685,69 @@ export class Factory {
       this.journal.append({kind:"candidate.disposition",candidate:{...c,token:t.id,disposition:"claimed"}});
       if (this.runtime.nodes.has('candidates/pool')) this.runtime.stockDelta("candidates/pool",-1,`${c.item} 已取出重试`);return t;
     });
+  }
+
+  private candidateCheckpoint(candidate: CandidateRecovery) {
+    const previous = this.state.tokens[candidate.token];
+    const raw = previous?.data.runtimeCheckpoint;
+    const saved = raw && typeof raw === 'object' ? raw as {
+      version?: unknown; entry?: unknown; done?: unknown; rounds?: unknown; notes?: unknown;
+    } : undefined;
+    const failedAt = previous?.finishedAtNode;
+    const node = failedAt && this.runtime.nodes.get(failedAt);
+    if (!previous || !saved || saved.version !== 1 || typeof saved.entry !== 'string' ||
+        !this.runtime.nodes.has(saved.entry) || !Array.isArray(saved.done) ||
+        !saved.done.every(key => typeof key === 'string') ||
+        !saved.rounds || typeof saved.rounds !== 'object' || Array.isArray(saved.rounds) ||
+        !Object.values(saved.rounds).every(value => Number.isSafeInteger(value) && value >= 0) ||
+        !Array.isArray(saved.notes) || !saved.notes.every(note => Array.isArray(note) &&
+          note.length === 2 && typeof note[0] === 'string' && note[1] &&
+          typeof note[1].reason === 'string' && typeof note[1].byHuman === 'boolean') ||
+        !node || !this.runtime.runnable(node) || !this.runtime.closureOf(saved.entry).has(node.key)) {
+      throw new ControlError(409, 'recovery_checkpoint_missing', '缺少原失败工位的完整持久检查点；已保留成果，不能自动回入口重做');
+    }
+    if (this.runtime.scopePaused(node.key)) throw new ControlError(409, 'scope_paused', '原失败工位已局部暂停，自动恢复继续等待');
+    if (previous.status === 'active' || typeof previous.data.retriedBy === 'string' &&
+        this.state.tokens[previous.data.retriedBy]) {
+      throw new ControlError(409, 'recovery_already_claimed', '原任务已有执行或恢复记录，不能重复领取');
+    }
+    return {previous, checkpoint: structuredClone(raw), node, entry: saved.entry};
+  }
+
+  /** Internal recovery never guesses an entry or discards a partially completed input. */
+  private resumeCandidateCheckpoint(
+    candidate: CandidateRecovery,
+    prepared: ReturnType<Factory['candidateCheckpoint']>,
+  ): TokenRun {
+    const {previous, checkpoint, node, entry} = prepared;
+    const data = structuredClone(previous.data);
+    for (const key of ['failure', 'manualReason', 'retriedBy', 'gate', 'digest', 'accessVerified', 'capacityWait', 'browserRecoveries', 'published']) delete data[key];
+    const token = this.runtime.create(node.key, {
+      item: previous.item, url: previous.url, title: previous.title, source: previous.source,
+      category: previous.category,
+      data: {...data, express: true, retryOf: previous.id, retryTag: candidate.failure?.tag,
+        recoveryStation: node.key, recoveryRoot: entry},
+    });
+    token.data.runtimeCheckpoint = checkpoint;
+    this.runtime.restoreCheckpoint(token);
+    for (const key of this.runtime.descendants(token, node.key)) token.done.delete(key);
+    this.runtime.restoreFlow(token);
+    this.runtime.resumeFrontier(token, node.key);
+    token.data.checkpointDone = [...token.done];
+    this.journal.append({kind: 'token.data', token: token.id, patch: {checkpointDone: [...token.done]}});
+    this.runtime.checkpoint(token);
+    for (const id of previous.evidence) {
+      const evidence = this.state.evidence[id];
+      if (evidence) this.journal.append({kind: 'evidence.added', evidence: {
+        ...evidence, id: `${evidence.id}-${token.id}`, token: token.id, at: Date.now(),
+        meta: {...evidence.meta, reusedFrom: evidence.id},
+      }});
+    }
+    this.journal.append({kind: 'token.data', token: previous.id, patch: {retriedBy: token.id}});
+    this.journal.append({kind: 'candidate.disposition', candidate: {...candidate, token: token.id, disposition: 'claimed'}});
+    if (this.runtime.nodes.has('candidates/pool')) this.runtime.stockDelta('candidates/pool', -1, `${candidate.item} 从持久检查点恢复`);
+    this.journal.append({kind: 'dispatch.note', node: node.key, tone: 'info', text: `${previous.title || previous.item} 从${node.name}自动继续，保留已完成成果与证据`});
+    return token;
   }
 
   pull(count: number, filter: { category?: string; query?: string; includeRepos?: boolean } = {}) {
@@ -777,7 +880,25 @@ export class Factory {
       }
       // A process can stop between saving a completed result and queuing its
       // successor. Exact scheduler checkpoints let us reconstruct that gap.
-      if (checkpointed.has(t.id)) rt.resumeFrontier(t, t.entry);
+      if (checkpointed.has(t.id)) {
+        // A cancelled entry attempt can clear the UI's `at` field before the
+        // process exits. It has no predecessor for resumeFrontier to evaluate,
+        // so restore its unfinished checkpoint directly on the same task.
+        const entryNode = rt.nodes.get(t.entry);
+        const entryQueue = rt.queues.get(t.entry);
+        const incoming = (rt.inFlow.get(t.entry) ?? []).filter(edge => t.closure.has(edge.from));
+        if (entryNode && rt.runnable(entryNode) && entryQueue && !incoming.length &&
+            !t.done.has(t.entry) && !t.dead.has(t.entry) && !t.inflight.has(t.entry) &&
+            !rt.awaitingRepair(t, t.entry) && !entryQueue.includes(t.id)) {
+          rt.atomicTransition(() => {
+            this.journal.append({kind: 'token.queued', token: t.id, node: t.entry, from: 'restart'});
+            entryQueue.push(t.id);
+            t.queuedAt.set(t.entry, Date.now());
+          });
+          requeued++;
+        }
+        rt.resumeFrontier(t, t.entry);
+      }
     }
     if (requeued || voided) this.journal.append({ kind: "dispatch.note", tone: "warn", text: `重启后从日志续跑：${requeued} 件货重新排队，${voided} 次中断的处理作废重做；已完成的工位结果不重做` });
     rt.measurementProposal();

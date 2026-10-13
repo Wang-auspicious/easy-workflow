@@ -45,9 +45,10 @@ test('retrying one failed branch preserves the unfinished repair and its budget 
     assert.equal(original.rounds['consult:curation/style>curation/proof'], 1);
     factory.clearAlert('model-transport', 'Fixture provider recovery; now test the saved workflow checkpoint.');
 
-    factory.clearAlert('model-transport', 'Fixture provider recovered before explicit retry.');
-    const [retry] = factory.retryCandidates({ items: ['parallel-repair'], count: 1 });
+    const [retry] = factory.retryCandidates({ items: ['parallel-repair'], count: 1, automatic: true, checkpointOnly: true });
     assert.ok(retry);
+    assert.equal(retry.entry, original.entry);
+    assert.equal(retry.source, original.source);
     assert.equal(retry.done.has('curation/style'), false, 'attempt.ok cannot override the exact unfinished checkpoint');
     assert.equal(retry.rounds['consult:curation/style>curation/proof'], 1, 'retrying the sibling cannot reset this repair budget');
     await factory.runtime.settle();
@@ -109,5 +110,70 @@ test('a failed repair owner receives the same redo contract after candidate retr
     await close();
     assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir())); assert.ok(path.basename(dir).startsWith('easy-workflow-retry-checkpoint-'));
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('automatic intake retry validates before claiming and retains original source inputs and evidence', {timeout: 15000}, async () => {
+  const factory = new Factory();
+  try {
+    await factory.boot();
+    factory.broker.memoryFloorMB = 0;
+    factory.recovery.close();
+    factory.runtime.start('Unfinished source intake');
+    factory.runtime.executors = () => async ctx => {
+      ctx.addEvidence({id: 'intake-receipt', kind: 'text', label: 'Input retained before failure'});
+      return {ok: false, summary: 'Temporary connection failure', failure: {
+        tag: 'network_connection', category: 'network', message: 'ECONNRESET', retryable: true, owner: 'system',
+      }};
+    };
+    const original = factory.runtime.create('candidates/tidy', {
+      item: 'unfinished-input', url: 'https://fixture.example/', source: 'source:fixture',
+      data: {sourceCandidate: 'candidate-1', input: {description: 'Keep this supplied input'},
+        rerunPublished: true, __runtimeRecovery: {networkAttempts: 1}},
+    });
+    await factory.runtime.settle();
+    const checkpoint = structuredClone(original.data.runtimeCheckpoint);
+    const before = factory.runtime.tokens.size;
+    factory.journal.append({kind: 'token.data', token: original.id,
+      patch: {runtimeCheckpoint: {version: 1, entry: original.entry, done: [], notes: null}}});
+    assert.throws(() => factory.retryCandidates({items: [original.item], count: 1,
+      automatic: true, checkpointOnly: true}), /完整持久检查点/);
+    assert.equal(factory.runtime.tokens.size, before, 'validation cannot claim a new task');
+    assert.equal(factory.runtime.running, true, 'invalid saved input is not a failed storage transaction');
+    assert.equal(factory.state.recoveries[original.item].disposition, 'retry');
+
+    factory.journal.append({kind: 'token.data', token: original.id, patch: {runtimeCheckpoint: checkpoint}});
+    factory.runtime.executors = () => async ctx => {
+      assert.equal(ctx.token.entry, original.entry);
+      assert.equal(ctx.token.source, original.source);
+      assert.deepEqual(ctx.token.data.input, {description: 'Keep this supplied input'});
+      assert.equal(ctx.token.data.sourceCandidate, 'candidate-1');
+      assert.equal(ctx.token.data.rerunPublished, true);
+      assert.deepEqual(ctx.token.data.__runtimeRecovery, {networkAttempts: 1});
+      return {ok: true, summary: 'Recovered input', finish: {status: 'published', reason: 'fixture'}};
+    };
+    const [retry] = factory.retryCandidates({items: [original.item], count: 1,
+      automatic: true, checkpointOnly: true, onClaim: token => {
+        token.data.claimReceipt = 'same transaction';
+        factory.journal.append({kind: 'token.data', token: token.id, patch: {claimReceipt: 'same transaction'}});
+      }});
+    assert.ok(retry);
+    assert.equal(retry.data.retryOf, original.id);
+    assert.equal(factory.state.tokens[retry.id].data.claimReceipt, 'same transaction');
+    assert.ok(factory.state.tokens[retry.id].evidence.some(id =>
+      factory.state.evidence[id].meta?.reusedFrom === 'intake-receipt'));
+    await factory.runtime.settle();
+    assert.equal(factory.state.tokens[retry.id].status, 'published');
+  } finally {
+    factory.recovery.close();
+    await factory.sources.close();
+    factory.channels?.close();
+    await factory.runtime.close();
+    factory.docs.flush();
+    factory.lessons.close();
+    factory.journal.close();
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(dir).startsWith('easy-workflow-retry-checkpoint-'));
+    fs.rmSync(dir, {recursive: true, force: true});
   }
 });

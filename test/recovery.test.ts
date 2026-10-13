@@ -6,7 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { classifyFailure, candidateFailure } from "../shared/failures.ts";
-import type { StationContext } from "../server/runtime.ts";
+import type { Executor, StationContext } from "../server/runtime.ts";
 
 // Every database, catalogue and report belongs to this test process.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-recovery-"));
@@ -18,6 +18,7 @@ const { Journal } = await import("../server/journal.ts");
 const { endRun, readReport } = await import("../server/report.ts");
 const { TOOLS, canonical, httpGet } = await import("../packs/vislexicon/tools.ts");
 const { closeNetwork } = await import("../server/network.ts");
+const { SourceSupervisor } = await import('../server/sources.ts');
 
 test("failed fetches, durable candidate recovery, tagged retry and paused-run termination", {timeout:30000}, async t => {
   let factory:InstanceType<typeof Factory>|undefined;
@@ -239,5 +240,193 @@ test("failed fetches, durable candidate recovery, tagged retry and paused-run te
     if(factory){await factory.runtime.close();factory.docs.flush();factory.lessons.close();factory.journal.close();}
     fixture.closeAllConnections();await new Promise<void>(resolve=>fixture.close(()=>resolve()));
     await closeNetwork();fs.rmSync(dir,{recursive:true,force:true});
+  }
+});
+
+test('unmanaged network recovery preserves source, channel and manual checkpoints with two durable attempts', {timeout: 30000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const finish = async (factory: InstanceType<typeof Factory>) => {
+    factory.recovery.close();
+    await factory.sources.close();
+    factory.channels?.close();
+    await factory.runtime.close();
+    factory.docs.flush();
+    factory.lessons.close();
+    factory.journal.close();
+  };
+  const settle = async (factory: InstanceType<typeof Factory>) => {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await factory.runtime.settle();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  };
+  for (const origin of ['manual', 'source', 'channel'] as const) {
+    let factory = new Factory();
+    const item = 'network-' + origin;
+    const failedStation = origin === 'channel' ? 'components/describe' : 'curation/reader';
+    const preparedStation = origin === 'channel' ? 'components/adapter' : 'curation/scout';
+    let prepared = 0;
+    let attempts = 0;
+    const execute: Executor = async ctx => {
+      if (ctx.token.item === 'healthy-source') return {ok: true, summary: 'Healthy next source', finish: {status: 'published', reason: 'fixture'}};
+      if (ctx.node.key === preparedStation) {
+        prepared++;
+        ctx.addEvidence({id: `prepared-${origin}`, kind: 'text', label: 'Existing preparation'});
+        return {ok: true, summary: 'Prepared once', data: {retained: 'saved work', canonical: ctx.token.url}};
+      }
+      if (ctx.node.key === failedStation) {
+        attempts++;
+        assert.equal(ctx.token.data.retained, 'saved work');
+        // The manual case deliberately lets a later-started parallel branch
+        // succeed before this failure. Its success must not hide the failed node.
+        if (origin === 'manual') await new Promise<void>(resolve => setImmediate(resolve));
+        if (origin === 'source' || attempts < 3) return {ok: false, summary: 'Fixture timeout', failure: {
+          tag: 'network_timeout', category: 'network', message: 'Fixture timeout', retryable: true, owner: 'system',
+        }};
+        return {ok: true, summary: 'Recovered', finish: {status: 'published', reason: 'fixture'}};
+      }
+      return {ok: true, summary: 'Local fixture step'};
+    };
+    const latest = () => {
+      const token = Object.values(factory.state.tokens).findLast(value => value.item === item &&
+        !value.data.retriedBy && (origin !== 'channel' || value.data.channelDelivery));
+      assert.ok(token);
+      return {token, plan: token.data.__runtimeRecovery as {state: string; nextAt: number; networkAttempts: number}};
+    };
+    try {
+      await factory.boot();
+      factory.broker.memoryFloorMB = 0;
+      factory.runtime.executors = () => execute;
+      factory.runtime.start('Unmanaged ' + origin);
+      if (origin === 'source') {
+        await factory.sources.close();
+        factory.sources = new SourceSupervisor(factory);
+        factory.sources.configure({id: 'fixture', name: 'Fixture source', url: 'https://feed.example/items',
+          platform: 'fixture', format: 'json', target: 'candidates/tidy', intervalMs: 86400000, enabled: true});
+        factory.journal.append({kind: 'source.polled', source: 'fixture', nextAt: Date.now() + 86400000, count: 0, duplicates: 0});
+        for (const id of [item, 'healthy-source']) factory.journal.append({kind: 'source.candidate', candidate: {
+          id, source: 'fixture', platform: 'fixture', sourceUrl: 'https://feed.example/items',
+          url: `https://${id}.example/`, title: id, discoveredAt: Date.now(), status: 'pending',
+        }});
+      } else if (origin === 'channel') {
+        const parent = factory.runtime.create('curation/published', {item, url: 'https://channel.example/', source: 'manual'});
+        factory.journal.append({kind: 'channel.emitted', channel: 'curation.component-source.confirmed',
+          token: parent.id, item, inventory: 'consumer'});
+        factory.runtime.setScopePaused({scope: 'line', key: 'curation', paused: true, reason: 'Independent parent remains queued'});
+        factory.runtime.create('curation/scout', {item: 'waiting-parent', url: 'https://parent.example/', source: 'manual'});
+      } else {
+        factory.runtime.create('curation/scout', {item, url: 'https://manual.example/', source: 'manual'});
+      }
+      await settle(factory);
+      assert.equal(attempts, 1);
+      assert.equal(latest().plan.state, 'waiting');
+      assert.equal(latest().plan.networkAttempts, 0);
+      if (origin === 'manual') assert.equal(factory.state.attempts[latest().token.attempts.at(-1)!].ok, true,
+        'the reproduction includes an unrelated later-started successful branch');
+      if (origin === 'source') assert.equal(factory.sources.list()[0].counts.acknowledged, 1,
+        'a failed item cannot occupy the source intake slot');
+      const deadline = latest().plan.nextAt;
+      factory.runtime.pause();
+      await finish(factory);
+      factory = new Factory();
+      await factory.boot();
+      factory.broker.memoryFloorMB = 0;
+      factory.runtime.executors = () => execute;
+      assert.equal(latest().plan.nextAt, deadline, 'restart cannot shorten the durable wait');
+      t.mock.timers.tick(60000);
+      factory.recovery.pump();
+      await settle(factory);
+      assert.equal(attempts, 1, 'global pause keeps an overdue retry queued');
+      factory.runtime.resume();
+      factory.recovery.pump();
+      await settle(factory);
+      assert.equal(attempts, 2);
+      assert.equal(prepared, 1);
+      assert.equal(latest().plan.networkAttempts, 1);
+      factory.runtime.setScopePaused({scope: 'station', key: failedStation, paused: true, reason: 'Inspect retry'});
+      t.mock.timers.tick(60000);
+      factory.recovery.pump();
+      await settle(factory);
+      assert.equal(attempts, 2);
+      factory.runtime.setScopePaused({scope: 'station', key: failedStation, paused: false, reason: 'Resume retry'});
+      factory.recovery.pump();
+      await settle(factory);
+      assert.equal(attempts, 3);
+      assert.equal(prepared, 1);
+      assert.equal(latest().plan.networkAttempts, 2);
+      assert.equal(latest().plan.state, origin === 'source' ? 'exhausted' : 'completed');
+      assert.equal(latest().token.status, origin === 'source' ? 'parked' : 'published');
+      assert.ok(latest().token.evidence.some(id => factory.state.evidence[id].meta?.reusedFrom));
+      for (let i = 0; i < 3; i++) {t.mock.timers.tick(3600000); factory.recovery.pump(); await settle(factory);}
+      assert.equal(attempts, 3, 'exhausted automatic budgets never become an unbounded loop');
+      if (origin === 'channel') {
+        assert.equal(factory.channels!.status()[0].status, 'acknowledged');
+        assert.equal(Object.values(factory.state.tokens).find(token => token.item === 'waiting-parent')?.status, 'active',
+          'an independent child does not wait for its parent workflow to finish');
+      }
+    } finally {
+      await finish(factory);
+      assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+      fs.rmSync(dir, {recursive: true, force: true});
+    }
+  }
+});
+
+test('unmanaged recovery rejects broken channel checkpoints and ambiguous item ownership without stopping storage', {timeout: 30000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const factory = new Factory();
+  const settle = async () => {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await factory.runtime.settle();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  };
+  try {
+    await factory.boot();
+    factory.broker.memoryFloorMB = 0;
+    factory.runtime.executors = node => async ctx => {
+      if (ctx.token.data.retryOf || ctx.token.item === 'unrelated') return {ok: true, summary: 'Fixture publication', finish: {status: 'published', reason: 'fixture'}};
+      return node.key === 'components/describe' || node.key === 'curation/reader'
+        ? {ok: false, summary: 'Fixture timeout', failure: {tag: 'network_timeout', category: 'network', message: 'Fixture timeout', retryable: true, owner: 'system'}}
+        : {ok: true, summary: 'Fixture preparation'};
+    };
+    factory.runtime.start('Checkpoint validation is not a storage failure');
+    const parent = factory.runtime.create('curation/published', {item: 'broken-child', url: 'https://child.example/', source: 'manual'});
+    factory.journal.append({kind: 'channel.emitted', channel: 'curation.component-source.confirmed', token: parent.id, item: parent.item, inventory: 'consumer'});
+    await settle();
+    const failed = factory.channels!.status()[0].targetToken!;
+    assert.ok(factory.state.tokens[failed].data.__runtimeRecovery);
+    factory.journal.append({kind: 'token.data', token: failed, patch: {runtimeCheckpoint: null}});
+    t.mock.timers.tick(60000);
+    factory.recovery.pump();
+    await settle();
+    assert.equal((factory.state.tokens[failed].data.__runtimeRecovery as {state: string}).state, 'blocked');
+    assert.equal(factory.state.tokens[failed].data.retriedBy, undefined);
+    assert.equal(factory.runtime.running, true);
+    assert.equal(factory.runtime.paused, false);
+    const left = factory.runtime.create('curation/reader', {item: 'shared-item', url: 'https://left.example/', source: 'manual'});
+    const right = factory.runtime.create('components/describe', {item: 'shared-item', url: 'https://right.example/', source: 'manual'});
+    await settle();
+    const owner = factory.state.recoveries['shared-item'].token;
+    const other = owner === left.id ? right.id : left.id;
+    t.mock.timers.tick(60000);
+    factory.recovery.pump();
+    await settle();
+    assert.equal(factory.state.tokens[other].data.retriedBy, undefined, 'an item-key collision must never claim the other workflow');
+    assert.equal((factory.state.tokens[other].data.__runtimeRecovery as {state: string}).state, 'blocked');
+    const retried = Object.values(factory.state.tokens).filter(token => token.data.retryOf);
+    assert.equal(retried.length, 1);
+    assert.equal(retried[0].data.retryOf, owner);
+    const independent = factory.runtime.create('curation/reader', {item: 'unrelated', url: 'https://healthy.example/', source: 'manual'});
+    await settle();
+    assert.equal(factory.state.tokens[independent.id].status, 'published');
+  } finally {
+    factory.recovery.close();
+    await factory.sources.close();
+    factory.channels?.close();
+    await factory.runtime.close();
+    factory.docs.flush();
+    factory.lessons.close();
+    factory.journal.close();
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true});
   }
 });

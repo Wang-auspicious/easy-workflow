@@ -7,7 +7,7 @@ import type { Attachment, CompiledFactory, Stamped, StationAgentBinding } from "
 import { apply, initialState, type FactoryState } from "../../shared/project.ts";
 import type { LayoutResult } from "../../shared/layout.ts";
 import { emptyLive, idleDispatcher, type DispatcherStatus, type LiveChat } from "./chat/live.ts";
-import {executionIndex, recordNodeExecution, type NodeExecution} from './canvas/status.ts';
+import {executionIndex, recordNodeExecution, runtimeRecoveryIndex, type NodeExecution} from './canvas/status.ts';
 import {applyUiEvent, isUiState, type UiEvent} from '../../shared/client-view.ts';
 export type { LiveChat } from "./chat/live.ts";
 
@@ -47,6 +47,7 @@ export interface Store {
   nodeRev: Record<string, number>;
   agentBindings: Record<string, NodeAgentBinding>;
   nodeExecutions: Record<string, NodeExecution>;
+  nodeRecoveries: Record<string, string[]>;
   view: View;
   layer: Layer;
   reportRun: string | null;
@@ -88,7 +89,7 @@ const LS = (k: string, v?: unknown) => {
 let state: Store = {
   ready: false, connected: false, factory: null, defaultLayout: null, replayLoading: null,
   layout: { pos: {}, open: {}, colors: {}, bots: {}, capsules: {} },
-  fs: initialState(), version: 0, nodeRev: {}, agentBindings: {}, nodeExecutions: {},
+  fs: initialState(), version: 0, nodeRev: {}, agentBindings: {}, nodeExecutions: {}, nodeRecoveries: {},
   view: (LS("view") as View) ?? "canvas", layer: "pipeline", reportRun: null,
   attachments: [], chatOpen: (LS("chatOpen") as boolean) ?? false, chatWidth: (LS("chatWidth") as number) ?? 320, unread: 0,
   live: emptyLive(), dispatcher: idleDispatcher(),
@@ -103,6 +104,7 @@ export function setState(patch: Partial<Store> | ((s: Store) => Partial<Store>))
   const p = typeof patch === "function" ? patch(state) : patch;
   state = {...state, ...p,
     ...(p.fs && p.fs !== state.fs && !('nodeExecutions' in p) ? {nodeExecutions: executionIndex(p.fs)} : {}),
+    ...(p.fs && p.fs !== state.fs && !('nodeRecoveries' in p) ? {nodeRecoveries: runtimeRecoveryIndex(p.fs)} : {}),
   };
   if ("view" in p) LS("view", state.view);
   if ("chatOpen" in p) LS("chatOpen", state.chatOpen);
@@ -164,6 +166,7 @@ function flush() {
   const nodeExecutions = {...state.nodeExecutions};
   let unread = state.unread;
   let changedProjection = false;
+  let changedRecovery = false;
   const started = performance.now();
   let cursor = 0;
   for (; cursor < batch.length && cursor < 200 && performance.now() - started < 8; cursor++) {
@@ -177,6 +180,10 @@ function flush() {
     const changed = touched(e, fs);
     if (isUiState(fs) && !state.replay) applyUiEvent(fs, e);
     else apply(fs, e);
+    if (['run.started', 'run.ended', 'batch.configured', 'token.created', 'token.queued', 'token.finished', 'correction.reverted'].includes(e.kind) ||
+        e.kind === 'token.data' && ['__runtimeRecovery', 'retriedBy', 'workflowPack', 'channelDelivery'].some(key => Object.hasOwn(e.patch, key))) {
+      changedRecovery = true;
+    }
     if (e.kind === 'attempt.finished') recordNodeExecution(nodeExecutions, fs.attempts[e.attempt]);
     for (const k of new Set([...changed, ...touched(e, fs)])) rev[k] = (rev[k] ?? 0) + 1;
     if (e.kind === "evidence.added") flashes[e.evidence.id] = e.at;
@@ -185,7 +192,9 @@ function flush() {
   }
   if (cursor < batch.length) pending = batch.slice(cursor).concat(pending);
   if (changedProjection) {
-    setState({ version: state.version + 1, nodeRev: rev, nodeExecutions, flashes, unread });
+    setState({ version: state.version + 1, nodeRev: rev, nodeExecutions, flashes, unread,
+      ...(changedRecovery ? {nodeRecoveries: runtimeRecoveryIndex(fs)} : {}),
+    });
   }
   if (pending.length && !raf) raf = requestAnimationFrame(flush);
 }

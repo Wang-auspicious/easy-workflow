@@ -22,6 +22,12 @@ function tokenData(data: Record<string, unknown>) {
     'retriedBy', 'channelDelivery', 'workflowPack', 'batchRecovery', 'failure',
     'title', 'kind', 'kindAgreed', 'mode', 'shotReview', 'factReview', 'copyReview',
   ]);
+  if (Object.hasOwn(data, '__runtimeRecovery')) {
+    summary.__runtimeRecovery = object(data.__runtimeRecovery) ? pick(data.__runtimeRecovery, [
+      'version', 'runId', 'kind', 'state', 'station', 'nextAt',
+      'networkAttempts', 'modelFailures', 'failureAttempt', 'reason',
+    ]) : null;
+  }
   const nested = {
     style: ['applicable', 'subjectVisible', 'styles'],
     facts: ['price', 'license'],

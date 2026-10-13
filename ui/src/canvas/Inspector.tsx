@@ -96,6 +96,7 @@ function Head({ onDrag, onClose, onPin, pinned, children }: { onDrag: (e: React.
 
 function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspector; onDrag: (e: React.PointerEvent) => void; onClose: () => void; onPin: () => void; onWorker: (w: string) => void }) {
   useStore((s) => s.nodeRev[insp.key]);
+  const recoveryTokens = useStore(state => state.nodeRecoveries[insp.key]);
   const now = useNow(1000);
   const [tab, setTab] = useState<"work" | "metrics" | "spec">("work");
   const [attemptSel, setAttemptSel] = useState<string | null>(null);
@@ -115,7 +116,7 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
   const durations = n?.durations ?? [];
   const locked = useStore((s) => s.fs.lockedStations.includes(insp.key));
   const lineWired = s.factory!.lines.find((l) => l.id === node.line)?.wired;
-  const currentStatus = stationStatus(node, s.fs, s.replay?.at ?? now, Boolean(node.dormant) || (!lineWired && node.kind !== 'store'));
+  const currentStatus = stationStatus(node, s.fs, s.replay?.at ?? now, Boolean(node.dormant) || (!lineWired && node.kind !== 'store'), recoveryTokens);
   const usage = recordedUsage(attempts.filter(attempt => attempt.startedAt >= s.fs.run.startedAt));
   const togglePause = async () => {
     setScopeBusy(true);

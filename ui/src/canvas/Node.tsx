@@ -38,6 +38,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   useStore((s) => s.nodeRev[node.key]);
   const agentBinding = useStore(state => state.agentBindings[node.key]);
   const actualExecution = useStore(state => state.nodeExecutions[node.key]);
+  const recoveryTokens = useStore(state => state.nodeRecoveries[node.key]);
   const replay = useStore(state => Boolean(state.replay));
   const colorOverride = useStore((s) => s.layout.colors[node.key]);
   const open = useStore((s) => s.inspectors.some((i) => i.key === node.key));
@@ -50,7 +51,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const shape = shapeOf(node);
   const displayName = node.name;
   const c = roleColors(node.role, colorOverride !== undefined ? { h: colorOverride } : undefined);
-  const status = stationStatus(node, s.fs, s.replay?.at ?? now, dormant);
+  const status = stationStatus(node, s.fs, s.replay?.at ?? now, dormant, recoveryTokens);
   const strip = dormant ? [] : (n?.strip ?? []).map((id) => s.fs.evidence[id]).filter(Boolean) as EvidenceRef[];
   const visualEvidence = strip.filter((ev) => ev.kind === "image" || ev.kind === "video");
   const workers = n?.workers.length ?? 0;

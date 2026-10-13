@@ -202,6 +202,32 @@ try {
   assert.equal(await page.evaluate(() => window.inspectorFixture.getState().fs.evidence.evtext.meta.rawText), undefined);
   await page.screenshot({path: path.join(out, 'lazy-evidence.png')});
   await page.getByRole('button', {name: '关闭', exact: true}).click();
+  const recoveryPlan = {version: 1, runId: 'fixture-run', kind: 'network', state: 'waiting', station: 'curation/capture',
+    nextAt: Date.now() + 60000, networkAttempts: 0, modelFailures: 0, failureAttempt: 'fixture-timeout', reason: '原网页连接超时'};
+  await page.evaluate(plan => {
+    const fixture = window.inspectorFixture;
+    fixture.emit({kind: 'token.created', token: 'recovering', item: '恢复状态验收', line: 'curation', source: 'fixture', url: ''});
+    fixture.emit({kind: 'token.finished', token: 'recovering', node: plan.station, status: 'parked', reason: '原网页连接超时'});
+    fixture.emit({kind: 'token.data', token: 'recovering', patch: {__runtimeRecovery: plan}});
+    fixture.setState({view: 'canvas', inspectors: [{key: plan.station, kind: 'node', x: 40, y: 40, pinned: true}]});
+  }, recoveryPlan);
+  await page.locator('[data-station-status="等待自动恢复"]').waitFor();
+  assert.match(await page.locator('[data-station-status]').innerText(), /0\/2.*当前排队 0/);
+  await page.evaluate(() => window.inspectorFixture.emit({kind: 'run.paused', runId: 'fixture-run'}));
+  await page.locator('[data-station-status="已暂停"]').waitFor();
+  assert.doesNotMatch(await page.locator('[data-station-status]').innerText(), /秒后/);
+  await page.evaluate(plan => {
+    const fixture = window.inspectorFixture;
+    fixture.emit({kind: 'run.resumed', runId: 'fixture-run'});
+    fixture.emit({kind: 'token.data', token: 'recovering', patch: {__runtimeRecovery: {...plan, state: 'exhausted', nextAt: 0, networkAttempts: 2, reason: '两次恢复后原网页仍超时'}}});
+  }, recoveryPlan);
+  await page.locator('[data-station-status="自动恢复次数耗尽"]').waitFor();
+  assert.match(await page.locator('[data-station-status]').innerText(), /两次恢复后原网页仍超时/);
+  await page.evaluate(() => window.inspectorFixture.setState({inspectors: [{key: 'recovering', kind: 'token', x: 40, y: 40, pinned: true}]}));
+  await page.locator('[data-token-status="自动恢复次数耗尽"]').waitFor();
+  await page.screenshot({path: path.join(out, 'recovery-state.png')});
+  await page.evaluate(() => window.inspectorFixture.emit({kind: 'token.finished', token: 'recovering', node: 'curation/published', status: 'published', reason: '已核验的发布结果'}));
+  await page.locator('[data-token-status="已发布"]').waitFor();
   const liveDetailCount = detailRequests.length;
   await page.evaluate(() => {
     const fixture = window.inspectorFixture;

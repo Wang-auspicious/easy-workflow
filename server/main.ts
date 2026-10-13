@@ -332,6 +332,7 @@ const shutdown = async () => {
   if (stopping) return; stopping = true;
   removeConnection();
   clearInterval(ping);
+  factory.recovery.close();
   factory.channels?.close();
   const sourceTask = factory.sources.close();
   closeReportReaders();

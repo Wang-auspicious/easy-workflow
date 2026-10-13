@@ -162,11 +162,41 @@ export class ChannelSupervisor {
     this.pump();
     return structuredClone(this.deliveries.get(id)!);
   }
+
+  /** Resume exactly this failed child; ordinary intake and its turn are separate. */
+  resumeFailed(id: string, onClaim?: (token: TokenRun) => void): TokenRun | null {
+    const f = this.f;
+    if (process.env.FACTORY_READONLY === '1') throw new ControlError(403, 'read_only', '只读项目不能重试信道投递');
+    if (this.closed || !f.runtime.running || f.runtime.paused || f.runtime.ending) return null;
+    const delivery = this.deliveries.get(id);
+    if (!delivery) throw new ControlError(404, 'channel_delivery_not_found', '没有这次信道投递');
+    if (delivery.status !== 'failed') return null;
+    if ([...this.deliveryByToken.keys()].some(token => f.state.tokens[token]?.status === 'active')) return null;
+    const {failedAt} = this.retryPlan(delivery);
+    if (f.runtime.scopePaused(delivery.target) || f.runtime.scopePaused(failedAt)) return null;
+    let token: TokenRun | null = null;
+    f.runtime.atomicTransition(() => {
+      token = this.resumeChild(delivery);
+      this.append({...delivery, targetToken: token.id, attempts: delivery.attempts + 1,
+        status: 'delivered', inventory: {...this.reservation(delivery), held: false}, reason: undefined});
+      onClaim?.(token);
+    });
+    return token;
+  }
   private retryPlan(delivery: ChannelDelivery) {
     const previous = delivery.targetToken && this.f.state.tokens[delivery.targetToken];
-    const saved = previous && previous.data.runtimeCheckpoint as { version?: number; entry?: string; done?: string[] } | undefined;
+    const saved = previous && previous.data.runtimeCheckpoint as { version?: number; entry?: string; done?: string[]; notes?: unknown; rounds?: unknown } | undefined;
     const failedAt = previous && [previous.finishedAtNode, ...previous.attempts.map(id => this.f.state.attempts[id]?.node).reverse()].find(key => key && this.f.runtime.nodes.has(key) && this.f.runtime.runnable(this.f.runtime.nodes.get(key)!));
-    if (!previous || !saved || saved.version !== 1 || !saved.entry || !Array.isArray(saved.done) || !this.f.runtime.nodes.has(saved.entry) || !failedAt || !this.f.runtime.closureOf(saved.entry).has(failedAt)) throw new ControlError(409, 'channel_checkpoint_missing', '信道子任务缺少可恢复的持久检查点；请恢复原流水线包，不能从入口盲目重做');
+    if (!previous || !saved || saved.version !== 1 || !saved.entry || !Array.isArray(saved.done) ||
+        !saved.done.every(key => typeof key === 'string') ||
+        !Array.isArray(saved.notes) || !saved.rounds || typeof saved.rounds !== 'object' || Array.isArray(saved.rounds) ||
+        !Object.values(saved.rounds).every(value => Number.isSafeInteger(value) && value >= 0) ||
+        !saved.notes.every(note => Array.isArray(note) && note.length === 2 &&
+          typeof note[0] === 'string' && note[1] && typeof note[1].reason === 'string' &&
+          typeof note[1].byHuman === 'boolean') ||
+        !this.f.runtime.nodes.has(saved.entry) || !failedAt || !this.f.runtime.closureOf(saved.entry).has(failedAt)) {
+      throw new ControlError(409, 'channel_checkpoint_missing', '信道子任务缺少可恢复的持久检查点；请恢复原流水线包，不能从入口盲目重做');
+    }
     return { previous, saved: structuredClone(previous.data.runtimeCheckpoint), failedAt };
   }
   private resumeChild(delivery: ChannelDelivery): TokenRun {

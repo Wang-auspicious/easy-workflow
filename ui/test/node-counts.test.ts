@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { apply, initialState } from '../../shared/project.ts';
 import type { Stamped } from '../../shared/types.ts';
 import { nodeCountPresentation } from '../src/canvas/node-counts.ts';
-import { executionIndex, nodeExecutionPresentation, recordNodeExecution, recordedUsage, runStatus, stationStatus, tokenStatus } from '../src/canvas/status.ts';
+import { executionIndex, nodeExecutionPresentation, recordNodeExecution, recordedUsage, runStatus, runtimeRecoveryIndex, stationStatus, tokenStatus } from '../src/canvas/status.ts';
+import {applyUiEvent, uiEvent, uiState} from '../../shared/client-view.ts';
 
 test('resource counters report journaled arrivals even though stores never execute attempts', () => {
   const state = initialState(); let seq = 0;
@@ -137,4 +138,111 @@ test('node execution labels distinguish actual receipts, requested bindings and 
   } finally {
     store.setState(previous);
   }
+});
+
+test('runtime recovery summaries preserve only the v1 status metadata through snapshots and events', () => {
+  const {state, emit, create} = statusFixture();
+  create('recovering');
+  const plan = {version: 1, runId: state.run.id, kind: 'network', state: 'waiting', station: 'curation/capture',
+    nextAt: 5000, networkAttempts: 1, modelFailures: 0, failureAttempt: 'failed-1', reason: 'Connection timeout'};
+  emit({kind: 'token.data', token: 'recovering', patch: {__runtimeRecovery: {...plan, internalPayload: 'x'.repeat(100000)}}});
+  const summary = uiState(state);
+  assert.deepEqual(summary.tokens.recovering.data.__runtimeRecovery, plan);
+  const completed = {...plan, state: 'completed', nextAt: 0};
+  applyUiEvent(summary, uiEvent({kind: 'token.data', token: 'recovering', patch: {__runtimeRecovery: completed}, seq: summary.seq + 1, at: 200, run: state.run.id}));
+  assert.deepEqual(summary.tokens.recovering.data.__runtimeRecovery, completed);
+  applyUiEvent(summary, uiEvent({kind: 'token.data', token: 'recovering', patch: {__runtimeRecovery: null}, seq: summary.seq + 1, at: 201, run: state.run.id}));
+  assert.equal(summary.tokens.recovering.data.__runtimeRecovery, null, 'clearing a plan cannot keep a stale automatic recovery label');
+});
+
+test('network recovery waits, pauses, attempts and completion remain separate from task publication', () => {
+  const {state, emit, create} = statusFixture();
+  const node = {key: 'curation/capture', line: 'curation', kind: 'program' as const, resource: 'browser' as const};
+  create('one');
+  emit({kind: 'token.finished', token: 'one', node: node.key, status: 'parked', reason: 'Original timeout'});
+  const plan = {version: 1, runId: state.run.id, kind: 'network', state: 'waiting', station: node.key,
+    nextAt: 5000, networkAttempts: 0, modelFailures: 0, failureAttempt: 'failed-1'};
+  emit({kind: 'token.data', token: 'one', patch: {__runtimeRecovery: plan}});
+  const station = () => stationStatus(node, state, 1000, false, runtimeRecoveryIndex(state)[node.key]);
+  assert.equal(station().label, '等待自动恢复');
+  assert.match(station().detail, /最早 4 秒后.*Original timeout.*0\/2/);
+  assert.equal(runStatus(state, 1000).label, '等待自动恢复');
+  assert.equal(tokenStatus(state.tokens.one, state, 6000).label, '等待恢复条件');
+  emit({kind: 'scope.paused', scope: 'station', key: node.key, paused: true, reason: 'Inspect'});
+  assert.equal(station().label, '已暂停');
+  assert.equal(tokenStatus(state.tokens.one, state, 6000).label, '恢复已暂停');
+  assert.doesNotMatch(tokenStatus(state.tokens.one, state, 6000).detail, /秒后/);
+  emit({kind: 'scope.paused', scope: 'station', key: node.key, paused: false, reason: 'Continue'});
+  emit({kind: 'token.created', token: 'retry', item: 'one', line: 'curation', source: 'manual', url: ''});
+  emit({kind: 'token.data', token: 'one', patch: {retriedBy: 'retry'}});
+  emit({kind: 'token.data', token: 'retry', patch: {__runtimeRecovery: {...plan, state: 'trial', nextAt: 0, networkAttempts: 1}}});
+  emit({kind: 'token.queued', token: 'retry', node: node.key});
+  assert.deepEqual(runtimeRecoveryIndex(state)[node.key], ['retry']);
+  assert.equal(tokenStatus(state.tokens.one, state, 6000).label, '已接续重试');
+  assert.equal(tokenStatus(state.tokens.retry, state, 6000).label, '等待恢复验证');
+  assert.equal(station().pulse, false);
+  emit({kind: 'attempt.started', token: 'retry', node: node.key, attempt: 'recovery-trial', worker: 'fixture', input: ''});
+  assert.equal(station().label, '正在自动恢复');
+  assert.equal(station().pulse, true);
+  emit({kind: 'attempt.finished', attempt: 'recovery-trial', ok: true, summary: 'Recovered station', ms: 1, queuedMs: 0});
+  emit({kind: 'token.data', token: 'retry', patch: {__runtimeRecovery: {...plan, state: 'completed', nextAt: 0, networkAttempts: 1}}});
+  assert.deepEqual(runtimeRecoveryIndex(state), {});
+  assert.equal(tokenStatus(state.tokens.retry, state, 6000).label, '等待调度');
+  assert.equal(runStatus(state, 6000).counts.published, 0);
+  emit({kind: 'token.finished', token: 'retry', node: 'curation/published', status: 'published', reason: 'Published'});
+  assert.equal(tokenStatus(state.tokens.retry, state, 6000).label, '已发布');
+});
+
+test('model trial, blocked and exhausted recovery preserve reasons without reviving old or completed work', () => {
+  const {state, emit, create} = statusFixture();
+  const node = {key: 'curation/reader', line: 'curation', kind: 'agent' as const, resource: 'model' as const};
+  create('one');
+  emit({kind: 'token.finished', token: 'one', node: node.key, status: 'parked', reason: 'Transport failure'});
+  const plan = {version: 1, runId: state.run.id, kind: 'model', state: 'waiting', station: node.key,
+    nextAt: 60000, networkAttempts: 0, modelFailures: 4, failureAttempt: 'failed-model'};
+  emit({kind: 'token.data', token: 'one', patch: {__runtimeRecovery: plan}});
+  assert.equal(tokenStatus(state.tokens.one, state, 1000).label, '模型冷却');
+  emit({kind: 'run.paused', runId: state.run.id});
+  assert.equal(tokenStatus(state.tokens.one, state, 1000).label, '恢复已暂停');
+  assert.equal(runStatus(state, 1000).label, '已暂停');
+  emit({kind: 'run.resumed', runId: state.run.id});
+  create('model-trial');
+  emit({kind: 'token.data', token: 'model-trial', patch: {__runtimeRecovery: {...plan, state: 'trial', nextAt: 0}}});
+  emit({kind: 'token.queued', token: 'model-trial', node: node.key});
+  assert.equal(tokenStatus(state.tokens['model-trial'], state, 1000).label, '等待恢复验证');
+  emit({kind: 'attempt.started', token: 'model-trial', node: node.key, attempt: 'model-check', worker: 'fixture', input: ''});
+  assert.equal(tokenStatus(state.tokens['model-trial'], state, 1000).label, '验证模型恢复');
+  emit({kind: 'scope.paused', scope: 'station', key: node.key, paused: true, reason: 'Pause receiving'});
+  assert.equal(tokenStatus(state.tokens['model-trial'], state, 1000).label, '在途收尾');
+  emit({kind: 'scope.paused', scope: 'station', key: node.key, paused: false, reason: 'Continue'});
+  emit({kind: 'attempt.finished', attempt: 'model-check', ok: true, summary: 'Verified', ms: 1, queuedMs: 0});
+  emit({kind: 'token.finished', token: 'model-trial', node: 'curation/published', status: 'published', reason: 'Published'});
+  for (const [phase, reason, expected] of [['blocked', '缺少持久检查点', '自动恢复受阻'], ['exhausted', '恢复两次后仍连接失败', '自动恢复次数耗尽']]) {
+    emit({kind: 'token.data', token: 'one', patch: {__runtimeRecovery: {...plan, state: phase, reason, nextAt: 0}}});
+    assert.equal(tokenStatus(state.tokens.one, state, 1000).label, expected);
+    assert.match(runStatus(state, 1000).detail, new RegExp(reason));
+  }
+  const indexed = runtimeRecoveryIndex(state)[node.key];
+  const withoutScan = {...state, tokens: new Proxy(state.tokens, {ownKeys() {throw new Error('station status must not scan every token');}})};
+  assert.equal(stationStatus(node, withoutScan, 1000, false, indexed).label, '自动恢复次数耗尽');
+  create('healthy');
+  emit({kind: 'token.queued', token: 'healthy', node: node.key});
+  const queued = stationStatus(node, state, 1000, false, runtimeRecoveryIndex(state)[node.key]);
+  assert.equal(queued.label, '排队中', 'one exhausted task does not claim the healthy queue is blocked');
+  assert.match(queued.detail, /恢复两次后仍连接失败/);
+  assert.equal(runStatus(state, 1000).label, '运行中');
+  assert.equal(runStatus(state, 1000).light, 'yellow');
+  assert.match(runStatus(state, 1000).detail, /恢复两次后仍连接失败/);
+  state.resources.waiting[node.key] = '模型资源暂不可用';
+  assert.equal(runStatus(state, 1000).label, '等待调度条件');
+  assert.notEqual(runStatus(state, 1000).light, 'red');
+  emit({kind: 'token.data', token: 'one', patch: {__runtimeRecovery: {...plan, runId: 'old-run'}}});
+  assert.deepEqual(runtimeRecoveryIndex(state), {});
+  assert.equal(tokenStatus(state.tokens.one, state, 1000).label, '待重试');
+  emit({kind: 'token.data', token: 'one', patch: {__runtimeRecovery: plan}});
+  emit({kind: 'token.finished', token: 'one', node: 'curation/published', status: 'published', reason: 'Real publication'});
+  assert.equal(tokenStatus(state.tokens.one, state, 1000).label, '已发布');
+  assert.deepEqual(runtimeRecoveryIndex(state), {});
+  emit({kind: 'run.started', runId: 'new-run', title: 'New'});
+  assert.equal(tokenStatus(state.tokens.healthy, state, 1000).label, '历史未完成');
 });
