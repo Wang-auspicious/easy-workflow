@@ -33,6 +33,7 @@ import { browserCommand } from './browser.ts';
 import { loadWorkflowPacks, type LoadedWorkflowPacks } from './workflow-packs.ts';
 import { flushAtlas } from '../packs/vislexicon/components.ts';
 import { ChannelSupervisor } from './channels.ts';
+import { SourceSupervisor } from './sources.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -59,6 +60,7 @@ export class Factory {
   batch!: BatchSupervisor;
   workflowPacks?: LoadedWorkflowPacks;
   channels?: ChannelSupervisor;
+  sources!: SourceSupervisor;
   private services!: Services;
 
   constructor() {
@@ -111,7 +113,12 @@ export class Factory {
     this.batch = new BatchSupervisor(this);
     this.runtime.onTick = () => this.maintainRuntime();
     this.wireRecovery();
-    if (process.env.FACTORY_READONLY === "1") { this.catalog = this.runtime.nodes.has('candidates/pool') ? loadCatalog() : []; this.channels = new ChannelSupervisor(this); return; }
+    if (process.env.FACTORY_READONLY === "1") {
+      this.catalog = this.runtime.nodes.has('candidates/pool') ? loadCatalog() : [];
+      this.channels = new ChannelSupervisor(this);
+      this.sources = new SourceSupervisor(this);
+      return;
+    }
     this.wireStock();
     this.wireDocs();
     try { this.lessons.recoverApproved(); } catch (error) { this.lessonIssue(error); }
@@ -132,6 +139,8 @@ export class Factory {
     this.reconcileManualStock();
     this.reconcileBusinessStock();
     this.channels = new ChannelSupervisor(this);
+    this.sources = new SourceSupervisor(this);
+    this.sources.start();
     this.runtime.tick();
     this.batch.schedule();
   }

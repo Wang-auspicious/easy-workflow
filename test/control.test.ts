@@ -3,9 +3,12 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from 'node:http';
 import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import h2Extension from "../integrations/pi/h2-factory.ts";
+import {Journal} from '../server/journal.ts';
+import type {SourceSpec} from '../shared/types.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const secret = "factory-test-only";
@@ -202,5 +205,136 @@ test("headless service: real HTTP capability discovery, control, validation, act
     // Only remove this test's freshly created, resolved temp directory.
     assert.ok(path.resolve(dir).startsWith(path.join(path.resolve(os.tmpdir()), "h2-control-")));
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('configured sources use real HTTP, retain provenance and survive lifecycle boundaries without extra delivery', {timeout: 60000}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'h2-control-sources-'));
+  const hits = new Map<string, number>();
+  let heldClosed = false;
+  const feed = http.createServer((request, response) => {
+    const route = request.url ?? '/';
+    hits.set(route, (hits.get(route) ?? 0) + 1);
+    if (route === '/hold') {
+      response.once('close', () => {heldClosed = true;});
+      return;
+    }
+    if (route === '/oversized') {
+      response.writeHead(200, {'content-type': 'application/json', 'content-length': 3 * 1024 * 1024});
+      response.write('[');
+      return;
+    }
+    if (route === '/rss') {
+      response.setHeader('content-type', 'application/rss+xml');
+      response.end('<rss><channel><item><title>Same recommendation</title><link>https://resource.fixture.test/shared</link><author>Second author</author></item></channel></rss>');
+      return;
+    }
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify(route === '/mixed' ? [
+      null, {}, 'not a record', {url: 42}, {url: {href: '/fake'}},
+      {url: 'https://resource.fixture.test/shared?utm_source=feed', title: 'Shared recommendation', author: 'First author'},
+      {url: 'https://resource.fixture.test/shared#chapter', title: 'Same resource'},
+      {url: 'https://resource.fixture.test/app#/second', title: 'Distinct SPA route'},
+    ] : [{url: 'https://resource.fixture.test/catchup', title: 'Missed scheduled item'}]));
+  });
+  await new Promise<void>(resolve => feed.listen(0, '127.0.0.1', resolve));
+  const port = (feed.address() as {port: number}).port;
+  let server: Awaited<ReturnType<typeof start>> | undefined;
+  const waitFor = async (predicate: () => Promise<boolean>) => {
+    const deadline = Date.now() + 7000;
+    while (!await predicate()) {
+      if (Date.now() >= deadline) throw new Error('Source fixture state did not settle');
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  };
+  const spec = (id: string, route: string): SourceSpec => ({
+    id, name: id, url: `http://127.0.0.1:${port}${route}`, format: 'json',
+    platform: `fixture-${id}`, target: 'candidates/tidy', intervalMs: 86400000, enabled: false,
+  });
+  try {
+    server = await start(dir);
+    assert.deepEqual((await server.tool('source_list')).body.result.sources, []);
+    assert.equal(hits.size, 0, 'an unconfigured project makes no source requests');
+    const mixed = spec('mixed', '/mixed');
+    assert.equal((await server.tool('source_configure', mixed)).status, 403);
+    assert.equal((await server.request('/api/sources/configure', {...mixed, target: 'curation/published'})).status, 422);
+    const configured = await server.request('/api/sources/configure', mixed);
+    assert.equal(configured.status, 200, JSON.stringify(configured.body));
+    assert.equal(hits.size, 0, 'configuration defaults and explicit disabled state do not collect');
+    const first = await server.tool('source_poll', {id: mixed.id});
+    assert.equal(first.status, 200);
+    assert.equal(first.body.result.count, 2);
+    assert.equal(first.body.result.duplicates, 1);
+    assert.equal(first.body.result.invalid, 5);
+    const deferred = await server.tool('source_poll', {id: mixed.id});
+    assert.equal(deferred.body.result.deferred, true);
+    assert.equal(hits.get('/mixed'), 1, 'manual polling cannot bypass the persisted platform deadline');
+
+    const rss = {...spec('rss', '/rss'), format: 'rss' as const};
+    await server.request('/api/sources/configure', rss);
+    assert.equal((await server.tool('source_poll', {id: rss.id})).body.result.duplicates, 1);
+    const sources = (await server.tool('source_list')).body.result.sources;
+    const shared = sources.find((source: {id: string}) => source.id === mixed.id).candidates.find((candidate: {url: string}) => candidate.url.endsWith('/shared'));
+    assert.deepEqual(shared.origins.map((origin: {source: string}) => origin.source), ['mixed', 'rss']);
+    assert.equal(sources.find((source: {id: string}) => source.id === rss.id).candidates[0].id, shared.id);
+    assert.equal(Object.keys((await server.request('/api/state')).body.tokens).length, 0, 'disabled collection preserves candidates without creating work');
+    assert.equal((await server.tool('source_enable', {id: rss.id, enabled: true})).status, 403);
+    assert.equal((await server.request('/api/sources/enable', {id: rss.id, enabled: true})).status, 200);
+    assert.equal((await server.request('/api/sources/enable', {id: rss.id, enabled: false})).status, 200);
+    const afterToggle = (await server.tool('source_list')).body.result.sources.find((source: {id: string}) => source.id === rss.id);
+    assert.equal(afterToggle.duplicates, 1, 'enable/disable preserves the last actual poll receipt');
+    assert.ok(afterToggle.nextAt > Date.now(), 'enable/disable does not reset the schedule to immediate polling');
+
+    const oversized = spec('oversized', '/oversized');
+    await server.request('/api/sources/configure', oversized);
+    assert.equal((await server.tool('source_poll', {id: oversized.id})).status, 409);
+    const oversizedStatus = (await server.tool('source_list')).body.result.sources.find((source: {id: string}) => source.id === oversized.id);
+    assert.match(oversizedStatus.attention, /2097152 bytes/);
+    assert.equal((await server.tool('status')).status, 200, 'a single source error never stalls the service');
+
+    const catchup = spec('catchup', '/catchup');
+    await server.request('/api/sources/configure', catchup);
+    await stop(server.child);
+    server = undefined;
+    const journal = new Journal(path.join(dir, 'journal.db'));
+    // A persisted, explicitly enabled source missed its scheduled time while closed.
+    journal.append({kind: 'source.configured', source: {...catchup, enabled: true}});
+    journal.append({kind: 'source.polled', source: catchup.id, nextAt: Date.now() - 60000, count: 0, duplicates: 0});
+    journal.close();
+    server = await start(dir);
+    await waitFor(async () => (await server!.tool('source_list')).body.result.sources.some((source: {id: string; count: number}) => source.id === catchup.id && source.count === 1));
+    assert.equal(hits.get('/catchup'), 1);
+    await stop(server.child);
+    server = await start(dir);
+    const resumed = (await server.tool('source_list')).body.result.sources;
+    assert.equal(resumed.find((source: {id: string}) => source.id === catchup.id).count, 1);
+    assert.equal(hits.get('/catchup'), 1, 'restart does not collect again before the durable next deadline');
+    assert.equal(Object.keys((await server.request('/api/state')).body.tokens).length, 0, 'an idle restart does not start a workflow to deliver sources');
+
+    const hold = spec('hold', '/hold');
+    await server.request('/api/sources/configure', hold);
+    await server.request('/api/sources/enable', {id: hold.id, enabled: true});
+    await waitFor(async () => hits.get('/hold') === 1);
+    const closingAt = Date.now();
+    await stop(server.child);
+    server = undefined;
+    assert.ok(Date.now() - closingAt < 4000, 'shutdown cancels an in-flight source rather than waiting its timeout');
+    await waitFor(async () => heldClosed);
+    const disable = new Journal(path.join(dir, 'journal.db'));
+    disable.append({kind: 'source.configured', source: hold});
+    disable.close();
+    server = await start(dir, true);
+    const before = (await server.request('/api/state')).body.seq;
+    assert.equal((await server.tool('source_list')).status, 200);
+    assert.equal((await server.tool('source_poll', {id: mixed.id})).status, 403);
+    assert.equal((await server.request('/api/state')).body.seq, before);
+    assert.equal(hits.get('/catchup'), 1);
+    assert.equal(hits.get('/hold'), 1);
+  } finally {
+    if (server) await stop(server.child);
+    feed.closeAllConnections();
+    await new Promise<void>(resolve => feed.close(() => resolve()));
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true});
   }
 });

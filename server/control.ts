@@ -77,6 +77,48 @@ function definitions(f: Factory): Tool[] {
     const dictionary = () => Type.Record(Type.String(), Type.Unknown());
     const files = () => Type.Record(Type.String(), Type.String());
     return [
+      {
+        name: 'source_list', label: '持续来源状态',
+        description: 'List explicitly configured sources, valid entry stations, durable candidates, deduplication, rate deadlines and per-source attention. An empty project has no automatic sources.',
+        parameters: object({}),
+        execute: async () => ok({sources: f.sources.list(), targets: f.sources.targets()}, '读取持续来源与候选状态'),
+      },
+      {
+        name: 'source_configure', label: '配置持续来源',
+        description: 'User-only source configuration. Defaults to disabled. RSS/JSON use bounded shared HTTP transport; social pages require the shared logged-in browser. Raw candidates can enter only a declared workflow entry or independent line root.',
+        parameters: object({
+          id: Type.String({pattern: '^[a-z][a-z0-9-]{0,63}$'}), name: name(),
+          url: Type.String({minLength: 1, maxLength: 4000}), format: choice('rss', 'json', 'browser'),
+          target: name(), intervalMs: Type.Integer({minimum: 10000, maximum: 30 * 86400000}),
+          enabled: Type.Optional(Type.Boolean()), platform: Type.Optional(name()),
+          perMinute: Type.Optional(Type.Integer({minimum: 1, maximum: 6})),
+          perDay: Type.Optional(Type.Integer({minimum: 1, maximum: 300})),
+          limit: Type.Optional(Type.Integer({minimum: 1, maximum: 100})),
+          externalLinksOnly: Type.Optional(Type.Boolean()),
+          input: Type.Optional(files()), constants: Type.Optional(dictionary()),
+        }),
+        execute: async (_id, parameters, actor) => {
+          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '持续来源需由用户配置；调度员只能轮询已配置来源');
+          const source = f.sources.configure({...parameters, enabled: parameters.enabled ?? false, platform: parameters.platform ?? ''});
+          return ok(source, `已配置来源 ${source.name}，${source.enabled ? '按计划采集' : '保持停用'}`);
+        },
+      },
+      {
+        name: 'source_enable', label: '启停持续来源',
+        description: 'User-only activation or deactivation of an existing source. Disabling cancels its in-flight collection and preserves candidates; it never changes other sources or an active workflow.',
+        parameters: object({id: name(), enabled: Type.Boolean()}),
+        execute: async (_id, parameters, actor) => {
+          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '持续来源启停需由用户决定');
+          const source = f.sources.setEnabled(parameters.id, parameters.enabled);
+          return ok(source, `${source.enabled ? '已启用' : '已停用'}来源 ${source.name}`);
+        },
+      },
+      {
+        name: 'source_poll', label: '采集已配置来源',
+        description: 'Collect one existing source within persisted per-platform quotas and bounded backlog. Does not enable it. Disabled sources save candidates without admitting tokens; attention and timeouts affect this source only.',
+        parameters: object({id: name()}),
+        execute: async (_id, parameters) => ok(await f.sources.run(parameters.id), '已处理来源采集请求，请核对新增、重复、坏条目或延后原因'),
+      },
       { name:'business_feed',label:'资料流水线投料',description:'Feed a structured resource into components, skills, sci-figure, ppt, or image-fx. Scientific figures require supplied numeric series; image effects require a real source image and an explicit supported recipe. All original files and review gates remain mandatory.',parameters:object({line:choice('components','skills','sci-figure','ppt','image-fx'),item:name(),url:name(),data:Type.Optional(dictionary())}),execute:async(_id,p)=>{
         let parsed:URL;try{parsed=new URL(p.url);}catch{throw new ControlError(400,'invalid_url','需要完整来源网址');}
         if(!['http:','https:'].includes(parsed.protocol)||parsed.username||parsed.password)throw new ControlError(400,'invalid_url','需要不含凭据的HTTP(S)来源网址');
@@ -395,7 +437,7 @@ function definitions(f: Factory): Tool[] {
     ];
   }
 
-const READS = new Set(["workflow_templates", "status", "inspect", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
+const READS = new Set(["source_list", "workflow_templates", "status", "inspect", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
 
 export class FactoryControl {
   private f: Factory;

@@ -2,8 +2,9 @@
 import { useEffect, useState } from 'react';
 import { Plus, Upload, LayoutTemplate, Play, Pause, X, ArrowUpRight, Loader2 } from 'lucide-react';
 import { roleColors } from '../../../shared/palette.ts';
+import type {SourceCandidate, SourceSpec} from '../../../shared/types.ts';
 import { setState, useStore } from '../store.ts';
-import { boot } from '../api.ts';
+import {api, boot} from '../api.ts';
 import { openLine } from '../canvas/Canvas.tsx';
 import { isOpen } from '../canvas/geometry.ts';
 import { AllocationProposal } from './AllocationProposal.tsx';
@@ -56,6 +57,7 @@ export function Library() {
     {error && <p className="workflow-error" role="alert">{error}</p>}
     {receipt && <p className="workflow-receipt" role="status">{receipt}</p>}
     <AllocationProposal />
+    <Sources disabled={readOnly} digest={factory.digest} />
     {panel && (panel.kind === 'business' ? <BusinessForm key={panel.line} line={panel.line} title={panel.title} disabled={readOnly || run.status === 'paused'} onBusy={setFormBusy} onClose={() => setPanel(null)} onDone={done} /> : <WorkflowForm key={panel.kind === 'template' ? panel.id : panel.kind === 'install' ? 'install' : `${panel.kind}:${panel.pack.id}:${panel.kind === 'feed' ? panel.line : ''}`} panel={panel} structureBlocked={structureBlocked} feedBlocked={readOnly || run.status === 'paused'} onBusy={setFormBusy} onClose={() => setPanel(null)} onDone={done} />)}
     <section className="lib-pack"><div className="lib-pack-head"><b>项目中的流程</b><span className="muted">{factory.packs.map(pack => `${pack.name} v${pack.version}`).join(' · ')}</span></div>
       <div className="lib-grid">{factory.lines.map(line => {
@@ -86,6 +88,131 @@ export function Library() {
     </section>
     <p className="muted lib-note">安装与结构修改由你操作后生效，运行及暂停期间保持当前结构。当前规格 <code className="mono">{factory.digest.slice(0, 12)}</code></p>
   </div></div>;
+}
+
+interface SourceStatus extends SourceSpec {
+  nextAt: number;
+  nextAllowedAt: number;
+  count: number;
+  duplicates: number;
+  invalid?: number;
+  running: boolean;
+  attention?: string;
+  failure?: {message: string; tag: string};
+  deferred?: {reason: string; nextAt: number};
+  deliveryHold?: string;
+  counts: Record<SourceCandidate['status'], number> & {total: number};
+  candidates: SourceCandidate[];
+}
+interface SourceCatalog {
+  sources: SourceStatus[];
+  targets: {key: string; name: string; line: string}[];
+}
+
+function Sources({disabled, digest}: {disabled: boolean; digest: string}) {
+  const [catalog, setCatalog] = useState<SourceCatalog | null>(null);
+  const [revision, setRevision] = useState(0);
+  const [form, setForm] = useState(false);
+  const [draft, setDraft] = useState({id: `source-${crypto.randomUUID().slice(0, 8)}`, name: '', url: '', format: 'rss', target: '', minutes: '360', enabled: false, input: '', constants: ''});
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [receipt, setReceipt] = useState('');
+  useEffect(() => {
+    if (disabled) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    const refresh = async () => {
+      try {
+        const response = await fetch('/api/tools/source_list', {
+          method: 'POST', headers: {'content-type': 'application/json'}, body: '{}', signal: controller.signal,
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error ?? '持续来源状态读取失败');
+        if (active) setCatalog(result.result as SourceCatalog);
+      } catch (reason) {
+        if (active) setError(reason instanceof Error ? reason.message : '持续来源状态读取失败');
+      } finally {
+        if (active) timer = setTimeout(refresh, 15000);
+      }
+    };
+    void refresh();
+    return () => {
+      active = false;
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [disabled, digest, revision]);
+  const mutate = async (action: 'configure' | 'enable' | 'poll', body: Record<string, unknown>, id: string) => {
+    if (disabled || busy) return;
+    setBusy(id);
+    setError('');
+    setReceipt('');
+    try {
+      const response = await api.post<{ok: boolean; summary: string; result: {ok?: boolean; cancelled?: boolean; attention?: string; failure?: {message: string}; count?: number; duplicates?: number; invalid?: number; deferred?: boolean; reason?: string; nextAt?: number}}>(`/api/sources/${action}`, body);
+      if (!response.ok) throw new Error(response.summary);
+      const result = response.result;
+      if (action === 'poll' && result.ok === false) {
+        throw new Error(result.attention || result.failure?.message ||
+          (result.cancelled ? '本次采集已取消，候选和出处已保留。' : '本次采集失败，请查看来源状态。'));
+      }
+      setReceipt(action !== 'poll' ? response.summary : result.deferred
+        ? `${result.reason}；下次可采集 ${new Date(result.nextAt!).toLocaleString()}`
+        : `本次采集新增 ${result.count}，重复 ${result.duplicates}，跳过坏条目 ${result.invalid ?? 0}。`);
+      if (action === 'configure') {
+        setForm(false);
+        setDraft({...draft, id: `source-${crypto.randomUUID().slice(0, 8)}`, name: '', url: '', enabled: false});
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '来源操作失败，请核对状态后再试');
+    } finally {
+      setBusy('');
+      setRevision(value => value + 1);
+    }
+  };
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault();
+    try {
+      const input = draft.input.trim() ? parseObject(draft.input, '来源输入映射') : undefined;
+      if (input && Object.values(input).some(value => typeof value !== 'string')) throw new Error('来源输入映射的值必须是字段路径字符串。');
+      const constants = draft.constants.trim() ? parseObject(draft.constants, '来源常量') : undefined;
+      void mutate('configure', {
+        id: draft.id, name: draft.name.trim(), url: draft.url.trim(), format: draft.format,
+        target: draft.target || catalog?.targets[0]?.key, intervalMs: Number(draft.minutes) * 60000,
+        enabled: draft.enabled, ...(input ? {input} : {}), ...(constants ? {constants} : {}),
+      }, 'configure');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '来源输入无效');
+    }
+  };
+  const update = (field: keyof typeof draft, value: string | boolean) => setDraft(current => ({...current, [field]: value}));
+  return <section className="lib-pack source-section" aria-label="持续来源">
+    <div className="lib-pack-head"><b>持续来源</b><span className="muted">只采集你配置的地址；新候选照常通过完整流水线。</span><button className="btn btn--sm" disabled={disabled || Boolean(busy)} onClick={() => setForm(value => !value)}><Plus size={13} />添加来源</button></div>
+    {error && <p className="workflow-error" role="alert">{error}</p>}
+    {receipt && <p className="workflow-receipt" role="status">{receipt}</p>}
+    {form && <form className="workflow-form source-form" aria-label="配置持续来源" onSubmit={submit}>
+      <div className="source-fields">
+        <label>来源名称<input required value={draft.name} onChange={event => update('name', event.target.value)} /></label>
+        <label>采集格式<select aria-label="采集格式" value={draft.format} onChange={event => update('format', event.target.value)}><option value="rss">RSS / Atom / Sitemap</option><option value="json">JSON 列表</option><option value="browser">共享浏览器页面</option></select></label>
+      </div>
+      <label>来源地址<input required type="url" value={draft.url} onChange={event => update('url', event.target.value)} placeholder="https://example.com/feed.xml" /></label>
+      <div className="source-fields">
+        <label>候选入口<select aria-label="候选入口" required value={draft.target || catalog?.targets[0]?.key || ''} onChange={event => update('target', event.target.value)}>{catalog?.targets.map(target => <option key={target.key} value={target.key}>{target.name} · {target.line}</option>)}</select></label>
+        <label>采集间隔（分钟）<input required type="number" min="1" max="43200" step="1" value={draft.minutes} onChange={event => update('minutes', event.target.value)} /></label>
+      </div>
+      <details><summary>输入映射与常量（需要时填写）</summary><p>可用来源字段：url、title、text、excerpt、author。映射值为字段路径，例如 {JSON.stringify({text: 'excerpt'})}。</p><label>来源输入映射（JSON）<textarea aria-label="来源输入映射（JSON）" rows={3} value={draft.input} onChange={event => update('input', event.target.value)} placeholder='{"text":"excerpt"}' /></label><label>来源常量（JSON）<textarea aria-label="来源常量（JSON）" rows={3} value={draft.constants} onChange={event => update('constants', event.target.value)} placeholder="{}" /></label></details>
+      <label className="workflow-check"><input type="checkbox" checked={draft.enabled} onChange={event => update('enabled', event.target.checked)} />保存后启用定期采集</label>
+      <p>默认停用。停用时“采集一次”只保存候选；启用后，在运行中的轮次按空位投料，默认一次仅 1 件。社交页面需你先在共享浏览器登录。</p>
+      <div className="workflow-form-actions"><button type="button" className="btn btn--sm" disabled={Boolean(busy)} onClick={() => setForm(false)}>取消添加来源</button><button className="btn btn--sm btn--primary" disabled={disabled || Boolean(busy) || !catalog?.targets.length}>{busy === 'configure' ? '正在保存…' : '保存来源配置'}</button></div>
+    </form>}
+    {!catalog ? <p className="muted">{disabled ? '连接服务后可查看来源。' : error ? '来源状态暂不可用。' : '正在读取持续来源…'}{error && <button className="btn btn--sm" disabled={disabled} onClick={() => setRevision(value => value + 1)}>重新读取来源</button>}</p> : !catalog.sources.length ? <p className="muted">尚未配置来源，不会自动发起采集。</p> : <div className="source-list">{catalog.sources.map(source => <article className="source-row" key={source.id} data-source-id={source.id}>
+      <div className="source-row-head"><b>{source.name}</b><span className="chip">{source.running ? '正在采集' : source.attention ? '需处理' : source.failure ? '上次采集失败' : source.enabled ? '已启用' : '已停用'}</span><span className="mono muted">{source.target}</span></div>
+      <p className="source-address">{source.url}</p>
+      <p className="muted">候选 {source.counts.total} · 待投 {source.counts.pending + source.counts.blocked} · 已投未完成 {source.counts.delivered + source.counts.failed} · 已确认 {source.counts.acknowledged} · 已排除 {source.counts.rejected} · {source.nextAt ? `上次新增 ${source.count} / 重复 ${source.duplicates} / 坏条目 ${source.invalid ?? 0}` : '尚未采集'}</p>
+      {(source.attention || source.failure || source.deferred || source.deliveryHold) && <p className={source.attention || source.failure ? 'source-attention' : 'muted'}>{source.attention || source.failure?.message || source.deferred?.reason || source.deliveryHold}</p>}
+      <div className="source-row-foot"><span className="muted">{source.enabled && !source.attention ? source.nextAt ? `下次计划 ${new Date(Math.max(source.nextAt, source.nextAllowedAt, source.deferred?.nextAt ?? 0)).toLocaleString()}` : '等待首次计划采集' : '候选和出处已保留'}</span><button className="btn btn--sm" disabled={disabled || Boolean(busy) || source.running} onClick={() => void mutate('poll', {id: source.id}, source.id)}>采集一次</button><button className="btn btn--sm" disabled={disabled || Boolean(busy)} onClick={() => void mutate('enable', {id: source.id, enabled: !source.enabled}, source.id)}>{source.enabled ? '停用来源' : '启用来源'}</button></div>
+    </article>)}</div>}
+  </section>;
 }
 
 function WorkflowForm({ panel, structureBlocked, feedBlocked, onBusy, onClose, onDone }: { panel: Exclude<Panel, {kind: 'business'}>; structureBlocked: boolean; feedBlocked: boolean; onBusy: (busy: boolean) => void; onClose: () => void; onDone: (message: string) => Promise<void> }) {

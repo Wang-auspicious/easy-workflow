@@ -237,6 +237,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST") {
       const b = await body(req);
       switch (p) {
+        case '/api/sources/configure': return send(res, 200, await control.execute('source_configure', b, 'user'));
+        case '/api/sources/enable': return send(res, 200, await control.execute('source_enable', b, 'user'));
+        case '/api/sources/poll': return send(res, 200, await control.execute('source_poll', b, 'user'));
         case "/api/workflows/template": return send(res, 200, await control.execute("workflow_template", b, "user"));
         case "/api/workflows/install": return send(res, 200, await control.execute("workflow_install", b, "user"));
         case "/api/workflows/line": return send(res, 200, await control.execute("workflow_line", b, "user"));
@@ -321,12 +324,13 @@ const shutdown = async () => {
   removeConnection();
   clearInterval(ping);
   factory.channels?.close();
+  const sourceTask = factory.sources.close();
   closeReportReaders();
   factory.runtime.paused = true;
   dispatcher.interrupt();
   for (const client of clients) client.close();
   server.close(); server.closeAllConnections();
-  await Promise.all([factory.runtime.close(), chatTask]);
+  await Promise.all([sourceTask, factory.runtime.close(), chatTask]);
   await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]); factory.docs.flush(); factory.lessons.close(); factory.journal.close(); process.exit(0);
 };
 process.on("SIGINT", shutdown);

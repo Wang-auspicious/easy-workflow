@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Executor } from '../server/runtime.ts';
+import type { SourceCandidate, SourceSpec } from '../shared/types.ts';
 import { station, line } from '../server/spec/dsl.ts';
 import { installWorkflowPack, type WorkflowManifest } from '../server/workflow-packs.ts';
 
@@ -16,6 +17,7 @@ process.env.FACTORY_HTTP_CACHE = '0';
 process.env.VISLEXICON_ROOT = path.join(directory, 'unconnected');
 const { Factory } = await import('../server/factory.ts');
 const { ChannelSupervisor } = await import('../server/channels.ts');
+const { SourceSupervisor } = await import('../server/sources.ts');
 const { latestRunTokens } = await import('../shared/project.ts');
 
 before(async () => {
@@ -54,6 +56,7 @@ async function boot(executor: Executor = success) {
   return factory;
 }
 async function close(factory: InstanceType<typeof Factory>) {
+  await factory.sources?.close();
   factory.channels?.close(); await factory.runtime.close(); factory.docs.flush(); factory.lessons.close(); factory.journal.close();
 }
 async function settle(factory: InstanceType<typeof Factory>) {
@@ -280,4 +283,281 @@ test('component continuations are finite, unique and discard prior batch executi
     factory.channels!.close(); factory.channels = new ChannelSupervisor(factory); await settle(factory);
     assert.deepEqual(cursors, [0, 20, 40]); assert.equal(factory.channels.status().length, 2);
   } finally { await close(factory); }
+});
+
+const sourceSpec = (overrides: Partial<SourceSpec> = {}): SourceSpec => ({
+  id: 'fixture-source', name: 'Fixture source', url: 'https://feed.fixture.test/items',
+  platform: 'feed.fixture.test', format: 'json', target: 'components/inbox',
+  intervalMs: 86400000, enabled: false, input: {text: 'title'}, ...overrides,
+});
+const sourceItem = (id: string): SourceCandidate => ({
+  id, source: 'fixture-source', platform: 'feed.fixture.test',
+  sourceUrl: 'https://feed.fixture.test/items', url: `https://resource.fixture.test/${id}`,
+  title: id, author: 'Fixture author', discoveredAt: Date.now(), status: 'pending',
+});
+
+test('sources reject middle stations, terminal stores, connected lines and fractional rate limits', async () => {
+  const factory = await boot();
+  await factory.sources?.close();
+  const sources = new SourceSupervisor(factory);
+  try {
+    for (const target of ['components/published', 'components/discover', 'child/inbox', 'child/paid']) {
+      assert.throws(() => sources.configure(sourceSpec({target})), /入口|上游|独立/);
+    }
+    for (const field of ['perMinute', 'perDay', 'limit'] as const) {
+      assert.throws(() => sources.configure(sourceSpec({[field]: 1.5})), /整数/);
+    }
+    for (const constants of [JSON.parse('{"__proto__":{"polluted":true}}'), {constructor: 'reserved'}, {prototype: 'reserved'}, ['not an object'], new Date()]) {
+      assert.throws(() => sources.configure(sourceSpec({constants})), /保留字段|普通对象/);
+    }
+    assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    assert.equal(sources.configure(sourceSpec()).target, 'components/inbox');
+    assert.equal(sources.configure(sourceSpec({target: 'parent/prepare'})).target, 'parent/prepare', 'declared manifest entry remains supported');
+  } finally {
+    await sources.close();
+    await close(factory);
+  }
+});
+
+test('a source terminal result in the same committed batch is acknowledged and retry lineage cannot lose completion', async () => {
+  const factory = await boot();
+  await factory.sources?.close();
+  let sources = new SourceSupervisor(factory);
+  try {
+    sources.configure(sourceSpec());
+    const candidate = sourceItem('same-batch');
+    factory.journal.append({kind: 'source.candidate', candidate});
+    factory.runtime.atomicTransition(() => {
+      // A legacy record can finish before its delivered receipt in the same commit.
+      const token = factory.runtime.create('components/published', {
+        item: candidate.id, url: candidate.url, source: 'source:fixture-source',
+        data: {sourceCandidate: candidate.id},
+      });
+      factory.journal.append({kind: 'source.candidate', candidate: {...candidate, status: 'delivered', targetToken: token.id}});
+    });
+    assert.equal(sources.list()[0].candidates[0].status, 'acknowledged');
+    const retryCandidate = sourceItem('retried');
+    const original = factory.runtime.create('components/inbox', {
+      item: retryCandidate.id, url: retryCandidate.url, source: 'source:fixture-source',
+      data: {sourceCandidate: retryCandidate.id},
+    });
+    factory.journal.append({kind: 'source.candidate', candidate: {...retryCandidate, status: 'failed', targetToken: original.id}});
+    const retry = factory.runtime.create('components/published', {
+      item: retryCandidate.id, url: retryCandidate.url, source: 'source:fixture-source',
+      data: {sourceCandidate: retryCandidate.id, retryOf: original.id},
+    });
+    assert.equal(sources.list()[0].candidates[1].status, 'acknowledged');
+    assert.equal(sources.list()[0].candidates[1].targetToken, retry.id);
+    const accepted = [...factory.journal.read()].filter(event => event.kind === 'source.reputation').at(-1);
+    assert.equal(accepted?.kind === 'source.reputation' && accepted.accepted, 2);
+    await sources.close();
+    sources = new SourceSupervisor(factory);
+    assert.equal(sources.list()[0].candidates[1].targetToken, retry.id);
+    assert.equal([...factory.journal.read()].filter(event => event.kind === 'source.reputation').length, 2, 'replay never credits the same success twice');
+  } finally {
+    await sources.close();
+    await close(factory);
+  }
+});
+
+test('source delivery is bounded, respects pauses and rolls back a failed claim before restart', async t => {
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => {release = resolve;});
+  const execute: Executor = async ctx => {
+    await blocked;
+    return success(ctx);
+  };
+  let factory = await boot(execute);
+  await factory.sources?.close();
+  let sources = new SourceSupervisor(factory);
+  t.mock.method(console, 'error', () => {});
+  try {
+    sources.configure(sourceSpec({enabled: true}));
+    factory.journal.append({kind: 'source.polled', source: 'fixture-source', nextAt: Date.now() + 86400000, count: 0, duplicates: 0});
+    for (let i = 0; i < 3; i++) factory.journal.append({kind: 'source.candidate', candidate: sourceItem(`bounded-${i}`)});
+    factory.runtime.start('Bounded source admission');
+    factory.runtime.pause();
+    sources.pump();
+    assert.equal(Object.keys(factory.state.tokens).length, 0);
+    factory.runtime.setScopePaused({scope: 'line', key: 'components', paused: true, reason: 'Source fixture pause'});
+    factory.runtime.resume();
+    sources.pump();
+    assert.equal(Object.keys(factory.state.tokens).length, 0);
+    factory.runtime.setScopePaused({scope: 'line', key: 'components', paused: false, reason: 'Source fixture resume'});
+    factory.broker.modelHold = 'Fixture provider cooldown';
+    sources.pump();
+    assert.equal(Object.keys(factory.state.tokens).length, 0);
+    assert.match(sources.list()[0].deliveryHold ?? '', /cooldown/);
+    factory.broker.modelHold = null;
+    factory.journal.append({kind: 'batch.configured', batch: {
+      runId: factory.state.run.id, target: 1, maxInFlight: 1, intakeWindow: 1,
+      maxRecoveries: 2, mode: 'running', startedAt: Date.now(), category: 'scoped-fixture',
+    }});
+    sources.pump();
+    assert.equal(Object.keys(factory.state.tokens).length, 0, 'sources cannot consume an unrelated managed batch target');
+    assert.match(sources.list()[0].deliveryHold ?? '', /筛选范围/);
+    factory.runtime.end();
+    factory.runtime.start('Unmanaged source fixture');
+    let injected = false;
+    const append = factory.journal.append.bind(factory.journal);
+    factory.journal.append = event => {
+      if (!injected && event.kind === 'source.candidate' && event.candidate.status === 'delivered') {
+        injected = true;
+        throw new Error('Fixture source claim crash');
+      }
+      return append(event);
+    };
+    assert.throws(() => sources.pump(), /claim crash/);
+    assert.equal(Object.keys(factory.state.tokens).length, 0);
+    assert.ok(sources.list()[0].candidates.every(candidate => candidate.status === 'pending'));
+    await sources.close();
+    await close(factory);
+    factory = await boot(execute);
+    await factory.sources?.close();
+    sources = new SourceSupervisor(factory);
+    factory.runtime.resume();
+    sources.pump();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(Object.keys(factory.state.tokens).length, 1, 'default source admission never opens twelve tasks');
+    assert.match(sources.list()[0].deliveryHold ?? '', /1 件/);
+    assert.equal(sources.list()[0].candidates.filter(candidate => candidate.status === 'pending').length, 2);
+    release();
+    await settle(factory);
+    assert.equal(Object.keys(factory.state.tokens).length, 3);
+    assert.ok(sources.list()[0].candidates.every(candidate => candidate.status === 'acknowledged'));
+    assert.equal(new Set(sources.list()[0].candidates.map(candidate => candidate.targetToken)).size, 3);
+  } finally {
+    release();
+    await sources.close();
+    await close(factory);
+  }
+});
+
+test('manual and parked records retain their backlog without consuming source execution slots', async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => {release = resolve;});
+  const factory = await boot(async ctx => {
+    if (ctx.token.item === 'manual-backlog' || ctx.token.item === 'parked-backlog') {
+      return {
+        ok: true, summary: 'Fixture retained for later resolution',
+        finish: {status: ctx.token.item === 'manual-backlog' ? 'manual' : 'parked', reason: 'Fixture awaiting separate recovery'},
+      };
+    }
+    await blocked;
+    return success(ctx);
+  });
+  await factory.sources.close();
+  const sources = new SourceSupervisor(factory);
+  try {
+    factory.runtime.start('Source slots count live work');
+    for (const item of ['manual-backlog', 'parked-backlog']) {
+      factory.runtime.create('components/inbox', {
+        item, url: `https://resource.fixture.test/${item}`, source: 'manual',
+        data: {input: {text: item}, express: true},
+      });
+    }
+    await settle(factory);
+    assert.deepEqual(Object.values(factory.state.tokens).map(token => token.status), ['manual', 'parked']);
+    assert.ok([...factory.runtime.tokens.values()].every(token => token.finished));
+    sources.configure(sourceSpec({enabled: true}));
+    for (const id of ['source-one', 'source-two']) {
+      factory.journal.append({kind: 'source.candidate', candidate: sourceItem(id)});
+    }
+    sources.pump();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const created = Object.values(factory.state.tokens).filter(token => token.data.sourceCandidate);
+    assert.equal(created.length, 1, 'terminal manual/parked records cannot block the first new source task');
+    assert.equal(created[0].status, 'active');
+    sources.pump();
+    assert.equal(Object.values(factory.state.tokens).filter(token => token.data.sourceCandidate).length, 1, 'a real active task still holds the single execution slot');
+    assert.equal(sources.list()[0].counts.pending, 1);
+    release();
+    await settle(factory);
+    assert.equal(sources.list()[0].counts.acknowledged, 2);
+    assert.deepEqual(Object.values(factory.state.tokens).slice(0, 2).map(token => token.status), ['manual', 'parked']);
+  } finally {
+    release();
+    await sources.close();
+    await close(factory);
+  }
+});
+
+test('source login, timeout, persisted quotas and backlog affect only the configured source', async t => {
+  const factory = await boot();
+  await factory.sources.close();
+  let now = Date.now();
+  let sources = new SourceSupervisor(factory, {now: () => now, random: () => 0});
+  let calls = 0;
+  t.mock.method(factory.toolbox, 'call', async (_allowed: unknown, _name: unknown, args: {url: string}) => {
+    calls++;
+    if (args.url.includes('/login')) {
+      return {ok: false, failure: {tag: 'auth_required', message: 'Fixture requires login', owner: 'user', retryable: false}};
+    }
+    if (args.url.includes('/timeout')) throw new Error('request timed out');
+    return {ok: true, links: [{href: 'https://resource.fixture.test/healthy', text: 'Healthy source'}]};
+  });
+  try {
+    for (const id of ['login', 'timeout', 'healthy']) {
+      sources.configure(sourceSpec({id, format: 'browser', platform: id, url: `https://feed.fixture.test/${id}`, enabled: true}));
+    }
+    await sources.runDue();
+    const first = sources.list();
+    assert.match(first.find(source => source.id === 'login')?.attention ?? '', /login/);
+    assert.equal(first.find(source => source.id === 'timeout')?.attention, undefined, 'a transport timeout is scheduled for bounded later retry');
+    assert.equal(first.find(source => source.id === 'timeout')?.failure?.tag, 'network_timeout', 'the last failure remains visible instead of looking like an empty successful poll');
+    assert.equal(first.find(source => source.id === 'healthy')?.candidates.length, 1);
+    assert.equal(calls, 3);
+    await sources.close();
+    sources = new SourceSupervisor(factory, {now: () => now, random: () => 0});
+    assert.deepEqual(await sources.run('healthy'), {deferred: true, nextAt: now + 10000, reason: '平台访问次数或随机间隔尚未到期'});
+    assert.equal(calls, 3, 'replay retains the rate ledger');
+    now += 20000;
+    await sources.run('healthy');
+    assert.equal(sources.list().find(source => source.id === 'healthy')?.candidates.length, 1);
+    assert.equal([...factory.journal.read()].filter(event => event.kind === 'source.candidate').length, 1, 'same-source duplicates do not append the raw excerpt repeatedly');
+    for (let i = 0; i < 499; i++) factory.journal.append({kind: 'source.candidate', candidate: {...sourceItem(`backlog-${i}`), source: 'healthy'}});
+    now += 20000;
+    const held = await sources.run('healthy');
+    assert.ok(held && typeof held === 'object' && 'deferred' in held && held.deferred === true);
+    assert.ok('reason' in held && typeof held.reason === 'string');
+    assert.match(held.reason, /500/);
+    assert.equal(calls, 4, 'a full unresolved backlog does not request another page');
+    const full = sources.list().find(source => source.id === 'healthy')!;
+    assert.match(full.deferred?.reason ?? '', /500/);
+    assert.equal(full.counts.total, 500);
+    assert.equal(full.counts.pending, 500);
+    assert.equal(full.candidates.length, 50, 'periodic status never returns every historical candidate body');
+    assert.equal(full.hasMoreCandidates, true);
+    assert.equal(full.candidates.at(-1)?.id, 'backlog-498');
+  } finally {
+    await sources.close();
+    await close(factory);
+  }
+});
+
+test('a downstream rejection resolves its source backlog without counting as publication', async () => {
+  const factory = await boot(async () => ({
+    ok: true, summary: 'Fixture excluded invalid resource',
+    finish: {status: 'rejected', reason: 'Fixture URL is not an eligible resource'},
+  }));
+  await factory.sources.close();
+  const sources = new SourceSupervisor(factory);
+  try {
+    sources.configure(sourceSpec({enabled: true}));
+    factory.journal.append({kind: 'source.candidate', candidate: sourceItem('excluded')});
+    factory.runtime.start('Source exclusion');
+    sources.pump();
+    await settle(factory);
+    const candidate = sources.list()[0].candidates[0];
+    assert.equal(candidate.status, 'rejected');
+    assert.equal(factory.state.tokens[candidate.targetToken!].status, 'rejected');
+    assert.equal(sources.list()[0].deferred, undefined);
+    assert.equal(sources.list()[0].deliveryHold, undefined);
+    const reputation = [...factory.journal.read()].filter(event => event.kind === 'source.reputation').at(-1);
+    assert.equal(reputation?.kind === 'source.reputation' && reputation.accepted, 0);
+    assert.equal(reputation?.kind === 'source.reputation' && reputation.rejected, 1);
+  } finally {
+    await sources.close();
+    await close(factory);
+  }
 });

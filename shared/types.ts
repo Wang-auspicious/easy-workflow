@@ -198,7 +198,7 @@ export interface SourceSpec {
 export interface SourceCandidate {
   id: string; source: string; platform: string; sourceUrl: string; url: string; title: string;
   author?: string; publishedAt?: string; excerpt?: string; images?: string[];
-  discoveredAt: number; status: 'pending' | 'delivered' | 'acknowledged' | 'blocked' | 'failed';
+  discoveredAt: number; status: 'pending' | 'delivered' | 'acknowledged' | 'rejected' | 'blocked' | 'failed';
   targetToken?: string; reason?: string;
   origins?: Array<Pick<SourceCandidate, 'source' | 'sourceUrl' | 'platform' | 'author' | 'publishedAt' | 'excerpt' | 'images'>>;
 }

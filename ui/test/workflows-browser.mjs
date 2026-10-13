@@ -3,13 +3,21 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { liveApp } from './live-app.mjs';
 
 const app = await liveApp('workflows');
+const sourceFeed = http.createServer((_request, response) => {
+  response.setHeader('content-type', 'application/json');
+  response.end(JSON.stringify([{url: 'https://resource.fixture.test/ui-source', title: 'Real source fixture', excerpt: 'Source text enters normalization and the full analysis workflow.'}]));
+});
+await new Promise(resolve => sourceFeed.listen(0, '127.0.0.1', resolve));
 const out = path.join(app.root, 'var/verification/workflows-ui');
 await fs.mkdir(out, { recursive: true });
 const errors = [], checks = [];
+const sourcesOnly = process.env.WORKFLOW_SOURCES_ONLY === '1';
+let measuredProof;
 let page;
 try {
   page = await app.browser.newPage({ viewport: { width: 1440, height: 1000 } });
@@ -29,6 +37,7 @@ try {
   assert.equal((await app.request('/api/factory')).factory.lines.filter(line => line.id === pack.lines[0].id).length, 1);
   checks.push('user template creation installs a real compiled pack without duplicating line cards');
 
+  if (!sourcesOnly) {
   const line = page.locator(`[data-workflow-line="${pack.lines[0].id}"]`);
   await line.getByRole('button', { name: '暂停此线' }).click();
   await line.getByRole('button', { name: '恢复此线' }).waitFor();
@@ -65,6 +74,7 @@ try {
   await page.getByText('查看各工位的建议人数', { exact: true }).click();
   const measured = (await app.request('/api/state')).measurement;
   assert.equal(measured.status, 'proposed'); assert.ok(measured.sampleItems >= 10);
+  measuredProof = {sampleItems: measured.sampleItems, artifact: {sha256: artifact.sha256, bytes: artifact.bytes}};
   await page.screenshot({ path: path.join(out, 'allocation-proposal.png'), fullPage: false });
   await page.getByRole('button', { name: '应用这份建议' }).click();
   await page.getByRole('region', { name: '实测配员建议' }).waitFor({ state: 'hidden' });
@@ -129,6 +139,13 @@ try {
   await page.locator('[data-tip^="画布 · 流水线"]').click();
   await page.evaluate(async token => (await import('/src/canvas/Canvas.tsx')).toggleInspector(token, 'token'), first);
   await page.getByRole('button', { name: '纠错退回…' }).click();
+  const correctionHit = await page.getByRole('dialog', {name: '纠错与撤销'}).evaluate(dialog => {
+    const target = dialog.querySelector('.corr-reasons button:last-child');
+    if (!target) return false;
+    const bounds = target.getBoundingClientRect();
+    return dialog.contains(document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2));
+  });
+  assert.equal(correctionHit, true, 'the correction dialog receives pointer hits above canvas inspectors');
   await page.locator('.correction select').selectOption(pack.entry);
   await page.locator('.corr-reasons button').last().click();
   const corrected = page.waitForResponse(response => response.url().endsWith('/api/correct') && response.request().method() === 'POST');
@@ -145,8 +162,61 @@ try {
   assert.equal((await app.request('/api/state')).corrections[correction.correction].status, 'reverted');
   assert.equal((await app.request('/api/state')).tokens[first].status, 'published');
   checks.push('correction receipt offers undo only while pending, survives reload and restores published state');
+  }
+
+  await page.locator('[data-tip="流水线库"]').click();
+  const sources = page.getByRole('region', {name: '持续来源'});
+  await sources.getByRole('button', {name: '添加来源'}).click();
+  await page.getByLabel('来源名称', {exact: true}).fill('浏览器验收来源');
+  await page.getByLabel('采集格式', {exact: true}).selectOption('json');
+  await page.getByLabel('来源地址', {exact: true}).fill(`http://127.0.0.1:${sourceFeed.address().port}/items`);
+  await page.getByLabel('候选入口', {exact: true}).selectOption(pack.entry);
+  await page.getByText('输入映射与常量（需要时填写）', {exact: true}).click();
+  await page.getByLabel('来源输入映射（JSON）', {exact: true}).fill('{bad-json');
+  await page.getByRole('button', {name: '保存来源配置', exact: true}).click();
+  await sources.getByRole('alert').waitFor();
+  assert.equal(await page.getByLabel('来源输入映射（JSON）', {exact: true}).inputValue(), '{bad-json');
+  await page.getByLabel('来源输入映射（JSON）', {exact: true}).fill('{"text":"excerpt"}');
+  const sourceSaved = page.waitForResponse(response => response.url().endsWith('/api/sources/configure') && response.request().method() === 'POST');
+  await page.getByRole('button', {name: '保存来源配置', exact: true}).click();
+  const configured = await (await sourceSaved).json();
+  assert.equal(configured.ok, true, JSON.stringify(configured));
+  assert.equal(configured.result.enabled, false);
+  const sourceRow = page.locator(`[data-source-id="${configured.result.id}"]`);
+  await sourceRow.getByText('已停用', {exact: true}).waitFor();
+  const beforeSourceTokens = Object.keys((await app.request('/api/state')).tokens).length;
+  const sourcePolled = page.waitForResponse(response => response.url().endsWith('/api/sources/poll') && response.request().method() === 'POST');
+  await sourceRow.getByRole('button', {name: '采集一次', exact: true}).click();
+  const collected = await (await sourcePolled).json();
+  assert.equal(collected.result.count, 1);
+  await sourceRow.getByText(/候选 1 · 待投 1/).waitFor();
+  assert.equal(Object.keys((await app.request('/api/state')).tokens).length, beforeSourceTokens);
+  await sourceRow.getByRole('button', {name: '启用来源', exact: true}).click();
+  await sourceRow.getByRole('button', {name: '停用来源', exact: true}).waitFor();
+  const sourceLine = page.locator(`[data-workflow-line="${pack.lines[0].id}"]`);
+  const resumeSourceLine = sourceLine.getByRole('button', {name: '恢复此线', exact: true});
+  if (await resumeSourceLine.count()) await resumeSourceLine.click();
+  const beforeRun = await app.request('/api/state');
+  await app.request('/api/run', {action: beforeRun.run.status === 'paused' ? 'resume' : 'start', title: 'Configured source fixture'});
+  await page.waitForFunction(async id => {
+    const response = await fetch('/api/tools/source_list', {method: 'POST', headers: {'content-type': 'application/json'}, body: '{}'});
+    const state = await response.json();
+    return state.result.sources.find(source => source.id === id)?.candidates[0]?.status === 'acknowledged';
+  }, configured.result.id);
+  const deliveredSource = (await app.request('/api/tools/source_list', {})).result.sources.find(source => source.id === configured.result.id);
+  const sourceToken = (await app.request('/api/state')).tokens[deliveredSource.candidates[0].targetToken];
+  assert.equal(sourceToken.status, 'published');
+  assert.equal(sourceToken.data.normalized.text, 'Source text enters normalization and the full analysis workflow.');
+  assert.equal(sourceToken.attempts.length, pack.lines[0].stations.length - 1, 'every executable station and the publication gate run');
+  await sourceRow.getByRole('button', {name: '停用来源', exact: true}).click();
+  await sourceRow.getByText('已停用', {exact: true}).waitFor();
+  await sourceRow.getByText(/已确认 1/).waitFor();
+  await sourceRow.getByText(/上次新增 1/).waitFor();
+  await sources.scrollIntoViewIfNeeded();
+  await page.screenshot({path: path.join(out, 'sources.png')});
+  checks.push('source form preserves invalid drafts; explicit configure/poll/enable sends one durable candidate through every workflow station, then disables without losing provenance');
   assert.deepEqual(errors, []);
-  await fs.writeFile(path.join(out, 'result.json'), JSON.stringify({ checks, errors, sampleItems: measured.sampleItems, artifact: { sha256: artifact.sha256, bytes: artifact.bytes } }, null, 2));
+  await fs.writeFile(path.join(out, 'result.json'), JSON.stringify({checks, errors, sourcesOnly, ...measuredProof}, null, 2));
   console.log(JSON.stringify({ checks, errors, out }, null, 2));
 } catch (error) {
   await fs.writeFile(path.join(out, 'backend.log'), app.logs());
@@ -155,4 +225,8 @@ try {
     await fs.writeFile(path.join(out, 'failure.txt'), JSON.stringify({ errors, text: await page.locator('body').innerText() }, null, 2));
   }
   throw error;
-} finally { await app.close(); }
+} finally {
+  await app.close();
+  sourceFeed.closeAllConnections();
+  await new Promise(resolve => sourceFeed.close(resolve));
+}
