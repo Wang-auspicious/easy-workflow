@@ -6,7 +6,8 @@ import path from 'node:path';
 import { arbiter, audit, classify, copy, facts, factReview, FACT_FIELDS, shotReview, style } from '../packs/vislexicon/agents.ts';
 import { KINDS } from '../packs/vislexicon/env.ts';
 import { rememberRead, withEvidenceReads } from '../server/network.ts';
-import {runFfmpeg, type EvidenceStore} from '../server/evidence.ts';
+import {EvidenceStore, runFfmpeg} from '../server/evidence.ts';
+import {readRole} from '../server/roles.ts';
 import type { StationContext } from '../server/runtime.ts';
 
 const context = (patch: Record<string, unknown> = {}) => ({
@@ -94,12 +95,50 @@ test('screenshot approval accounts for each required image exactly once and neve
   assert.deepEqual(def.check!({ ...answer, perImage: [{ role: 'poster', ok: true, reason: 'The video subject is visible.' }] }, context({ mode: 'video' })), []);
 });
 
-test('final audit receives the complete record and the persisted source material', async () => {
+test('final audit receives complete records and sources for static and video preview contracts', async () => {
+  const role = readRole('curation/audit').content;
+  assert.match(role, /静态模式[\s\S]*identity[\s\S]*breadth[\s\S]*proof/);
+  assert.match(role, /录屏模式[\s\S]*identity[\s\S]*src[\s\S]*card[\s\S]*poster[\s\S]*posterCard/);
+  assert.doesNotMatch(role, /以及三张截图|三张图是否齐全|三条导览和 alt/);
+  assert.match(role, /不把产出者填写的 quote 本身当成独立证据/);
+  assert.match(role, /逐字段审/);
+  assert.match(role, /每个实际页面的导览和 alt/);
   const record = { editorial: { descriptionZh: 'Long but valid source-derived text. '.repeat(600) }, facts: [{ field: 'license', value: 'MIT', quote: 'MIT License' }], tailField: 'This last field must be reviewed.' };
   const source = 'The complete retained license source ends here.';
-  const input = await audit(store).input(context({ draftV3: record, factPages: [{ url: 'https://site.example/license', text: source }] }));
+  const images = ['identity', 'breadth', 'proof'].map(role => ({
+    role, src: `${role}.webp`, card: `${role}-card.webp`, href: `https://site.example/${role}`,
+  }));
+  const factPages = [{url: 'https://site.example/license', text: source}];
+  const input = await audit(store).input(context({draftV3: record, images, factPages}));
   assert.ok(input.text.includes(JSON.stringify(record, null, 1)), 'never cut a JSON record in the middle of a field');
   assert.ok(input.text.includes(source), 'reviewers need the source, not only the producer’s quote');
+  assert.deepEqual(input.images, images.map(image => ({file: image.card, label: `${image.role}: ${image.href}`})));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-audit-preview-contract-'));
+  try {
+    const evidence = new EvidenceStore(directory);
+    const poster = evidence.put(await runFfmpeg([
+      '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=320x180',
+      '-frames:v', '1', '-c:v', 'libwebp', '-f', 'webp', 'pipe:1',
+    ]), 'webp');
+    const clip = evidence.put(await runFfmpeg([
+      '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=320x180:d=0.2',
+      '-c:v', 'libx264', '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov', 'pipe:1',
+    ]), 'mp4');
+    const video = {src: clip.src, card: clip.src, poster: poster.src, posterCard: poster.src, evidence: 'recorded-fixture', issues: []};
+    const videoRecord = {
+      ...record, preview: {mode: 'video', video},
+      pages: [{role: 'identity', selectionRationale: 'Start at the actual home page.', shot: {alt: 'Blue fixture scene.'}}],
+    };
+    const videoInput = await audit(evidence).input(context({mode: 'video', video, draftV3: videoRecord, factPages}));
+    assert.ok(videoInput.text.includes(JSON.stringify(videoRecord, null, 1)), 'the complete video references and identity rationale/alt stay in the final review');
+    assert.ok(videoInput.text.includes(source));
+    assert.equal(videoInput.images?.length, 1);
+    assert.equal(videoInput.images[0].file, poster.file);
+    assert.match(videoInput.images[0].label, /^identity/);
+  } finally {
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
 });
 
 test('copy numbers require complete source values after normalizing counting punctuation', () => {
