@@ -54,6 +54,8 @@
 ## 判断规则
 
 - **许可证** 写 SPDX 短名。站方自己写的条款记为 custom，在 evidence 里说清限制了什么，比如"禁止商业再利用和改编"。
+- **公开源码不等于开源许可。** sourceCode=open 仅表示公开可读。另交 repositoryLicense（SPDX 或 unknown，含完整来源、原文和范围）记录仓库源码许可；生成图的 CC0、图片素材许可不能用作代码许可。没有代码许可证就保留 unknown，程序不得因此生成 open-source 标签。
+- 审查点名 facets.access 时，核对 facts.pricing、facts.sourceCode、facts.repositoryLicense；点名 facets.licenses 时修改 facts.license。这些标签由组装程序派生，本工位修改其事实输入后程序会重建。
 - **写明覆盖范围（scope）。**
   - Apache-2.0 只覆盖仓库源码，站上的图片和文章另算。
   - Magic UI 的 MIT 只覆盖免费组件，Pro 模板要另外付费。
@@ -85,4 +87,4 @@
 
 ## 提交
 
-调用 `submit`：七个字段，每个包含 value、sourceUrl、quote、evidence、scope；另交 pricingNote、conflicts、reply（首次处理可空）。
+调用 `submit`：七个字段，每个包含 value、sourceUrl、quote、evidence、scope；有仓库时另交同结构 repositoryLicense（未核实则 unknown），另交 pricingNote、conflicts、reply（首次处理可空）。

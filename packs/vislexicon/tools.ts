@@ -13,6 +13,7 @@ import { pickByImages, pickOne } from "../../server/agent-station.ts";
 import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { KIND_ZH, PREVIEW_RULES, loadPublished } from "./env.ts";
 import { scout } from "./scout.ts";
+import { publicationImages, videoPreview } from "./preview.ts";
 import { repoOf } from "../../server/repo.ts";
 import { ALL_AXES, CHOSEN_AXES, derivedFacets, loadTaxonomy, validateV3, webpSize } from "./v3.ts";
 import {
@@ -584,25 +585,25 @@ const record: Tool = async (ctx, svc) => {
   const dir = path.join(workDir(svc, ctx), "video");
   fs.mkdirSync(dir, { recursive: true });
   const { page, close } = await openPage(VIEW, "zh-CN", ctx.signal);
-  let report;
-  try { report = await recordScroll(page, url, dir, (t) => ctx.progress(t, { tool: "record", text: t }),ctx.signal); } finally { await close(); }
+  let report, finalUrl = url;
+  try { report = await recordScroll(page, url, dir, (t) => ctx.progress(t, { tool: "record", text: t }),ctx.signal); finalUrl = page.url(); } finally { await close(); }
   const put = (name: string, ext: string) => svc.store.put(fs.readFileSync(path.join(dir, name)), ext);
   const full = put("preview.mp4", "mp4"), card = put("preview.card.mp4", "mp4"), poster = put("poster.webp", "webp"), posterCard = put("poster.card.webp", "webp");
   const ev = ctx.addEvidence({ id: `vid-${card.sha.slice(0, 16)}`, kind: "video", src: full.src, card: card.src, poster: posterCard.src, label: "滚动录屏", tone: report.issues.length ? "bad" : "ok", meta: { ...report, posterFull: poster.src } });
   ctx.progress(`录屏 ${report.durationSec}s · 变化帧 ${Math.round((report.changedShare as number) * 100)}% · 卡片版 ${(((report.bytes as { card: number }).card) / 1048576).toFixed(2)}MB`, { tool: "gate", text: report.issues.join(", ") || "闸门通过", ok: !report.issues.length, evidence: [ev.id] });
   fs.rmSync(dir, { recursive: true, force: true });
   if (report.issues.length) return { ok: false, summary: `录屏闸门不过：${report.issues.join("、")}`, error: report.issues.join(", ") };
-  return { ok: true, summary: `录屏 ✓ ${report.durationSec}s`, data: { video: { evidence: ev.id, src: full.src, card: card.src, poster: poster.src, posterCard: posterCard.src, sha256: card.sha, ...report } } };
+  return { ok: true, summary: `录屏 ✓ ${report.durationSec}s`, data: { video: { evidence: ev.id, url, finalUrl, src: full.src, card: card.src, poster: poster.src, posterCard: posterCard.src, sha256: card.sha, ...report } } };
 };
 
 /* ------------------------------------------------------------------ ⑩ process */
 
 const processShots: Tool = async (ctx, svc) => {
   if (ctx.token.data.mode === "video") {
-    const v = ctx.token.data.video as { evidence: string } | undefined;
-    if (!v) return { ok: false, summary: "没有录屏", error: "video missing" };
-    ctx.progress("录屏路线：封面已是 WebP，校验字节与尺寸", { tool: "webp", text: "poster.webp + poster.card.webp", ok: true });
-    return { ok: true, summary: "录屏 + 封面就绪", data: { images: [] } };
+    const preview = videoPreview(ctx.token.data, svc.store);
+    if (preview.issues.length) return { ok: false, summary: "录屏或封面校验失败", error: preview.issues.join("；"), data: { images: [] } };
+    ctx.progress("录屏与封面内容摘要、格式及尺寸已核对，保留来源页", { tool: "webp", text: preview.images[0].href, ok: true });
+    return { ok: true, summary: "录屏 + 封面就绪", data: { images: preview.images } };
   }
   const shots = shotsOf(ctx);
   const roles = ["identity", "breadth", "proof"].filter((r) => shots[r]);
@@ -638,7 +639,7 @@ export function buildV3(d: Record<string, any>, token: { id: string; url: string
   const copy = d.copy ?? {}, facts = d.facts ?? {}, cat = d.catalogV3 ?? {};
   const entryId = slug(copy.name || d.title || "") || slug(String(d.host));
   const derived = derivedFacets(facts, tax);
-  const pages = ((d.images ?? []) as { role: string; src: string; card: string; sha256: string; href: string; title?: string }[]).map((im) => {
+  const pages = publicationImages(d, store).map((im) => {
     const file = store.resolve(im.src);
     const size = file ? webpSize(file) : null;
     return {
@@ -697,6 +698,7 @@ const gate: Tool = async (ctx, svc) => {
   if (!d.kind) missing.push("分类");
   if (!(d.kindAgreed || d.arbiterDecided)) missing.push("分类复核");
   if (d.mode === "video" ? !d.video : (d.images?.length ?? 0) < 3) missing.push(d.mode === "video" ? "录屏" : "三张图");
+  if (d.mode === "video") missing.push(...videoPreview(d, svc.store).issues);
   if (d.shotReview !== "pass") missing.push("截图审查");
   for (const [k, label] of [["fact-reviewVerdict", "事实审查"], ["copy-reviewVerdict", "文案审查"], ["auditVerdict", "终审"]]) if (d[k] !== "pass") missing.push(label);
   const tax = await loadTaxonomy();

@@ -14,7 +14,8 @@ import { repoSources, type RepoMeta } from "../../server/repo.ts";
 import { FRONTEND, KINDS, KIND_ZH, VOCAB, ruleExcerpt } from "./env.ts";
 import { dossierText, type Dossier } from "./scout.ts";
 import { breadthPreviewIssues } from "./capture.ts";
-import { CHOSEN_AXES, KIND_CATEGORIES, loadTaxonomy, ownerOf, taxonomyLoaded } from "./v3.ts";
+import { CHOSEN_AXES, KIND_CATEGORIES, loadTaxonomy, ownerOf, editableFields, taxonomyLoaded } from "./v3.ts";
+import { publicationImages } from "./preview.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const prompt = (name: string) => fs.readFileSync(path.join(HERE, "stations", name), "utf8");
@@ -371,7 +372,7 @@ export async function warmStyleLib() {
 
 export const FACT_FIELDS = ["author", "organization", "repository", "license", "pricing", "sourceCode", "commercial"] as const;
 type FactValue = { value: string; sourceUrl: string; quote: string; evidence: string; scope: string };
-type FactsOut = Record<(typeof FACT_FIELDS)[number], FactValue> & { pricingNote: string; conflicts: string[]; reply: string };
+type FactsOut = Record<(typeof FACT_FIELDS)[number], FactValue> & { repositoryLicense?: FactValue; pricingNote: string; conflicts: string[]; reply: string };
 
 /** Program legwork before the model: repository API, LICENSE, package.json and the pages the reader pointed to. */
 async function factSources(ctx: StationContext) {
@@ -411,9 +412,10 @@ export const facts: AgentStationDef<FactsOut> = {
 - 每个不是 unknown 的值：sourceUrl 必须是资料里或你用工具读过的页面，quote 是该页原文里连续的一段（不改写、不翻译），evidence 用中文说清在哪里看到、说明了什么，scope 写适用范围（比如"只覆盖仓库源码"，没有就空字符串）。
 - unknown 也要写 evidence：看了哪些页没找到。sourceUrl 可以写最后查看的那一页。
 - pricingNote：价格的一句中文说明（比如"免费核心组件 + 付费 Pro"），没有就空。conflicts：两处说法矛盾时写出来。
+- sourceCode=open 只说明仓库公开可读，不代表获得开源许可。repositoryLicense 单独记录仓库源码许可证（SPDX 或 unknown），必须引用许可证原文；不要用生成作品、图片或付费输出的许可代替源码许可。facets.access / facets.licenses 是由这些事实派生的，只修改事实，程序会重新组装标签。
 - 被审核员要求修改时，只改被点名的项，在 reply 里一句话说明改了什么。`,
   tools: ["fetch_text", "page_text", "repo_meta", "site_files"],
-  schema: Type.Object({ ...Object.fromEntries(FACT_FIELDS.map((f) => [f, FactT])), pricingNote: Type.String(), conflicts: Type.Array(Type.String()), reply: Type.String() } as Record<string, any>),
+  schema: Type.Object({ ...Object.fromEntries(FACT_FIELDS.map((f) => [f, FactT])), repositoryLicense: Type.Optional(FactT), pricingNote: Type.String(), conflicts: Type.Array(Type.String()), reply: Type.String() } as Record<string, any>),
   input: async (ctx) => {
     const pages = await factSources(ctx);
     factCache.set(ctx.token, pages);
@@ -424,7 +426,7 @@ export const facts: AgentStationDef<FactsOut> = {
   check: (out, ctx) => {
     const pages = factCache.get(ctx.token) ?? [];
     const issues: string[] = [];
-    for (const f of FACT_FIELDS) {
+    for (const f of [...FACT_FIELDS, ...(out.repositoryLicense ? ["repositoryLicense" as const] : [])]) {
       const v = out[f];
       if (!v) { issues.push(`${f}: 缺少`); continue; }
       if (v.value === "unknown" || !v.value) continue;
@@ -446,11 +448,11 @@ export const facts: AgentStationDef<FactsOut> = {
   },
   describe: (o) => `作者 ${o.author?.value} · 仓库 ${o.repository?.value === "unknown" ? "未知" : "有"} · 许可 ${o.license?.value} · 价格 ${o.pricing?.value} · 商用 ${o.commercial?.value}`,
   after: (out, ctx) => {
-    const facts = Object.fromEntries(FACT_FIELDS.map((f) => [f, out[f]]));
+    const facts = Object.fromEntries([...FACT_FIELDS, ...(out.repositoryLicense ? ["repositoryLicense" as const] : [])].map((f) => [f, out[f]]));
     const pages = factCache.get(ctx.token) ?? [];
     // Preserve the actual cited evidence for downstream review, even when it
     // came from beyond the prefetched excerpt or a second read of the same URL.
-    const read = readEvidence().filter(p => FACT_FIELDS.some(f => evidenceURL(out[f]?.sourceUrl ?? "") === evidenceURL(p.url) && quoted(out[f]?.quote ?? "", norm(p.text))));
+    const read = readEvidence().filter(p => Object.values(facts).some(f => evidenceURL(f?.sourceUrl ?? "") === evidenceURL(p.url) && quoted(f?.quote ?? "", norm(p.text))));
     ctx.addEvidence({ id: `fa-${ctx.attempt}`, kind: "verdict", label: "事实", verdict: `${out.pricing?.value} · ${out.license?.value}`, tone: FACT_FIELDS.some((f) => out[f]?.value !== "unknown") ? "ok" : "warn", meta: { ...facts, pricingNote: out.pricingNote, conflicts: out.conflicts } });
     return {
       ok: true, summary: `作者 ${out.author?.value} · 许可 ${out.license?.value} · 价格 ${out.pricing?.value} · 商用 ${out.commercial?.value}${out.reply ? `；${out.reply}` : ""}`,
@@ -470,7 +472,7 @@ const ReviewSchema = Type.Object({ verdict: lit("pass", "fix"), problems: Type.A
 function fixesOf(problems: Problem[], fallback: string, via?: string[]): Fix[] {
   const by = new Map<string, Problem[]>();
   for (const p of problems) { const o = ownerOf(p.field) ?? fallback; by.set(o, [...(by.get(o) ?? []), p]); }
-  return [...by].map(([station, ps]) => ({ station, fields: ps.map((p) => p.field), problem: ps.map((p) => `${p.field}：${p.problem}`).join("；"), via }));
+  return [...by].map(([station, ps]) => ({ station, fields: [...new Set(ps.flatMap((p) => editableFields(p.field)))], problem: ps.map((p) => `${p.field}：${p.problem}${editableFields(p.field).join() !== p.field ? `（这是派生字段；核对并修改 ${editableFields(p.field).join("、")}，由组装程序重建，不能直接编辑 facets）` : ""}`).join("；"), via }));
 }
 
 const reviewer = (station: string, label: string, fallbackOwner: string, system: string, text: (ctx: StationContext) => string, images?: (ctx: StationContext) => { file: string; label: string }[], tools?: string[], via?: string[]): AgentStationDef<ReviewOut> => ({
@@ -504,9 +506,9 @@ export const factReview = reviewer("fact-review", "事实审查", "curation/fact
 
 /* ------------------------------------------------------------------ ⑭ editor */
 
-type CopyOut = { name: string; takeawayZh: string; noteZh: string; rationale: { identity: string; breadth: string; proof: string }; alt: { identity: string; breadth: string; proof: string }; descriptionZh: string; descriptionEn: string; reasons: { statement: string; evidenceUrl: string }[]; reply: string };
+type CopyOut = { name: string; takeawayZh: string; noteZh: string; rationale: { identity: string; breadth?: string; proof?: string }; alt: { identity: string; breadth?: string; proof?: string }; descriptionZh: string; descriptionEn: string; reasons: { statement: string; evidenceUrl: string }[]; reply: string };
 const BANNED = /精美|高级感|极致|强大的|一站式|赋能|海量|顶级|神器|必备/;
-const imagesFor = (store: EvidenceStore) => (ctx: StationContext) => ((data(ctx).images ?? []) as { role: string; card: string; href: string }[]).map((im) => ({ file: store.resolve(im.card)!, label: `${im.role}: ${im.href}` }));
+const imagesFor = (store: EvidenceStore) => (ctx: StationContext) => publicationImages(data(ctx), store).map((im) => ({ file: store.resolve(im.card)!, label: `${im.role}: ${im.href}` }));
 
 export const copy = (store: EvidenceStore): AgentStationDef<CopyOut> => ({
   system: `按 VisLexicon 编辑语气写六样东西（细则见你的 ROLE.md）：
@@ -515,35 +517,36 @@ export const copy = (store: EvidenceStore): AgentStationDef<CopyOut> => ({
 - noteZh：编辑手记 120–180 字、2–4 句，用"我们"，依次写进去看到了什么 → 先点开哪里、为什么 → 适合谁或要注意什么；不用感叹号。
 - rationale.identity / breadth / proof：每条不超过 40 字，写成导览。
 - alt.identity / breadth / proof：画面里实际有什么，不是模板句。
+- 录屏路线只提供 identity 封面，只填写 identity 的导览和 alt；不得杜撰 breadth / proof 画面。静态截图路线必须填写三张图。
 - descriptionZh：中性、完整的 1–2 句；descriptionEn 是它的平实英文版。
 - reasons：1–2 条收录理由，每条带一个证据网址。
 - 被审核员要求修改时，只改被点名的字段，在 reply 里一句话说明改了什么。`,
   schema: Type.Object({
     name: Type.String(), takeawayZh: Type.String(), noteZh: Type.String(),
-    rationale: Type.Object({ identity: Type.String(), breadth: Type.String(), proof: Type.String() }),
-    alt: Type.Object({ identity: Type.String(), breadth: Type.String(), proof: Type.String() }),
+    rationale: Type.Object({ identity: Type.String(), breadth: Type.Optional(Type.String()), proof: Type.Optional(Type.String()) }),
+    alt: Type.Object({ identity: Type.String(), breadth: Type.Optional(Type.String()), proof: Type.Optional(Type.String()) }),
     descriptionZh: Type.String(), descriptionEn: Type.String(),
     reasons: Type.Array(Type.Object({ statement: Type.String(), evidenceUrl: Type.String() }), { minItems: 1, maxItems: 2 }), reply: Type.String(),
   }),
   input: (ctx) => {
     const d = data(ctx);
-    const shots = ((d.images ?? []) as { role: string; href: string }[]).map((im, i) => `图 ${i + 1}（${im.role}）：${im.href}`).join("\n");
+    const shots = publicationImages(d, store).map((im, i) => `图 ${i + 1}（${im.role}）：${im.href}`).join("\n");
     const prev = d.copy ? `\n\n当前文案（修改时只改被点名的字段）：${JSON.stringify(d.copy)}` : "";
     return {
-      text: `网站：${d.title}（${d.canonical}）\n分类：${KIND_ZH[d.kind]}\n站点理解：${JSON.stringify(d.understanding ?? {})}\n事实：${JSON.stringify(Object.fromEntries(Object.entries(d.facts ?? {}).map(([k, v]: [string, any]) => [k, { value: v?.value, scope: v?.scope }])))}\n价格说明：${d.pricingNote ?? ""}\n风格：${d.style?.applicable ? `${(d.style.styles ?? []).map((s: D) => s.id).join(", ")}；${d.style.signatureZh ?? ""}` : "不适用"}\n三张图：\n${shots}${prev}\n\n卷宗节选：\n${dossierText(dossier(ctx), 4000)}`,
+      text: `网站：${d.title}（${d.canonical}）\n分类：${KIND_ZH[d.kind]}\n站点理解：${JSON.stringify(d.understanding ?? {})}\n事实：${JSON.stringify(Object.fromEntries(Object.entries(d.facts ?? {}).map(([k, v]: [string, any]) => [k, { value: v?.value, scope: v?.scope }])))}\n价格说明：${d.pricingNote ?? ""}\n风格：${d.style?.applicable ? `${(d.style.styles ?? []).map((s: D) => s.id).join(", ")}；${d.style.signatureZh ?? ""}` : "不适用"}\n${d.mode === "video" ? "录屏封面（只写 identity）" : "三张静态图"}：\n${shots}${prev}\n\n卷宗节选：\n${dossierText(dossier(ctx), 4000)}`,
       images: imagesFor(store)(ctx),
     };
   },
   check: (o, ctx) => {
     const issues: string[] = [];
-    const len = (s: string) => [...s].length;
+    const len = (s: string | undefined) => [...(s ?? "")].length;
     if (len(o.takeawayZh) > 28 || len(o.takeawayZh) < 6 || /\d/.test(o.takeawayZh)) issues.push(`takeawayZh 有 ${len(o.takeawayZh)} 字，需 6–28 字且不含数字`);
     if (len(o.noteZh) < 120 || len(o.noteZh) > 180) issues.push(`noteZh 有 ${len(o.noteZh)} 字，需 120–180`);
     if (/[!！]/.test(o.noteZh)) issues.push("noteZh 不用感叹号");
     if (!o.noteZh.includes("我们")) issues.push("noteZh 用第一人称复数“我们”");
-    for (const k of ["identity", "breadth", "proof"] as const) {
+    for (const k of (data(ctx).mode === "video" ? ["identity"] : ["identity", "breadth", "proof"]) as ("identity" | "breadth" | "proof")[]) {
       if (len(o.rationale[k]) > 40 || len(o.rationale[k]) < 6) issues.push(`rationale.${k} 需 6–40 字`);
-      if (len(o.alt[k]) < 6 || /screenshot|evidence|截图$/i.test(o.alt[k])) issues.push(`alt.${k} 要写画面里有什么`);
+      if (len(o.alt[k]) < 6 || /screenshot|evidence|截图$/i.test(o.alt[k] ?? "")) issues.push(`alt.${k} 要写画面里有什么`);
     }
     const all = o.takeawayZh + o.noteZh + o.descriptionZh;
     if (BANNED.test(all)) issues.push(`禁用词：${all.match(BANNED)![0]}`);
@@ -562,9 +565,9 @@ export const copy = (store: EvidenceStore): AgentStationDef<CopyOut> => ({
 });
 
 export const copyReview = (store: EvidenceStore) => reviewer("copy-review", "文案审查", "curation/copy",
-  `独立审查编辑交来的文案。逐条核对：每个说法是否有卷宗、事实或截图支持；数字是否在资料里；价格与许可的说法是否和事实一致；手记是否像真的进去看过（具体到页面和元素，用"我们"，不用营销腔和感叹号）；三条导览与三条 alt 是否和对应截图一致。
+  `独立审查编辑交来的文案。逐条核对：每个说法是否有卷宗、事实或截图支持；数字是否在资料里；价格与许可的说法是否和事实一致；手记是否像真的进去看过（具体到页面和元素，用"我们"，不用营销腔和感叹号）；每个实际页面的导览与 alt 是否和对应画面一致；录屏只有 identity 封面，不要求或编造 breadth/proof。
 不把自己的措辞偏好当问题。有问题就 verdict=fix，problems 里逐项写 field（editorial.noteZh、pages[2].shot.alt、pages[1].selectionRationale、editorial.takeawayZh、classification.reasons 等）和具体哪句、为什么、往哪改。全部没问题就 pass。`,
-  (ctx) => { const d = data(ctx); return `文案：${JSON.stringify(d.copy)}\n\n事实：${JSON.stringify(Object.fromEntries(Object.entries(d.facts ?? {}).map(([k, v]: [string, any]) => [k, { value: v?.value, scope: v?.scope }])))}\n站点理解：${JSON.stringify(d.understanding ?? {})}\n截图顺序：pages[0]=identity，pages[1]=breadth，pages[2]=proof\n\n卷宗节选：\n${dossierText(dossier(ctx), 4000)}`; },
+  (ctx) => { const d = data(ctx); return `文案：${JSON.stringify(d.copy)}\n\n事实：${JSON.stringify(Object.fromEntries(Object.entries(d.facts ?? {}).map(([k, v]: [string, any]) => [k, { value: v?.value, scope: v?.scope }])))}\n站点理解：${JSON.stringify(d.understanding ?? {})}\n画面顺序：${publicationImages(d, store).map((im, i) => `pages[${i}]=${im.role}`).join("，")}（${d.mode === "video" ? "录屏封面" : "静态截图"}）\n\n卷宗节选：\n${dossierText(dossier(ctx), 4000)}`; },
   imagesFor(store));
 
 /* ------------------------------------------------------------------ ⑯ final audit */
@@ -574,7 +577,7 @@ export const audit = (store: EvidenceStore): AgentStationDef<ReviewOut> => {
     `你是发布前的最后一道关。下面是将要发布的整条 VisLexicon v3 记录，以及程序已经做过的结构校验结果（已通过）。逐字段做语义审核：
 - 分类理由与证据一致；primaryCategory / subcategory 与站点实际相符；标签有依据。
 - 每条事实的出处真的支持它，覆盖范围写清；事实之间、事实与文案之间不矛盾。
-- 名称、takeaway、手记、简介与事实、截图一致；三条导览和 alt 对得上画面。
+- 名称、takeaway、手记、简介与事实、截图一致；每条实际页面的导览和 alt 对得上画面；录屏路线只有 identity 封面，静态路线有三张图。
 有问题就 verdict=fix，problems 逐项写字段路径（如 facts.license、classification.subcategory、editorial.noteZh、pages[2].shot.alt）和具体问题。拿不准可以用 fetch_text / page_text 打开原页核对。全部没问题就 pass。`,
     (ctx) => `待发布记录（完整）：\n${JSON.stringify(data(ctx).draftV3 ?? {}, null, 1)}\n\n已保存的事实原文（与事实审查使用相同资料）：\n${JSON.stringify(data(ctx).factPages ?? [], null, 1)}`,
     imagesFor(store), ["fetch_text", "page_text", "repo_meta"], ["curation/assemble"]);

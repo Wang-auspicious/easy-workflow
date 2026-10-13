@@ -59,6 +59,29 @@ export const FIELD_OWNERS: [RegExp, string][] = [
 ];
 export function ownerOf(field: string) { return FIELD_OWNERS.find(([re]) => re.test(field))?.[1] ?? null; }
 
+/** Derived output paths are not fields an agent can edit. Translate them back to
+ * their actual inputs so consultations cannot ask facts to edit facets directly. */
+export function editableFields(field: string): string[] {
+  if (/^facets\.access(?:\[|$)/.test(field)) return ["facts.pricing", "facts.sourceCode", "facts.repositoryLicense"];
+  if (/^facets\.licenses(?:\[|$)/.test(field)) return ["facts.license"];
+  if (field === "editorial.pricing") return ["facts.pricing", "pricingNote"];
+  return [field];
+}
+
+const OPEN_CODE_LICENSES = new Set(["mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc", "mpl-2.0", "zlib", "unlicense", "gpl-2.0-only", "gpl-2.0-or-later", "gpl-3.0-only", "gpl-3.0-or-later", "lgpl-2.1-only", "lgpl-2.1-or-later", "lgpl-3.0-only", "lgpl-3.0-or-later", "agpl-3.0-only", "agpl-3.0-or-later", "epl-2.0"]);
+function hasOpenCodeLicense(facts: Record<string, any>) {
+  const explicit = facts.repositoryLicense;
+  const license = explicit ?? facts.license;
+  if (!OPEN_CODE_LICENSES.has(String(license?.value ?? "").toLowerCase()) || !license?.quote?.trim()) return false;
+  if (explicit) return true; // Separately checked, source-bound repository license fact.
+  // Legacy entries may already have a real code license. Only reuse it when its
+  // source belongs to the verified repository; generated artwork licenses do not.
+  try {
+    const repo = new URL(facts.repository?.value), source = new URL(license.sourceUrl);
+    return source.origin === repo.origin && (source.pathname === repo.pathname || source.pathname.startsWith(repo.pathname.replace(/\/$/, "") + "/"));
+  } catch { return false; }
+}
+
 const SPDX_OK = /^[A-Za-z0-9.+-]+$/;
 
 /** Mechanical facets from verified facts (VisLexicon agentGuidance rule): never guessed. */
@@ -68,7 +91,7 @@ export function derivedFacets(facts: Record<string, any>, tax: Taxonomy) {
   if (price === "free") access.push("free");
   else if (price === "freemium") access.push("freemium");
   else if (price === "paid") access.push("paid");
-  if (facts?.sourceCode?.value === "open") access.push("open-source");
+  if (facts?.sourceCode?.value === "open" && hasOpenCodeLicense(facts)) access.push("open-source");
   const lic = String(facts?.license?.value ?? "unknown");
   const licenseIds = new Set(tax.axes.licenses.flatMap((v) => [v.id, ...v.aliases].map((x) => x.toLowerCase())));
   const licenses = lic === "unknown" ? ["unknown"] : licenseIds.has(lic.toLowerCase()) ? [lic] : SPDX_OK.test(lic) && licenseIds.has("custom") ? ["custom"] : ["unknown"];
