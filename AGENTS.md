@@ -2,6 +2,12 @@
 
 禁止使用 Superpowers 及其流程。优先完成用户明确授权的实际工作，不增加流程性审批。
 
+## TypeScript 与验证
+
+- 新增和改动的 TypeScript 按 [Google TypeScript Style Guide](https://google.github.io/styleguide/tsguide.html) 编写：两空格缩进、单引号、优先 `const`、稳定成员使用 `readonly`、具名导出、边界数据以 `unknown` 接收并验证，不将多步状态变更压成一行。
+- 保留本仓库 NodeNext、原生 TypeScript 加载和 `erasableSyntaxOnly` 约束；不机械引入不兼容的构造函数参数属性，也不为格式统一全仓重写。
+- 验证围绕真实故障和数据完整性，优先补进已有回归文件。非必要不新增测试文件，不用镜像实现细节的测试制造覆盖率。
+
 ## 产品名称与公开文档
 
 - 产品统一命名为 **Easy Workflow**，仓库名为 `easy-workflow`。公开页面、README、规格、应用文案及发布说明都使用这一名称。

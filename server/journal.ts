@@ -109,6 +109,28 @@ export class Journal {
     return row.seq ?? 0;
   }
 
+  /** Rehydrate a lightweight event index without retaining every event body. */
+  *readSequences(sequences: readonly number[]): Generator<Stamped> {
+    let previous = 0;
+    for (const seq of sequences) {
+      if (!Number.isSafeInteger(seq) || seq <= previous) {
+        throw new RangeError('Journal sequences must be positive and strictly increasing');
+      }
+      previous = seq;
+    }
+    for (let start = 0; start < sequences.length; start += 400) {
+      const page = sequences.slice(start, start + 400);
+      const placeholders = page.map(() => '?').join(',');
+      const rows = this.db.prepare(
+        `SELECT seq, at, run, body FROM events WHERE seq IN (${placeholders}) ORDER BY seq`
+      ).all(...page) as {seq: number; at: number; run: string; body: string}[];
+      if (rows.length !== page.length) throw new Error('Referenced journal event is missing');
+      for (const row of rows) {
+        yield {...JSON.parse(row.body), seq: row.seq, at: row.at, run: row.run} as Stamped;
+      }
+    }
+  }
+
   /** A bounded immutable cursor for replay. New events never extend an in-flight export. */
   readPage(options: {since?: number; run?: string; limit?: number; through?: number} = {}) {
     const since = options.since ?? 0;

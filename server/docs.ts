@@ -22,7 +22,7 @@ const hash = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
 // Preserve ordinary existing item folders. The reserved ~ prefix prevents unsafe
 // IDs, Windows aliases and case-insensitive names from colliding with ordinary IDs.
 const segment = (s: string) => /^[a-z0-9][a-z0-9._-]{0,99}$/.test(s) && !s.endsWith(".") && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(s) ? s : `~${hash(s)}`;
-type Host = { state: FactoryState; compiled: CompiledFactory; journal: Pick<Journal, "read">; runtime?: { roleResolver?: (station: string) => ReturnType<typeof readRole> } };
+type Host = { state: FactoryState; compiled: CompiledFactory; journal: Pick<Journal, 'read' | 'readSequences'>; runtime?: { roleResolver?: (station: string) => ReturnType<typeof readRole> } };
 export type CaseScope = { token: string; attempt: string };
 type Of<K extends Stamped["kind"]> = Extract<Stamped, { kind: K }>;
 const of = <K extends Stamped["kind"]>(events: Stamped[], kind: K) => events.filter((e): e is Of<K> => e.kind === kind);
@@ -150,7 +150,7 @@ export class Docs {
   private f: Host;
   private readOnly: boolean;
   private indexedSeq = 0;
-  private caseEvents = new Map<string, Stamped[]>();
+  private readonly caseSequences = new Map<string, number[]>();
   private tokenCases = new Map<string, string>();
   private attemptTokens = new Map<string, string>();
   private runs = new Map<string, { id: string; title: string | null; startedAt: number | null; endedAt: number | null; status: string }>();
@@ -241,20 +241,22 @@ export class Docs {
       if (e.kind === "attempt.started") this.attemptTokens.set(e.attempt, e.token);
       const token = "token" in e && typeof e.token === "string" ? e.token : e.kind === "evidence.added" ? e.evidence.token : e.kind === "candidate.disposition" ? e.candidate.token : "attempt" in e ? this.attemptTokens.get(e.attempt) : undefined;
       const item = e.kind === "case.noted" ? e.caseId : e.kind === "candidate.disposition" ? this.tokenCases.get(e.candidate.token) ?? e.candidate.item : token ? this.tokenCases.get(token) : undefined;
-      // Activity spans and channel dispatch are not case findings. Keep the full
-      // progress stream here, unlike the intentionally capped UI state projection.
+      // Keep a lightweight index. Full progress and payloads stay in SQLite and
+      // are read only for the requested case, including after a process restart.
       if (item !== undefined && e.kind !== "attempt.activity" && e.kind !== "channel.emitted") {
-        const list = this.caseEvents.get(item) ?? [];
-        list.push(e); this.caseEvents.set(item, list);
+        const sequences = this.caseSequences.get(item) ?? [];
+        sequences.push(e.seq);
+        this.caseSequences.set(item, sequences);
       }
     }
   }
 
-  caseIds() { this.refresh(); return [...this.caseEvents.keys()]; }
+  caseIds() { this.refresh(); return [...this.caseSequences.keys()]; }
 
   caseData(caseId: string) {
     this.refresh();
-    const events = this.caseEvents.get(caseId) ?? [], state = initialState(this.f.compiled);
+    const events = [...this.f.journal.readSequences(this.caseSequences.get(caseId) ?? [])];
+    const state = initialState(this.f.compiled);
     // Item IDs and old journal identifiers are data, including names such as
     // __proto__. Use dictionaries without inherited properties during replay.
     for (const key of ["tokens", "attempts", "nodes", "evidence", "cases", "consults", "recoveries"] as const) Object.setPrototypeOf(state[key], null);
