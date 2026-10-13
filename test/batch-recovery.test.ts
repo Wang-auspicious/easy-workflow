@@ -14,6 +14,7 @@ const { FactoryControl } = await import('../server/control.ts');
 const { SourceSupervisor } = await import('../server/sources.ts');
 const { batchSummary } = await import('../shared/batch.ts');
 const close = async (factory: InstanceType<typeof Factory>) => {
+  factory.recovery?.close();
   await factory.sources?.close(); factory.channels?.close();
   await factory.runtime.close(); factory.docs.flush(); factory.lessons.close(); factory.journal.close();
 };
@@ -45,6 +46,59 @@ test('legacy system-created manual stops with a missing sibling become resumable
     factory.runtime.resume();const [retry]=factory.retryCandidates({items:[token.item],count:1});await factory.runtime.settle();
     assert.equal(factory.state.tokens[retry.id].status,'published');
   } finally {await close(factory);fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('managed model recovery requires a matching real response and preserves business or authentication failures', async t => {
+  const factory = new Factory();
+  const reported = {usageReported: true, execution: {adapter: 'fixture', model: 'fixture-model'},
+    time: {firstTokenMs: 1, outputMs: 1, toolMs: 0, programMs: 0, modelCalls: 1, toolCalls: 0}};
+  try {
+    await factory.boot();
+    factory.runtime.start('Managed receipt verification fixture');
+    factory.runtime.pause();
+    for (const scenario of [
+      {name: 'program-only success', ok: true, metrics: undefined, recovered: false},
+      {name: 'usage without a model call', ok: true, metrics: {...reported, time: {...reported.time, modelCalls: 0}}, recovered: false},
+      {name: 'verified model success', ok: true, metrics: reported, recovered: true},
+      {name: 'verified response with a business rejection', ok: false, metrics: reported, recovered: true,
+        failure: {tag: 'quality_rejected' as const, category: 'system' as const, message: 'Fixture business gate failed', retryable: true}},
+      {name: 'authentication failure after an earlier paid response', ok: false, metrics: reported, recovered: false,
+        failure: {tag: 'model_unavailable' as const, category: 'auth' as const, message: 'Fixture credentials rejected', retryable: true, owner: 'user' as const}},
+      {name: 'cancelled reported response', ok: true, metrics: reported, recovered: false, cancelled: true},
+    ]) {
+      await t.test(scenario.name, () => {
+        for (const id of Object.keys(factory.state.alerts)) factory.clearAlert(id, 'Reset isolated fixture');
+        const token = factory.runtime.create('curation/reader', {item: scenario.name, url: 'https://fixture.invalid/', source: 'fixture'});
+        const attempt = `attempt-${token.id}`;
+        factory.raiseAlert({id: 'model-transport', level: 'red', kind: 'model', message: 'Fixture transport hold'});
+        factory.journal.append({kind: 'batch.configured', batch: {runId: factory.state.run.id, target: 20,
+          maxInFlight: 1, intakeWindow: 1, maxRecoveries: 2, mode: 'paused', startedAt: Date.now(),
+          modelCircuit: {state: 'trial', failures: 1, nextAt: 0, trialToken: token.id, station: 'curation/reader'}}});
+        factory.broker.modelHold = null;
+        factory.broker.recoveryToken = token.id;
+        factory.journal.append({kind: 'attempt.started', attempt, token: token.id, node: 'curation/reader', worker: 'fixture-worker', input: 'fixture'});
+        factory.journal.atomic(() => {
+          if (scenario.failure) factory.journal.append({kind: 'token.data', token: token.id, patch: {failure: scenario.failure}});
+          if (scenario.failure?.tag === 'model_unavailable') factory.raiseAlert({id: 'model', level: 'red', kind: 'model', message: scenario.failure.message});
+          factory.journal.append({kind: 'attempt.finished', attempt, ok: scenario.ok, summary: scenario.name,
+            ms: 1, queuedMs: 0, metrics: scenario.metrics, cancelled: scenario.cancelled});
+          factory.journal.append({kind: 'token.finished', token: token.id, node: 'curation/reader',
+            status: scenario.ok ? 'published' : 'manual', reason: scenario.name});
+        });
+        assert.equal(factory.state.batch?.modelCircuit === undefined, scenario.recovered);
+        assert.equal(factory.state.alerts['model-transport'] === undefined, scenario.recovered);
+        if (scenario.failure) {
+          assert.equal(factory.state.tokens[token.id].status, 'manual', 'model health does not override the business result');
+          assert.deepEqual(factory.state.tokens[token.id].data.failure, scenario.failure);
+        }
+        if (!scenario.recovered) assert.ok(factory.broker.modelHold);
+      });
+    }
+  } finally {
+    await close(factory);
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
 });
 
 test('retrying a failed screenshot review also restores the cancelled facts-review sibling', async () => {
@@ -107,7 +161,9 @@ test('a shared provider outage stops intake and recovers one real checkpoint bef
     await factory.boot(); factory.catalog=catalog(10);
     factory.runtime.executors=()=>async()=>broken
       ? {ok:false,summary:'模型调用失败',failure:{tag:'model_transport',category:'system',message:'Connection error.',retryable:true,owner:'system'}}
-      : {ok:true,summary:'real checkpoint fixture',finish:{status:'published',reason:'fixture'}};
+      : {ok:true,summary:'real checkpoint fixture',finish:{status:'published',reason:'fixture'},
+        metrics: {usageReported: true, execution: {adapter: 'fixture', model: 'local-model-response'},
+          time: {firstTokenMs: 1, outputMs: 1, toolMs: 0, programMs: 0, modelCalls: 1, toolCalls: 0}}};
     factory.batch.configure({target:6,maxInFlight:4,intakeWindow:2});
     await factory.runtime.settle();
     assert.ok(batchSummary(factory.state)!.admitted<=2,'an outage must not feed the remaining catalog');

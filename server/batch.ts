@@ -16,18 +16,31 @@ export class BatchSupervisor {
     factory.journal.subscribe(event => {
       if (factory.importing) return;
       const circuit = factory.state.batch?.modelCircuit;
-      if (event.kind === 'attempt.finished' && event.ok && !event.cancelled && !['stale', 'restart'].includes(event.error ?? '') && circuit?.state === 'trial') {
+      if (event.kind === 'attempt.finished' && !event.cancelled &&
+          !['stale', 'restart'].includes(event.error ?? '') && circuit?.state === 'trial') {
         const attempt = factory.state.attempts[event.attempt];
-        if (attempt?.token === circuit.trialToken && attempt.node === circuit.station) this.modelRecovered();
+        const token = attempt && factory.state.tokens[attempt.token];
+        const failure = token?.data.failure as {tag?: string} | undefined;
+        const responded = event.metrics?.usageReported && (event.metrics.time?.modelCalls ?? 0) > 0;
+        if (attempt?.token === circuit.trialToken && attempt.node === circuit.station && responded &&
+            !['model_transport', 'model_unavailable'].includes(failure?.tag ?? '')) {
+          this.modelRecovered(event.ok ? undefined : '真实工位已收到模型回答；该任务的业务检查仍未通过，保留单独的失败原因');
+        }
       }
       if (event.kind === 'token.finished' && event.token === circuit?.trialToken && circuit.state === 'trial') {
         // A transport-healthy answer may still fail a content check. Keep that
         // item's failure; do not leave the entire provider locked to a dead token.
         const token = factory.state.tokens[event.token];
-        if ((token?.data.failure as { tag?: string })?.tag !== 'model_transport') {
-          const attempt = token?.attempts.map(id=>factory.state.attempts[id]).reverse().find(a=>a?.node===circuit.station && !a.cancelled);
-          if (attempt?.metrics?.usageReported && (attempt.metrics.time?.modelCalls ?? 0) > 0) this.modelRecovered('真实工位已收到模型回答；该任务的业务检查仍未通过，保留单独的失败原因');
-          else { factory.broker.modelHold = '恢复验证尚未完成；等待另一个真实模型工位'; this.modelFailed(); }
+        if (!['model_transport', 'model_unavailable'].includes((token?.data.failure as {tag?: string})?.tag ?? '')) {
+          const attempt = token?.attempts.map(id => factory.state.attempts[id]).reverse()
+            .find(value => value?.node === circuit.station && !value.cancelled &&
+              !['stale', 'restart'].includes(value.error ?? ''));
+          if (attempt?.metrics?.usageReported && (attempt.metrics.time?.modelCalls ?? 0) > 0) {
+            this.modelRecovered('真实工位已收到模型回答；该任务的业务检查仍未通过，保留单独的失败原因');
+          } else {
+            factory.broker.modelHold = '恢复验证尚未完成；等待另一个真实模型工位';
+            this.modelFailed();
+          }
         }
       }
       if (['batch.configured', 'run.resumed', 'token.finished', 'token.queued', 'candidate.disposition', 'alert.cleared'].includes(event.kind)) this.schedule();
