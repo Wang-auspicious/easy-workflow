@@ -3,6 +3,7 @@ import {batchSummary, flowWindow, latestBatchTokens, modelRecoveryDelay, occupie
   type BatchGoal, type BatchRecovery, type FlowObservation} from '../shared/batch.ts';
 import { ControlError } from './errors.ts';
 import { classifyFailure } from '../shared/failures.ts';
+import {hasRecoveryPolicy} from '../shared/recovery-policy.ts';
 
 const TRANSIENT = new Set(['network_timeout', 'network_connection', 'network_dns', 'http_server', 'http_rate_limit', 'browser_capture', 'http_forbidden']);
 const REPLAN = new Set(['needs_selection', 'page_unavailable', 'quality_rejected']);
@@ -24,6 +25,7 @@ export class BatchSupervisor {
         const failure = token?.data.failure as {tag?: string} | undefined;
         const responded = event.metrics?.usageReported && (event.metrics.time?.modelCalls ?? 0) > 0;
         if (attempt?.token === circuit.trialToken && attempt.node === circuit.station && responded &&
+            token && !hasRecoveryPolicy(token.data, attempt.node) &&
             !['model_transport', 'model_unavailable'].includes(failure?.tag ?? '')) {
           this.modelRecovered(event.ok ? undefined : '真实工位已收到模型回答；该任务的业务检查仍未通过，保留单独的失败原因');
         }
@@ -32,7 +34,8 @@ export class BatchSupervisor {
         // A transport-healthy answer may still fail a content check. Keep that
         // item's failure; do not leave the entire provider locked to a dead token.
         const token = factory.state.tokens[event.token];
-        if (!['model_transport', 'model_unavailable'].includes((token?.data.failure as {tag?: string})?.tag ?? '')) {
+        if (token && !hasRecoveryPolicy(token.data, circuit.station ?? '') &&
+            !['model_transport', 'model_unavailable'].includes((token.data.failure as {tag?: string})?.tag ?? '')) {
           const attempt = token?.attempts.map(id => factory.state.attempts[id]).reverse()
             .find(value => value?.node === circuit.station && !value.cancelled &&
               !['stale', 'restart'].includes(value.error ?? ''));
@@ -213,6 +216,7 @@ export class BatchSupervisor {
         if (circuit.state === 'trial' || !circuit.nextAt || now < circuit.nextAt || f.broker.used.model > 0) return;
         if (Object.values(f.state.alerts).some(a => a.kind === 'model' && a.id !== 'model-transport')) return;
         const pending = circuit.trialToken ? f.state.tokens[circuit.trialToken] : undefined;
+        if (pending && hasRecoveryPolicy(pending.data, circuit.station ?? '')) return;
         if (pending?.status === 'active') {
           const node = circuit.station && f.runtime.nodes.get(circuit.station);
           if (!node || f.runtime.scopePaused(node.key)) return;
@@ -222,7 +226,8 @@ export class BatchSupervisor {
         }
         const candidate = recoveryOrder.find(t => {
           const recovery = f.state.recoveries[t.item], failure = recovery?.failure;
-          return t.status === 'parked' && recovery?.token === t.id && recovery.disposition === 'retry' && failure?.tag === 'model_transport' && classifyFailure(failure.message, { stage: 'model', status: failure.status }).tag !== 'model_unavailable';
+          return t.status === 'parked' && !hasRecoveryPolicy(t.data, t.finishedAtNode ?? '') &&
+            recovery?.token === t.id && recovery.disposition === 'retry' && failure?.tag === 'model_transport' && classifyFailure(failure.message, { stage: 'model', status: failure.status }).tag !== 'model_unavailable';
         });
         if (!candidate) return;
         const node = candidate.finishedAtNode && f.runtime.nodes.get(candidate.finishedAtNode);
@@ -242,6 +247,7 @@ export class BatchSupervisor {
       }
       for (const token of recoveryOrder) {
         if (token.status !== 'parked') continue;
+        if (hasRecoveryPolicy(token.data, token.finishedAtNode ?? '')) continue;
         const candidate = f.state.recoveries[token.item];
         if (!candidate || candidate.disposition !== 'retry' || candidate.token !== token.id) continue;
         const failure = candidate.failure;

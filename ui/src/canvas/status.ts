@@ -1,6 +1,7 @@
 import {batchSummary, isBatchToken, type BatchRecovery} from '../../../shared/batch.ts';
 import { latestRunTokens, type AttemptState, type FactoryState, type Light, type TokenState } from '../../../shared/project.ts';
-import type { CompiledNode, ModelDependency, StationAgentBinding } from '../../../shared/types.ts';
+import type { CompiledNode, ModelDependency, StationAgentBinding, StationRecoveryPolicy } from '../../../shared/types.ts';
+import {parseRecoveryPolicy} from '../../../shared/recovery-policy.ts';
 
 export interface NodeExecution {
   readonly adapter: string;
@@ -79,6 +80,10 @@ interface RuntimeRecovery {
   failureAttempt: string;
   dependency?: ModelDependency;
   reason?: string;
+  policy?: StationRecoveryPolicy | null;
+  startedAt?: number;
+  deadlineAt?: number;
+  attempts?: number;
 }
 
 function runtimeRecovery(token: TokenState, state: FactoryState): RuntimeRecovery | undefined {
@@ -88,12 +93,22 @@ function runtimeRecovery(token: TokenState, state: FactoryState): RuntimeRecover
       typeof token.data.retriedBy === 'string' && state.tokens[token.data.retriedBy]?.item === token.item ||
       ['published', 'merged', 'rejected'].includes(token.status)) return;
   const plan = value as Record<string, unknown>;
+  if (plan.policy !== undefined && plan.policy !== null) {
+    try {
+      parseRecoveryPolicy(plan.policy);
+    } catch {
+      return;
+    }
+  }
+  if (['startedAt', 'deadlineAt', 'attempts'].some(key => plan[key] !== undefined &&
+      (!Number.isSafeInteger(plan[key]) || Number(plan[key]) < 0))) return;
   const dependency = plan.dependency as Partial<ModelDependency> | undefined;
   if (dependency !== undefined && (!dependency || typeof dependency !== 'object' ||
       typeof dependency.key !== 'string' || typeof dependency.model !== 'string' ||
       !['pi', 'claude-code', 'opencode', 'codex', 'launcher'].includes(String(dependency.adapter)) ||
       dependency.provider !== undefined && typeof dependency.provider !== 'string')) return;
-  if (state.batch?.runId === state.run.id && !dependency && (isBatchToken(token) || plan.kind === 'model')) return;
+  if (state.batch?.runId === state.run.id && !dependency && !plan.policy &&
+      (isBatchToken(token) || plan.kind === 'model')) return;
   if (plan.version !== 1 || plan.runId !== state.run.id ||
       !['network', 'model'].includes(String(plan.kind)) ||
       !['waiting', 'trial', 'completed', 'exhausted', 'blocked'].includes(String(plan.state)) ||
@@ -122,10 +137,18 @@ function runtimeRecoveryStatus(token: TokenState, state: FactoryState, now: numb
   const circuit = plan.dependency ? state.modelCircuits?.[plan.dependency.key] : undefined;
   const reason = plan.reason || circuit?.reason || token.reason || '已保留原工位检查点与已有成果。';
   const service = plan.dependency ? `${plan.dependency.provider ?? adapterNames[plan.dependency.adapter]} / ${plan.dependency.model}。` : '';
-  const attempts = plan.kind === 'network' ? `网络恢复已尝试 ${plan.networkAttempts}/2 次。`
-    : `已记录 ${circuit?.failures ?? plan.modelFailures} 次模型暂态失败；每次只放行一个工位验证。`;
-  const detail = `${service}${plan.station}：${reason} ${attempts}`;
-  if (plan.state === 'exhausted') return {label: '自动恢复次数耗尽', detail, light: 'red'};
+  const attempts = plan.policy
+    ? `自动恢复已领取 ${plan.attempts ?? '未记录'}/${plan.policy.maxRetries} 次；耗尽后${plan.policy.exhausted === 'manual' ? '转人工复核' : '保留待重试'}。`
+    : plan.kind === 'network'
+      ? `网络恢复已领取 ${plan.networkAttempts} 次（默认或历史计划未记录上限）。`
+      : `已记录 ${circuit?.failures ?? plan.modelFailures} 次模型暂态失败；每次只放行一个工位验证。`;
+  const deadlineReached = plan.deadlineAt !== undefined && now >= plan.deadlineAt;
+  const deadline = plan.deadlineAt === undefined ? ''
+    : `截止 ${new Date(plan.deadlineAt).toLocaleString('zh-CN', {hour12: false})}（墙钟计时，包含排队与暂停）。${deadlineReached ? '恢复期限已到。' : ''}`;
+  const detail = `${service}${plan.station}：${reason} ${attempts}${deadline}`;
+  if (plan.state === 'exhausted') {
+    return {label: plan.policy ? '自动恢复已耗尽' : '自动恢复次数耗尽', detail, light: 'red'};
+  }
   if (plan.state === 'blocked') return {label: '自动恢复受阻', detail, light: 'red'};
   if (state.run.status === 'ended' || state.run.status === 'idle') {
     return {label: '自动恢复已停止', detail: `本轮未运行，自动恢复不会继续。${detail}`, light: 'yellow'};
@@ -135,6 +158,9 @@ function runtimeRecoveryStatus(token: TokenState, state: FactoryState, now: numb
     state.pausedScopes?.lines.includes(plan.station.split('/')[0]);
   if (paused) return {label: '恢复已暂停', detail: `领取已暂停，恢复计划和检查点保留；继续后仍需资源空位。${detail}`, light: 'yellow'};
   if (batch?.mode === 'stopped') return {label: '自动恢复已停止', detail: `网站托管已停止，不再自动领取恢复尝试。${detail}`, light: 'yellow'};
+  if (deadlineReached) {
+    return {label: '恢复期限已到', detail: `等待运行时确认最终处置，不表示已转人工或已完成。${detail}`, light: 'red'};
+  }
   if (circuit?.state === 'blocked') return {label: '模型服务待处理', detail, light: 'red'};
   if (circuit?.state === 'trial' && circuit.trialToken !== token.id) {
     return {label: '等待服务验证', detail: `同一模型服务正由另一件任务验证，当前任务保留检查点等待。${detail}`, light: 'yellow'};

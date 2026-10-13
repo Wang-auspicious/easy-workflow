@@ -286,14 +286,37 @@ function definitions(f: Factory): Tool[] {
       }},
       { name:'undo_correction',label:'撤销尚未执行的纠错',description:'Restore the durable snapshot of a correction before any new attempt has run. Executed corrections are rejected; all audit events are retained.',parameters:object({correction:name()}),execute:async(_id,p)=>ok(f.runtime.undoCorrection(p.correction),'已撤销未执行的纠错') },
       {
-        name:"candidate_failures",label:"候选失败库",description:"Read durable failed candidates by reason tag or disposition: retry, removed, claimed, resolved. Network/system errors are retained; invalid URLs and HTTP 404/410 are excluded from active inventory.",
-        parameters:object({tag:Type.Optional(name()),disposition:Type.Optional(choice("retry","removed","claimed","resolved"))}),
-        execute:async(_id,p)=>ok(f.candidateFailures(p),"读取候选失败与处置记录"),
+        name: 'candidate_failures',
+        label: '候选失败库',
+        description: 'Read durable failed candidates by reason tag or disposition: retry, manual, removed, claimed, resolved. Manual recovery requires an explicit user retry after resolving the cause; it is excluded from automatic intake.',
+        parameters: object({
+          tag: Type.Optional(name()),
+          disposition: Type.Optional(choice('retry', 'manual', 'removed', 'claimed', 'resolved')),
+        }),
+        execute: async (_id, parameters) => ok(f.candidateFailures(parameters), '读取候选失败与处置记录'),
       },
       {
-        name:"retry_candidates",label:"按标签批量重试",description:"Explicitly retry retained candidates after resolving their cause. Filter by tag and/or item ids; removed invalid URLs cannot be retried. Returns inspectable new token ids.",
-        parameters:object({tag:Type.Optional(name()),items:Type.Optional(Type.Array(name(),{minItems:1,maxItems:200})),count:Type.Integer({minimum:1,maximum:200})}),
-        execute:async(_id,p)=>{if(!f.runtime.running)await f.ensureReady();const tasks=f.retryCandidates(p);return ok({count:tasks.length,tokens:tasks.map(t=>({id:t.id,item:t.item})),runId:f.state.run.id},`已取出 ${tasks.length} 件重试`);},
+        name: 'retry_candidates',
+        label: '按标签批量重试',
+        description: 'Explicitly retry retained candidates after resolving their cause. Filter by tag and/or item ids; removed invalid URLs cannot be retried. includeManual requires a user request with explicit item ids and preserves the original checkpoint.',
+        parameters: object({
+          tag: Type.Optional(name()),
+          items: Type.Optional(Type.Array(name(), {minItems: 1, maxItems: 200})),
+          count: Type.Integer({minimum: 1, maximum: 200}),
+          includeManual: Type.Optional(Type.Boolean()),
+        }),
+        execute: async (_id, parameters, actor) => {
+          if (parameters.includeManual && actor !== 'user') {
+            throw new ControlError(403, 'owner_decision_required', '恢复策略已转人工复核，需由用户明确选择条目继续');
+          }
+          if (parameters.includeManual && !parameters.items?.length) {
+            throw new ControlError(400, 'manual_retry_requires_items', '请明确选择要恢复的人工复核条目');
+          }
+          if (!f.runtime.running) await f.ensureReady();
+          const tasks = f.retryCandidates(parameters);
+          return ok({count: tasks.length, tokens: tasks.map(token => ({id: token.id, item: token.item})), runId: f.state.run.id},
+            `已取出 ${tasks.length} 件重试`);
+        },
       },
       {
         name:"choose_preview_page",label:"指定采集页并继续",description:"Resolve a needs_selection candidate by supplying a concrete same-site breadth (catalogue/overview) or proof (demo/example) page. Resumes at that station, retains prior evidence, and still runs quality checks.",

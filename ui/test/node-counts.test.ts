@@ -146,7 +146,10 @@ test('runtime recovery summaries preserve only the v1 status metadata through sn
   const {state, emit, create} = statusFixture();
   create('recovering');
   const plan = {version: 1, runId: state.run.id, kind: 'network', state: 'waiting', station: 'curation/capture',
-    nextAt: 5000, networkAttempts: 1, modelFailures: 0, failureAttempt: 'failed-1', reason: 'Connection timeout'};
+    nextAt: 5000, networkAttempts: 1, modelFailures: 0, failureAttempt: 'failed-1', reason: 'Connection timeout',
+    startedAt: 1000, deadlineAt: 61000, attempts: 1,
+    policy: {tags: ['network_timeout'], maxRetries: 5, backoff: {initialMs: 2000, factor: 2, maxMs: 30000, jitter: 0.2},
+      deadlineMs: 60000, exhausted: 'manual'}};
   emit({kind: 'token.data', token: 'recovering', patch: {__runtimeRecovery: {...plan, internalPayload: 'x'.repeat(100000)}}});
   const summary = uiState(state);
   assert.deepEqual(summary.tokens.recovering.data.__runtimeRecovery, plan);
@@ -199,7 +202,7 @@ test('network recovery waits, pauses, attempts and completion remain separate fr
   emit({kind: 'token.data', token: 'one', patch: {__runtimeRecovery: plan}});
   const station = () => stationStatus(node, state, 1000, false, runtimeRecoveryIndex(state)[node.key]);
   assert.equal(station().label, '等待自动恢复');
-  assert.match(station().detail, /最早 4 秒后.*Original timeout.*0\/2/);
+  assert.match(station().detail, /最早 4 秒后.*Original timeout.*0 次.*未记录上限/);
   assert.equal(runStatus(state, 1000).label, '等待自动恢复');
   assert.equal(tokenStatus(state.tokens.one, state, 6000).label, '等待恢复条件');
   emit({kind: 'scope.paused', scope: 'station', key: node.key, paused: true, reason: 'Inspect'});
@@ -225,6 +228,67 @@ test('network recovery waits, pauses, attempts and completion remain separate fr
   assert.equal(runStatus(state, 6000).counts.published, 0);
   emit({kind: 'token.finished', token: 'retry', node: 'curation/published', status: 'published', reason: 'Published'});
   assert.equal(tokenStatus(state.tokens.retry, state, 6000).label, '已发布');
+});
+
+test('declared recovery uses its captured budget and wall-clock deadline instead of legacy limits', () => {
+  const {state, emit, create} = statusFixture();
+  const node = {key: 'curation/capture', line: 'curation', kind: 'program' as const, resource: 'browser' as const};
+  const policy = {tags: ['network_timeout'] as const, maxRetries: 5,
+    backoff: {initialMs: 2000, factor: 2, maxMs: 30000, jitter: 0.2}, deadlineMs: 60000, exhausted: 'manual'};
+  const plan = {version: 1, runId: state.run.id, kind: 'network', state: 'waiting', station: node.key,
+    nextAt: 5000, networkAttempts: 1, modelFailures: 0, failureAttempt: 'failed-policy',
+    policy, startedAt: 1000, deadlineAt: 61000, attempts: 3};
+  create('policy');
+  emit({kind: 'token.finished', token: 'policy', node: node.key, status: 'parked', reason: 'Retained evidence'});
+  emit({kind: 'token.data', token: 'policy', patch: {__runtimeRecovery: plan}});
+  emit({kind: 'batch.configured', batch: {runId: state.run.id, target: 100, maxInFlight: 3,
+    intakeWindow: 1, maxRecoveries: 2, mode: 'running', startedAt: state.run.startedAt}});
+  const compact = uiState(state);
+  assert.deepEqual(tokenStatus(compact.tokens.policy, compact, 1000), tokenStatus(state.tokens.policy, state, 1000),
+    'the compact snapshot and full state describe the same persisted recovery plan');
+  assert.equal(tokenStatus(compact.tokens.policy, compact, 1000).label, '等待自动恢复');
+  assert.match(tokenStatus(compact.tokens.policy, compact, 1000).detail, /3\/5 次/);
+  assert.match(tokenStatus(compact.tokens.policy, compact, 1000).detail, /截止.*墙钟.*暂停/);
+  assert.doesNotMatch(tokenStatus(compact.tokens.policy, compact, 1000).detail, /1\/2|3\/2/);
+
+  compact.pausedScopes = {lines: ['curation'], stations: []};
+  const paused = tokenStatus(compact.tokens.policy, compact, 62000);
+  assert.equal(paused.label, '恢复已暂停');
+  assert.match(paused.detail, /期限已到/);
+  assert.match(paused.detail, /3\/5 次/);
+  compact.pausedScopes = {lines: [], stations: []};
+  assert.equal(tokenStatus(compact.tokens.policy, compact, 62000).label, '恢复期限已到');
+  assert.equal(compact.tokens.policy.status, 'parked', 'displaying an elapsed deadline cannot synthesize a manual disposition');
+
+  compact.tokens.policy.data.__runtimeRecovery = {...plan, state: 'exhausted'};
+  assert.equal(tokenStatus(compact.tokens.policy, compact, 62000).label, '自动恢复已耗尽');
+  compact.tokens.policy.status = 'manual';
+  assert.equal(tokenStatus(compact.tokens.policy, compact, 62000).label, '待人工');
+  assert.match(tokenStatus(compact.tokens.policy, compact, 62000).detail, /自动恢复已耗尽.*3\/5 次/);
+});
+
+test('custom model recovery waits for both its persisted delay and matching circuit without inventing old budgets', () => {
+  const {state, emit, create} = statusFixture();
+  const dependency = {key: 'pi:policy-service', adapter: 'pi', provider: 'fixture', model: 'fixture'} as const;
+  const policy = {tags: ['model_transport'], maxRetries: 4,
+    backoff: {initialMs: 1000, factor: 2, maxMs: 30000}, exhausted: 'parked'};
+  const plan = {version: 1, runId: state.run.id, kind: 'model', state: 'waiting', station: 'curation/reader',
+    nextAt: 21000, networkAttempts: 0, modelFailures: 7, failureAttempt: 'model-policy', dependency,
+    policy, startedAt: 1000, attempts: 2};
+  create('model-policy');
+  emit({kind: 'token.finished', token: 'model-policy', node: plan.station, status: 'parked', reason: 'Transport unavailable'});
+  emit({kind: 'token.data', token: 'model-policy', patch: {__runtimeRecovery: plan}});
+  emit({kind: 'model.circuit', key: dependency.key, circuit: {dependency, state: 'open', failures: 7,
+    nextAt: 5000, runId: state.run.id}});
+  assert.match(tokenStatus(state.tokens['model-policy'], state, 1000).detail, /最早 20 秒后.*2\/4 次/);
+  state.modelCircuits[dependency.key].nextAt = 31000;
+  assert.match(tokenStatus(state.tokens['model-policy'], state, 1000).detail, /最早 30 秒后.*2\/4 次/);
+  state.tokens['model-policy'].data.__runtimeRecovery = {...plan, policy: null, attempts: undefined};
+  const legacy = tokenStatus(state.tokens['model-policy'], state, 1000);
+  assert.match(legacy.detail, /7 次模型暂态失败/);
+  assert.doesNotMatch(legacy.detail, /2\/4|\/2 次|截止/);
+  state.tokens['model-policy'].data.__runtimeRecovery = {...plan, policy: {...policy, maxRetries: -1}};
+  assert.equal(tokenStatus(state.tokens['model-policy'], state, 1000).label, '待重试', 'invalid policy data cannot promise automatic execution');
 });
 
 test('website batch state does not hide or pause independent pack and channel recovery', () => {

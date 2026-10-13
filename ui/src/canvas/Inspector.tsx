@@ -26,6 +26,7 @@ import { inspectPart, partTone } from "../../../shared/parts.ts";
 import { recordedUsage, stationStatus, tokenStatus } from './status.ts';
 import { CrewStrip, CrewTimeline, WorkerTrace } from "./CrewTrace.tsx";
 import {useDetail, type TokenDetail} from '../details.ts';
+import {failureLabels} from '../../../shared/failures.ts';
 
 export function Inspectors({ geo, cam }: { geo: Geometry; cam: Camera }) {
   const list = useStore((s) => s.inspectors);
@@ -233,6 +234,7 @@ function SpecView({ node }: { node: CompiledNode }) {
       <div className="spec-row"><span>I/O</span><code>{node.input} → {node.output}</code></div>
       <div className="spec-row"><span>工人</span><code>min {node.workers.min} · max {node.workers.max} · 初始 {node.workers.initial} · {node.workers.policy === "auto" ? "自动伸缩" : "固定"}</code></div>
       <div className="spec-row"><span>预计耗时</span><code>{node.estimateSeconds}s</code></div>
+      {node.kind !== 'store' && node.kind !== 'source' && <RecoveryPolicyDetails node={node} />}
       {node.rules.length > 0 && <div className="spec-row"><span>规则</span><div className="chips">{node.rules.map((r) => <span key={r} className="chip mono">{r.replace("vislexicon:", "")}</span>)}</div></div>}
       {node.accept.length > 0 && <div className="spec-row"><span>验收</span><ul>{node.accept.map((a) => <li key={a}>{a}</li>)}</ul></div>}
       {node.returnTo?.length ? <div className="spec-row"><span>退回</span><code>{node.returnTo.map((r) => `→ ${r.station} ≤${r.maxRounds} 轮`).join("   ")}</code></div> : null}
@@ -240,6 +242,28 @@ function SpecView({ node }: { node: CompiledNode }) {
       <div className="spec-note muted">在画布上拖动不会改这里；改结构请对主调度说，它会起草补丁让你确认。</div>
     </div>
   );
+}
+
+function RecoveryPolicyDetails({node}: {node: CompiledNode}) {
+  const policy = node.recovery;
+  const seconds = (milliseconds: number) => `${(milliseconds / 1000).toLocaleString('zh-CN')} 秒`;
+  return <section aria-label="自动恢复策略">
+    <div className="sec-title">自动恢复策略</div>
+    {policy ? <>
+      <div className="spec-row"><span>适用原因</span><div>{policy.tags.length
+        ? policy.tags.map(tag => failureLabels[tag]).join('、') : '未启用自动恢复原因'}</div></div>
+      <div className="spec-row"><span>次数</span><div>{policy.maxRetries === 0
+        ? '不自动重试' : `首次失败后最多 ${policy.maxRetries} 次自动恢复`}</div></div>
+      <div className="spec-row"><span>退避</span><div>首次 {seconds(policy.backoff.initialMs)}，每次 ×{policy.backoff.factor}，
+        最长 {seconds(policy.backoff.maxMs)}；抖动 ±{Math.round((policy.backoff.jitter ?? 0) * 100)}%</div></div>
+      <div className="spec-row"><span>总期限</span><div>{policy.deadlineMs === undefined
+        ? '未单独设置；执行自身的超时限制仍生效。'
+        : `从首次失败起 ${seconds(policy.deadlineMs)}，墙钟计时，包含排队与暂停。`}</div></div>
+      <div className="spec-row"><span>耗尽后</span><div>{policy.exhausted === 'manual'
+        ? '转人工复核，核查后由用户选择条目继续原工位。' : '保留检查点与成果，等待后续处理。'}</div></div>
+    </> : <p className="spec-note muted">未单独声明，沿用系统默认恢复边界。具体次数与截止时间以任务已保存的恢复计划为准。</p>}
+    <p className="spec-note muted">这里显示当前工位声明；已有恢复任务继续使用当时保存的策略。全局或局部暂停仍阻止新派发，认证问题、取消和结果未知的外部操作不会因此自动重试。</p>
+  </section>;
 }
 
 function AgentBindingSettings({node}: {node: CompiledNode}) {

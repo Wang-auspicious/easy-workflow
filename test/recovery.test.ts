@@ -9,6 +9,9 @@ import { classifyFailure, candidateFailure } from "../shared/failures.ts";
 import type { Executor, StationContext } from "../server/runtime.ts";
 import {line, station} from '../server/spec/dsl.ts';
 import {installWorkflowPack, type WorkflowManifest} from '../server/workflow-packs.ts';
+import type {ModelDependency, StationRecoveryPolicy} from '../shared/types.ts';
+import type {RecoveryPlan} from '../server/recovery.ts';
+import {recoverySnapshot} from '../shared/recovery-policy.ts';
 
 // Every database, catalogue and report belongs to this test process.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-recovery-"));
@@ -22,6 +25,63 @@ const { TOOLS, canonical, httpGet } = await import("../packs/vislexicon/tools.ts
 const { closeNetwork } = await import("../server/network.ts");
 const { SourceSupervisor } = await import('../server/sources.ts');
 const {pack} = await import('../packs/vislexicon/pack.ts');
+
+async function policyFixture(policy?: StationRecoveryPolicy) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-policy-'));
+  const schema = {type: 'object', properties: {text: {type: 'string'}}, required: ['text'], additionalProperties: false};
+  const manifest: WorkflowManifest = {
+    format: 1, id: 'policy-fixture', name: 'Recovery policy fixture', version: '1', blurb: 'Local deterministic recovery',
+    entry: 'policy-fixture/prepare', inputSchema: 'text', schemas: {text: schema}, conditions: {}, links: [], channels: [],
+    resources: {model: 1, browser: 0, cpu: 2, http: 1},
+    bindings: Object.fromEntries(['prepare', 'work'].map(id => [`policy-fixture/${id}`, {
+      role: 'roles/worker/ROLE.md', inputSchema: 'text', outputSchema: 'text',
+      input: {text: {path: id === 'prepare' ? 'input.text' : 'prepared.text'}},
+      outputKey: id === 'prepare' ? 'prepared' : 'result',
+      execute: {kind: 'builtin' as const, name: 'normalize-text' as const},
+      ...(id === 'work' && policy ? {recovery: policy} : {}),
+    }])),
+    lines: [line({id: 'policy-fixture', name: 'Recovery policy', layer: 3, priority: 'mid', wired: true, blurb: 'Fixture',
+      stations: [
+        ...['prepare', 'work'].map(id => station({id, name: id, role: 'process', kind: 'program', resource: 'cpu',
+          input: 'text', output: 'text', accept: ['Preserve the original input and report failures accurately'],
+          workers: {min: 1, max: 1, initial: 1, policy: 'fixed'}})),
+        station({id: 'published', name: 'Published', kind: 'store', role: 'store'}),
+        station({id: 'manual', name: 'Manual', kind: 'store', role: 'store'}),
+      ], edges: [['prepare', 'work'], ['work', 'published']]})],
+  };
+  await installWorkflowPack(directory, {manifest, builtins: ['vislexicon'], files: {
+    'roles/worker/ROLE.md': '# Recovery fixture\nPreserve the supplied text and completed preparation. Return only actual output; a failure must keep the original checkpoint and evidence for recovery.',
+  }}, {running: false}, [pack]);
+  const open = async () => {
+    const factory = new Factory(directory);
+    await factory.boot();
+    factory.broker.memoryFloorMB = 0;
+    factory.catalog = [];
+    return factory;
+  };
+  return {directory, factory: await open(), open};
+}
+
+async function closePolicyFixture(factory: InstanceType<typeof Factory>) {
+  factory.recovery.close();
+  await factory.sources.close();
+  factory.channels?.close();
+  await factory.runtime.close();
+  factory.docs.flush();
+  factory.lessons.close();
+  factory.journal.close();
+}
+
+async function settlePolicy(factory: InstanceType<typeof Factory>) {
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await factory.runtime.settle();
+  await new Promise<void>(resolve => setImmediate(resolve));
+}
+
+function removePolicyFixture(directory: string) {
+  assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+  fs.rmSync(directory, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+}
 
 test("failed fetches, durable candidate recovery, tagged retry and paused-run termination", {timeout:30000}, async t => {
   let factory:InstanceType<typeof Factory>|undefined;
@@ -431,6 +491,370 @@ test('unmanaged recovery rejects broken channel checkpoints and ambiguous item o
     factory.journal.close();
     assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
     fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+test('declared retries freeze before observers, retain jitter across restart and stop at their own budget', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  t.mock.method(Math, 'random', () => 0.75);
+  const policy: StationRecoveryPolicy = {tags: ['network_timeout'], maxRetries: 3,
+    backoff: {initialMs: 1000, factor: 2, maxMs: 4000, jitter: 0.5}, deadlineMs: 60000, exhausted: 'parked'};
+  const fixture = await policyFixture(policy);
+  let factory = fixture.factory;
+  let calls = 0;
+  let prepared = 0;
+  let healthy = false;
+  const execute = (node: {key: string}): Executor => async context => {
+    if (node.key === 'policy-fixture/prepare') {
+      prepared++;
+      return {ok: true, summary: 'Original input retained', data: {prepared: {text: 'retained'}}};
+    }
+    calls++;
+    assert.deepEqual(context.token.data.prepared, {text: 'retained'});
+    return healthy ? {ok: true, summary: 'Local fixture recovered', data: {result: 'original result'}}
+      : {ok: false, summary: 'Controlled timeout', failure: classifyFailure('ETIMEDOUT controlled fixture')};
+  };
+  const latest = () => Object.values(factory.state.tokens).findLast(token => token.item === 'bounded' && !token.data.retriedBy)!;
+  try {
+    factory.runtime.executors = execute;
+    const unsubscribe = factory.journal.subscribe(event => {
+      if (event.kind === 'attempt.started' && event.node === 'policy-fixture/work') {
+        factory.runtime.nodes.get(event.node)!.recovery = {...policy, maxRetries: 0};
+      }
+    });
+    factory.runtime.start('Frozen policy');
+    factory.runtime.create('policy-fixture/prepare', {item: 'bounded', url: '', source: 'manual', data: {workflowPack: 'policy-fixture'}});
+    await settlePolicy(factory);
+    unsubscribe();
+    let plan = latest().data.__runtimeRecovery as RecoveryPlan;
+    assert.equal(plan.policy?.maxRetries, 3, 'the started observer cannot change this attempt policy');
+    assert.equal(plan.nextAt - Date.now(), 1250, 'jitter is sampled once into the durable deadline');
+    const persisted = JSON.parse(JSON.stringify(plan));
+    factory.runtime.pause();
+    await closePolicyFixture(factory);
+    factory = await fixture.open();
+    factory.runtime.executors = execute;
+    factory.runtime.nodes.get('policy-fixture/work')!.recovery = {...policy, maxRetries: 0};
+    assert.deepEqual(latest().data.__runtimeRecovery, persisted);
+    t.mock.timers.tick(1250);
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    assert.equal(calls, 1, 'restart must retain explicit pause');
+    factory.runtime.resume();
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    for (const expected of [2500, 4000]) {
+      plan = latest().data.__runtimeRecovery as RecoveryPlan;
+      assert.equal(plan.nextAt - Date.now(), expected);
+      const before: number = calls;
+      t.mock.timers.tick(expected - 1);
+      factory.recovery.pump();
+      await settlePolicy(factory);
+      assert.equal(calls, before);
+      t.mock.timers.tick(1);
+      factory.recovery.pump();
+      await settlePolicy(factory);
+    }
+    plan = latest().data.__runtimeRecovery as RecoveryPlan;
+    assert.equal(calls, 4);
+    assert.equal(prepared, 1, 'retries never repeat the completed predecessor');
+    assert.equal(plan.state, 'exhausted');
+    assert.equal(plan.attempts, 3);
+    assert.equal(plan.policy?.maxRetries, 3);
+    t.mock.timers.tick(3600000);
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    assert.equal(calls, 4);
+    healthy = true;
+    factory.runtime.nodes.get('policy-fixture/work')!.recovery = {...policy, maxRetries: 1};
+    const [retry] = factory.retryCandidates({items: ['bounded'], count: 1});
+    await settlePolicy(factory);
+    assert.equal(factory.state.tokens[retry.id].status, 'published');
+    assert.equal((latest().data.__runtimeRecovery as RecoveryPlan).attempts, 0, 'explicit retry is a new request, not an automatic budget debit');
+    assert.equal(recoverySnapshot(latest().data, 'policy-fixture/work')?.policy?.maxRetries, 1);
+    assert.equal(prepared, 1);
+  } finally {
+    await closePolicyFixture(factory);
+    removePolicyFixture(fixture.directory);
+  }
+});
+
+test('a policy deadline expires queued work after restart without executing or losing manual recovery', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const policy: StationRecoveryPolicy = {tags: ['network_timeout'], maxRetries: 3,
+    backoff: {initialMs: 1000, factor: 1, maxMs: 1000}, deadlineMs: 2000, exhausted: 'manual'};
+  const fixture = await policyFixture(policy);
+  let factory = fixture.factory;
+  let calls = 0;
+  const execute: Executor = async () => {
+    calls++;
+    return {ok: false, summary: 'Controlled timeout', failure: classifyFailure('ETIMEDOUT fixture')};
+  };
+  try {
+    factory.runtime.executors = () => execute;
+    factory.runtime.start('Deadline fixture');
+    factory.runtime.create('policy-fixture/work', {item: 'deadline', url: '', source: 'manual', data: {workflowPack: 'policy-fixture', retained: 'paid evidence'}});
+    await settlePolicy(factory);
+    t.mock.timers.tick(1000);
+    factory.recovery.pump();
+    factory.runtime.pause();
+    await settlePolicy(factory);
+    assert.equal(calls, 1, 'claimed recovery is queued while paused');
+    const retry = Object.values(factory.state.tokens).findLast(token => token.item === 'deadline')!;
+    assert.equal(retry.status, 'active');
+    await closePolicyFixture(factory);
+    t.mock.timers.tick(5000);
+    factory = await fixture.open();
+    factory.runtime.executors = () => execute;
+    factory.runtime.resume();
+    await settlePolicy(factory);
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    const current = factory.state.tokens[retry.id];
+    assert.equal(calls, 1, 'an expired queued episode cannot dispatch after restart');
+    assert.equal(current.status, 'manual');
+    assert.equal((current.data.__runtimeRecovery as RecoveryPlan).state, 'exhausted');
+    assert.equal(current.data.retained, 'paid evidence');
+    assert.equal(factory.state.recoveries.deadline.disposition, 'manual');
+    assert.equal(factory.state.nodes['candidates/pool'].stock, 0);
+    assert.equal(factory.state.nodes['policy-fixture/manual'].stock, 1);
+  } finally {
+    await closePolicyFixture(factory);
+    removePolicyFixture(fixture.directory);
+  }
+});
+
+test('a recovery deadline cancels its executing signal and rejects late business output', {timeout: 10000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const policy: StationRecoveryPolicy = {tags: ['network_timeout'], maxRetries: 3,
+    backoff: {initialMs: 1000, factor: 1, maxMs: 1000}, deadlineMs: 2000, exhausted: 'parked'};
+  const fixture = await policyFixture(policy);
+  const factory = fixture.factory;
+  let calls = 0;
+  let cancelled = false;
+  try {
+    factory.runtime.executors = () => async context => {
+      if (++calls === 1) return {ok: false, summary: 'Controlled timeout', failure: classifyFailure('ETIMEDOUT fixture')};
+      await new Promise<void>(resolve => context.signal.addEventListener('abort', () => {
+        cancelled = true;
+        resolve();
+      }, {once: true}));
+      return {ok: true, summary: 'Late result must not publish', data: {result: 'late'},
+        usage: {input: 7, output: 2, cost: 0.01}};
+    };
+    factory.runtime.start('Owning signal deadline');
+    factory.runtime.create('policy-fixture/work', {item: 'active-deadline', url: '', source: 'manual'});
+    await settlePolicy(factory);
+    t.mock.timers.tick(1000);
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    const token = Object.values(factory.state.tokens).findLast(value => value.item === 'active-deadline')!;
+    assert.equal(cancelled, true);
+    assert.equal(token.status, 'parked');
+    assert.equal(token.data.result, undefined);
+    assert.equal((token.data.__runtimeRecovery as RecoveryPlan).state, 'exhausted');
+    assert.equal(factory.state.attempts[token.attempts[0]].usage.input, 7, 'late receipt cost remains real incurred work');
+    assert.equal(factory.broker.used.cpu, 0);
+    let authCalls = 0;
+    factory.runtime.executors = () => async context => {
+      if (++authCalls === 1) return {ok: false, summary: 'Controlled timeout', failure: classifyFailure('ETIMEDOUT fixture')};
+      await new Promise<void>(resolve => context.signal.addEventListener('abort', () => resolve(), {once: true}));
+      const failure = classifyFailure('insufficient credit', {stage: 'model'});
+      return {ok: false, summary: failure.message, failure};
+    };
+    factory.runtime.create('policy-fixture/work', {item: 'deadline-auth', url: '', source: 'manual'});
+    await settlePolicy(factory);
+    t.mock.timers.tick(1000);
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    const lateAuth = Object.values(factory.state.tokens).findLast(value => value.item === 'deadline-auth')!;
+    assert.equal((lateAuth.data.failure as {tag: string}).tag, 'model_unavailable');
+    assert.ok(factory.state.alerts.model, 'deadline must not erase the credential/quota boundary');
+    assert.equal(authCalls, 2);
+  } finally {
+    await closePolicyFixture(factory);
+    removePolicyFixture(fixture.directory);
+  }
+});
+
+test('declared recovery cannot authorize authentication, TLS, unknown effects or a cancelled run', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const policy: StationRecoveryPolicy = {tags: ['network_timeout', 'tool_error', 'model_transport'], maxRetries: 10,
+    backoff: {initialMs: 1000, factor: 1, maxMs: 1000}, deadlineMs: 60000, exhausted: 'manual'};
+  const fixture = await policyFixture(policy);
+  const factory = fixture.factory;
+  let calls = 0;
+  try {
+    factory.runtime.executors = () => async context => {
+      calls++;
+      const key = context.token.item;
+      if (key === 'cancel') {
+        await new Promise<void>((_resolve, reject) => context.signal.addEventListener('abort', () => reject(context.signal.reason), {once: true}));
+      }
+      const failure = key === 'unknown' ? {tag: 'tool_error' as const, category: 'system' as const,
+        owner: 'user' as const, retryable: false, code: 'EXTERNAL_OPERATION_UNKNOWN', message: 'Result unknown'}
+        : key === 'auth' ? classifyFailure('loginWall fixture')
+        : key === 'tls' ? classifyFailure(Object.assign(new Error('certificate verification failed'), {code: 'CERT_HAS_EXPIRED'}))
+        : key === 'quota' ? classifyFailure('insufficient credit', {stage: 'model'})
+        : classifyFailure('HTTP 503 fixture', {status: 503});
+      return {ok: false, summary: failure.message, failure};
+    };
+    factory.runtime.start('Protected failure boundaries');
+    for (const item of ['unknown', 'auth', 'tls', 'quota', 'unlisted']) {
+      factory.runtime.create('policy-fixture/work', {item, url: '', source: 'manual'});
+      await settlePolicy(factory);
+      t.mock.timers.tick(10000);
+      factory.recovery.pump();
+      await settlePolicy(factory);
+    }
+    assert.equal(calls, 5);
+    factory.runtime.create('policy-fixture/work', {item: 'cancel', url: '', source: 'manual'});
+    await new Promise<void>(resolve => setImmediate(resolve));
+    factory.runtime.end();
+    await settlePolicy(factory);
+    t.mock.timers.tick(60000);
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    assert.equal(calls, 6);
+    assert.equal(Object.values(factory.state.tokens).find(token => token.item === 'unknown')?.status, 'manual');
+    assert.equal(factory.state.recoveries.unknown, undefined);
+  } finally {
+    await closePolicyFixture(factory);
+    removePolicyFixture(fixture.directory);
+  }
+});
+
+test('declared model recovery limits one task without shortening the shared keyed or legacy cooldown', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  for (const keyed of [true, false]) await t.test(keyed ? 'keyed provider' : 'legacy global provider', async () => {
+    const policy: StationRecoveryPolicy = {tags: ['model_transport'], maxRetries: 1,
+      backoff: {initialMs: 1000, factor: 1, maxMs: 1000}, deadlineMs: 600000, exhausted: 'parked'};
+    const fixture = await policyFixture(policy);
+    const factory = fixture.factory;
+    const dependency: ModelDependency = {key: 'policy-fixture-provider', adapter: 'pi', provider: 'fixture', model: 'fixture-model'};
+    let calls = 0;
+    let healthy = false;
+    const latest = () => Object.values(factory.state.tokens).findLast(token => token.item === 'model-policy' && !token.data.retriedBy)!;
+    try {
+      factory.runtime.executors = () => ({prepare: () => ({dependency: keyed ? dependency : undefined,
+        execute: async () => {
+          calls++;
+          return healthy ? {ok: true, summary: 'Synthetic provider receipt for the isolated fixture',
+            usage: {input: 3, output: 1, cost: 0}, metrics: {usageReported: true,
+              time: {firstTokenMs: 1, outputMs: 1, toolMs: 0, programMs: 0, modelCalls: 1, toolCalls: 0}}}
+            : {ok: false, summary: 'Model fixture timeout', failure: classifyFailure('Request timed out.', {stage: 'model'})};
+        }})});
+      factory.runtime.start('Policy model fixture');
+      factory.batch.configure({target: 10, maxInFlight: 1, intakeWindow: 1});
+      factory.runtime.create('policy-fixture/work', {item: 'model-policy', url: '', source: 'manual', data: {workflowPack: 'policy-fixture'}});
+      await settlePolicy(factory);
+      assert.equal((latest().data.__runtimeRecovery as RecoveryPlan).policy?.maxRetries, 1);
+      const due = keyed ? factory.state.modelCircuits[dependency.key].nextAt : factory.state.batch!.modelCircuit!.nextAt;
+      assert.equal(due - Date.now(), 30000);
+      t.mock.timers.tick(1000);
+      factory.batch.pump();
+      factory.recovery.pump();
+      await settlePolicy(factory);
+      assert.equal(calls, 1, 'a short task backoff cannot shorten the shared service cooldown');
+      t.mock.timers.tick(due - Date.now());
+      factory.recovery.pump();
+      await settlePolicy(factory);
+      assert.equal(calls, 2);
+      const plan = latest().data.__runtimeRecovery as RecoveryPlan;
+      assert.equal(plan.state, 'exhausted');
+      assert.equal(plan.attempts, 1);
+      const circuit = keyed ? factory.state.modelCircuits[dependency.key] : factory.state.batch!.modelCircuit!;
+      assert.equal(circuit.state, 'open');
+      assert.equal(circuit.failures, 2, 'task exhaustion never resets the service failure budget');
+      t.mock.timers.tick(3600000);
+      factory.batch.pump();
+      factory.recovery.pump();
+      await settlePolicy(factory);
+      assert.equal(calls, 2, 'Batch must not separately claim a policy-owned exhausted task');
+      healthy = true;
+      factory.retryCandidates({items: ['model-policy'], count: 1});
+      await settlePolicy(factory);
+      assert.equal(calls, 3);
+      assert.equal(latest().status, 'published');
+      assert.equal(keyed ? factory.state.modelCircuits[dependency.key] : factory.state.batch!.modelCircuit, undefined);
+      assert.equal((latest().data.__runtimeRecovery as RecoveryPlan).attempts, 0);
+    } finally {
+      await closePolicyFixture(factory);
+      removePolicyFixture(fixture.directory);
+    }
+  });
+});
+
+test('a model reply followed by a tool failure keeps the same declared retry budget', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const policy: StationRecoveryPolicy = {tags: ['model_transport', 'network_timeout'], maxRetries: 1,
+    backoff: {initialMs: 1000, factor: 1, maxMs: 1000}, exhausted: 'parked'};
+  const fixture = await policyFixture(policy);
+  const factory = fixture.factory;
+  const dependency: ModelDependency = {key: 'policy-reply-fixture', adapter: 'pi', provider: 'fixture', model: 'fixture'};
+  let calls = 0;
+  try {
+    factory.runtime.executors = () => ({prepare: () => ({dependency, execute: async () => {
+      if (++calls === 1) return {ok: false, summary: 'Model unavailable temporarily',
+        failure: classifyFailure('Request timed out.', {stage: 'model'})};
+      return {ok: false, summary: 'Model replied but later fixture tool timed out',
+        failure: classifyFailure('ETIMEDOUT local fixture'), usage: {input: 4, output: 2, cost: 0},
+        metrics: {usageReported: true, time: {firstTokenMs: 1, outputMs: 1, toolMs: 1, programMs: 0, modelCalls: 1, toolCalls: 1}},
+        data: {__runtimeRecovery: {version: 1, state: 'completed', attempts: 0}, __runtimeRecoveryPolicies: {}}};
+    }})});
+    factory.runtime.start('Provider health is separate from successful work');
+    factory.runtime.create('policy-fixture/work', {item: 'reply-then-failure', url: '', source: 'manual'});
+    await settlePolicy(factory);
+    t.mock.timers.tick(30000);
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    const current = Object.values(factory.state.tokens).findLast(token => token.item === 'reply-then-failure')!;
+    const plan = current.data.__runtimeRecovery as RecoveryPlan;
+    assert.equal(calls, 2);
+    assert.equal(factory.state.modelCircuits[dependency.key], undefined, 'a matching real-shaped receipt verifies service health');
+    assert.equal(plan.state, 'exhausted');
+    assert.equal(plan.attempts, 1, 'the receipt cannot reset the failing station budget');
+    assert.equal(plan.policy?.maxRetries, 1, 'returned business data cannot replace host recovery metadata');
+    t.mock.timers.tick(60000);
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    assert.equal(calls, 2);
+  } finally {
+    await closePolicyFixture(factory);
+    removePolicyFixture(fixture.directory);
+  }
+});
+
+test('an explicit retry recaptures policy after a default-policy episode rather than pinning null forever', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const fixture = await policyFixture();
+  const factory = fixture.factory;
+  let calls = 0;
+  try {
+    factory.runtime.executors = () => async () => {
+      calls++;
+      return {ok: false, summary: 'Controlled timeout', failure: classifyFailure('ETIMEDOUT fixture')};
+    };
+    factory.runtime.start('Default policy migration');
+    const first = factory.runtime.create('policy-fixture/work', {item: 'default-policy', url: '', source: 'manual'});
+    await settlePolicy(factory);
+    assert.equal((factory.state.tokens[first.id].data.__runtimeRecovery as RecoveryPlan).policy, null);
+    assert.equal((factory.state.tokens[first.id].data.__runtimeRecovery as RecoveryPlan).nextAt - Date.now(), 15000);
+    factory.runtime.nodes.get('policy-fixture/work')!.recovery = {tags: ['network_timeout'], maxRetries: 0,
+      backoff: {initialMs: 1000, factor: 1, maxMs: 1000}, exhausted: 'parked'};
+    const [second] = factory.retryCandidates({items: ['default-policy'], count: 1});
+    await settlePolicy(factory);
+    const plan = factory.state.tokens[second.id].data.__runtimeRecovery as RecoveryPlan;
+    assert.equal(calls, 2, 'the explicit requested attempt is allowed');
+    assert.equal(plan.policy?.maxRetries, 0);
+    assert.equal(plan.state, 'exhausted', 'the new declaration governs future automatic retries');
+    t.mock.timers.tick(60000);
+    factory.recovery.pump();
+    await settlePolicy(factory);
+    assert.equal(calls, 2);
+  } finally {
+    await closePolicyFixture(factory);
+    removePolicyFixture(fixture.directory);
   }
 });
 

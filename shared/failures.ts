@@ -7,7 +7,20 @@ export interface Failure { tag:FailureTag; category:"invalid"|"network"|"auth"|"
   owner?:"agent"|"user"|"system";
   /** Methods already tried, so nobody repeats them. */
   tried?:string[] }
-export interface CandidateRecovery { item:string; token:string; url:string; title:string; source:string; category?:string; disposition:"retry"|"removed"|"claimed"|"resolved"; failure?:Failure; at:number; attempts:number }
+export interface CandidateRecovery {
+  item: string;
+  token: string;
+  url: string;
+  title: string;
+  source: string;
+  category?: string;
+  disposition: 'retry' | 'manual' | 'removed' | 'claimed' | 'resolved';
+  /** Original executable frontier when a retry policy escalates to review. */
+  recoveryStation?: string;
+  failure?: Failure;
+  at: number;
+  attempts: number;
+}
 export const failureLabels:Record<FailureTag,string>={invalid_url:"网址格式错误",http_not_found:"页面不存在",page_unavailable:"采集子页面失效",network_timeout:"网络超时",network_dns:"DNS 解析失败",network_connection:"连接中断",network_tls:"TLS / 证书问题",http_rate_limit:"访问限流",http_server:"站点暂时异常",http_forbidden:"服务器拒绝请求",auth_required:"登录 / 人机验证",browser_capture:"浏览器截图异常",tool_error:"工具执行异常",run_ended:"本轮中止，尚未完成",needs_selection:"需要重新选页",missing_artifact:"产物引用失效",quality_rejected:"图像质量不合格",model_unavailable:"模型凭据 / 额度不可用",model_transport:"模型服务连接 / 超时"};
 
 export function recoveryAdvice(f:Failure|undefined) {

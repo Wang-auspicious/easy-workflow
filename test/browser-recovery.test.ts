@@ -129,6 +129,53 @@ test("browser process loss invalidates an attempt and resumes its checkpoint wit
         assert.equal(broker.used.browser, 0);
       } finally { await runtime.close(); journal.close(); await closeBrowser(); }
     });
+    await t.test('a declared browser policy sends the crash to recovery without an implicit pool retry', async () => {
+      const graph = structuredClone(compiled);
+      graph.nodes.find(node => node.key === 'curation/identity')!.recovery = {
+        tags: ['browser_capture'], maxRetries: 0,
+        backoff: {initialMs: 1000, factor: 1, maxMs: 1000}, exhausted: 'parked',
+      };
+      const journal = new Journal(':memory:');
+      const broker = new Broker({browser: 1}, 0);
+      const state = initialState(graph);
+      journal.subscribeProjection(event => apply(state, event));
+      let calls = 0;
+      let failures = 0;
+      const runtime = new Runtime(graph, journal, broker, pack.conditions, () => async context => {
+        calls++;
+        const lease = await openPage(undefined, undefined, context.signal);
+        try {
+          await lease.page.goto(url);
+          const session = await lease.context.newCDPSession(lease.page);
+          const crashed = lease.page.waitForEvent('crash');
+          void session.send('Page.crash').catch(() => {});
+          await crashed;
+          return {ok: true, summary: 'Swallowed crash must not publish', data: {poisoned: true}};
+        } finally {
+          await lease.close();
+        }
+      });
+      runtime.onRecovery = (_token, failure) => {
+        failures++;
+        assert.equal(failure.tag, 'browser_capture');
+      };
+      runtime.ensureWorkers([]);
+      runtime.start('Declared browser recovery');
+      const token = runtime.create('curation/identity', {item: 'declared-browser', url, source: 'manual'});
+      try {
+        await runtime.settle();
+        assert.equal(calls, 1);
+        assert.equal(failures, 1);
+        assert.equal(state.tokens[token.id].status, 'parked');
+        assert.equal(token.data.poisoned, undefined);
+        assert.equal(token.data.browserRecoveries, undefined, 'the package policy owns the budget');
+        assert.equal(broker.used.browser, 0);
+      } finally {
+        await runtime.close();
+        journal.close();
+        await closeBrowser();
+      }
+    });
     await t.test("ending the run during a real crash cancels without requeueing or publishing", async () => {
       const journal = new Journal(":memory:"), broker = new Broker({ browser: 3 }, 0), state = initialState(compiled);
       journal.subscribe(event => apply(state, event));

@@ -77,3 +77,53 @@ test('an independent channel child cannot hide its unresolved parent manual inve
     assert.equal(factory.state.tokens['active-child'].status, 'active');
   } finally { await close(factory); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('exhausted recovery moves to manual once and resumes only by an explicit checkpoint request', async () => {
+  let factory = new Factory();
+  try {
+    await factory.boot();
+    factory.recovery.close();
+    factory.runtime.start('Policy review inventory');
+    factory.runtime.executors = () => async () => ({ok: false, summary: 'HTTP 503', failure: {
+      tag: 'http_server', category: 'network', retryable: true, owner: 'system', message: 'HTTP 503',
+    }});
+    const token = factory.runtime.create('curation/assemble', {item: 'policy-review', url: 'https://fixture.invalid/', source: 'manual'});
+    await factory.runtime.settle();
+    const pool = factory.state.nodes['candidates/pool'].stock;
+    assert.equal(factory.state.tokens[token.id].status, 'parked');
+    factory.holdRecoveryForReview(token.id, 'curation/assemble', 'Configured recovery budget is exhausted');
+    assert.equal(factory.state.tokens[token.id].status, 'manual');
+    assert.equal(factory.state.recoveries[token.item].disposition, 'manual');
+    assert.equal(factory.state.nodes['candidates/pool'].stock, pool - 1);
+    assert.equal(factory.state.nodes['curation/manual'].stock, 1);
+    const through = factory.journal.seq;
+    factory.holdRecoveryForReview(token.id, 'curation/assemble', 'Repeated hold');
+    assert.equal(factory.journal.seq, through, 'the same manual transfer cannot add another arrival');
+    assert.deepEqual(factory.retryCandidates({items: [token.item], count: 1, automatic: true}), []);
+    assert.throws(() => factory.retryCandidates({count: 1, includeManual: true}), /明确指定/);
+    factory.runtime.pause();
+    await close(factory);
+    factory = new Factory();
+    await factory.boot();
+    factory.recovery.close();
+    assert.equal(factory.state.recoveries[token.item].disposition, 'manual');
+    assert.equal(factory.state.nodes['curation/manual'].stock, 1);
+    assert.equal(factory.state.tokens[token.id].status, 'manual');
+    factory.runtime.resume();
+    const beforeClaim = factory.state.nodes['candidates/pool'].stock;
+    const [resumed] = factory.retryCandidates({items: [token.item], count: 1, includeManual: true});
+    factory.runtime.pause();
+    assert.equal(resumed.data.retryOf, token.id);
+    assert.equal(resumed.data.recoveryStation, 'curation/assemble');
+    assert.ok(factory.runtime.queues.get('curation/assemble')?.includes(resumed.id));
+    assert.equal(factory.state.nodes['candidates/pool'].stock, beforeClaim, 'manual work cannot decrement candidate inventory again');
+    factory.reconcileManualStock();
+    assert.equal(factory.state.nodes['curation/manual'].stock, 0);
+    assert.equal(factory.state.recoveries[token.item].disposition, 'claimed');
+  } finally {
+    factory.recovery?.close();
+    await close(factory);
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});

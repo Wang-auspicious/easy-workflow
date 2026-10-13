@@ -50,7 +50,12 @@ async function exerciseStorageFailure(t: TestContext, boundary: 'result checkpoi
         && (event.patch.runtimeCheckpoint as { done?: string[] } | undefined)?.done?.includes('curation/facts');
       const attemptStart = boundary === 'attempt start' && event.kind === 'attempt.started' && event.node === 'curation/facts';
       if (!injected && (resultCheckpoint || attemptStart)) {
-        if (event.kind === 'attempt.started') { mainAttempt = event.attempt; baseline = mainRows(); }
+        if (event.kind === 'attempt.started') {
+          mainAttempt = event.attempt;
+          // A read on this connection also sees pending SQL writes. Only the
+          // committed projection watermark belongs to the durable baseline.
+          baseline = mainRows().filter(row => row.seq <= factory.state.seq);
+        }
         injected = true; throw new Error(`fixture storage failure at ${boundary}`);
       }
       return append(event);

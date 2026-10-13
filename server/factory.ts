@@ -718,6 +718,32 @@ export class Factory {
     }
   }
 
+  /** Transfer an exhausted recovery once, without counting it in both stores. */
+  holdRecoveryForReview(tokenId: string, station: string, reason: string): void {
+    const token = this.runtime.tokens.get(tokenId);
+    const current = this.state.tokens[tokenId];
+    const node = this.runtime.nodes.get(station);
+    if (!token || !current || !node || !this.runtime.runnable(node) || !token.closure.has(station)) {
+      throw new ControlError(409, 'recovery_station_missing', '人工复核必须保留原可执行工位与检查点');
+    }
+    if (current.status === 'manual') return;
+    if (!['parked', 'failed'].includes(current.status) || token.inflight.size) {
+      throw new ControlError(409, 'recovery_still_active', '等待原尝试结束并保存回执后再转人工复核');
+    }
+    const candidate = this.state.recoveries[token.item];
+    this.runtime.atomicTransition(() => {
+      if (candidate?.token === tokenId && candidate.disposition === 'retry') {
+        this.journal.append({kind: 'candidate.disposition', candidate: {
+          ...candidate, disposition: 'manual', recoveryStation: station,
+        }});
+        if (this.runtime.nodes.has('candidates/pool')) {
+          this.runtime.stockDelta('candidates/pool', -1, `${token.item} 自动恢复耗尽，转人工复核`);
+        }
+      }
+      this.runtime.toManual(token, node, reason);
+    });
+  }
+
   candidateFailures(filter:{tag?:string;disposition?:string}={}) {
     return Object.values(this.state.recoveries).filter(c=>(!filter.tag||c.failure?.tag===filter.tag)&&(!filter.disposition||c.disposition===filter.disposition)).sort((a,b)=>b.at-a.at);
   }
@@ -740,6 +766,7 @@ export class Factory {
     count: number;
     preview?: {role: 'breadth' | 'proof'; url: string};
     automatic?: boolean;
+    includeManual?: boolean;
     replan?: boolean;
     checkpointOnly?: boolean;
     onClaim?: (token: TokenRun) => void;
@@ -747,7 +774,12 @@ export class Factory {
     if (this.runtime.paused && this.runtime.running) {
       throw new ControlError(409, 'run_paused', '请先继续或结束当前暂停的轮次');
     }
-    const selected = this.candidateFailures({tag: filter.tag, disposition: 'retry'})
+    if (filter.includeManual && (filter.automatic || !filter.items?.length)) {
+      throw new ControlError(400, 'manual_retry_requires_items', '人工复核项仅能按明确指定的条目主动重试');
+    }
+    const selected = this.candidateFailures({tag: filter.tag})
+      .filter(candidate => candidate.disposition === 'retry' ||
+        (filter.includeManual && candidate.disposition === 'manual'))
       .filter(candidate => !filter.items || filter.items.includes(candidate.item)).slice(0, filter.count);
     if (!selected.length) return [];
     if (filter.checkpointOnly) {
@@ -771,6 +803,8 @@ export class Factory {
         const saved = this.state.tokens[candidate.token]?.data.runtimeCheckpoint;
         if (saved && typeof saved === 'object' && (saved as {version?: number}).version === 1) {
           requestedCheckpoints.set(candidate.token, this.candidateCheckpoint(candidate, true));
+        } else if (candidate.disposition === 'manual') {
+          throw new ControlError(409, 'recovery_checkpoint_missing', '人工复核项缺少完整检查点，不能回入口重做');
         }
       }
     }
@@ -832,7 +866,7 @@ export class Factory {
       }
       this.journal.append({kind:"dispatch.note",node:checkpoint,tone:"info",text:`${c.title} 从${this.compiled.nodes.find(n=>n.key===checkpoint)?.name??checkpoint}继续，保留此前成果`});
       this.journal.append({kind:"candidate.disposition",candidate:{...c,token:t.id,disposition:"claimed"}});
-      if (this.runtime.nodes.has('candidates/pool')) this.runtime.stockDelta("candidates/pool",-1,`${c.item} 已取出重试`);
+      if (c.disposition === 'retry' && this.runtime.nodes.has('candidates/pool')) this.runtime.stockDelta("candidates/pool",-1,`${c.item} 已取出重试`);
       if (!filter.automatic) this.recovery?.requestedRetry(previous, t);
       return t;
     });
@@ -854,7 +888,11 @@ export class Factory {
           typeof note[1].reason === 'string' && typeof note[1].byHuman === 'boolean')) {
       throw new ControlError(409, 'recovery_checkpoint_missing', '缺少原失败工位的完整持久检查点；已保留成果，不能自动回入口重做');
     }
-    let node = previous.finishedAtNode ? this.runtime.nodes.get(previous.finishedAtNode) : undefined;
+    const failedStation = candidate.disposition === 'manual' ? candidate.recoveryStation : previous.finishedAtNode;
+    let node = failedStation ? this.runtime.nodes.get(failedStation) : undefined;
+    if (candidate.disposition === 'manual' && (!node || saved.done.includes(node.key))) {
+      throw new ControlError(409, 'recovery_checkpoint_missing', '人工复核项没有尚未完成的原工位，不能猜测恢复入口');
+    }
     if (allowPaused && candidate.failure?.tag === 'run_ended' &&
         (!node || !this.runtime.runnable(node) || saved.done.includes(node.key))) {
       // Ending parks inventory at its source, which need not be its unfinished
@@ -914,8 +952,8 @@ export class Factory {
     }
     this.journal.append({kind: 'token.data', token: previous.id, patch: {retriedBy: token.id}});
     this.journal.append({kind: 'candidate.disposition', candidate: {...candidate, token: token.id, disposition: 'claimed'}});
-    if (this.runtime.nodes.has('candidates/pool')) this.runtime.stockDelta('candidates/pool', -1, `${candidate.item} 从持久检查点恢复`);
-    this.journal.append({kind: 'dispatch.note', node: node.key, tone: 'info', text: `${previous.title || previous.item} 从${node.name}自动继续，保留已完成成果与证据`});
+    if (candidate.disposition === 'retry' && this.runtime.nodes.has('candidates/pool')) this.runtime.stockDelta('candidates/pool', -1, `${candidate.item} 从持久检查点恢复`);
+    this.journal.append({kind: 'dispatch.note', node: node.key, tone: 'info', text: `${previous.title || previous.item} 从${node.name}继续，保留已完成成果与证据`});
     return token;
   }
 

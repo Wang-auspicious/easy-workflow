@@ -250,6 +250,8 @@ test("headless service: real HTTP capability discovery, control, validation, act
       assert.equal((await tool("feed_urls", { urls: ["file:///C:/private"] })).status, 400);
       assert.equal((await tool("feed_urls", { urls: ["https://user:password@example.test"] })).status, 400);
       assert.equal((await tool("settings", { values: { browser: 99 } })).status, 400);
+      assert.equal((await tool('retry_candidates', {count: 1, items: ['manual-fixture'], includeManual: true})).status, 403);
+      assert.equal((await request('/api/candidates/retry', {count: 1, includeManual: true})).status, 400);
       assert.equal((await tool("no_such_tool")).status, 404);
       assert.equal((await request("/api/typo")).status, 404);
       assert.equal((await request("/api/state", {})).status, 405);
@@ -402,6 +404,7 @@ test("headless service: real HTTP capability discovery, control, validation, act
       assert.equal((await tool('agent_defaults')).status, 200);
       assert.equal((await request('/api/agents/defaults', {station: {adapter: 'pi'}})).status, 403);
       assert.equal((await request('/api/agents/binding', {node: 'curation/copy', binding: {adapter: 'pi'}})).status, 403);
+      assert.equal((await request('/api/candidates/retry', {count: 1, items: ['manual-fixture'], includeManual: true})).status, 403);
       assert.equal((await tool("inspect", { station: "curation/proof" })).body.result.locked, true);
       assert.equal((await tool("workers", { station: "curation/proof", action: "unlock", reason: "must be rejected" })).status, 403);
       assert.equal((await tool("feed_urls", { urls: ["https://c.example.test"] })).status, 403);

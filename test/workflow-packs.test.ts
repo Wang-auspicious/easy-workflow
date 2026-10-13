@@ -10,7 +10,7 @@ import { installWorkflowPack, loadWorkflowPacks, readWorkflowIndex, addWorkflowL
 import { invokeWorkflowTool, describeWorkflowTool } from '../server/workflow-tools.ts';
 import { compile } from '../server/spec/compile.ts';
 import { station, line } from '../server/spec/dsl.ts';
-import type {StationAgentBinding} from '../shared/types.ts';
+import type {StationAgentBinding, StationRecoveryPolicy} from '../shared/types.ts';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-packs-'));
 process.env.FACTORY_VAR = root;
@@ -63,6 +63,40 @@ test('parallel workflow writers are rejected before replacing the installed inde
     fs.writeFileSync(file, JSON.stringify(request.manifest));
     await assert.rejects(loadWorkflowPacks(dir), /并行工位.*outputKey "result"/);
   } finally { fs.writeFileSync(file, original); }
+});
+
+test('workflow recovery policies validate atomically and binding overrides affect the compiled graph', async () => {
+  const directory = path.join(root, 'recovery-policy');
+  const request = outputWriterFixture('policy-contract');
+  request.manifest.bindings['policy-contract/right'].outputKey = 'rightResult';
+  const policy: StationRecoveryPolicy = {tags: ['network_timeout', 'model_transport'], maxRetries: 3,
+    backoff: {initialMs: 1000, factor: 2, maxMs: 60000, jitter: 0.2}, deadlineMs: 300000, exhausted: 'parked'};
+  request.manifest.lines[0].stations[0].recovery = policy;
+  request.manifest.bindings['policy-contract/left'].recovery = {...policy, maxRetries: 1, exhausted: 'manual'};
+  await installWorkflowPack(directory, request, idle);
+  const before = compile((await loadWorkflowPacks(directory)).packs);
+  assert.deepEqual(before.issues, []);
+  assert.deepEqual(before.nodes.find(node => node.key === 'policy-contract/entry')?.recovery, policy);
+  assert.equal(before.nodes.find(node => node.key === 'policy-contract/left')?.recovery?.maxRetries, 1);
+  const index = fs.readFileSync(path.join(directory, 'packs/installed.json'), 'utf8');
+  for (const invalid of [
+    {...policy, tags: ['auth_required']}, {...policy, tags: ['network_tls']},
+    {...policy, tags: ['model_unavailable']}, {...policy, maxRetries: 11},
+    {...policy, maxRetries: 0.5}, {...policy, backoff: {...policy.backoff, jitter: 1.1}},
+    {...policy, backoff: {...policy.backoff, maxMs: 500}}, {...policy, deadlineMs: -1},
+    {...policy, exhausted: 'published'}, {...policy, bypassAuthentication: true},
+  ]) {
+    const changed = structuredClone(request);
+    changed.manifest.bindings['policy-contract/left'].recovery = invalid as StationRecoveryPolicy;
+    await assert.rejects(installWorkflowPack(directory, {...changed, replace: true}, idle), /恢复策略/);
+    assert.equal(fs.readFileSync(path.join(directory, 'packs/installed.json'), 'utf8'), index);
+  }
+  const changed = structuredClone(request);
+  changed.manifest.bindings['policy-contract/left'].recovery!.maxRetries = 2;
+  await installWorkflowPack(directory, {...changed, replace: true}, idle);
+  const after = compile((await loadWorkflowPacks(directory)).packs);
+  assert.notEqual(before.digest, after.digest, 'recovery policy is executable graph state, not layout metadata');
+  assert.equal(after.nodes.find(node => node.key === 'policy-contract/left')?.recovery?.maxRetries, 2);
 });
 
 test('ordered replacement and independent token entries keep their actual data semantics', async () => {

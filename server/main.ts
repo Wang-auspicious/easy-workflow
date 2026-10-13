@@ -253,6 +253,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST") {
       const b = await body(req);
       switch (p) {
+        case '/api/candidates/retry': return send(res, 200, await control.execute('retry_candidates', b, 'user'));
         case '/api/batch/admission': return send(res, 200, await control.execute('run_batch', {...b, action: 'configure'}, 'user'));
         case '/api/agents/defaults': return send(res, 200, await control.execute('set_agent_defaults', b, 'user'));
         case '/api/agents/binding': return send(res, 200, await control.execute('set_agent_binding', b, 'user'));

@@ -14,6 +14,7 @@ import { apply, initialState } from "../../shared/project.ts";
 import {uiState, uiEvent} from '../../shared/client-view.ts';
 import {EvidenceBoard} from '../src/board/EvidenceBoard.tsx';
 import {Settings} from '../src/views/Settings.tsx';
+import {Candidates} from '../src/views/Candidates.tsx';
 import { botFor } from "../../shared/palette.ts";
 import type { CompiledFactory, CompiledNode, Stamped } from "../../shared/types.ts";
 import type { Geometry } from "../src/canvas/geometry.ts";
@@ -27,6 +28,9 @@ const station = (key: string, name: string, role: CompiledNode["role"], kind: Co
 });
 const nodes = [station("curation/review", "截图审查员", "review", "review"),
   station('curation/capture', '截图程序', 'process', 'program')];
+nodes[1].recovery = {tags: ['network_timeout'], maxRetries: 5,
+  backoff: {initialMs: 2000, factor: 2, maxMs: 30000, jitter: 0.2},
+  deadlineMs: 60000, exhausted: 'manual'};
 const lines = [{ id: "curation", name: "策展线", layer: 3 as const, priority: "mid" as const, blurb: "fixture", stations: nodes, edges: [], wired: true }];
 const factory: CompiledFactory = { nodes, lines, edges: [], packs: [], channels: [], resources: { browser: 0, model: 0, cpu: 0, http: 0 }, issues: [], digest: "fixture", specVersion: "fixture", ui: { order: ["curation"], hints: {}, collapsed: [] } };
 
@@ -90,7 +94,8 @@ setState({fs: uiState(fs), factory, ready: true, connected: true, version: 1, vi
 }};
 function Fixture() {
   const view = useStore(state => state.view);
-  return view === 'board' ? <EvidenceBoard /> : view === 'settings' ? <Settings /> : <Inspectors geo={geo} cam={{x: 0, y: 0, k: 1}} />;
+  return view === 'board' ? <EvidenceBoard /> : view === 'settings' ? <Settings />
+    : view === 'candidates' ? <Candidates /> : <Inspectors geo={geo} cam={{x: 0, y: 0, k: 1}} />;
 }
 createRoot(document.getElementById("root")!).render(
   <div className="app" style={{ ["--chat-w" as string]: "0px" }}>

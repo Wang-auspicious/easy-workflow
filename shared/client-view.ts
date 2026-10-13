@@ -27,9 +27,17 @@ function tokenData(data: Record<string, unknown>) {
     const recovery = plan ? pick(plan, [
       'version', 'runId', 'kind', 'state', 'station', 'nextAt',
       'networkAttempts', 'modelFailures', 'failureAttempt', 'reason',
+      'startedAt', 'deadlineAt', 'attempts',
     ]) : null;
     if (recovery && object(plan?.dependency)) {
       recovery.dependency = pick(plan?.dependency, ['key', 'adapter', 'provider', 'model']);
+    }
+    if (recovery && plan && Object.hasOwn(plan, 'policy')) {
+      const policy = object(plan.policy);
+      recovery.policy = plan.policy === null ? null : {
+        ...pick(policy, ['tags', 'maxRetries', 'deadlineMs', 'exhausted']),
+        backoff: pick(policy?.backoff, ['initialMs', 'factor', 'maxMs', 'jitter']),
+      };
     }
     summary.__runtimeRecovery = recovery;
   }

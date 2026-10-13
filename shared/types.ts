@@ -20,6 +20,21 @@ export interface WorkerPolicy { min: number; max: number; initial: number; polic
 export interface BotLook { shape: BotShape; hue: number; eyes: "dot" | "round" | "wide" | "sleepy"; seed: number }
 export type BotShape = "circle" | "squircle" | "drop" | "capsule" | "star" | "hex" | "bean";
 
+/** Policies can narrow transient recovery; they cannot authorize unsafe retries. */
+export type RecoveryFailureTag = 'network_timeout' | 'network_connection' | 'network_dns' |
+  'http_server' | 'http_rate_limit' | 'http_forbidden' | 'browser_capture' |
+  'tool_error' | 'model_transport';
+
+export interface StationRecoveryPolicy {
+  tags: RecoveryFailureTag[];
+  /** Automatic attempts after the original failure, excluding explicit user retries. */
+  maxRetries: number;
+  backoff: {initialMs: number; factor: number; maxMs: number; jitter?: number};
+  /** Wall-clock recovery window from the first failure, including pauses and queues. */
+  deadlineMs?: number;
+  exhausted: 'parked' | 'manual';
+}
+
 export interface StationSpec {
   id: string;
   name: string;
@@ -35,6 +50,7 @@ export interface StationSpec {
   resource: ResourceClass;
   estimateSeconds: number;
   workers: WorkerPolicy;
+  recovery?: StationRecoveryPolicy;
   /** Pseudo-code that states I/O boundaries and side effects (never executed). */
   pseudo?: string;
   /** Station prompt file (agent stations), relative to the pack. */

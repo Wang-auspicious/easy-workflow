@@ -15,6 +15,8 @@ import type { Journal } from "./journal.ts";
 import { browserAttemptScope, withBrowserAttempt, type BrowserPoolFault } from "./browser.ts";
 import type { SessionRef } from './station-session.ts';
 import type { ClosedSessionReference } from './mcp-station.ts';
+import {captureRecoveryPolicy, RECOVERY_PLAN_KEY, RECOVERY_POLICY_KEY, recoveryDeadline,
+  recoverySnapshot, type RecoveryPolicySnapshot} from '../shared/recovery-policy.ts';
 
 export interface TokenRun {
   id: string;
@@ -100,6 +102,23 @@ export interface StationResult {
 }
 
 export type Executor = (ctx: StationContext) => Promise<StationResult>;
+
+function retainedRecoverySessions(token: TokenRun, node: string, result: StationResult) {
+  const data = Object.fromEntries(['stationSessions', 'closedStationSessions']
+    .flatMap(key => result.data?.[key] ? [[key, result.data[key]]] : []));
+  if (result.sessionCheckpoint?.pi) data.stationSessions = {
+    ...(token.data.stationSessions as object ?? {}), [node]: result.sessionCheckpoint.pi,
+  };
+  if (result.sessionCheckpoint?.closed) data.closedStationSessions = {
+    ...(token.data.closedStationSessions as object ?? {}), [node]: result.sessionCheckpoint.closed,
+  };
+  return data;
+}
+
+function requiresExternalResolution(failure: Failure | undefined): failure is Failure {
+  return Boolean(failure && (!failure.retryable || failure.owner === 'user' ||
+    failure.category === 'auth' || failure.tag === 'network_tls' || failure.code === 'EXTERNAL_OPERATION_UNKNOWN'));
+}
 
 /** Configuration and execution are captured together before the start receipt. */
 export interface PreparedExecutor {
@@ -593,15 +612,44 @@ export class Runtime {
     const epoch = t.nodeEpochs?.get(n.key)??0;
     const queuedMs = Date.now() - (t.queuedAt.get(n.key) ?? Date.now());
     const ctrl = new AbortController();
-    const browserScope = browserAttemptScope(ctrl.signal, fault => ctrl.abort(fault));
+    let policySnapshot: RecoveryPolicySnapshot;
+    let policyError: Error | undefined;
+    try {
+      policySnapshot = captureRecoveryPolicy(t.data, n.key, n.recovery, attempt, Date.now());
+    } catch (error) {
+      policySnapshot = {policy: null, capturedAt: Date.now(), attempt};
+      policyError = Object.assign(new Error('恢复策略快照无效，保留原任务等待配置修复', {cause: error}), {
+        failure: {tag: 'tool_error', category: 'system', owner: 'agent', retryable: false,
+          code: 'INVALID_RECOVERY_POLICY', message: '恢复策略快照无效，保留原任务等待配置修复'} satisfies Failure,
+      });
+    }
+    const deadlineAt = recoveryDeadline(t.data, n.key);
+    const deadline = new AbortController();
+    const deadlineFailure: Failure = {tag: 'tool_error', category: 'system', owner: 'system',
+      retryable: true, code: 'RECOVERY_DEADLINE', message: '自动恢复总期限已到；保留检查点与已完成成果'};
+    const expire = () => deadline.abort(Object.assign(new Error(deadlineFailure.message), {failure: deadlineFailure}));
+    const signal = deadlineAt === undefined ? ctrl.signal : AbortSignal.any([ctrl.signal, deadline.signal]);
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    if (deadlineAt !== undefined) {
+      if (deadlineAt <= Date.now()) expire();
+      else deadlineTimer = setTimeout(expire, deadlineAt - Date.now());
+      deadlineTimer?.unref();
+    }
+    const browserScope = browserAttemptScope(signal, fault => ctrl.abort(fault));
     this.aborts.set(attempt, ctrl);
     this.attemptTokens.set(attempt,t.id);
     w.busy = attempt;
     t.inflight.add(n.key);
     try {
-      this.journal.append({kind: 'attempt.started', attempt, token: t.id, node: n.key,
-        worker: w.id, input: this.describeInput(t, n), dependency: prepared?.dependency});
+      this.journal.atomic(() => {
+        const snapshots = {...(t.data[RECOVERY_POLICY_KEY] as object ?? {}), [n.key]: policySnapshot};
+        t.data[RECOVERY_POLICY_KEY] = snapshots;
+        this.journal.append({kind: 'token.data', token: t.id, patch: {[RECOVERY_POLICY_KEY]: snapshots}});
+        this.journal.append({kind: 'attempt.started', attempt, token: t.id, node: n.key,
+          worker: w.id, input: this.describeInput(t, n), dependency: prepared?.dependency});
+      });
     } catch (error) {
+      clearTimeout(deadlineTimer);
       this.aborts.delete(attempt); this.attemptTokens.delete(attempt); t.inflight.delete(n.key);
       w.busy = null; w.idleSince = Date.now();
       this.haltForStorage(); lease.release();
@@ -656,19 +704,21 @@ export class Runtime {
       return reason;
     };
     try {
+      signal.throwIfAborted();
+      if (policyError) throw policyError;
       if (preparation.failed) throw preparation.error;
       const exec = prepared?.execute;
       if (!exec) throw new Error(`工位 ${n.key} 没有执行器`);
       const role=this.roleResolver(n.key);
       this.journal.append({kind:"attempt.progress",attempt,text:`按 ${n.name} 的 ROLE.md 执行`,step:{tool:"role",text:`${role.path} @ ${role.revision}`}});
       res = await withModelAdmission(modelAdmission, () => withBrowserAttempt(browserScope, () => exec({
-        token: t, node: n, attempt, worker: w, signal: ctrl.signal, redo: t.notes.get(n.key),
+        token: t, node: n, attempt, worker: w, signal, redo: t.notes.get(n.key),
         progress: (text, step) => {
-          if (!ctrl.signal.aborted && (t.nodeEpochs?.get(n.key)??0) === epoch && !t.finished) this.journal.append({ kind: "attempt.progress", attempt, text, step });
+          if (!signal.aborted && (t.nodeEpochs?.get(n.key)??0) === epoch && !t.finished) this.journal.append({ kind: "attempt.progress", attempt, text, step });
         },
         activity: activity => { this.journal.append({ kind: "attempt.activity", attempt, activity }); },
         addEvidence: (ev) => {
-          ctrl.signal.throwIfAborted();
+          signal.throwIfAborted();
           if ((t.nodeEpochs?.get(n.key)??0) !== epoch || t.finished) throw new Error("stale attempt");
           const full: EvidenceRef = { ...ev, station: n.key, token: t.id, attempt, at: Date.now() };
           this.journal.append({ kind: "evidence.added", evidence: full });
@@ -680,6 +730,7 @@ export class Runtime {
       const observed = err as Pick<StationResult, 'usage' | 'metrics' | 'sessionCheckpoint'>;
       res = { ok: false, summary: "工具出错", error: failure.message, failure, usage: observed?.usage, metrics: observed?.metrics, sessionCheckpoint: observed?.sessionCheckpoint };
     } finally {
+      clearTimeout(deadlineTimer);
       lease.release();
       this.aborts.delete(attempt);
       this.attemptTokens.delete(attempt);
@@ -720,6 +771,15 @@ export class Runtime {
         dependency: blockedModel.dependency,
       }};
     }
+    if ((deadline.signal.aborted || deadlineAt !== undefined && Date.now() >= deadlineAt) && !ctrl.signal.aborted) {
+      // A client may finish after cancellation. Its receipts remain observable,
+      // but late business output cannot pass the recovery deadline. An unknown
+      // external effect keeps its stricter reconciliation outcome.
+      const failure = requiresExternalResolution(res.failure) ? res.failure : deadlineFailure;
+      const data = retainedRecoverySessions(t, n.key, res);
+      res = {ok: false, summary: failure.message, error: failure.message, failure, data,
+        usage: res.usage, metrics: res.metrics, sessionCheckpoint: res.sessionCheckpoint};
+    }
     const ms = Date.now() - t0;
     try {
       this.journal.atomic(() => this.finishAttempt(t, n, attempt, ctrl, browserScope, epoch, res, ms, queuedMs));
@@ -754,6 +814,8 @@ export class Runtime {
 
   private finishAttempt(t: TokenRun, n: CompiledNode, attempt: string, ctrl: AbortController,
     browserScope: ReturnType<typeof browserAttemptScope>, epoch: number, res: StationResult, ms: number, queuedMs: number) {
+    const policyBrowserFault = Boolean(browserScope.fault && ctrl.signal.reason === browserScope.fault &&
+      recoverySnapshot(t.data, n.key)?.policy);
     if (res.failure?.code === 'MODEL_CIRCUIT_OPEN' && !ctrl.signal.aborted && !t.finished &&
         this.running && !this.ending && (t.nodeEpochs?.get(n.key) ?? 0) === epoch) {
       const modelWait = {...(t.data.modelWait as object ?? {}), [n.key]: {
@@ -784,11 +846,20 @@ export class Runtime {
       return;
     }
     if (browserScope.fault && this.running && !this.ending && !t.finished && (t.nodeEpochs?.get(n.key) ?? 0) === epoch) {
-      this.recoverBrowserAttempt(t, n, attempt, browserScope.fault, res, ms, queuedMs);
-      this.schedule();
-      return;
+      if (!policyBrowserFault) {
+        this.recoverBrowserAttempt(t, n, attempt, browserScope.fault, res, ms, queuedMs);
+        this.schedule();
+        return;
+      }
+      const fault = browserScope.fault;
+      const failure: Failure = requiresExternalResolution(res.failure) ? res.failure : {
+        tag: 'browser_capture', category: 'system', owner: 'system', retryable: true,
+        code: fault.code, message: fault.message, nextAction: fault.nextAction,
+      };
+      res = {ok: false, summary: failure.message, error: failure.message, failure,
+        usage: res.usage, metrics: res.metrics, data: retainedRecoverySessions(t, n.key, res)};
     }
-    if (ctrl.signal.aborted || (t.nodeEpochs?.get(n.key)??0) !== epoch || t.finished) {
+    if (ctrl.signal.aborted && !policyBrowserFault || (t.nodeEpochs?.get(n.key)??0) !== epoch || t.finished) {
       if (ctrl.signal.aborted && (t.nodeEpochs?.get(n.key) ?? 0) === epoch && res.sessionCheckpoint) {
         const patch: Record<string, unknown> = {};
         if (res.sessionCheckpoint.pi) {
@@ -807,7 +878,12 @@ export class Runtime {
       this.schedule();
       return;
     }
-    if (res.data && Object.keys(res.data).length) { Object.assign(t.data, res.data); this.journal.append({ kind: "token.data", token: t.id, patch: res.data }); }
+    if (res.data && Object.keys(res.data).length) {
+      const data = Object.fromEntries(Object.entries(res.data)
+        .filter(([key]) => key !== RECOVERY_PLAN_KEY && key !== RECOVERY_POLICY_KEY));
+      Object.assign(t.data, data);
+      this.journal.append({kind: 'token.data', token: t.id, patch: data});
+    }
     if (this.modelWait(t, n.key)) {
       const modelWait = {...t.data.modelWait as Record<string, unknown>};
       delete modelWait[n.key];
@@ -960,6 +1036,24 @@ export class Runtime {
     for (const q of this.queues.values()) { const i = q.indexOf(t.id); if (i >= 0) q.splice(i, 1); }
     if (this.nodes.has(manual)) this.enqueue(t, manual, at.key);
     else { t.finished = true; this.cancelTokenWork(t); this.journal.append({ kind: "token.finished", token: t.id, status: "manual", node: at.key, reason }); }
+  }
+
+  /** Expire a restored, queued recovery without invoking another executor. */
+  parkRecovery(t: TokenRun, station: string, reason: string) {
+    const node = this.nodes.get(station);
+    if (!node || !this.runnable(node) || t.inflight.size) return false;
+    if (t.finished) return true;
+    const failure = t.data.failure as Failure | undefined ?? {
+      tag: 'tool_error', category: 'system', owner: 'system', retryable: true,
+      code: 'RECOVERY_DEADLINE', message: reason,
+    } satisfies Failure;
+    t.finished = true;
+    t.data.failure = failure;
+    this.cancelTokenWork(t);
+    this.journal.append({kind: 'token.data', token: t.id, patch: {failure}});
+    this.journal.append({kind: 'token.finished', token: t.id, node: station, status: 'parked', reason});
+    this.onRecovery?.(t, failure);
+    return true;
   }
 
   descendants(t: TokenRun, key: string): Set<string> {

@@ -35,6 +35,10 @@ try {
   };
   const defaultWrites = [];
   const admissionWrites = [];
+  const candidateRetries = [];
+  let rejectCandidateRetry = false;
+  let holdCandidateRetry = false;
+  let releaseCandidateRetry;
   let rejectDefaultSave = false;
   const bindingResult = () => ({bindings: [{
     node: 'curation/review', configured,
@@ -49,6 +53,15 @@ try {
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(url.pathname);
+    if (url.pathname === '/api/candidates/retry') {
+      const request = route.request().postDataJSON();
+      candidateRetries.push(request);
+      if (holdCandidateRetry) await new Promise(resolve => { releaseCandidateRetry = resolve; });
+      await route.fulfill(rejectCandidateRetry
+        ? {status: 409, json: {ok: false, error: 'Fixture checkpoint is temporarily unavailable'}}
+        : {json: {ok: true, result: {count: request.items.length}}});
+      return;
+    }
     if (url.pathname === '/api/batch/admission') {
       const update = route.request().postDataJSON();
       admissionWrites.push(update);
@@ -183,6 +196,7 @@ try {
   await page.getByText("ROLE.md · 职责与异常处理").waitFor();
   assert.match(await page.locator(".node-role pre").innerText(), /只做判定，不改内容/);
   assert.ok(calls.includes("/api/tools/read_role"), "职责来自接口，不是写死的文案");
+  assert.match(await page.getByRole('region', {name: '自动恢复策略'}).innerText(), /未单独声明.*默认恢复/s);
 
   const settings = page.getByRole('region', {name: '工位 Agent 配置'});
   await settings.getByLabel('执行适配器').waitFor();
@@ -290,6 +304,10 @@ try {
   await page.getByRole('button', {name: '规格', exact: true}).click();
   await settings.getByText('程序执行，不使用 Agent 模型。').waitFor();
   assert.equal(await settings.getByLabel('执行适配器').count(), 0, 'programs never show a fake Agent selector');
+  const policyDetails = page.getByRole('region', {name: '自动恢复策略'});
+  assert.match(await policyDetails.innerText(), /网络超时.*最多 5 次.*首次 2 秒.*×2.*最长 30 秒.*±20%.*60 秒.*暂停.*转人工复核/s);
+  assert.equal(await policyDetails.locator('input, select, button').count(), 0, 'policy details are read-only');
+  await policyDetails.screenshot({path: path.join(out, 'recovery-policy.png')});
 
   await page.evaluate(() => window.inspectorFixture.setState({view: 'board'}));
   await page.getByRole('button', {name: '完整文字判定：查看完整证据'}).click();
@@ -307,7 +325,7 @@ try {
     fixture.setState({view: 'canvas', inspectors: [{key: plan.station, kind: 'node', x: 40, y: 40, pinned: true}]});
   }, recoveryPlan);
   await page.locator('[data-station-status="等待自动恢复"]').waitFor();
-  assert.match(await page.locator('[data-station-status]').innerText(), /0\/2.*当前排队 0/);
+  assert.match(await page.locator('[data-station-status]').innerText(), /0 次.*未记录上限.*当前排队 0/);
   await page.evaluate(() => window.inspectorFixture.emit({kind: 'run.paused', runId: 'fixture-run'}));
   await page.locator('[data-station-status="已暂停"]').waitFor();
   assert.doesNotMatch(await page.locator('[data-station-status]').innerText(), /秒后/);
@@ -323,6 +341,91 @@ try {
   await page.screenshot({path: path.join(out, 'recovery-state.png')});
   await page.evaluate(() => window.inspectorFixture.emit({kind: 'token.finished', token: 'recovering', node: 'curation/published', status: 'published', reason: '已核验的发布结果'}));
   await page.locator('[data-token-status="已发布"]').waitFor();
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    const policy = fixture.getState().factory.nodes.find(node => node.key === 'curation/capture').recovery;
+    fixture.emit({kind: 'token.created', token: 'policy-recovery', item: 'policy-recovery', line: 'curation', source: 'fixture', url: ''});
+    fixture.emit({kind: 'token.finished', token: 'policy-recovery', node: 'curation/capture', status: 'parked', reason: '等待恢复策略'});
+    fixture.emit({kind: 'token.data', token: 'policy-recovery', patch: {__runtimeRecovery: {
+      version: 1, runId: 'fixture-run', kind: 'network', state: 'waiting', station: 'curation/capture',
+      nextAt: Date.now() + 20000, networkAttempts: 1, modelFailures: 0, failureAttempt: 'custom-timeout',
+      startedAt: Date.now(), deadlineAt: Date.now() + 60000, attempts: 3, policy,
+    }}});
+    fixture.setState({inspectors: [{key: 'policy-recovery', kind: 'token', x: 40, y: 40, pinned: true}]});
+  });
+  await page.locator('[data-token-status="等待自动恢复"]').waitFor();
+  assert.match(await page.locator('[data-token-status]').innerText(), /3\/5 次.*截止.*墙钟.*暂停/);
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    fixture.emit({kind: 'run.paused', runId: 'fixture-run'});
+    const plan = fixture.fullState.tokens['policy-recovery'].data.__runtimeRecovery;
+    fixture.emit({kind: 'token.data', token: 'policy-recovery', patch: {__runtimeRecovery: {...plan, deadlineAt: Date.now() - 1}}});
+  });
+  await page.locator('[data-token-status="恢复已暂停"]').filter({hasText: '恢复期限已到'}).waitFor();
+  assert.match(await page.locator('[data-token-status]').innerText(), /恢复期限已到/);
+  await page.evaluate(() => window.inspectorFixture.emit({kind: 'run.resumed', runId: 'fixture-run'}));
+  await page.locator('[data-token-status="恢复期限已到"]').waitFor();
+  assert.equal(await page.evaluate(() => window.inspectorFixture.getState().fs.tokens['policy-recovery'].status), 'parked');
+
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    for (const [item, title, disposition] of [['manual-one', '需核查一', 'manual'], ['manual-two', '需核查二', 'manual'], ['retry-one', '网络待重试', 'retry']]) {
+      fixture.emit({kind: 'token.created', token: item, item, title, line: 'curation', source: 'fixture', url: `https://fixture.test/${item}`});
+      fixture.emit({kind: 'token.finished', token: item, node: disposition === 'manual' ? 'curation/manual' : 'curation/capture',
+        status: disposition === 'manual' ? 'manual' : 'parked', reason: '保留原有证据'});
+      fixture.emit({kind: 'candidate.disposition', candidate: {item, token: item, title, source: 'fixture',
+        url: `https://fixture.test/${item}`, disposition, recoveryStation: 'curation/capture',
+        failure: {tag: disposition === 'manual' ? 'tool_error' : 'network_timeout', category: 'system',
+          owner: 'system', retryable: true, message: '保留原有证据，核查故障后从原工位继续'}}});
+    }
+    fixture.emit({kind: 'token.created', token: 'quality-manual', item: 'quality-manual', title: '质量审查待人工', line: 'curation', source: 'fixture', url: ''});
+    fixture.emit({kind: 'token.finished', token: 'quality-manual', node: 'curation/manual', status: 'manual', reason: '需要用户质量判断'});
+    fixture.setState({view: 'candidates'});
+  });
+  await page.getByRole('button', {name: '恢复待人工 2', exact: true}).click();
+  assert.equal(candidateRetries.length, 0, 'opening the manual group must not execute anything');
+  assert.equal(await page.getByRole('button', {name: '选择人工项后继续', exact: true}).isDisabled(), true);
+  assert.match(await page.locator('.candidate-recovery').innerText(), /不含任务与证据板中的质量审查待人工项/);
+  assert.equal(await page.getByLabel('选择 质量审查待人工', {exact: true}).count(), 0);
+  assert.match(await page.locator('.recovery-row').first().innerText(), /恢复工位：截图程序 · curation\/capture/);
+  await page.getByLabel('选择 需核查一', {exact: true}).check();
+  rejectCandidateRetry = true;
+  holdCandidateRetry = true;
+  const manualRequest = page.waitForRequest(request => request.url().endsWith('/api/candidates/retry'));
+  await page.getByRole('button', {name: '继续已选 1 件原工位', exact: true}).dblclick();
+  await manualRequest;
+  assert.equal(candidateRetries.length, 1, 'a double click cannot submit the manual continuation twice');
+  assert.equal(await page.getByRole('button', {name: '正在取出…', exact: true}).isDisabled(), true);
+  assert.equal(await page.getByLabel('选择 需核查一', {exact: true}).isChecked(), true);
+  holdCandidateRetry = false;
+  releaseCandidateRetry();
+  await page.getByRole('alert').filter({hasText: 'Fixture checkpoint is temporarily unavailable'}).waitFor();
+  assert.equal(await page.getByLabel('选择 需核查一', {exact: true}).isChecked(), true, 'a rejected request preserves the explicit choice');
+  assert.deepEqual(candidateRetries[0], {count: 1, items: ['manual-one'], includeManual: true});
+  rejectCandidateRetry = false;
+  await page.getByRole('button', {name: '继续已选 1 件原工位', exact: true}).click();
+  await page.getByRole('status').filter({hasText: '已从原工位继续 1 件'}).waitFor();
+  assert.deepEqual(candidateRetries[1], candidateRetries[0], 'manual continuation never expands to unselected items');
+  await page.getByLabel('选择 需核查二', {exact: true}).check();
+  await page.evaluate(() => window.inspectorFixture.setState({connected: false}));
+  assert.equal(await page.getByRole('button', {name: '继续已选 1 件原工位', exact: true}).isDisabled(), true);
+  assert.equal(await page.getByLabel('选择 需核查二', {exact: true}).isDisabled(), true);
+  await page.evaluate(() => window.inspectorFixture.setState({connected: true,
+    replay: {run: 'fixture-run', speed: 1, playing: false, at: Date.now(), start: 1, end: Date.now(), events: [], cursor: 0}}));
+  assert.equal(await page.getByRole('button', {name: '继续已选 1 件原工位', exact: true}).isDisabled(), true);
+  assert.match(await page.locator('.candidate-recovery').innerText(), /回放为只读/);
+  assert.equal(candidateRetries.length, 2);
+  await page.evaluate(() => window.inspectorFixture.setState({replay: null}));
+  await page.getByLabel('失败原因标签').selectOption('network_timeout');
+  assert.equal(await page.getByRole('button', {name: '选择人工项后继续', exact: true}).isDisabled(), true);
+  await page.getByRole('button', {name: '待重试 1', exact: true}).click();
+  await page.getByRole('button', {name: '重试当前筛选 1 件', exact: true}).click();
+  await page.getByRole('status').filter({hasText: '已从原工位继续 1 件'}).waitFor();
+  assert.deepEqual(candidateRetries[2], {count: 1, items: ['retry-one'], tag: 'network_timeout'});
+  assert.equal(calls.includes('/api/tools/retry_candidates'), false, 'both paths use the authorized user route');
+  await page.getByLabel('失败原因标签').selectOption('');
+  await page.getByRole('button', {name: '恢复待人工 2', exact: true}).click();
+  await page.screenshot({path: path.join(out, 'manual-recovery.png')});
   const liveDetailCount = detailRequests.length;
   await page.evaluate(() => {
     const fixture = window.inspectorFixture;

@@ -4,7 +4,8 @@ import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { Check, Errors } from 'typebox/value';
 import type { TSchema } from 'typebox';
-import type { CompiledNode, EdgeSpec, LineSpec, PackSpec, StationAgentBinding } from '../shared/types.ts';
+import type { CompiledNode, EdgeSpec, LineSpec, PackSpec, StationAgentBinding, StationRecoveryPolicy } from '../shared/types.ts';
+import {parseRecoveryPolicy} from '../shared/recovery-policy.ts';
 import type { AgentStationDef } from './agent-station.ts';
 import type { Executor, StationContext, StationResult } from './runtime.ts';
 import type { Pack } from './spec/dsl.ts';
@@ -31,6 +32,8 @@ export interface WorkflowBinding {
   input: Record<string, WorkflowInput>;
   outputKey: string;
   execute: WorkflowExecution;
+  /** An execution binding can override the station's declared recovery policy. */
+  recovery?: StationRecoveryPolicy;
   reviewTarget?: string;
   manualWhen?: { path: string; equals: unknown };
   preserveInput?: Record<string, string>;
@@ -127,6 +130,14 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
     if (!record(line) || !slug.test(line.id) || !Array.isArray(line.stations) || !Array.isArray(line.edges) || ![1, 2, 3].includes(line.layer) || !['high', 'mid', 'low'].includes(line.priority) || typeof line.wired !== 'boolean') bad('流水线必须声明合法 id、layer、priority、wired、stations 与 edges');
     for (const station of line.stations) {
       if (!slug.test(station.id) || typeof station.input !== 'string' || typeof station.output !== 'string' || !Array.isArray(station.accept) || !Array.isArray(station.rules) || !record(station.workers)) bad(`${line.id} 的工位必须声明完整 I/O、验收与工人配置`);
+      if (station.recovery !== undefined) {
+        try {
+          if (station.kind === 'source' || station.kind === 'store') throw new Error('库存节点不能声明工位恢复策略');
+          station.recovery = parseRecoveryPolicy(station.recovery);
+        } catch (error) {
+          bad(`${line.id}/${station.id} 的恢复策略无效：${error instanceof Error ? error.message : '参数不符合契约'}`);
+        }
+      }
       keys.add(`${line.id}/${station.id}`);
     }
     if (line.wired && !line.stations.some(station => station.kind !== 'source' && station.kind !== 'store')) bad(`已接线的 ${line.id} 必须至少包含一个可执行工位`);
@@ -135,6 +146,13 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
   const roles = new Map<string, WorkflowRole>(), contracts: NonNullable<Pack['contracts']> = {};
   for (const [key, binding] of Object.entries(manifest.bindings)) {
     if (!keys.has(key) || !record(binding) || !record(binding.input) || typeof binding.outputKey !== 'string' || !safeKey(binding.outputKey) || !record(binding.execute)) bad(`工位绑定 ${key} 无效`);
+    if (binding.recovery !== undefined) {
+      try {
+        binding.recovery = parseRecoveryPolicy(binding.recovery);
+      } catch (error) {
+        bad(`${key} 的恢复策略无效：${error instanceof Error ? error.message : '参数不符合契约'}`);
+      }
+    }
     if (binding.execute.kind !== 'agent' && 'agent' in binding.execute) {
       bad(`${key} 是程序执行器，不能声明工位 Agent 配置`);
     }
@@ -166,7 +184,10 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
       } else if (typeof tool.command !== 'string' || !tool.command.trim() || tool.args && (!Array.isArray(tool.args) || tool.args.some(arg => typeof arg !== 'string')) || tool.kind === 'mcp' && !tool.tool) bad(`${key} 的进程工具命令、参数或 MCP 工具名无效`);
       code += JSON.stringify(tool);
     } else if (binding.execute.kind !== 'agent' && (binding.execute.kind !== 'builtin' || !['normalize-text', 'text-statistics', 'keywords', 'aggregate', 'page-text', 'prepare-source', 'route', 'publish-json'].includes(binding.execute.name))) bad(`${key} 没有已实现的执行器`);
-    const revision = digest(content + code + JSON.stringify([binding, manifest.schemas[binding.inputSchema], manifest.schemas[binding.outputSchema]])).slice(0, 16);
+    const declaredRecovery = manifest.lines.flatMap(line => line.stations.map(station => ({line: line.id, station})))
+      .find(value => `${value.line}/${value.station.id}` === key)?.station.recovery;
+    const revision = digest(content + code + JSON.stringify([binding, declaredRecovery,
+      manifest.schemas[binding.inputSchema], manifest.schemas[binding.outputSchema]])).slice(0, 16);
     roles.set(key, { station: key, path: path.relative(projectDir, contained(directory, binding.role)).split(path.sep).join('/'), revision, content });
     contracts[key] = { role: binding.role, inputSchema: binding.inputSchema, outputSchema: binding.outputSchema, executor: binding.execute.kind, revision, outputKey: binding.outputKey };
   }
@@ -174,7 +195,11 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
     if (!safeKey(key) || !record(def) || typeof def.path !== 'string' || !['equals', 'exists', 'in', 'truthy'].includes(def.op)) bad(`条件 ${key} 无效`);
     workflowValue({}, def.path);
   }
-  const pack: Pack = { ...manifest, conditions: Object.fromEntries(Object.entries(manifest.conditions).map(([name, value]) => [name, condition(value)])), contracts, order: manifest.lines.map(line => line.id), collapsed: [], hints: {} };
+  const lines = manifest.lines.map(line => ({...line, stations: line.stations.map(station => {
+    const binding = manifest.bindings[`${line.id}/${station.id}`];
+    return binding?.recovery === undefined ? station : {...station, recovery: binding.recovery};
+  })}));
+  const pack: Pack = { ...manifest, lines, conditions: Object.fromEntries(Object.entries(manifest.conditions).map(([name, value]) => [name, condition(value)])), contracts, order: manifest.lines.map(line => line.id), collapsed: [], hints: {} };
   // Cross-pack links are checked only after all enabled packs have been loaded.
   return { pack, roles };
 }

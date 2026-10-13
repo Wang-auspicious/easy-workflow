@@ -4,6 +4,7 @@
 import crypto from "node:crypto";
 import type { CompiledEdge, CompiledFactory, CompiledNode, EdgeSpec, LineSpec, StationSpec } from "../../shared/types.ts";
 import { botFor } from "../../shared/palette.ts";
+import {parseRecoveryPolicy} from '../../shared/recovery-policy.ts';
 import type { Pack } from "./dsl.ts";
 
 export const SPEC_VERSION = "2026-10-09.1";
@@ -163,6 +164,14 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
     const key = `${ln.id}/${st.id}`;
     if (byKey.has(key)) { issues.push({ at: key, message: "duplicate station id" }); continue; }
     const n: CompiledNode = { ...st, key, line: ln.id, layer: ln.layer, bot: botFor(key, st.role, st.bot) };
+    if (st.recovery !== undefined) {
+      try {
+        if (st.kind === 'source' || st.kind === 'store') throw new Error('库存节点不能声明工位恢复策略');
+        n.recovery = parseRecoveryPolicy(st.recovery);
+      } catch (error) {
+        issues.push({at: key, message: `恢复策略无效：${error instanceof Error ? error.message : '参数不符合契约'}`});
+      }
+    }
     nodes.push(n); byKey.set(key, n);
   }
   const edges: CompiledEdge[] = [];
