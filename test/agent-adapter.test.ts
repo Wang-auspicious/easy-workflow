@@ -23,6 +23,8 @@ import { closeModelTransport, models, piStatus, probeModelConnection, redactMode
 import type { StationAgentBinding } from '../shared/types.ts';
 import { sessionSignature, type SessionRef } from '../server/station-session.ts';
 import {withModelAdmission} from '../server/model-requests.ts';
+import {closedModelDependency} from '../server/agent-bindings.ts';
+import {installWorkflowPack, type WorkflowManifest} from '../server/workflow-packs.ts';
 
 test("closed launcher receives envelope first, calls scoped MCP, repairs and reports real usage", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-closed-agent-test-"));
@@ -694,4 +696,175 @@ test('structured launcher failures preserve category and timeout stops a silent 
     cancellable.abort(); await cancelled;
     assert.throws(() => process.kill(cancelledPid, 0), { code: 'ESRCH' }, 'owner cancellation also waits for child close');
   } finally { assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir())); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Factory captures installed Agent execution before start observers rebind the next item', {timeout: 30000}, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-factory-binding-'));
+  const keys = ['FACTORY_VAR', 'FACTORY_PREFLIGHT', 'FACTORY_START_PAUSED', 'FACTORY_RESUME_MANAGED',
+    'FACTORY_HTTP_CACHE', 'VISLEXICON_ROOT', 'PI_CODING_AGENT_DIR', 'FACTORY_STATION_COMMAND'];
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  const profile = path.join(dir, 'profile');
+  fs.mkdirSync(profile);
+  process.env.FACTORY_VAR = dir;
+  process.env.FACTORY_PREFLIGHT = '0';
+  process.env.FACTORY_START_PAUSED = '1';
+  process.env.FACTORY_RESUME_MANAGED = '0';
+  process.env.FACTORY_HTTP_CACHE = '0';
+  process.env.VISLEXICON_ROOT = path.join(dir, 'unconnected');
+  process.env.PI_CODING_AGENT_DIR = profile;
+  process.env.FACTORY_STATION_COMMAND = 'invalid unselected launcher default';
+  const receipt = path.join(dir, 'launcher.jsonl');
+  const launcher = path.join(dir, 'launcher.mjs');
+  fs.writeFileSync(launcher, `import assert from 'node:assert/strict';
+import fs from 'node:fs';
+let raw = ''; for await (const chunk of process.stdin) raw += chunk;
+const request = JSON.parse(raw);
+assert.match(request.firstMessage.content[0].text, /Captured fixture role/);
+fs.appendFileSync(process.argv[3], JSON.stringify({command: process.argv[2], model: request.model}) + '\\n');
+const connection = JSON.parse(fs.readFileSync(request.mcpServers.h2_station.env.EASY_WORKFLOW_STATION_CONNECTION, 'utf8'));
+const response = await fetch(connection.url + '/call', {method: 'POST', headers: {
+  authorization: 'Bearer ' + connection.token, 'content-type': 'application/json'},
+  body: JSON.stringify({name: 'submit', arguments: {value: process.argv[2]}})});
+assert.equal(response.status, 200);
+process.stdout.write(JSON.stringify({model: 'reported-' + request.model, modelCalls: 1,
+  usage: {input: 20, output: 5, cost: 0}}));`);
+  const bindings = ['a', 'b'].map(name => ({adapter: 'launcher' as const,
+    command: [process.execPath, launcher, name, receipt], model: `requested-${name}`}));
+  const valueSchema = {type: 'object', properties: {value: {type: 'string'}},
+    required: ['value'], additionalProperties: false};
+  const manifest: WorkflowManifest = {
+    format: 1, id: 'captured', name: 'Captured fixture', version: '1', blurb: 'Actual adapter capture',
+    entry: 'captured/work', inputSchema: 'value', resources: {model: 1, browser: 0, cpu: 0, http: 0},
+    lines: [line({id: 'captured', name: 'Captured fixture', layer: 3, priority: 'mid', wired: true,
+      blurb: 'Actual adapter capture', stations: [
+        station({id: 'work', name: 'Capture', kind: 'agent', role: 'process', resource: 'model',
+          accept: ['Submit the exact fixture result'], workers: {min: 1, max: 1, initial: 1, policy: 'fixed'}}),
+        station({id: 'published', name: 'Done', kind: 'store', role: 'store'}),
+      ], edges: [['work', 'published']]})],
+    channels: [], links: [], conditions: {}, schemas: {value: valueSchema},
+    bindings: {'captured/work': {role: 'roles/work/ROLE.md', inputSchema: 'value', outputSchema: 'value',
+      input: {value: {path: 'input.value'}}, outputKey: 'result', execute: {kind: 'agent',
+        instructions: 'Return only the supplied fixture value.', agent: bindings[0]}}},
+  };
+  const requests: {path: string; model: string}[] = [];
+  const server = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString()) as {model: string};
+    const name = request.url?.startsWith('/a/') ? 'a' : 'b';
+    requests.push({path: request.url!, model: body.model});
+    assert.equal(request.headers.authorization, `Bearer local-capture-${name}`);
+    assert.match(Buffer.concat(chunks).toString(), /Captured fixture role/);
+    response.writeHead(200, {'content-type': 'text/event-stream'});
+    for (const part of [
+      {choices: [{index: 0, delta: {role: 'assistant', tool_calls: [{index: 0, id: `capture-${requests.length}`,
+        type: 'function', function: {name: 'submit', arguments: JSON.stringify({value: name})}}]}, finish_reason: null}]},
+      {choices: [{index: 0, delta: {}, finish_reason: 'tool_calls'}],
+        usage: {prompt_tokens: 20, completion_tokens: 5, total_tokens: 25}},
+    ]) response.write(`data: ${JSON.stringify({id: 'capture', model: body.model, ...part})}\n\n`);
+    response.end('data: [DONE]\n\n');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as {port: number}).port;
+  const providerConfig = {providers: Object.fromEntries(['a', 'b'].map(name => [name, {
+    api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/${name}/v1`,
+    models: [{id: 'shared-model', input: ['text']}],
+  }]))};
+  fs.writeFileSync(path.join(profile, 'auth.json'), JSON.stringify(Object.fromEntries(['a', 'b']
+    .map(name => [name, {type: 'api_key', key: `local-capture-${name}`}]))));
+  fs.writeFileSync(path.join(profile, 'models.json'), JSON.stringify(providerConfig));
+  await installWorkflowPack(dir, {manifest, files: {'roles/work/ROLE.md':
+    '# Captured fixture role\n\nReturn only the supplied value through the submit contract. Use no external sources and do not invent additional evidence.'}, builtins: []}, {running: false});
+  const {Factory} = await import('../server/factory.ts');
+  const factory = new Factory();
+  try {
+    assert.equal(factory.project.dir, dir);
+    await factory.boot();
+    factory.broker.memoryFloorMB = 0;
+    factory.runtime.start('Captured execution fixture');
+    for (const adapter of ['launcher', 'pi'] as const) await t.test(adapter, async () => {
+      const selected: StationAgentBinding[] = adapter === 'launcher' ? bindings
+        : ['a', 'b'].map(provider => ({adapter: 'pi', provider, model: 'shared-model'}));
+      if (adapter === 'launcher') {
+        assert.equal(factory.agentBindings('captured/work').bindings[0].source, 'workflow');
+      } else factory.setAgentBinding('captured/work', selected[0]);
+      const identities = selected.map(binding => binding.adapter === 'pi'
+        ? models(binding).dependency : closedModelDependency(binding));
+      let changed = false;
+      const unsubscribe = factory.journal.subscribe(event => {
+        if (event.kind !== 'attempt.started' || event.node !== 'captured/work' || changed) return;
+        changed = true;
+        factory.setAgentBinding(event.node, selected[1]);
+        if (adapter === 'pi') {
+          providerConfig.providers.a.baseUrl = `http://127.0.0.1:${port}/changed-after-start/v1`;
+          fs.writeFileSync(path.join(profile, 'models.json'), JSON.stringify(providerConfig));
+        }
+      });
+      try {
+        for (const [index, name] of ['a', 'b'].entries()) {
+          const token = factory.runtime.create('captured/work', {item: `${adapter}-${name}`, url: '',
+            source: 'manual', data: {workflowPack: manifest.id, input: {value: name}}});
+          await factory.runtime.settle();
+          assert.equal(factory.state.tokens[token.id].status, 'published');
+          assert.deepEqual(token.data.result, {value: name});
+          const attempt = factory.state.attempts[factory.state.tokens[token.id].attempts[0]];
+          assert.deepEqual(attempt.dependency, identities[index]);
+          assert.deepEqual(attempt.metrics?.dependency, identities[index]);
+          assert.equal(attempt.metrics?.execution?.model,
+            adapter === 'launcher' ? `reported-requested-${name}` : 'shared-model');
+          const durable = [...factory.journal.read()].find(event =>
+            event.kind === 'attempt.started' && event.attempt === attempt.id);
+          assert.ok(durable?.kind === 'attempt.started');
+          assert.deepEqual(durable.dependency, identities[index]);
+        }
+      } finally {
+        unsubscribe();
+      }
+    });
+    assert.deepEqual(fs.readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line)),
+      [{command: 'a', model: 'requested-a'}, {command: 'b', model: 'requested-b'}]);
+    assert.deepEqual(requests, [{path: '/a/v1/chat/completions', model: 'shared-model'},
+      {path: '/b/v1/chat/completions', model: 'shared-model'}]);
+    await t.test('deterministic skip survives an invalid captured model without reopening configuration', async () => {
+      const {pack} = await import('../packs/vislexicon/pack.ts');
+      const node = compile([pack]).nodes.find(node => node.key === 'curation/style')!;
+      factory.journal.append({kind: 'agent.binding', node: node.key,
+        binding: {adapter: 'pi', provider: 'missing-provider', model: 'missing-model'}});
+      const registered = factory.runtime.executors(node);
+      assert.ok(registered && typeof registered !== 'function');
+      const prepared = registered.prepare();
+      factory.journal.append({kind: 'agent.binding', node: node.key,
+        binding: {adapter: 'pi', provider: 'b', model: 'shared-model'}});
+      let skipped = 0;
+      const context = {...nativeContext('deterministic-skip', {kind: 'component-source', mode: 'video'}),
+        node, progress: () => { skipped++; }};
+      const result = await prepared.execute(context);
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.data?.style, {applicable: false});
+      assert.equal(result.metrics, undefined);
+      assert.equal(skipped, 1, 'the deterministic skip runs once');
+      context.token.data.mode = 'screenshots';
+      await assert.rejects(prepared.execute(context), /Pi 模型未配置：missing-provider\/missing-model/,
+        'a non-skipped attempt must report its captured error instead of silently switching to the new binding');
+      assert.equal(requests.length, 2);
+    });
+  } finally {
+    factory.recovery?.close();
+    await factory.sources?.close();
+    factory.channels?.close();
+    await factory.runtime?.close();
+    factory.docs?.flush();
+    factory.lessons?.close();
+    factory.journal.close();
+    await closeModelTransport();
+    await closeNetwork();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+  }
 });

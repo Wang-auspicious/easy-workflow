@@ -132,3 +132,42 @@ test('a model recovery trial keeps unrelated local work flowing and still honors
     journal.close();
   }
 });
+
+test('an attempt captures its executor and dependency before observers can change the next binding', async () => {
+  const {runtime, journal, state} = setup();
+  const first = {key: 'fixture-a', adapter: 'pi' as const, provider: 'fixture', model: 'model-a'};
+  const second = {...first, key: 'fixture-b', model: 'model-b'};
+  let selected = first;
+  let preparations = 0;
+  const executed: string[] = [];
+  runtime.executors = () => ({prepare: () => {
+    preparations++;
+    const captured = selected;
+    return {dependency: captured, execute: async () => {
+      executed.push(captured.key);
+      return {ok: true, summary: 'Captured fixture execution'};
+    }};
+  }});
+  const unsubscribe = journal.subscribe(event => {
+    if (event.kind === 'attempt.started') selected = second;
+  });
+  try {
+    assert.ok(runtime.executors(runtime.nodes.get('fast/work')!));
+    assert.equal(preparations, 0, 'capability checks must not prepare model configuration');
+    const initial = runtime.create('fast/work', {item: 'first', url: '', source: 'fixture'});
+    await runtime.settle();
+    const next = runtime.create('fast/work', {item: 'next', url: '', source: 'fixture'});
+    await runtime.settle();
+    const initialAttempt = state.attempts[state.tokens[initial.id].attempts[0]];
+    const nextAttempt = state.attempts[state.tokens[next.id].attempts[0]];
+    assert.deepEqual(executed, [first.key, second.key]);
+    assert.deepEqual(initialAttempt.dependency, first);
+    assert.deepEqual(nextAttempt.dependency, second);
+    assert.equal(preparations, 2);
+    assert.ok(initial.finished && next.finished);
+  } finally {
+    unsubscribe();
+    await runtime.close();
+    journal.close();
+  }
+});

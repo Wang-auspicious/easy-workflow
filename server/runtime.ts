@@ -4,7 +4,7 @@
 // Everything that changes state is journaled first.
 import crypto from "node:crypto";
 import { withModelAdmission } from './model-requests.ts';
-import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
+import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, ModelDependency, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
 import { median, type FactoryState } from "../shared/project.ts";
 import { allocateResource } from './allocation.ts';
 import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
@@ -99,6 +99,16 @@ export interface StationResult {
 
 export type Executor = (ctx: StationContext) => Promise<StationResult>;
 
+/** Configuration and execution are captured together before the start receipt. */
+export interface PreparedExecutor {
+  readonly execute: Executor;
+  readonly dependency?: ModelDependency;
+}
+
+export interface ExecutorRegistration {
+  readonly prepare: () => PreparedExecutor;
+}
+
 /** A reviewer's request to the station that owns some fields (Spec §34). `via` lists the
  *  stations that must re-run after the owner before the reviewer looks again. */
 export interface Fix { station: string; fields: string[]; problem: string; via?: string[] }
@@ -155,14 +165,14 @@ export class Runtime {
   journal: Journal;
   broker: Broker;
   conditions: Record<string, (d: Record<string, unknown>) => boolean>;
-  executors: (node: CompiledNode) => Executor | null;
+  executors: (node: CompiledNode) => Executor | ExecutorRegistration | null;
 
   constructor(
     f: CompiledFactory,
     journal: Journal,
     broker: Broker,
     conditions: Record<string, (d: Record<string, unknown>) => boolean>,
-    executors: (node: CompiledNode) => Executor | null,
+    executors: (node: CompiledNode) => Executor | ExecutorRegistration | null,
   ) {
     this.journal = journal; this.broker = broker; this.conditions = conditions; this.executors = executors;
     this.f = f;
@@ -493,6 +503,16 @@ export class Runtime {
 
   private async run(w: Worker, t: TokenRun, n: CompiledNode, lease: Lease) {
     const attempt = `a-${short()}`;
+    let prepared: PreparedExecutor | null = null;
+    let preparationFailed = false;
+    let preparationError: unknown;
+    try {
+      const executor = this.executors(n);
+      prepared = typeof executor === 'function' ? {execute: executor} : executor?.prepare() ?? null;
+    } catch (error) {
+      preparationFailed = true;
+      preparationError = error;
+    }
     const epoch = t.nodeEpochs?.get(n.key)??0;
     const queuedMs = Date.now() - (t.queuedAt.get(n.key) ?? Date.now());
     const ctrl = new AbortController();
@@ -502,7 +522,8 @@ export class Runtime {
     w.busy = attempt;
     t.inflight.add(n.key);
     try {
-      this.journal.append({ kind: "attempt.started", attempt, token: t.id, node: n.key, worker: w.id, input: this.describeInput(t, n) });
+      this.journal.append({kind: 'attempt.started', attempt, token: t.id, node: n.key,
+        worker: w.id, input: this.describeInput(t, n), dependency: prepared?.dependency});
     } catch (error) {
       this.aborts.delete(attempt); this.attemptTokens.delete(attempt); t.inflight.delete(n.key);
       w.busy = null; w.idleSince = Date.now();
@@ -512,7 +533,8 @@ export class Runtime {
     const t0 = Date.now();
     let res: StationResult;
     try {
-      const exec = this.executors(n);
+      if (preparationFailed) throw preparationError;
+      const exec = prepared?.execute;
       if (!exec) throw new Error(`工位 ${n.key} 没有执行器`);
       const role=this.roleResolver(n.key);
       this.journal.append({kind:"attempt.progress",attempt,text:`按 ${n.name} 的 ROLE.md 执行`,step:{tool:"role",text:`${role.path} @ ${role.revision}`}});

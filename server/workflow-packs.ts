@@ -50,12 +50,13 @@ export interface WorkflowServices {
   runAgent?: (def: AgentStationDef & { role: WorkflowRole }, ctx: StationContext) => Promise<StationResult>;
   callCapability?: (name: string, args: Record<string, unknown>, ctx: StationContext) => Promise<any>;
 }
+export type WorkflowAgentRunner = NonNullable<WorkflowServices['runAgent']>;
 export interface WorkflowGuard { running: boolean; paused?: boolean; ending?: boolean; inflight?: number; assertIdle?: () => void }
 export interface WorkflowIndex { version: 1; builtins: string[]; packages: { id: string; revision: string }[] }
 export interface LoadedWorkflowPacks {
   packs: Pack[];
   conditions: Pack['conditions'];
-  executor(node: CompiledNode): Executor | null;
+  executor(node: CompiledNode, runAgent?: WorkflowAgentRunner): Executor | null;
   role(key: string): WorkflowRole | undefined;
   manifests: WorkflowManifest[];
   index: WorkflowIndex;
@@ -189,7 +190,8 @@ const revisionDirectory = (projectDir: string, id: string, revision: string) => 
 
 export async function loadWorkflowPacks(projectDir: string, options: { builtins?: Pack[]; services?: WorkflowServices } = {}): Promise<LoadedWorkflowPacks> {
   const index = readWorkflowIndex(projectDir, options.builtins), packs: Pack[] = [], manifests: WorkflowManifest[] = [];
-  const roles = new Map<string, WorkflowRole>(), executors = new Map<string, Executor>();
+  const roles = new Map<string, WorkflowRole>();
+  const executors = new Map<string, (ctx: StationContext, runAgent?: WorkflowAgentRunner) => Promise<StationResult>>();
   for (const id of index.builtins) { const pack = options.builtins?.find(pack => pack.id === id); if (!pack) bad(`项目依赖的内置包 ${id} 不可用`); packs.push(pack); }
   for (const installed of index.packages) {
     const directory = revisionDirectory(projectDir, installed.id, installed.revision);
@@ -206,7 +208,7 @@ export async function loadWorkflowPacks(projectDir: string, options: { builtins?
         if (typeof moduleExecute !== 'function') bad(`${key} 的模块没有可调用的执行函数`);
       }
       const role = loaded.roles.get(key)!;
-      executors.set(key, async ctx => {
+      executors.set(key, async (ctx, runAgent) => {
         ctx.signal.throwIfAborted();
         const input = Object.fromEntries(Object.entries(binding.input).map(([name, selector]) => [name, 'value' in selector ? structuredClone(selector.value) : workflowValue(ctx.token.data, selector.path) ?? selector.default]).filter(([, value]) => value !== undefined));
         verify(manifest.schemas[binding.inputSchema], input, `${key} 输入`);
@@ -227,7 +229,7 @@ export async function loadWorkflowPacks(projectDir: string, options: { builtins?
             ...(binding.reviewTarget && output.verdict === 'pass' && output.issues?.length ? ['通过审查时 issues 必须为空；否则退回并说明原因'] : []),
             ...Object.entries(binding.preserveInput ?? {}).filter(([field, source]) => JSON.stringify(workflowValue(output, field)) !== JSON.stringify(workflowValue(input, source))).map(([, source]) => `必须原样保留输入字段 ${source}，不能补造内容`),
           ] };
-          const run = options.services?.runAgent ?? (await import('./agent-station.ts')).runAgentStation;
+          const run = runAgent ?? options.services?.runAgent ?? (await import('./agent-station.ts')).runAgentStation;
           return run(def, ctx);
         }
         const output = binding.execute.kind === 'node' ? await moduleExecute!(input, { signal: ctx.signal, workDir, projectDir, node: ctx.node.key, item: ctx.token.item, progress: ctx.progress })
@@ -244,7 +246,14 @@ export async function loadWorkflowPacks(projectDir: string, options: { builtins?
     }
   }
   const compiled = compile(packs); if (compiled.issues.length) bad(compiled.issues.map(issue => `${issue.at}: ${issue.message}`).join('；'));
-  return { packs, conditions: Object.assign({}, ...packs.map(pack => pack.conditions)), executor: node => executors.get(node.key) ?? null, role: key => roles.get(key), manifests, index };
+  return {
+    packs, conditions: Object.assign({}, ...packs.map(pack => pack.conditions)),
+    executor: (node, runAgent) => {
+      const execute = executors.get(node.key);
+      return execute ? context => execute(context, runAgent) : null;
+    },
+    role: key => roles.get(key), manifests, index,
+  };
 }
 
 async function builtin(name: Extract<WorkflowExecution, { kind: 'builtin' }>['name'], input: Record<string, any>, ctx: StationContext, projectDir: string, packId: string, services: WorkflowServices): Promise<unknown> {

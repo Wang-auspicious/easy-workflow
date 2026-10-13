@@ -10,7 +10,7 @@ import { compile, type Patch } from "./spec/compile.ts";
 import { Journal } from "./journal.ts";
 import { Broker } from "./broker.ts";
 import { EvidenceStore } from "./evidence.ts";
-import { Runtime, type Executor, type TokenRun } from "./runtime.ts";
+import { Runtime, type Executor, type ExecutorRegistration, type TokenRun } from "./runtime.ts";
 import { runAgentStation, type AgentStationDef } from "./agent-station.ts";
 import { pack } from "../packs/vislexicon/pack.ts";
 import { TOOLS, canonical, type Services } from "../packs/vislexicon/tools.ts";
@@ -34,9 +34,9 @@ import { loadWorkflowPacks, type LoadedWorkflowPacks } from './workflow-packs.ts
 import { flushAtlas } from '../packs/vislexicon/components.ts';
 import { ChannelSupervisor } from './channels.ts';
 import { SourceSupervisor } from './sources.ts';
-import {agentCapabilities, parseAgentBinding} from './agent-bindings.ts';
+import {agentCapabilities, closedModelDependency, parseAgentBinding} from './agent-bindings.ts';
 import {closedAgentConfig} from './mcp-station.ts';
-import {piSelection} from './pi.ts';
+import {models, piSelection} from './pi.ts';
 import {UnmanagedRecoverySupervisor} from './recovery.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -108,12 +108,45 @@ export class Factory {
     this.services = services;
     const defs = agentDefs(this.store, services);
     this.stationAgents = defs;
-    const executors = (n: CompiledNode): Executor | null => {
+    const executors = (n: CompiledNode): Executor | ExecutorRegistration | null => {
       const installed = this.workflowPacks?.executor(n);
-      if (installed) return installed;
+      if (installed) {
+        const declared = this.agentDefault(n.key);
+        if (!declared) return installed;
+        return {
+          prepare: () => {
+            const captured = this.captureAgent(n.key, declared.binding);
+            return {
+              dependency: captured.dependency,
+              execute: this.workflowPacks!.executor(n, (definition, context) =>
+                runAgentStation({...definition, agent: captured.binding, piRuntime: captured.piRuntime}, context))!,
+            };
+          },
+        };
+      }
       if (n.tool && TOOLS[n.tool]) return (ctx) => TOOLS[n.tool!](ctx, services);
       const def = defs[n.key];
-      return def ? (ctx) => runAgentStation(this.bindAgent(n.key, def), ctx) : null;
+      if (!def) return null;
+      return {
+        prepare: () => {
+          try {
+            const captured = this.captureAgent(n.key, def.agent);
+            return {
+              dependency: captured.dependency,
+              execute: context => runAgentStation({...def, agent: captured.binding, piRuntime: captured.piRuntime}, context),
+            };
+          } catch (error) {
+            // Deterministic rules still run without a configured model. If a
+            // model is needed, preserve this attempt's original capture error.
+            return {execute: async context => {
+              context.signal.throwIfAborted();
+              const skipped = def.skip?.(context);
+              if (skipped) return skipped;
+              throw error;
+            }};
+          }
+        },
+      };
     };
     this.runtime = new Runtime(this.compiled, this.journal, this.broker, this.workflowPacks.conditions, executors);
     this.runtime.roleResolver = key => this.workflowPacks?.role(key) ?? readRole(key);
@@ -208,6 +241,18 @@ export class Factory {
   private bindAgent(node: string, definition: AgentStationDef): AgentStationDef {
     const binding = this.state.agentBindings?.[node] ?? definition.agent;
     return binding ? {...definition, agent: parseAgentBinding(binding)} : definition;
+  }
+
+  private captureAgent(node: string, declared?: StationAgentBinding) {
+    const binding = parseAgentBinding(this.state.agentBindings?.[node] ?? declared ?? this.defaultAgentBinding());
+    if (binding.adapter === 'pi') {
+      const piRuntime = models(binding);
+      return {
+        binding: {adapter: 'pi' as const, provider: piRuntime.model.provider, model: piRuntime.model.id},
+        piRuntime, dependency: piRuntime.dependency,
+      };
+    }
+    return {binding, piRuntime: undefined, dependency: closedModelDependency(binding)};
   }
 
   private agentDefault(node: string): {binding?: StationAgentBinding} | undefined {

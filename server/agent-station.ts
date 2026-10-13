@@ -20,6 +20,7 @@ import { withEvidenceReads, readEvidence, rememberRead } from "./network.ts";
 import { classifyFailure, type Failure } from "../shared/failures.ts";
 import { loadStationSession, saveStationSession, sessionSignature, type SessionRef } from './station-session.ts';
 import { EvidenceStore } from './evidence.ts';
+import {closedModelDependency} from './agent-bindings.ts';
 export { models, MODEL_ID, apiKeyPresent } from "./pi.ts";
 
 export async function promptAgent(agent: Pick<Agent, "prompt" | "abort"> | ClosedStationAgent, text: string, images?: { type: "image"; data: string; mimeType: string }[], signal?: AbortSignal, timeoutMs = 120_000) {
@@ -37,6 +38,8 @@ export interface AgentInput { text: string; images?: { file: string; label: stri
 export interface AgentStationDef<T = any> {
   /** Captured per attempt; omitted bindings retain the existing process defaults. */
   agent?: StationAgentBinding;
+  /** Host-owned selection captured before this attempt starts. Never serialized. */
+  piRuntime?: ReturnType<typeof models>;
   role?: ReturnType<typeof readRole>;
   system: string;
   schema: TSchema;
@@ -142,7 +145,10 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   const projectDirectory = path.resolve(docs?.dir ?? process.env.FACTORY_VAR ?? process.cwd());
   const workDirectory = path.join(projectDirectory, 'work');
   const external = closedAgentConfig(path.join(workDirectory, ctx.token.id.replace(/[^a-zA-Z0-9_-]/g, '_')), { projectDirectory, workDirectory }, def.agent);
-  const selection = external ? null : models(def.agent?.adapter === 'pi' ? def.agent : undefined);
+  const selection = external ? null : def.piRuntime ?? models(def.agent?.adapter === 'pi' ? def.agent : undefined);
+  const dependency = external ? closedModelDependency({
+    adapter: external.adapter ?? 'launcher', command: external.command, model: external.model,
+  }) : selection!.dependency;
   const selectedPi = selection ? { provider: selection.model.provider, model: selection.model.id } : undefined;
   const activity = new StationActivity(ctx.activity);
   let modelId = external?.model ?? selection!.model.id;
@@ -292,7 +298,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     ctx.progress('恢复本工位已经完成的工具读取与对话，从中断的模型请求继续', {tool:'recover',text:'不重复打开页面或重做已完成的工具调用'});
   }
   const metrics = (): AttemptMetrics => ({
-    usageReported, modelTimeReported: modelTimeReported && (!external || externalReplies === promptCalls), execution: { adapter: external ? external.adapter === 'claude-code' ? 'claude-code' : "closed-command" : "pi", model: (external ? externalReplies : usageResponses) ? modelId : 'unreported' },
+    dependency, usageReported, modelTimeReported: modelTimeReported && (!external || externalReplies === promptCalls), execution: { adapter: external ? external.adapter === 'claude-code' ? 'claude-code' : "closed-command" : "pi", model: (external ? externalReplies : usageResponses) ? modelId : 'unreported' },
     usageComplete: usageReported && !usageMissing && usageResponses === (external ? promptCalls : activity.count("model_request")),
     cacheUsageComplete: usageReported && !usageMissing && !cacheUsageMissing && usageResponses === (external ? promptCalls : activity.count("model_request")),
     activity: activity.snapshot(),
