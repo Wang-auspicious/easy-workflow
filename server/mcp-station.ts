@@ -19,7 +19,15 @@ export interface StationTool {
   name: string; label: string; description: string; parameters: TSchema;
   execute: (id: string, args: any, signal?: AbortSignal) => Promise<{ content: { type: "text"; text: string }[] }>;
 }
-export interface ClosedAgentConfig { command: string[]; model: string; cwd: string; adapter?: 'launcher' | 'claude-code'; requestTimeoutMs?: number }
+export interface ClosedSessionScope { projectDirectory: string; workDirectory: string }
+export interface ClosedAgentConfig {
+  command: string[];
+  model: string;
+  cwd: string;
+  adapter?: 'launcher' | 'claude-code';
+  requestTimeoutMs?: number;
+  sessionScope?: ClosedSessionScope;
+}
 export interface ClosedAgentReply {
   model: string;
   usage?: Usage;
@@ -30,7 +38,7 @@ export interface ClosedAgentReply {
 }
 type Message = { role: "user" | "assistant"; content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] };
 
-export function closedAgentConfig(cwd: string): ClosedAgentConfig | null {
+export function closedAgentConfig(cwd: string, sessionScope?: ClosedSessionScope): ClosedAgentConfig | null {
   if (!process.env.FACTORY_STATION_COMMAND) return null;
   let command: unknown;
   try { command = JSON.parse(process.env.FACTORY_STATION_COMMAND); } catch { throw new Error("FACTORY_STATION_COMMAND must be a JSON argv array."); }
@@ -41,7 +49,34 @@ export function closedAgentConfig(cwd: string): ClosedAgentConfig | null {
   const requestTimeoutMs = Number(process.env.FACTORY_STATION_TIMEOUT_MS ?? 180000);
   if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 900000) throw new Error('FACTORY_STATION_TIMEOUT_MS must be an integer from 1 to 900000.');
   if (factorySecrets().some(secret => command.some(x => x.includes(secret)) || process.env.FACTORY_STATION_MODEL!.includes(secret))) throw new Error("Do not pass Easy Workflow control credentials to a station launcher.");
-  return { command, model: process.env.FACTORY_STATION_MODEL, cwd, adapter: adapter as ClosedAgentConfig['adapter'], requestTimeoutMs };
+  return { command, model: process.env.FACTORY_STATION_MODEL, cwd, adapter: adapter as ClosedAgentConfig['adapter'], requestTimeoutMs, sessionScope };
+}
+
+function inside(parent: string, candidate: string) {
+  const relative = path.relative(parent, candidate);
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+/** Validate before reading a checkpoint or starting a process in its directory. */
+function ownedWorkDirectory(scope: ClosedSessionScope, candidate: string, mustExist: boolean) {
+  const project = path.resolve(scope.projectDirectory);
+  const work = path.resolve(scope.workDirectory);
+  const target = path.resolve(candidate);
+  if (!inside(project, work) || !inside(work, target)) return;
+  let cursor = project;
+  for (const component of ['', ...path.relative(project, target).split(path.sep)]) {
+    if (component) cursor = path.join(cursor, component);
+    try {
+      const stat = fs.lstatSync(cursor);
+      // This also rejects Windows junctions. Never follow a checkpoint through
+      // a link to a different project, even when its lexical path is in work/.
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !mustExist) return target;
+      return;
+    }
+  }
+  return target;
 }
 
 export async function openStationMcp(tools: StationTool[], signal: AbortSignal) {
@@ -119,20 +154,54 @@ export class ClosedStationAgent {
   private sessionFile?: string;
   private signature = '';
   private readContext?: () => NonNullable<ClaudeSessionReference['context']>;
-  constructor(config: ClosedAgentConfig, envelope: string, tools: StationTool[], onReply: (reply: ClosedAgentReply) => void) { this.config = config; this.envelope = redactText(envelope, factorySecrets()); this.tools = tools; this.onReply = onReply; }
+  private workingDirectory: string;
+  constructor(config: ClosedAgentConfig, envelope: string, tools: StationTool[], onReply: (reply: ClosedAgentReply) => void) {
+    this.config = config;
+    this.envelope = redactText(envelope, factorySecrets());
+    this.tools = tools;
+    this.onReply = onReply;
+    this.workingDirectory = config.cwd;
+  }
   abort() { this.controller?.abort(); }
   configureSession(station: string, signature: string, saved?: unknown, readContext?: () => NonNullable<ClaudeSessionReference['context']>) {
     if (this.config.adapter !== 'claude-code') return;
     this.signature = signature;
     this.readContext = readContext;
     this.session = undefined;
+    const scope = this.config.sessionScope;
+    this.workingDirectory = this.config.cwd;
+    if (scope && !ownedWorkDirectory(scope, this.config.cwd, false)) {
+      throw new Error('The closed station directory must stay inside the explicit project work root without symbolic links.');
+    }
     this.sessionFile = path.join(this.config.cwd, 'closed-sessions', `${crypto.createHash('sha256').update(station).digest('hex').slice(0, 24)}.json`);
-    if (validClaudeSession(saved, this.config.model, signature)) {
-      this.session = structuredClone(saved);
-    } else {
+    if (scope && !ownedWorkDirectory(scope, path.dirname(this.sessionFile), false)) {
+      throw new Error('The closed station checkpoint directory must stay inside the project without symbolic links.');
+    }
+    const restore = (value: unknown, local: boolean) => {
+      if (!validClaudeSession(value, this.config.model, signature)) return false;
+      let directory = this.config.cwd;
+      if (value.workDirectory !== undefined) {
+        if (!scope || !value.workDirectory || path.isAbsolute(value.workDirectory)
+          || /^[a-z]:/i.test(value.workDirectory) || value.workDirectory.split(/[\\/]/).includes('..')) return false;
+        const owned = ownedWorkDirectory(scope, path.resolve(scope.projectDirectory, value.workDirectory), true);
+        if (!owned) return false;
+        directory = owned;
+      } else if (scope && !local) {
+        // Legacy metadata can be recovered in its own directory, but cannot
+        // safely locate a different token's vendor session on older CLIs.
+        return false;
+      }
+      this.workingDirectory = directory;
+      this.session = structuredClone(value);
+      return true;
+    };
+    if (!restore(saved, false)) {
       try {
-        const local: unknown = JSON.parse(fs.readFileSync(this.sessionFile, 'utf8'));
-        if (validClaudeSession(local, this.config.model, signature)) this.session = local;
+        const stat = fs.lstatSync(this.sessionFile);
+        if (stat.isFile() && !stat.isSymbolicLink()) {
+          const local: unknown = JSON.parse(fs.readFileSync(this.sessionFile, 'utf8'));
+          restore(local, true);
+        }
       } catch {
         // A new station has no saved vendor session.
       }
@@ -146,8 +215,16 @@ export class ClosedStationAgent {
     if (this.sessionFile) fs.rmSync(this.sessionFile, { force: true });
   }
   private saveSession(session: ClaudeSessionReference) {
-    this.session = { ...session, ...(this.readContext ? { context: this.readContext() } : {}) };
+    const scope = this.config.sessionScope;
+    this.session = {
+      ...session,
+      ...(scope ? { workDirectory: path.relative(scope.projectDirectory, this.workingDirectory).split(path.sep).join('/') } : {}),
+      ...(this.readContext ? { context: this.readContext() } : {}),
+    };
     if (!this.sessionFile) return;
+    if (scope && !ownedWorkDirectory(scope, path.dirname(this.sessionFile), false)) {
+      throw new Error('The closed station checkpoint directory is no longer inside the project.');
+    }
     fs.mkdirSync(path.dirname(this.sessionFile), { recursive: true });
     const temporary = `${this.sessionFile}.${crypto.randomUUID()}.tmp`;
     try {
@@ -178,7 +255,11 @@ export class ClosedStationAgent {
     try {
       const request = { product: "Easy Workflow", protocol: "h2-closed-agent/1", model: this.config.model, firstMessage: this.messages[0], messages: this.messages, mcpServers: { h2_station: session.config } };
       const vendor = this.config.adapter === 'claude-code' ? new ClaudeCodeProtocol(this.config.model, this.signature, this.session, reference => this.saveSession(reference)) : undefined;
-      const reply = await runLauncher(this.config, request, this.controller.signal, vendor);
+      const scope = this.config.sessionScope;
+      if (scope && !ownedWorkDirectory(scope, this.workingDirectory, !!this.session)) {
+        throw new Error('The saved closed station working directory is no longer available inside this project.');
+      }
+      const reply = await runLauncher({ ...this.config, cwd: this.workingDirectory }, request, this.controller.signal, vendor);
       const safe = session.redact(reply);
       if (safe.model !== reply.model) throw new Error("Launcher metadata contained credentials; it was not logged.");
       this.onReply(safe);

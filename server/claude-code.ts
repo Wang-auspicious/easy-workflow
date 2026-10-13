@@ -8,7 +8,8 @@ export interface ClaudeSessionReference {
   id: string;
   signature: string;
   model: string;
-  totalCostUsd?: number;
+  /** Host-owned working directory, relative to the explicit project root. */
+  workDirectory?: string;
   context?: { calls: number; evidence: { url: string; text: string }[] };
 }
 
@@ -44,7 +45,7 @@ export function validClaudeSession(value: unknown, model: string, signature: str
   return saved?.version === 1 && saved.adapter === 'claude-code'
     && typeof saved.id === 'string' && sessionId.test(saved.id)
     && saved.model === model && saved.signature === signature
-    && (saved.totalCostUsd === undefined || nonnegative(saved.totalCostUsd));
+    && (saved.workDirectory === undefined || typeof saved.workDirectory === 'string');
 }
 
 /** Convert vendor error categories without returning its prompt or raw diagnostic. */
@@ -130,7 +131,6 @@ export class ClaudeCodeProtocol {
       if (typeof value.model === 'string' && modelId.test(value.model)) this.actualModel = value.model;
       this.checkpoint({
         version: 1, adapter: 'claude-code', id: this.id, signature: this.signature, model: this.requestedModel,
-        ...(this.previous?.totalCostUsd === undefined ? {} : { totalCostUsd: this.previous.totalCostUsd }),
       });
     } else if (value.type === 'assistant') {
       const message = object(value.message);
@@ -151,30 +151,20 @@ export class ClaudeCodeProtocol {
       if (failure) throw Object.assign(new Error(failure.message), { failure });
       throw new Error('Claude Code did not report the actual model');
     }
-    // usage is per turn. total_cost_usd includes earlier resumed spend; subtract
-    // the last durable total. Cost remains the vendor's estimate, not billing.
+    // Each prompt starts a fresh CLI process. Its result reports this process's
+    // spend, including when --resume reloads a previous conversation. It is not
+    // the cumulative counter of a long-lived Agent SDK session.
     const raw = object(result.usage);
     const total = result.total_cost_usd;
-    const previousCost = this.previous?.totalCostUsd ?? 0;
-    const costReported = nonnegative(total) && total >= previousCost;
     let usage: Usage | undefined;
     if (raw && tokens(raw.input_tokens) && tokens(raw.output_tokens) && nonnegative(total)) {
-      // Some error results reset their cost field. Keep the real failure and the
-      // previous baseline; that response cannot certify a new usage amount.
-      if (!costReported && !failure) {
-        throw new Error('Claude Code cumulative cost moved backwards; usage cannot be reconciled');
-      }
-      if (costReported) {
-        usage = { input: raw.input_tokens, output: raw.output_tokens, cost: total - previousCost };
-        if (tokens(raw.cache_read_input_tokens)) usage.cacheRead = raw.cache_read_input_tokens;
-        if (tokens(raw.cache_creation_input_tokens)) usage.cacheWrite = raw.cache_creation_input_tokens;
-      }
+      usage = { input: raw.input_tokens, output: raw.output_tokens, cost: total };
+      if (tokens(raw.cache_read_input_tokens)) usage.cacheRead = raw.cache_read_input_tokens;
+      if (tokens(raw.cache_creation_input_tokens)) usage.cacheWrite = raw.cache_creation_input_tokens;
     }
-    const durableCost = costReported ? total : this.previous?.totalCostUsd;
     if (this.initialized) {
       this.checkpoint({
         version: 1, adapter: 'claude-code', id: this.id, signature: this.signature, model: this.requestedModel,
-        ...(durableCost === undefined ? {} : { totalCostUsd: durableCost }),
       });
     }
     return { model: this.actualModel, modelCalls: this.messageIds.size, ...(usage ? { usage } : {}), ...(failure ? { failure } : {}) };

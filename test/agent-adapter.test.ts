@@ -81,6 +81,9 @@ assert.equal(value('--setting-sources'), ''); assert.ok(args.includes('--strict-
 assert.ok(args.includes('--disable-slash-commands')); assert.ok(!args.includes('--dangerously-skip-permissions'));
 assert.equal(JSON.parse(value('--settings')).disableAllHooks, true);
 const resumed = args.includes('--resume'), id = value(resumed ? '--resume' : '--session-id');
+const vendorFile = require('node:path').join(process.cwd(), '.fixture-vendor-session-' + id);
+if (resumed) assert.ok(fs.existsSync(vendorFile), 'This fixture models the installed CLI: resume must use its original cwd');
+else fs.writeFileSync(vendorFile, 'Fixture vendor session');
 let raw = ''; process.stdin.on('data', data => { raw += data; });
 process.stdin.on('end', async () => {
   const input = JSON.parse(raw); assert.equal(input.type, 'user'); assert.equal(input.message.role, 'user');
@@ -102,7 +105,7 @@ process.stdin.on('end', async () => {
   emit({ type: 'assistant', message: { id: 'one-api-message', model: 'fixture-actual-claude', content: [{ type: 'text', text: 'Fixture' }] } });
   emit({ type: 'assistant', message: { id: 'one-api-message', model: 'fixture-actual-claude', content: [{ type: 'tool_use', name: 'submit' }] } });
   emit({ type: 'result', subtype: fail ? 'error_during_execution' : 'success', is_error: fail, session_id: id,
-    errors: fail ? ['ECONNRESET fixture-only secret must not be logged'] : [], total_cost_usd: resumed ? .15 : .1,
+    errors: fail ? ['ECONNRESET fixture-only secret must not be logged'] : [], total_cost_usd: resumed ? .05 : .1,
     usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 30, cache_creation_input_tokens: 5 } });
   process.exitCode = fail ? 1 : 0;
 });`;
@@ -134,7 +137,7 @@ const nativeContext = (id: string, data: Record<string, unknown> = {}) => ({
   worker: { id: 'fixture-worker' }, signal: new AbortController().signal, progress: () => {},
 }) as unknown as StationContext;
 
-test('Claude protocol adapter uses only station tools and reconciles resumed cost without fabricated timing', { timeout: 30000 }, async () => {
+test('Claude protocol adapter uses only station tools and sums each CLI process cost without fabricated timing', { timeout: 30000 }, async () => {
   await nativeFixture(async (_dir, reads) => {
     const result = await runAgentStation({ system: 'Fixture contract', schema: Type.Object({ score: Type.Integer() }), tools: ['fetch_text'], input: () => ({ text: 'native-repair' }),
       check: (out: { score: number }) => out.score === 1 ? [] : ['Use score 1'], after: () => ({ ok: true, summary: 'Fixture done' }) }, nativeContext('repair'));
@@ -156,7 +159,8 @@ test('Claude station failures preserve signed sessions, read evidence and tool b
     assert.equal(first.ok, false); assert.equal(first.failure?.tag, 'model_transport'); assert.match(first.error ?? '', /provider connection/); assert.ok(!JSON.stringify(first).includes('fixture-only secret'));
     const reference = (first.data!.closedStationSessions as Record<string, ClaudeSessionReference>)['curation/reader'];
     assert.equal(reference.context?.calls, 1); assert.equal(reference.context?.evidence.length, 1);
-    const local = new ClosedStationAgent({ ...closedAgentConfig(path.join(dir, 'work', 'initial'))! }, 'Fixture', [], () => {});
+    assert.equal(reference.workDirectory, 'work/initial');
+    const local = new ClosedStationAgent({ ...closedAgentConfig(path.join(dir, 'work', 'initial'), { projectDirectory: dir, workDirectory: path.join(dir, 'work') })! }, 'Fixture', [], () => {});
     local.configureSession('curation/reader', reference.signature);
     assert.equal(local.sessionReference()?.id, reference.id, 'a hard restart can find the last local checkpoint');
     local.configureSession('curation/reader', 'changed-input'); assert.equal(local.sessionReference(), undefined);
@@ -167,7 +171,41 @@ test('Claude station failures preserve signed sessions, read evidence and tool b
   });
 });
 
-test('Claude stream rejects foreign capabilities and cannot report cumulative cost twice', () => {
+test('closed session working directories require explicit project ownership and reject path or junction escapes', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-session-path-'));
+  const work = path.join(project, 'work');
+  const original = path.join(work, 'original');
+  const current = path.join(work, 'current');
+  const outside = path.join(project, 'outside-work');
+  fs.mkdirSync(original, { recursive: true }); fs.mkdirSync(current); fs.mkdirSync(outside);
+  const config = { command: [process.execPath], model: 'fixture', adapter: 'claude-code' as const, cwd: current, sessionScope: { projectDirectory: project, workDirectory: work } };
+  const reference: ClaudeSessionReference = { version: 1, adapter: 'claude-code', id: '11111111-1111-4111-8111-111111111111', signature: 'fixture', model: 'fixture', workDirectory: 'work/original' };
+  const agent = new ClosedStationAgent(config, 'Fixture', [], () => {});
+  try {
+    agent.configureSession('fixture/station', 'fixture', reference);
+    assert.equal(agent.sessionReference()?.id, reference.id);
+    for (const directory of ['../outside-work', 'outside-work', original, 'work/../outside-work', 'work/missing']) {
+      agent.configureSession('fixture/station', 'fixture', { ...reference, workDirectory: directory });
+      assert.equal(agent.sessionReference(), undefined, directory);
+    }
+    const link = path.join(work, 'linked');
+    fs.symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
+    agent.configureSession('fixture/station', 'fixture', { ...reference, workDirectory: 'work/linked' });
+    assert.equal(agent.sessionReference(), undefined);
+    const escaped = new ClosedStationAgent({ ...config, cwd: path.join(link, 'child') }, 'Fixture', [], () => {});
+    assert.throws(() => escaped.configureSession('fixture/station', 'fixture'), /without symbolic links/);
+    const unscoped = new ClosedStationAgent({ ...config, sessionScope: undefined }, 'Fixture', [], () => {});
+    unscoped.configureSession('fixture/station', 'fixture', reference);
+    assert.equal(unscoped.sessionReference(), undefined, 'an external relative path has no authority without an explicit root');
+    fs.symlinkSync(outside, path.join(current, 'closed-sessions'), process.platform === 'win32' ? 'junction' : 'dir');
+    assert.throws(() => agent.configureSession('fixture/station', 'fixture'), /without symbolic links/);
+  } finally {
+    assert.equal(path.dirname(path.resolve(project)), path.resolve(os.tmpdir()));
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test('Claude stream rejects foreign capabilities and never subtracts another CLI process cost', () => {
   let saved!: ClaudeSessionReference;
   const protocol = new ClaudeCodeProtocol('requested', 'signature', undefined, reference => { saved = reference; });
   const init = { type: 'system', subtype: 'init', session_id: protocol.id, model: 'actual', tools: ['mcp__h2_station__submit'], mcp_servers: [{ name: 'h2_station', status: 'connected' }] };
@@ -179,13 +217,35 @@ test('Claude stream rejects foreign capabilities and cannot report cumulative co
   const resumed = new ClaudeCodeProtocol('requested', 'signature', saved, () => {});
   resumed.accept(JSON.stringify({ ...init, session_id: resumed.id }));
   resumed.accept(JSON.stringify({ type: 'result', subtype: 'success', session_id: resumed.id, total_cost_usd: 1, usage: { input_tokens: 10, output_tokens: 5 } }));
-  assert.throws(() => resumed.finish(), /moved backwards/);
+  assert.equal(resumed.finish().usage?.cost, 1, 'a resumed CLI process reports its own spend');
   const failed = new ClaudeCodeProtocol('requested', 'signature', saved, reference => { saved = reference; });
   failed.accept(JSON.stringify({ ...init, session_id: failed.id }));
   failed.accept(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: failed.id, errors: ['ECONNRESET'], total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0 } }));
   const failure = failed.finish();
-  assert.equal(failure.failure?.tag, 'model_transport'); assert.equal(failure.usage, undefined);
-  assert.equal(saved.totalCostUsd, 2, 'a crash error cannot discard the cumulative cost already accounted for');
+  assert.equal(failure.failure?.tag, 'model_transport'); assert.equal(failure.usage?.cost, 0);
+  assert.equal('totalCostUsd' in saved, false, 'a session reference is not a cost baseline');
+});
+
+test('recorded native CLI receipts sum to the measured cost of two resumed processes', () => {
+  let saved!: ClaudeSessionReference;
+  // Only public protocol fields and measured counters are retained from the
+  // isolated live acceptance. No user directory, credential or transcript text.
+  const receipts = [
+    { input_tokens: 2780, output_tokens: 407, total_cost_usd: 0.004815 },
+    { input_tokens: 4005, output_tokens: 262, total_cost_usd: 0.005315 },
+  ];
+  let total = 0;
+  for (const [index, receipt] of receipts.entries()) {
+    const protocol = new ClaudeCodeProtocol('haiku', 'recorded-cli-contract', index ? saved : undefined, reference => { saved = reference; });
+    protocol.accept(JSON.stringify({ type: 'system', subtype: 'init', session_id: protocol.id,
+      model: 'claude-haiku-4-5-20251001', tools: ['mcp__h2_station__submit'], mcp_servers: [{ name: 'h2_station', status: 'connected' }] }));
+    protocol.accept(JSON.stringify({ type: 'result', subtype: 'success', session_id: protocol.id,
+      total_cost_usd: receipt.total_cost_usd, usage: { input_tokens: receipt.input_tokens, output_tokens: receipt.output_tokens, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }));
+    const result = protocol.finish();
+    assert.equal(result.usage?.cost, receipt.total_cost_usd);
+    total += result.usage!.cost;
+  }
+  assert.ok(Math.abs(total - 0.01013) < 1e-12);
 });
 
 test('document envelopes bind stable project, role and trial policy without hashing rolling history', () => {

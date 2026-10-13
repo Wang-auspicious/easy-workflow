@@ -139,7 +139,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     const bounded = { ...options, signal, [MODEL_REQUEST_DEADLINE]: { ms: requestTimeoutMs, expired: () => { requestTimedOut = true; } } };
     return stream(model, context, bounded);
   };
-  const external = closedAgentConfig(path.join(docs?.dir ?? process.env.FACTORY_VAR ?? process.cwd(), "work", ctx.token.id.replace(/[^a-zA-Z0-9_-]/g, "_")));
+  const projectDirectory = path.resolve(docs?.dir ?? process.env.FACTORY_VAR ?? process.cwd());
+  const workDirectory = path.join(projectDirectory, 'work');
+  const external = closedAgentConfig(path.join(workDirectory, ctx.token.id.replace(/[^a-zA-Z0-9_-]/g, '_')), { projectDirectory, workDirectory });
   const selection = external ? null : models();
   const activity = new StationActivity(ctx.activity);
   let modelId = external?.model ?? selection!.model.id;
