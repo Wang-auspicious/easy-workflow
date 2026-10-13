@@ -40,6 +40,8 @@ export interface AgentStationDef<T = any> {
   agent?: StationAgentBinding;
   /** Host-owned selection captured before this attempt starts. Never serialized. */
   piRuntime?: ReturnType<typeof models>;
+  /** Factory-owned context; never consult another project's global test wiring. */
+  services?: {docs: () => Docs; toolbox: () => Toolbox};
   role?: ReturnType<typeof readRole>;
   system: string;
   schema: TSchema;
@@ -124,8 +126,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   const usage: Usage = { input: 0, output: 0, cost: 0 };
   const caseId = ctx.token.item;
   const allowed = [...BASE_TOOLS, ...(def.tools ?? [])];
-  const docs = wired.docs?.();
-  const toolbox = wired.toolbox?.();
+  const services = def.services ?? wired;
+  const docs = services.docs?.();
+  const toolbox = services.toolbox?.();
   const requestTimeoutMs = def.requestTimeoutMs ?? 120_000;
   // Ten environment calls can each lead to another model request. Reserve
   // separate slots for submit, validation repair, a missing-submit reminder,
@@ -440,7 +443,7 @@ export interface ImagePick { index: number; basis: PageBasis; reason: string; us
  *  so the caller can fall back to its program rules. */
 export async function pickByImages(ctx: StationContext, question: string, shots: { file: string; label: string }[]): Promise<ImagePick | null> {
   if (!shots.length) return null;
-  const { stream, model } = models();
+  const {stream, model} = ctx.piRuntime ?? models();
   const activity = new StationActivity(ctx.activity);
   const usage: Usage = { input: 0, output: 0, cost: 0 };
   let picked: { index: number; basis: PageBasis; reason: string } | null = null;
@@ -502,7 +505,7 @@ export async function pickByImages(ctx: StationContext, question: string, shots:
  *  number from a numbered list. It never browses or decides anything else. */
 export async function pickOne(ctx: StationContext, question: string, options: string[]): Promise<{ index: number; reason: string; usage: Usage } | null> {
   if (!options.length) return null;
-  const { stream, model } = models();
+  const {stream, model} = ctx.piRuntime ?? models();
   const activity = new StationActivity(ctx.activity);
   const usage: Usage = { input: 0, output: 0, cost: 0 };
   let picked: { index: number; reason: string } | null = null;

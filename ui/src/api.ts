@@ -1,5 +1,5 @@
 // Talking to the factory server: boot snapshot, SSE stream, actions.
-import type { Attachment } from "../../shared/types.ts";
+import type { Attachment, ProjectAgentDefaults } from "../../shared/types.ts";
 import type { FactoryState } from "../../shared/project.ts";
 import { getState, ingest, setState, type LayoutFile, type NodeAgentBinding } from "./store.ts";
 import { toast } from "./shell/Toasts.tsx";
@@ -60,6 +60,7 @@ export function connect(since: number) {
     const event = JSON.parse(m.data) as UiEvent;
     ingest([event]);
     if (event.kind === 'agent.binding') void refreshAgentBindings(event.node);
+    if (event.kind === 'agent.defaults') void refreshSpec();
     if (event.kind === "factory.loaded" || event.kind === "spec.patched") void refreshSpec();
   };
   es.addEventListener("live", (m) => {
@@ -74,11 +75,13 @@ export function connect(since: number) {
   });
 }
 
-async function refreshSpec() {
+export async function refreshSpec() {
   try {
-    const f = await api.get<{ factory: any; defaultLayout: any; agentBindings?: NodeAgentBinding[] }>("/api/factory");
+    const f = await api.get<{ factory: any; defaultLayout: any; agentBindings?: NodeAgentBinding[]; agentDefaults?: ProjectAgentDefaults; model?: string; keyPresent?: boolean }>("/api/factory");
     if (!getState().replay) setState((s) => ({ factory: f.factory, defaultLayout: f.defaultLayout,
       agentBindings: Object.fromEntries((f.agentBindings ?? []).map(binding => [binding.node, binding])),
+      ...(f.model !== undefined ? {model: f.model} : {}),
+      ...(f.keyPresent !== undefined ? {keyPresent: f.keyPresent} : {}),
       inspectors: s.inspectors.filter((i) => i.kind === "token" || f.factory.nodes.some((n: { key: string }) => n.key === i.key)),
     }));
   } catch (err) { toast(`规格刷新失败：${(err as Error).message}`); }

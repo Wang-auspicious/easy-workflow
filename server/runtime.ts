@@ -72,6 +72,8 @@ export interface StationContext {
   attempt: string;
   worker: Worker;
   signal: AbortSignal;
+  /** Explicit project selection for Pi calls made inside program helpers. */
+  piRuntime?: ReturnType<typeof import('./pi.ts').models>;
   /** Set when this attempt re-runs a returned or corrected token. */
   redo?: { reason: string; note?: string; byHuman: boolean };
   progress(text: string, step?: StepDetail): void;

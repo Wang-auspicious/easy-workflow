@@ -401,17 +401,17 @@ async function finishRun(f: Factory) {
   const runId = f.runtime.end() ?? (f.state.run.status === "ended" ? f.state.run.id : null);
   if (!runId) return null;
   await f.runtime.settle();
-  const existing=readReport(runId);if(existing)return existing;
+  const existing=readReport(runId, f.project.dir);if(existing)return existing;
   const {readReportJson} = await import('./report-reader.ts');
   const result = await readReportJson(f, runId, undefined, f.journal.seq);
   const report: RunReport = JSON.parse(result.body.toString('utf8'));
-  const dir = path.join(VAR, "runs", runId);
+  const dir = path.join(f.project.dir, 'runs', runId);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "report.json"), JSON.stringify(report, null, 2));
   f.journal.append({ kind: "report.ready", runId });
   return report;
 }
 
-export function readReport(runId: string): RunReport | null {
-  try { const report = JSON.parse(fs.readFileSync(path.join(VAR, "runs", runId, "report.json"), "utf8")); return report.version === 3 ? report : null; } catch { return null; }
+export function readReport(runId: string, projectDirectory = VAR): RunReport | null {
+  try { const report = JSON.parse(fs.readFileSync(path.join(projectDirectory, 'runs', runId, 'report.json'), 'utf8')); return report.version === 3 ? report : null; } catch { return null; }
 }

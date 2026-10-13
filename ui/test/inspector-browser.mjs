@@ -29,12 +29,18 @@ try {
   });
   let configured = null;
   let rejectSave = false;
+  let projectDefaults = {
+    station: {adapter: 'pi', provider: 'fixture-provider', model: 'fixture-model'},
+    dispatcher: {adapter: 'pi', provider: 'dispatcher-provider', model: 'dispatcher-model'},
+  };
+  const defaultWrites = [];
+  let rejectDefaultSave = false;
   const bindingResult = () => ({bindings: [{
     node: 'curation/review', configured,
     effective: configured?.adapter === 'pi'
-      ? {adapter: 'pi', provider: configured.provider || 'fixture-provider', model: configured.model || 'fixture-model'}
+      ? {adapter: 'pi', provider: configured.provider || projectDefaults.station.provider, model: configured.model || projectDefaults.station.model}
       : configured ? {...configured, requestTimeoutMs: configured.requestTimeoutMs ?? 180000}
-        : {adapter: 'pi', provider: 'fixture-provider', model: 'fixture-model'},
+        : projectDefaults.station,
     source: configured ? 'project' : 'default',
     capabilities: {stream: !configured || configured.adapter === 'pi', cancel: true, resume: configured?.adapter !== 'launcher', usage: configured?.adapter === 'launcher' ? 'unknown' : 'reported'},
     lastModel: 'last-actual-fixture-model',
@@ -42,6 +48,27 @@ try {
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(url.pathname);
+    if (url.pathname === '/api/tools/agent_defaults') {
+      await route.fulfill({json: {ok: true, result: projectDefaults}});
+      return;
+    }
+    if (url.pathname === '/api/agents/defaults') {
+      if (rejectDefaultSave) {
+        await route.fulfill({status: 422, json: {ok: false, error: 'Fixture rejected project defaults'}});
+        return;
+      }
+      const update = route.request().postDataJSON();
+      defaultWrites.push(update);
+      projectDefaults = {...projectDefaults, ...update};
+      await route.fulfill({json: {ok: true, result: projectDefaults}});
+      return;
+    }
+    if (url.pathname === '/api/factory') {
+      const factory = await page.evaluate(() => window.inspectorFixture.getState().factory);
+      await route.fulfill({json: {factory, defaultLayout: null, agentBindings: bindingResult().bindings,
+        agentDefaults: projectDefaults, model: projectDefaults.dispatcher.model, keyPresent: true}});
+      return;
+    }
     if (url.pathname === '/api/tools/inspect') {
       const args = route.request().postDataJSON();
       detailRequests.push(args);
@@ -151,7 +178,7 @@ try {
   const settings = page.getByRole('region', {name: '工位 Agent 配置'});
   await settings.getByLabel('执行适配器').waitFor();
   assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'inherit');
-  assert.match(await settings.locator('.agent-binding-effective').innerText(), /Pi · fixture-model.*应用默认/s);
+  assert.match(await settings.locator('.agent-binding-effective').innerText(), /Pi · fixture-model.*本项目默认/s);
   assert.match(await settings.innerText(), /最近回报模型：last-actual-fixture-model/);
   await settings.getByLabel('执行适配器').selectOption('claude-code');
   await settings.getByLabel('Agent 请求模型').fill('fixture-claude');
@@ -170,7 +197,7 @@ try {
   await settings.getByRole('status').waitFor();
   await page.waitForFunction(() => window.inspectorFixture.getState().agentBindings['curation/review']?.effective?.adapter === 'claude-code');
   assert.deepEqual(configured, {adapter: 'claude-code', command: ['claude'], model: 'fixture-claude'});
-  assert.match(await settings.locator('.agent-binding-effective').innerText(), /Claude Code · fixture-claude.*本项目覆盖/s);
+  assert.match(await settings.locator('.agent-binding-effective').innerText(), /Claude Code · fixture-claude.*本节点覆盖/s);
   const statsHeight = await page.locator('.insp-stats').evaluate(element => element.getBoundingClientRect().height);
   assert.ok(statsHeight >= 40, `a long adapter form must not collapse the station statistics (${statsHeight}px)`);
   await page.locator('.spec-view').evaluate(element => { element.scrollTop = 0; });
@@ -191,6 +218,31 @@ try {
   await page.waitForFunction(() => window.inspectorFixture.getState().agentBindings['curation/review']?.configured === null);
   assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'inherit');
   assert.equal(savedBindings.length, 4);
+  await page.evaluate(() => window.inspectorFixture.setState({view: 'settings'}));
+  const stationDefaults = page.getByRole('form', {name: '工位默认配置'});
+  const dispatcherDefaults = page.getByRole('form', {name: '主调度配置'});
+  await stationDefaults.getByLabel('Agent 请求模型').fill('next-station-model');
+  await stationDefaults.getByRole('button', {name: '保存工位默认'}).click();
+  await stationDefaults.getByRole('status').waitFor();
+  assert.deepEqual(defaultWrites, [{station: {adapter: 'pi', provider: 'fixture-provider', model: 'next-station-model'}}]);
+  assert.equal(await dispatcherDefaults.getByLabel('Agent 请求模型').inputValue(), 'dispatcher-model');
+  await dispatcherDefaults.getByLabel('Agent provider').fill('independent-dispatcher');
+  await dispatcherDefaults.getByLabel('Agent 请求模型').fill('next-dispatcher-model');
+  await dispatcherDefaults.getByRole('button', {name: '保存主调度'}).click();
+  await dispatcherDefaults.getByRole('status').waitFor();
+  await page.waitForFunction(() => window.inspectorFixture.getState().model === 'next-dispatcher-model');
+  assert.equal(projectDefaults.station.model, 'next-station-model');
+  assert.deepEqual(Object.keys(defaultWrites[1]), ['dispatcher'], 'saving the dispatcher cannot overwrite station defaults');
+  rejectDefaultSave = true;
+  await stationDefaults.getByLabel('Agent 请求模型').fill('rejected-default');
+  await stationDefaults.getByRole('button', {name: '保存工位默认'}).click();
+  await stationDefaults.getByRole('alert').filter({hasText: 'Fixture rejected project defaults'}).waitFor();
+  assert.equal(projectDefaults.station.model, 'next-station-model');
+  rejectDefaultSave = false;
+  await stationDefaults.getByRole('button', {name: '重新读取', exact: true}).click();
+  await page.waitForFunction(() => document.querySelector('[aria-label="工位默认配置"] [aria-label="Agent 请求模型"]').value === 'next-station-model');
+  await page.locator('.set-sec').first().screenshot({path: path.join(out, 'project-model-defaults.png')});
+  await page.evaluate(() => window.inspectorFixture.setState({view: 'canvas'}));
   await page.evaluate(() => window.inspectorFixture.setState({inspectors: [{key: 'curation/capture', kind: 'node', x: 40, y: 40, pinned: true}]}));
   await page.getByRole('button', {name: '规格', exact: true}).click();
   await settings.getByText('程序执行，不使用 Agent 模型。').waitFor();

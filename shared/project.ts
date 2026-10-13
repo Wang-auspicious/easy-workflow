@@ -2,7 +2,7 @@
 // materialized view, the dashboard keeps another fed by SSE, and offline replay feeds
 // a recorded journal through the very same function (Spec §10.11, §11).
 import type {
-  Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, JournalEvent, ModelDependency, PreflightCheck, Stamped, StepDetail, TokenStatus, Usage,
+  Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, JournalEvent, ModelDependency, PreflightCheck, ProjectAgentDefaults, Stamped, StepDetail, TokenStatus, Usage,
 } from "./types.ts";
 import { legacyReply, type ConversationEntry } from "./conversation.ts";
 import { mergeActivity } from "./activity.ts";
@@ -141,6 +141,7 @@ export interface FactoryState {
   reportReady: string | null;
   lockedStations: string[];
   alerts: Record<string, Alert & { at: number }>;
+  agentDefaults?: ProjectAgentDefaults;
   preflight: { at: number; ok: boolean; checks: PreflightCheck[] } | null;
   /** Case files keyed by item, so retries continue the same dossier (Spec §33). */
   cases: Record<string, (CaseNote & { at: number; token: string })[]>;
@@ -192,6 +193,9 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
   s.seq = e.seq;
   const node = (key: string) => (s.nodes[key] ??= emptyNode(key));
   switch (e.kind) {
+    case 'agent.defaults':
+      s.agentDefaults = structuredClone(e.defaults);
+      break;
     case 'agent.binding': {
       const bindings = s.agentBindings ??= {};
       if (e.binding === null) delete bindings[e.node];

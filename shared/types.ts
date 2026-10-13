@@ -226,6 +226,11 @@ export type StationAgentBinding =
   | {adapter: 'pi'; provider?: string; model?: string}
   | {adapter: 'claude-code' | 'launcher'; command: string[]; model: string; requestTimeoutMs?: number};
 
+export interface ProjectAgentDefaults {
+  station: StationAgentBinding;
+  dispatcher: StationAgentBinding;
+}
+
 /** Public fault-domain identity. Endpoints, command arguments and credentials are private. */
 export interface ModelDependency {
   readonly key: string;
@@ -238,6 +243,7 @@ export type JournalEvent =
   | import("./lessons.ts").LessonEvent
   | { kind: "factory.loaded"; digest: string; specVersion: string }
   | { kind: 'agent.binding'; node: string; binding: StationAgentBinding | null }
+  | { kind: 'agent.defaults'; defaults: ProjectAgentDefaults }
   | { kind: "run.started"; runId: string; title: string }
   | { kind: "run.paused"; runId: string }
   | { kind: "run.resumed"; runId: string }

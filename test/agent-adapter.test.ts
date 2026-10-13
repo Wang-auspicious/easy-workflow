@@ -20,7 +20,7 @@ import { ClosedStationAgent, closedAgentConfig } from '../server/mcp-station.ts'
 import { ClaudeCodeProtocol, type ClaudeSessionReference } from '../server/claude-code.ts';
 import { EvidenceStore, type ImageProcessOptions } from '../server/evidence.ts';
 import { closeModelTransport, models, piStatus, probeModelConnection, redactModelError } from '../server/pi.ts';
-import type { StationAgentBinding } from '../shared/types.ts';
+import type {ModelDependency, StationAgentBinding} from '../shared/types.ts';
 import { sessionSignature, type SessionRef } from '../server/station-session.ts';
 import {withModelAdmission} from '../server/model-requests.ts';
 import {closedModelDependency} from '../server/agent-bindings.ts';
@@ -866,5 +866,182 @@ process.stdout.write(JSON.stringify({model: 'reported-' + request.model, modelCa
     }
     assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
     fs.rmSync(dir, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+  }
+});
+
+test('project defaults, dispatcher turns and concurrent station contexts remain independent of the external Pi default', {timeout: 30000}, async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-project-models-'));
+  const profile = path.join(directory, 'profile');
+  fs.mkdirSync(profile);
+  const keys = ['PI_CODING_AGENT_DIR', 'FACTORY_PROVIDER', 'FACTORY_MODEL', 'FACTORY_STATION_COMMAND',
+    'FACTORY_PREFLIGHT', 'FACTORY_HTTP_CACHE', 'FACTORY_START_PAUSED', 'FACTORY_RESUME_MANAGED'];
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  process.env.PI_CODING_AGENT_DIR = profile;
+  delete process.env.FACTORY_PROVIDER;
+  delete process.env.FACTORY_MODEL;
+  process.env.FACTORY_STATION_COMMAND = 'unselected external command must never start';
+  process.env.FACTORY_PREFLIGHT = '0';
+  process.env.FACTORY_HTTP_CACHE = '0';
+  process.env.FACTORY_START_PAUSED = '1';
+  process.env.FACTORY_RESUME_MANAGED = '0';
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => {release = resolve;});
+  const requests: {provider: string; body: string}[] = [];
+  let active = 0;
+  let peak = 0;
+  const server = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const text = Buffer.concat(chunks).toString();
+    const body = JSON.parse(text) as {model: string; tools?: {function: {name: string}}[]; messages: {role: string}[]};
+    const provider = request.url!.split('/')[1];
+    requests.push({provider, body: text});
+    active++;
+    peak = Math.max(peak, active);
+    await gate;
+    const station = body.tools?.some(tool => tool.function.name === 'submit');
+    const wroteNote = body.messages.some(message => message.role === 'tool');
+    const delta = station ? {role: 'assistant', tool_calls: [{index: 0, id: `project-${requests.length}-${provider}`,
+      type: 'function', function: wroteNote ? {name: 'submit', arguments: JSON.stringify({value: provider})}
+        : {name: 'env_call', arguments: JSON.stringify({name: 'case_note', arguments: {section: 'fixture', text: `local-${provider}-note`}})}}]}
+      : {role: 'assistant', content: `Dispatcher ${provider}`};
+    response.writeHead(200, {'content-type': 'text/event-stream'});
+    for (const part of [
+      {choices: [{index: 0, delta, finish_reason: null}]},
+      {choices: [{index: 0, delta: {}, finish_reason: station ? 'tool_calls' : 'stop'}],
+        usage: {prompt_tokens: 20, completion_tokens: 5, total_tokens: 25}},
+    ]) response.write(`data: ${JSON.stringify({id: 'project-selection', model: body.model, ...part})}\n\n`);
+    response.end('data: [DONE]\n\n');
+    active--;
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as {port: number}).port;
+  fs.writeFileSync(path.join(profile, 'auth.json'), JSON.stringify(Object.fromEntries(['a', 'b']
+    .map(provider => [provider, {type: 'api_key', key: `fixture-project-${provider}`}]))));
+  fs.writeFileSync(path.join(profile, 'models.json'), JSON.stringify({providers: Object.fromEntries(['a', 'b']
+    .map(provider => [provider, {api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/${provider}/v1`,
+      models: [{id: 'fixture-model', input: ['text']}]}]))}));
+  const selectExternal = (provider: string) => fs.writeFileSync(path.join(profile, 'settings.json'),
+    JSON.stringify({defaultProvider: provider, defaultModel: 'fixture-model'}));
+  const schema = {type: 'object', properties: {value: {type: 'string'}}, required: ['value'], additionalProperties: false};
+  const manifest: WorkflowManifest = {
+    format: 1, id: 'independent', name: 'Independent contexts', version: '1', blurb: 'Local model fixture',
+    entry: 'independent/alpha', inputSchema: 'value', resources: {model: 4, browser: 0, cpu: 0, http: 0},
+    lines: [line({id: 'independent', name: 'Independent contexts', layer: 3, priority: 'mid', wired: true,
+      blurb: 'Concurrent contexts', stations: [
+        ...['alpha', 'beta'].map(id => station({id, name: id, kind: 'agent', role: 'process', resource: 'model',
+          accept: ['Write the own case note and submit the fixture value'],
+          workers: {min: 2, max: 2, initial: 2, policy: 'fixed'}})),
+        station({id: 'published', name: 'Done', kind: 'store', role: 'store'}),
+      ], edges: [['alpha', 'published'], ['beta', 'published']]})],
+    channels: [], links: [], conditions: {}, schemas: {value: schema},
+    bindings: Object.fromEntries(['alpha', 'beta'].map(node => [`independent/${node}`, {
+      role: `roles/${node}/ROLE.md`, inputSchema: 'value', outputSchema: 'value',
+      input: {value: {path: 'input.value'}}, outputKey: 'result', execute: {kind: 'agent' as const,
+        instructions: 'Keep this station input separate. Write one case note, then submit the fixture value.'},
+    }])),
+  };
+  const {Factory} = await import('../server/factory.ts');
+  const {Dispatcher} = await import('../server/dispatcher.ts');
+  const factories: InstanceType<typeof Factory>[] = [];
+  const sessions: {project: string; node: string; session: string; input: string}[] = [];
+  type Captured = {binding: StationAgentBinding; piRuntime?: ReturnType<typeof models>; dependency: ModelDependency};
+  const binding = (provider: string): StationAgentBinding => ({adapter: 'pi', provider, model: 'fixture-model'});
+  try {
+    for (const project of ['a', 'b']) {
+      const root = path.join(directory, `project-${project}`);
+      await installWorkflowPack(root, {manifest, builtins: [], files: Object.fromEntries(['alpha', 'beta']
+        .map(node => [`roles/${node}/ROLE.md`, `# ${node} isolated role\n\nUse only this station's input, write its case note, and submit the exact fixture value.`]))}, {running: false});
+      selectExternal(project);
+      const factory = new Factory(root);
+      factories.push(factory);
+      await factory.boot();
+      fs.writeFileSync(path.join(root, 'PROJECT.md'), `# Private project ${project}\n\nPROJECT_${project.toUpperCase()}_ONLY`);
+      factory.broker.memoryFloorMB = 0;
+      factory.broker.limits.model = 4;
+      assert.deepEqual(factory.getAgentDefaults(), {station: binding(project), dispatcher: binding(project)});
+      const host = factory as unknown as {captureAgent: (node: string, declared?: StationAgentBinding) => Captured};
+      const capture = host.captureAgent.bind(factory);
+      t.mock.method(host, 'captureAgent', (node: string, declared?: StationAgentBinding) => {
+        const result = capture(node, declared);
+        if (result.piRuntime) {
+          const stream = result.piRuntime.stream;
+          result.piRuntime = {...result.piRuntime, stream: async (model, context, options) => {
+            sessions.push({project, node, session: options?.sessionId ?? '', input: JSON.stringify(context)});
+            return stream(model, context, options);
+          }};
+        }
+        return result;
+      });
+      factory.runtime.start('Independent project fixture');
+    }
+    const [left, right] = factories;
+    selectExternal('nonexistent-outside-provider');
+    left.setAgentBinding('independent/beta', {adapter: 'pi', provider: 'b'});
+    const tokens = [
+      left.runtime.create('independent/alpha', {item: 'left-one', url: '', source: 'manual', data: {input: {value: 'LEFT_ONE'}}}),
+      left.runtime.create('independent/alpha', {item: 'left-two', url: '', source: 'manual', data: {input: {value: 'LEFT_TWO'}}}),
+      left.runtime.create('independent/beta', {item: 'left-beta', url: '', source: 'manual', data: {input: {value: 'LEFT_BETA'}}}),
+      right.runtime.create('independent/alpha', {item: 'right-one', url: '', source: 'manual', data: {input: {value: 'RIGHT_ONE'}}}),
+    ];
+    for (let i = 0; i < 400 && (sessions.length < 4 || requests.length < 2); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(sessions.length, 4, 'two workers, another node and another project own distinct captured model requests');
+    assert.ok(peak >= 2, 'independent contexts really overlap at the local model service within its shared capacity');
+    left.setAgentDefaults({station: binding('b'), dispatcher: binding('b')});
+    right.setAgentDefaults({dispatcher: binding('a')});
+    release();
+    await Promise.all(factories.map(factory => factory.runtime.settle()));
+    assert.deepEqual(tokens.map(token => token.data.result), [{value: 'a'}, {value: 'a'}, {value: 'b'}, {value: 'b'}]);
+    const firstRequests = sessions.filter((_value, index) => index < 4);
+    assert.equal(new Set(firstRequests.map(value => value.session)).size, 4);
+    for (const value of sessions) {
+      assert.ok(value.session);
+      assert.match(value.input, new RegExp(`PROJECT_${value.project.toUpperCase()}_ONLY`));
+      assert.ok(!value.input.includes(value.project === 'a' ? 'PROJECT_B_ONLY' : 'PROJECT_A_ONLY'));
+    }
+    assert.ok(left.state.cases['left-one'].some(note => note.text === 'local-a-note'));
+    assert.equal(right.state.cases['left-one'], undefined, 'the host toolbox cannot write into another project');
+    assert.ok(right.state.cases['right-one'].some(note => note.text === 'local-b-note'));
+    assert.equal(left.state.cases['right-one'], undefined);
+    const next = left.runtime.create('independent/alpha', {item: 'left-next', url: '', source: 'manual', data: {input: {value: 'LEFT_NEXT'}}});
+    await left.runtime.settle();
+    assert.deepEqual(next.data.result, {value: 'b'}, 'a project change applies to the next attempt');
+    const dispatchers = factories.map(factory => new Dispatcher(factory));
+    await Promise.all(dispatchers.map((dispatcher, index) => dispatcher.chat(`Independent dispatch ${index}`, [])));
+    assert.match(left.state.conversation.at(-1)?.message.content.toString() ?? '', /./);
+    assert.equal(dispatchers[0].agent!.state.model.provider, 'b');
+    assert.equal(dispatchers[1].agent!.state.model.provider, 'a');
+    assert.notEqual(dispatchers[0].agent!.sessionId, dispatchers[1].agent!.sessionId);
+    assert.ok(dispatchers.every(dispatcher => dispatcher.agent!.sessionId?.startsWith('easy-workflow-dispatcher-')));
+    const checkpoint = [...left.journal.read()].findLast(event => event.kind === 'chat.checkpoint');
+    assert.ok(checkpoint?.kind === 'chat.checkpoint');
+    assert.deepEqual(checkpoint.checkpoint.agent, binding('b'));
+    assert.ok(requests.some(request => request.provider === 'b' && request.body.includes('Independent dispatch 0')));
+    assert.ok(requests.some(request => request.provider === 'a' && request.body.includes('Independent dispatch 1')));
+    for (const dispatcher of dispatchers) dispatcher.interrupt();
+    assert.throws(() => left.setAgentDefaults({dispatcher: {adapter: 'launcher', command: ['never-run'], model: 'unused'}}),
+      /主调度目前支持 Pi/);
+    const persisted = left.getAgentDefaults();
+    left.recovery.close(); await left.sources.close(); left.channels?.close(); await left.runtime.close();
+    left.docs.flush(); left.lessons.close(); left.journal.close();
+    const restarted = new Factory(left.project.dir);
+    factories[0] = restarted;
+    await restarted.boot();
+    assert.deepEqual(restarted.getAgentDefaults(), persisted, 'restart never rereads the external Pi default');
+    assert.equal(restarted.agentBindings('independent/alpha').bindings[0].effective?.model, 'fixture-model');
+  } finally {
+    release();
+    for (const factory of factories) {
+      factory.recovery?.close(); await factory.sources?.close(); factory.channels?.close();
+      await factory.runtime?.close(); factory.docs?.flush(); factory.lessons?.close(); factory.journal.close();
+    }
+    await closeModelTransport();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    fs.rmSync(directory, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
   }
 });

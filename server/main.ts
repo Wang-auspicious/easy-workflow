@@ -138,8 +138,9 @@ const server = http.createServer(async (req, res) => {
     if (p.startsWith("/evidence/")) { const file = factory.store.resolve(p); if (!file) { res.writeHead(404); res.end(); return; } serveFile(res, file, req); return; }
     if (p === "/api/factory") {
       const c = factory.compiled;
-      const pi = piStatus();
-      return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: pi.id, pi, keyPresent: pi.ready, patches: factory.patches, agentBindings: factory.agentBindings().bindings });
+      const agentDefaults = factory.getAgentDefaults();
+      const pi = piStatus(agentDefaults.dispatcher);
+      return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: pi.id, pi, keyPresent: pi.ready, patches: factory.patches, agentDefaults, agentBindings: factory.agentBindings().bindings });
     }
     const view = url.searchParams.get('view');
     if (['/api/state', '/api/events'].includes(p) && view !== null && view !== 'raw' && view !== 'ui-v1') {
@@ -252,6 +253,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST") {
       const b = await body(req);
       switch (p) {
+        case '/api/agents/defaults': return send(res, 200, await control.execute('set_agent_defaults', b, 'user'));
         case '/api/agents/binding': return send(res, 200, await control.execute('set_agent_binding', b, 'user'));
         case '/api/sources/configure': return send(res, 200, await control.execute('source_configure', b, 'user'));
         case '/api/sources/enable': return send(res, 200, await control.execute('source_enable', b, 'user'));

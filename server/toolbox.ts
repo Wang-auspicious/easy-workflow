@@ -6,7 +6,8 @@ import { Check, Errors } from "typebox/value";
 import type { Journal } from "./journal.ts";
 import type { Broker, Lease } from "./broker.ts";
 import type { Docs } from "./docs.ts";
-import { rememberRead, webGet } from "./network.ts";
+import {rememberRead, webGet, withNetworkCache} from './network.ts';
+import {projectPaths} from './workspace.ts';
 import { fetchRepoMeta, RepoError } from "./repo.ts";
 import { openPage } from "./browser.ts";
 import { classifyFailure, type Failure } from "../shared/failures.ts";
@@ -54,7 +55,9 @@ export class Toolbox {
     const d = this.defs.get(name);
     if (!d || !allowed.includes(name)) return { ok: false, failure: { tag: "tool_error", message: `本工位没有工具 ${name}`, nextAction: `可用：${allowed.join("、")}`, owner: "agent" } };
     if (!Check(d.parameters, args ?? {})) return { ok: false, failure: { tag: "tool_error", message: "参数不符合 schema", details: [...Errors(d.parameters, args ?? {})].slice(0, 5).map((e) => `${e.instancePath} ${e.message}`), nextAction: `先 env_help({name:"${name}"}) 看参数`, owner: "agent" } };
-    try { return { ok: true, ...(await d.run(args ?? {}, ctx)) as object }; }
+    const directory = this.deps.docs().dir;
+    try { return { ok: true, ...(await withNetworkCache(process.env.FACTORY_HTTP_CACHE === '0' || !directory
+      ? null : projectPaths(directory).cache, () => d.run(args ?? {}, ctx))) as object }; }
     catch (err) {
       ctx.signal.throwIfAborted();
       const f = err instanceof ToolError ? err.failure : classifyFailure(err, {});

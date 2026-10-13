@@ -55,6 +55,7 @@ export class Dispatcher {
   private replayOperations: DispatcherCheckpoint["operations"] = [];
   private preparingInputs: Promise<void> = Promise.resolve();
   private readonly queuedInputIds = new Set<string>();
+  private agentSignature = '';
 
   constructor(f: Factory, control = new FactoryControl(f), options: DispatcherOptions = {}) {
     this.f = f; this.control = control;
@@ -117,12 +118,17 @@ export class Dispatcher {
     };
   }
   private ensure(includeCurrent = false) {
-    if (this.agent) return this.agent;
-    const { stream, model } = this.options.modelFactory();
+    const binding = this.checkpoint.agent ?? this.f.getAgentDefaults?.().dispatcher;
+    if (binding && binding.adapter !== 'pi') throw new Error('主调度目前只支持 Pi 执行器');
+    const signature = JSON.stringify([binding, this.checkpoint.state.turn]);
+    if (this.agent && this.agentSignature === signature) return this.agent;
+    const {stream, model} = this.options.modelFactory(binding);
+    this.agentSignature = signature;
+    const project = crypto.createHash('sha256').update(this.f.project.dir).digest('hex').slice(0, 16);
     this.agent = new Agent({
       initialState: { systemPrompt: (this.f.docs ? this.f.docs.envelope("dispatcher").text : readRole("dispatcher").content) + "\n\n" + SYSTEM + "\n\n" + this.control.bootstrap().instructions,
         model, thinkingLevel: "off", tools: this.guardedTools() as never },
-      streamFn: this.boundedStream(stream), sessionId: "factory-dispatcher", toolExecution: "sequential",
+      streamFn: this.boundedStream(stream), sessionId: `easy-workflow-dispatcher-${project}-${this.checkpoint.state.turn}`, toolExecution: 'sequential',
       transformContext: async (messages: AgentMessage[]) => {
         if (messages.length <= 80) return messages;
         const active = messages.findIndex(m => m.role === "user" && textOf(m).startsWith(this.checkpoint.request.text));
@@ -253,7 +259,8 @@ export class Dispatcher {
     if (this.agent) { this.agent.clearAllQueues(); this.agent.state.messages = recoverDispatcherMessages(this.agent.state.messages, this.checkpoint.operations); }
     this.replayOperations = [];
     const id = `m-${requestId ?? crypto.randomUUID()}`;
-    this.checkpoint = { state: { ...idle(this.options.maxAttempts), turn: id }, prompted: false, messageNumber: 0, request: { text, attachments }, scope: id, inputs: [], operations: [] };
+    this.checkpoint = {agent: this.f.getAgentDefaults?.().dispatcher,
+      state: { ...idle(this.options.maxAttempts), turn: id }, prompted: false, messageNumber: 0, request: { text, attachments }, scope: id, inputs: [], operations: [] };
     this.streamedAt = 0; this.toolLog = [];
     this.f.journal.append({ kind: "chat.user", id, text, attachments }); return this.run(false);
   }

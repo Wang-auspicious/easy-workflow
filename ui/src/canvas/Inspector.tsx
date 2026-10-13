@@ -6,6 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
 import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, CircleMinus, Check, AlertTriangle, Loader2, ExternalLink, Play, Pause } from "lucide-react";
 import type { CompiledNode, EvidenceRef, StationAgentBinding } from "../../../shared/types.ts";
+import {AgentBindingFields, adapterLabel, agentBindingDraft, parseBindingDraft, selectBindingAdapter, type AgentBindingDraft} from './AgentBindingFields.tsx';
 import { median, quantile, type AttemptState, type TokenState } from "../../../shared/project.ts";
 import { roleColors } from "../../../shared/palette.ts";
 import { attach, getState, setState, useStore, type Inspector, type NodeAgentBinding } from "../store.ts";
@@ -241,26 +242,11 @@ function SpecView({ node }: { node: CompiledNode }) {
   );
 }
 
-interface AgentBindingDraft {
-  adapter: 'inherit' | StationAgentBinding['adapter'];
-  provider: string;
-  model: string;
-  command: string;
-  requestTimeoutMs: string;
-}
-const agentBindingDraft = (binding: StationAgentBinding | null): AgentBindingDraft => ({
-  adapter: binding?.adapter ?? 'inherit',
-  provider: binding?.adapter === 'pi' ? binding.provider ?? '' : '',
-  model: binding?.model ?? '',
-  command: binding && binding.adapter !== 'pi' ? JSON.stringify(binding.command) : '',
-  requestTimeoutMs: binding && binding.adapter !== 'pi' && binding.requestTimeoutMs ? String(binding.requestTimeoutMs) : '',
-});
-const adapterLabel = (adapter: StationAgentBinding['adapter']) => ({pi: 'Pi', 'claude-code': 'Claude Code', launcher: '自定义 launcher'})[adapter];
-
 function AgentBindingSettings({node}: {node: CompiledNode}) {
   const connected = useStore(state => state.connected);
   const replay = useStore(state => Boolean(state.replay));
   const configuredRevision = useStore(state => JSON.stringify(state.fs.agentBindings?.[node.key] ?? null));
+  const defaultsRevision = useStore(state => JSON.stringify(state.fs.agentDefaults ?? null));
   const [entry, setEntry] = useState<NodeAgentBinding | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -311,7 +297,7 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
       active = false;
       controller.abort();
     };
-  }, [node.key, node.kind, connected, replay, revision, configuredRevision]);
+  }, [node.key, node.kind, connected, replay, revision, configuredRevision, defaultsRevision]);
 
   const save = async (binding: StationAgentBinding | null) => {
     if (disabled) return;
@@ -334,7 +320,7 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
       }
       setDraft(agentBindingDraft(saved?.configured ?? binding));
       setDirty(false);
-      setReceipt(binding ? '已保存，下一次尝试使用此配置；当前执行保持原配置。' : '已恢复继承，下一次尝试使用工作流包或应用默认配置。');
+      setReceipt(binding ? '已保存，下一次尝试使用此配置；当前执行保持原配置。' : '已恢复继承，下一次尝试使用工作流包或本项目默认配置。');
       setRevision(value => value + 1);
     } catch (reason) {
       setError(reason instanceof Error && reason.name === 'TimeoutError'
@@ -347,29 +333,7 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
     try {
-      if (draft.adapter === 'inherit') {
-        void save(null);
-        return;
-      }
-      if (draft.adapter === 'pi') {
-        void save({adapter: 'pi', ...(draft.provider.trim() ? {provider: draft.provider.trim()} : {}), ...(draft.model.trim() ? {model: draft.model.trim()} : {})});
-        return;
-      }
-      let command: unknown;
-      try {
-        command = JSON.parse(draft.command);
-      } catch {
-        throw new Error('启动命令必须是 JSON 字符串数组，例如 ["claude"]。');
-      }
-      if (!Array.isArray(command) || !command.length || command.some(value => typeof value !== 'string' || !value.trim())) {
-        throw new Error('启动命令的每个参数都必须是非空字符串，不拼接 shell 命令。');
-      }
-      if (!draft.model.trim()) throw new Error('请填写请求模型。实际模型仍以执行回执为准。');
-      const requestTimeoutMs = draft.requestTimeoutMs.trim() ? Number(draft.requestTimeoutMs) : undefined;
-      if (requestTimeoutMs !== undefined && (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 900000)) {
-        throw new Error('请求超时必须是 1–900000 毫秒的整数。');
-      }
-      void save({adapter: draft.adapter, command: command as string[], model: draft.model.trim(), ...(requestTimeoutMs === undefined ? {} : {requestTimeoutMs})});
+      void save(parseBindingDraft(draft));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Agent 配置无效');
     }
@@ -382,9 +346,7 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
   const selectAdapter = (value: AgentBindingDraft['adapter']) => {
     setDirty(true);
     setReceipt('');
-    setDraft(value === 'inherit' ? agentBindingDraft(null) : value === entry?.configured?.adapter
-      ? agentBindingDraft(entry.configured)
-      : {adapter: value, provider: '', model: '', command: value === 'claude-code' ? '["claude"]' : '', requestTimeoutMs: ''});
+    setDraft(selectBindingAdapter(value, entry?.configured ?? null));
   };
   const effective = entry?.effective;
   return <section className="agent-binding" aria-label="工位 Agent 配置">
@@ -392,20 +354,12 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
     {error && <p className="agent-binding-error" role="alert">{error}</p>}
     {receipt && <p className="agent-binding-receipt" role="status">{receipt}</p>}
     {!loaded ? <p className="muted">{loading ? '正在读取工位配置…' : replay ? '回放期间不能修改工位配置。' : !connected ? '连接恢复后可读取工位配置。' : '配置未读取，请重试。'}</p> : !entry ? <p className="muted">{node.kind === 'source' || node.kind === 'store' ? '此节点不运行 Agent。' : node.kind === 'agent' || node.kind === 'review' ? '此工位尚未接入可配置的 Agent 执行器。' : '程序执行，不使用 Agent 模型。'}</p> : <>
-      <p className="agent-binding-effective">{effective ? `${adapterLabel(effective.adapter)} · ${effective.model || '应用默认模型'}` : '当前配置不可执行'}<small>来源：{({project: '本项目覆盖', workflow: '工作流包默认', default: '应用默认'})[entry.source]}</small></p>
+      <p className="agent-binding-effective">{effective ? `${adapterLabel(effective.adapter)} · ${effective.model || '客户端默认模型'}` : '当前配置不可执行'}<small>来源：{({project: '本节点覆盖', workflow: '工作流包默认', default: '本项目默认'})[entry.source]}</small></p>
       {entry.lastModel && <p className="muted">最近回报模型：{entry.lastModel === 'unreported' ? '未回报' : entry.lastModel}</p>}
       {entry.error && <p className="agent-binding-error" role="alert">{entry.error}</p>}
       <p className="agent-binding-capabilities">流式 {entry.capabilities.stream ? '支持' : '不支持'} · 取消 {entry.capabilities.cancel ? '支持' : '不支持'} · 续接 {entry.capabilities.resume ? '支持' : '不支持'} · 用量 {entry.capabilities.usage === 'reported' ? '客户端回报' : '未提供'}</p>
       <form onSubmit={submit}>
-        <label>执行适配器<select aria-label="执行适配器" disabled={disabled} value={draft.adapter} onChange={event => selectAdapter(event.target.value as AgentBindingDraft['adapter'])}><option value="inherit">继承默认</option><option value="pi">Pi</option><option value="claude-code">Claude Code</option><option value="launcher">自定义 launcher</option></select></label>
-        {draft.adapter !== 'inherit' && <>
-          {draft.adapter === 'pi' && <label>Provider（留空继承）<input aria-label="Agent provider" disabled={disabled} value={draft.provider} maxLength={200} onChange={event => change('provider', event.target.value)} placeholder="应用默认 provider" /></label>}
-          <label>{draft.adapter === 'pi' ? '请求模型（留空继承）' : '请求模型'}<input aria-label="Agent 请求模型" disabled={disabled} required={draft.adapter !== 'pi'} maxLength={200} value={draft.model} onChange={event => change('model', event.target.value)} placeholder={draft.adapter === 'pi' ? '应用默认模型' : '厂商支持的模型 ID 或别名'} /></label>
-          {draft.adapter !== 'pi' && <>
-            <label>启动命令（JSON argv）<textarea aria-label="Agent 启动命令" disabled={disabled} required rows={3} value={draft.command} onChange={event => change('command', event.target.value)} placeholder='["node", "path/to/launcher.mjs"]' /></label>
-            <label>单次请求超时（毫秒，可留空）<input aria-label="Agent 请求超时" disabled={disabled} type="number" min={1} max={900000} step={1} value={draft.requestTimeoutMs} onChange={event => change('requestTimeoutMs', event.target.value)} placeholder="使用适配器默认值" /></label>
-          </>}
-        </>}
+        <AgentBindingFields draft={draft} disabled={disabled} scope="node" change={change} selectAdapter={selectAdapter} />
         <p className="muted">只影响下次尝试。角色、工具权限、输出契约和程序审查保持有效。</p>
         <div className="agent-binding-actions"><button type="button" className="btn btn--sm" disabled={disabled || !entry.configured} onClick={() => void save(null)}>恢复继承</button><button className="btn btn--sm btn--primary" disabled={disabled || !dirty}>{busy ? '正在保存…' : '保存配置'}</button></div>
       </form>

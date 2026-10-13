@@ -1,5 +1,5 @@
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
-import type { Attachment } from "./types.ts";
+import type {Attachment, StationAgentBinding} from './types.ts';
 
 /** Pi's native ordered message stream, without system prompts or binary attachments. */
 export type PiMessage = Exclude<Message, { role: "system" }>;
@@ -20,6 +20,7 @@ export interface DispatcherStatus {
 
 /** Private recovery metadata; native messages and user input remain in the journal. */
 export interface DispatcherCheckpoint {
+  agent?: StationAgentBinding;
   state: DispatcherStatus;
   prompted: boolean;
   messageNumber: number;

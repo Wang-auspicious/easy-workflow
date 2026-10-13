@@ -13,6 +13,7 @@ import { setState, getState, ingest, useStore } from "../src/store.ts";
 import { apply, initialState } from "../../shared/project.ts";
 import {uiState, uiEvent} from '../../shared/client-view.ts';
 import {EvidenceBoard} from '../src/board/EvidenceBoard.tsx';
+import {Settings} from '../src/views/Settings.tsx';
 import { botFor } from "../../shared/palette.ts";
 import type { CompiledFactory, CompiledNode, Stamped } from "../../shared/types.ts";
 import type { Geometry } from "../src/canvas/geometry.ts";
@@ -73,9 +74,15 @@ fs.evidenceOrder = ['ev1', 'ev2', 'evtext'];
 fs.tokens.t1.evidence = [...fs.evidenceOrder];
 fs.activity = events.filter((e) => e.kind === "dispatch.note").map((e, i) => ({ id: `n${i}`, role: "note" as const, text: (e as { text: string }).text, at: (e as { at: number }).at, tone: (e as { tone?: "info" | "fork" | "warn" }).tone, node: "curation/review" }));
 fs.run = { id: "fixture-run", title: "候选 × 100", startedAt: now - 60_000, pausedMs: 0, status: "running" };
+fs.agentDefaults = {
+  station: {adapter: 'pi', provider: 'fixture-provider', model: 'fixture-model'},
+  dispatcher: {adapter: 'pi', provider: 'dispatcher-provider', model: 'dispatcher-model'},
+};
 
 const geo: Geometry = { nodes: [], place: {}, capsules: [], capsuleOf: {}, docks: [], dockOf: {}, edges: [], returns: [], bounds: { x: 0, y: 0, w: 1200, h: 800 }, halls: [], bays: [], shelf: null };
-setState({fs: uiState(fs), factory, ready: true, connected: true, version: 1, view: 'canvas', model: "fixture-model", inspectors: [{ key: "curation/review", kind: "node", x: 40, y: 40, pinned: true }]});
+setState({fs: uiState(fs), factory, ready: true, connected: true, version: 1, view: 'canvas', model: "fixture-model",
+  settings: {browser: 2, model: 1, cpu: 2, http: 2, memoryFloorMB: 1024, socialPerMinute: 2, socialPerDay: 60},
+  inspectors: [{ key: "curation/review", kind: "node", x: 40, y: 40, pinned: true }]});
 (window as any).inspectorFixture = {getState, setState, fullState: fs, emit: (event: Stamped) => {
   const stamped = {...event, seq: fs.seq + 1, at: Date.now(), run: fs.run.id} as Stamped;
   apply(fs, stamped);
@@ -83,7 +90,7 @@ setState({fs: uiState(fs), factory, ready: true, connected: true, version: 1, vi
 }};
 function Fixture() {
   const view = useStore(state => state.view);
-  return view === 'board' ? <EvidenceBoard /> : <Inspectors geo={geo} cam={{x: 0, y: 0, k: 1}} />;
+  return view === 'board' ? <EvidenceBoard /> : view === 'settings' ? <Settings /> : <Inspectors geo={geo} cam={{x: 0, y: 0, k: 1}} />;
 }
 createRoot(document.getElementById("root")!).render(
   <div className="app" style={{ ["--chat-w" as string]: "0px" }}>

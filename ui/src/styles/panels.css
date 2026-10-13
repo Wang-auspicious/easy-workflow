@@ -52,6 +52,10 @@
 .agent-binding-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; margin-top: 12px; }
 .agent-binding-error { color: var(--bad); }
 .agent-binding-receipt { color: var(--ok); }
+.agent-default { border: 0; border-top: 1px solid var(--line); border-radius: 0; padding: 16px 0 0; margin: 0; }
+.agent-default .agent-binding-heading b { font-size: 13px; }
+.agent-default label { font-size: 12px; }
+.agent-default input, .agent-default select, .agent-default textarea { font-size: 13px; padding: 8px 10px; }
 .spec-view > * { flex-shrink: 0; }
 .workers { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
 .worker { display: grid; grid-template-columns: 24px 1fr auto auto; align-items: center; gap: 8px; padding: 4px 8px 4px 4px; border-radius: 9px; text-align: left; font-size: 12.5px; }

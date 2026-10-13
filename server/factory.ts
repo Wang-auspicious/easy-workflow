@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { CompiledFactory, CompiledNode, Stamped, StationAgentBinding } from "../shared/types.ts";
+import type {CompiledFactory, CompiledNode, ProjectAgentDefaults, Stamped, StationAgentBinding} from '../shared/types.ts';
 import { apply, initialState, latestRunTokens, tokenWorkKey, type FactoryState } from "../shared/project.ts";
 import { compile, type Patch } from "./spec/compile.ts";
 import { Journal } from "./journal.ts";
@@ -20,11 +20,10 @@ import { ControlError } from "./errors.ts";
 import { classifyFailure, type CandidateRecovery, type Failure } from "../shared/failures.ts";
 import { readRole } from "./roles.ts";
 import { ensureProject, projectPaths, synchronizeProjectPacks, type ProjectInfo } from "./workspace.ts";
-import { configureNetwork } from "./network.ts";
+import {withNetworkCache} from './network.ts';
 import { Docs } from "./docs.ts";
 import { Lessons } from "./lessons.ts";
 import { Toolbox } from "./toolbox.ts";
-import { configureAgentStations } from "./agent-station.ts";
 import { preflight } from "./preflight.ts";
 import type { Alert } from "../shared/types.ts";
 import type { BrowserState } from "../shared/browser.ts";
@@ -35,7 +34,6 @@ import { flushAtlas } from '../packs/vislexicon/components.ts';
 import { ChannelSupervisor } from './channels.ts';
 import { SourceSupervisor } from './sources.ts';
 import {agentCapabilities, closedModelDependency, parseAgentBinding} from './agent-bindings.ts';
-import {closedAgentConfig} from './mcp-station.ts';
 import {models, piSelection} from './pi.ts';
 import {UnmanagedRecoverySupervisor} from './recovery.ts';
 
@@ -69,18 +67,18 @@ export class Factory {
   private services!: Services;
   private stationAgents: Record<string, AgentStationDef> = {};
 
-  constructor() {
+  constructor(projectDirectory = VAR) {
     const readOnly = process.env.FACTORY_READONLY === "1";
-    if (!readOnly) fs.mkdirSync(VAR, { recursive: true });
-    this.project = readOnly ? { name: path.basename(VAR), dir: VAR, pack: "vislexicon", createdAt: "" } : ensureProject(VAR, process.env.FACTORY_PROJECT_NAME ?? path.basename(VAR));
-    if (!readOnly && process.env.FACTORY_HTTP_CACHE !== "0") configureNetwork({ cacheDir: projectPaths(VAR).cache });
-    this.journal = new Journal(path.join(VAR, "journal.db"), readOnly);
-    this.store = new EvidenceStore(path.join(VAR, "evidence"), readOnly);
-    const saved = this.readJson<Partial<Settings> & { browserCapV2?: boolean }>(path.join(VAR, "settings.json"), {});
+    const directory = path.resolve(projectDirectory);
+    if (!readOnly) fs.mkdirSync(directory, { recursive: true });
+    this.project = readOnly ? { name: path.basename(directory), dir: directory, pack: "vislexicon", createdAt: "" } : ensureProject(directory, process.env.FACTORY_PROJECT_NAME ?? path.basename(directory));
+    this.journal = new Journal(path.join(this.project.dir, 'journal.db'), readOnly);
+    this.store = new EvidenceStore(path.join(this.project.dir, 'evidence'), readOnly);
+    const saved = this.readJson<Partial<Settings> & { browserCapV2?: boolean }>(path.join(this.project.dir, 'settings.json'), {});
     // Browser pages were capped at three before Spec §30.6; lift old saved caps once to the new default.
     if (!saved.browserCapV2 && (saved.browser ?? 0) <= 3) delete saved.browser;
     this.settings = { browser: 8, model: 8, cpu: 4, http: 6, memoryFloorMB: 1024, socialPerMinute: 6, socialPerDay: 300, ...saved };
-    this.patches = this.readJson(path.join(VAR, "patches.json"), []);
+    this.patches = this.readJson(path.join(this.project.dir, 'patches.json'), []);
   }
 
   private readJson<T>(file: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; } catch { return fallback; } }
@@ -89,18 +87,24 @@ export class Factory {
     this.workflowPacks = await this.loadWorkflowPacks();
     this.compiled = compile(this.workflowPacks.packs, this.patches);
     if (this.compiled.issues.length) throw new ControlError(422, "invalid_spec", "规格校验失败，未启动运行时", this.compiled.issues);
-    if (process.env.FACTORY_READONLY !== '1') this.project = synchronizeProjectPacks(VAR, this.workflowPacks.packs.map(entry => entry.id));
+    if (process.env.FACTORY_READONLY !== '1') this.project = synchronizeProjectPacks(this.project.dir, this.workflowPacks.packs.map(entry => entry.id));
     this.state = initialState(this.compiled);
     for (const e of this.journal.read(0)) apply(this.state, e);
     this.journal.subscribeProjection((e) => apply(this.state, e));
+    if (!this.state.agentDefaults) {
+      const selection = piSelection();
+      const binding: StationAgentBinding = {adapter: 'pi', provider: selection.provider, model: selection.id};
+      const defaults = {station: {...binding}, dispatcher: {...binding}};
+      if (process.env.FACTORY_READONLY === '1') this.state.agentDefaults = defaults;
+      else this.journal.append({kind: 'agent.defaults', defaults});
+    }
     if (process.env.FACTORY_READONLY !== "1" && this.state.digest !== this.compiled.digest) this.journal.append({ kind: "factory.loaded", digest: this.compiled.digest, specVersion: this.compiled.specVersion });
     this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
-    this.docs = new Docs(this, VAR, this.project.name);
-    this.lessons = new Lessons(this, VAR);
+    this.docs = new Docs(this, this.project.dir, this.project.name);
+    this.lessons = new Lessons(this, this.project.dir);
     this.toolbox = new Toolbox({ journal: this.journal, broker: this.broker, docs: () => this.docs });
-    configureAgentStations({ docs: () => this.docs, toolbox: () => this.toolbox });
     const services: Services = {
-      store: this.store, workDir: path.join(VAR, "work"), publishDir: path.join(VAR, "published"),
+      store: this.store, workDir: path.join(this.project.dir, 'work'), publishDir: path.join(this.project.dir, 'published'),
       tryBrowser:()=>this.broker.tryAcquire("browser"),
       acquireBrowser:(signal,timeoutMs)=>this.broker.acquire("browser",{signal,timeoutMs}),
       inFlight: (self) => new Set([...this.runtime.tokens.values()].filter((t) => !t.finished && t.id !== self && t.data.key).map((t) => String(t.data.key))),
@@ -108,23 +112,41 @@ export class Factory {
     this.services = services;
     const defs = agentDefs(this.store, services);
     this.stationAgents = defs;
+    const scoped = (execute: Executor): Executor => context => withNetworkCache(
+      process.env.FACTORY_HTTP_CACHE === '0' ? null : projectPaths(this.project.dir).cache, () => execute(context));
     const executors = (n: CompiledNode): Executor | ExecutorRegistration | null => {
       const installed = this.workflowPacks?.executor(n);
       if (installed) {
         const declared = this.agentDefault(n.key);
-        if (!declared) return installed;
+        if (!declared) return scoped(installed);
         return {
           prepare: () => {
             const captured = this.captureAgent(n.key, declared.binding);
             return {
               dependency: captured.dependency,
-              execute: this.workflowPacks!.executor(n, (definition, context) =>
-                runAgentStation({...definition, agent: captured.binding, piRuntime: captured.piRuntime}, context))!,
+              execute: scoped(this.workflowPacks!.executor(n, (definition, context) =>
+                runAgentStation({...definition, services: this.stationServices(), agent: captured.binding, piRuntime: captured.piRuntime}, context))!),
             };
           },
         };
       }
-      if (n.tool && TOOLS[n.tool]) return (ctx) => TOOLS[n.tool!](ctx, services);
+      if (n.tool && TOOLS[n.tool]) {
+        const execute: Executor = scoped(ctx => TOOLS[n.tool!](ctx, services));
+        if (!['curation.breadth', 'curation.proof'].includes(n.tool)) return execute;
+        return {prepare: () => {
+          try {
+            const binding = this.resolveAgentBinding({adapter: 'pi'});
+            if (binding.adapter !== 'pi') throw new Error('内置看图工具需要项目的 Pi 选择');
+            const selected = models(binding);
+            return {execute: ctx => execute({...ctx, piRuntime: selected}), dependency: selected.dependency};
+          }
+          catch (error) {
+            return {execute: ctx => execute(Object.defineProperty({...ctx}, 'piRuntime', {
+              get: () => { throw error; },
+            }))};
+          }
+        }};
+      }
       const def = defs[n.key];
       if (!def) return null;
       return {
@@ -133,7 +155,7 @@ export class Factory {
             const captured = this.captureAgent(n.key, def.agent);
             return {
               dependency: captured.dependency,
-              execute: context => runAgentStation({...def, agent: captured.binding, piRuntime: captured.piRuntime}, context),
+              execute: scoped(context => runAgentStation({...def, services: this.stationServices(), agent: captured.binding, piRuntime: captured.piRuntime}, context)),
             };
           } catch (error) {
             // Deterministic rules still run without a configured model. If a
@@ -199,7 +221,7 @@ export class Factory {
     for (const t of Object.values(this.state.tokens)) if (t.source === "candidates/pool") this.taken.add(t.item);
     const left = this.catalog.filter((c) => !this.taken.has(c.id) && !publishedHosts.has(this.hostOf(c.canonicalUrl)));
     const pool = "candidates/pool";
-    const localPublished = fs.existsSync(path.join(VAR, "published")) ? fs.readdirSync(path.join(VAR, "published"), { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.endsWith('.json')).length : 0;
+    const localPublished = fs.existsSync(path.join(this.project.dir, 'published')) ? fs.readdirSync(path.join(this.project.dir, 'published'), { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.endsWith('.json')).length : 0;
     const deferred=Object.values(this.state.recoveries).filter(c=>c.disposition==="retry").length;
     const want: Record<string, number> = { [pool]: left.length+deferred, "curation/published": publishedHosts.size + localPublished };
     for (const [node, stock] of Object.entries(want)) {
@@ -212,7 +234,7 @@ export class Factory {
   private hostOf(u: string) { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return u; } }
 
   private loadWorkflowPacks() {
-    return loadWorkflowPacks(VAR, { builtins: [pack], services: {
+    return loadWorkflowPacks(this.project.dir, { builtins: [pack], services: {
       journal: this.journal,
       runAgent: (definition, context) => runAgentStation(this.bindAgent(context.node.key, definition), context),
       callCapability: (name, args, context) => this.toolbox.call([name], name, args, { node: context.node.key, token: context.token.id, caseId: context.token.item, signal: context.signal, progress: context.progress }),
@@ -228,7 +250,7 @@ export class Factory {
     previous.dispose();
     for (const pool of previous.workers.values()) for (const worker of pool) this.journal.append({ kind: 'worker.retired', node: worker.node, worker: worker.id, reason: '流水线包更新，按新规格配员' });
     this.workflowPacks = loaded; this.compiled = compiled;
-    this.project = synchronizeProjectPacks(VAR, loaded.packs.map(entry => entry.id));
+    this.project = synchronizeProjectPacks(this.project.dir, loaded.packs.map(entry => entry.id));
     this.runtime = new Runtime(compiled, this.journal, this.broker, loaded.conditions, previous.executors);
     this.runtime.roleResolver = key => loaded.role(key) ?? readRole(key);
     this.runtime.onTick = () => this.maintainRuntime();
@@ -239,12 +261,16 @@ export class Factory {
   }
 
   private bindAgent(node: string, definition: AgentStationDef): AgentStationDef {
-    const binding = this.state.agentBindings?.[node] ?? definition.agent;
-    return binding ? {...definition, agent: parseAgentBinding(binding)} : definition;
+    const binding = this.state.agentBindings?.[node] ?? definition.agent ?? this.defaultAgentBinding();
+    return {...definition, services: this.stationServices(), agent: this.resolveAgentBinding(binding)};
+  }
+
+  private stationServices() {
+    return {docs: () => this.docs, toolbox: () => this.toolbox};
   }
 
   private captureAgent(node: string, declared?: StationAgentBinding) {
-    const binding = parseAgentBinding(this.state.agentBindings?.[node] ?? declared ?? this.defaultAgentBinding());
+    const binding = this.resolveAgentBinding(this.state.agentBindings?.[node] ?? declared ?? this.defaultAgentBinding());
     if (binding.adapter === 'pi') {
       const piRuntime = models(binding);
       return {
@@ -264,16 +290,44 @@ export class Factory {
   }
 
   private defaultAgentBinding(): StationAgentBinding {
-    const workDirectory = path.join(VAR, 'work');
-    const external = closedAgentConfig(path.join(workDirectory, 'binding-preview'), {
-      projectDirectory: VAR, workDirectory,
-    });
-    if (external) return parseAgentBinding({
-      adapter: external.adapter ?? 'launcher', command: external.command, model: external.model,
-      requestTimeoutMs: external.requestTimeoutMs,
-    });
-    const selection = piSelection();
-    return {adapter: 'pi', provider: selection.provider, model: selection.id};
+    return this.getAgentDefaults().station;
+  }
+
+  private resolveAgentBinding(input: StationAgentBinding): StationAgentBinding {
+    const binding = parseAgentBinding(input);
+    if (binding.adapter !== 'pi') return binding;
+    const defaults = this.getAgentDefaults();
+    const fallback = defaults.station.adapter === 'pi' ? defaults.station : defaults.dispatcher;
+    if (fallback.adapter !== 'pi') throw new ControlError(422, 'explicit_pi_selection_required', '请为 Pi 工位配置明确的供应商和模型');
+    return {...binding, provider: binding.provider ?? fallback.provider, model: binding.model ?? fallback.model};
+  }
+
+  getAgentDefaults(): ProjectAgentDefaults {
+    if (!this.state.agentDefaults) throw new ControlError(409, 'project_not_ready', '项目模型选择尚未初始化');
+    return structuredClone(this.state.agentDefaults);
+  }
+
+  setAgentDefaults(update: {station?: StationAgentBinding; dispatcher?: StationAgentBinding}): ProjectAgentDefaults {
+    if (process.env.FACTORY_READONLY === '1') throw new ControlError(403, 'read_only', '只读项目不能配置 Agent');
+    const defaults = this.getAgentDefaults();
+    for (const key of ['station', 'dispatcher'] as const) {
+      if (!update[key]) continue;
+      let binding = parseAgentBinding(update[key]);
+      if (key === 'dispatcher' && binding.adapter !== 'pi') {
+        throw new ControlError(422, 'unsupported_dispatcher_adapter', '主调度目前支持 Pi；其他客户端尚未接入主调度协议');
+      }
+      if (binding.adapter === 'pi') {
+        const prior = defaults[key].adapter === 'pi' ? defaults[key] : undefined;
+        binding = {...binding, provider: binding.provider ?? prior?.provider, model: binding.model ?? prior?.model};
+        if (!binding.provider || !binding.model) throw new ControlError(422, 'explicit_pi_selection_required', '请选择这个项目明确使用的 Pi 供应商和模型');
+      }
+      defaults[key] = binding;
+    }
+    if (JSON.stringify(defaults) !== JSON.stringify(this.state.agentDefaults)) {
+      this.journal.append({kind: 'agent.defaults', defaults});
+      this.lastPreflight = 0;
+    }
+    return this.getAgentDefaults();
   }
 
   agentBindings(node?: string) {
@@ -298,7 +352,7 @@ export class Factory {
       let effective: StationAgentBinding | null = null;
       let error: string | undefined;
       try {
-        const requested = parseAgentBinding(configured ?? declared.binding ?? this.defaultAgentBinding());
+        const requested = this.resolveAgentBinding(configured ?? declared.binding ?? this.defaultAgentBinding());
         if (requested.adapter === 'pi') {
           const selection = piSelection(requested);
           effective = {adapter: 'pi', provider: selection.provider, model: selection.id};
@@ -339,7 +393,7 @@ export class Factory {
     for (const line of this.compiled.lines.filter(line => !['sources', 'candidates', 'curation'].includes(line.id))) {
       const node = `${line.id}/published`;
       if (this.runtime.nodes.get(node)?.kind !== 'store') continue;
-      const directory = path.join(VAR, 'published', 'business', line.id);
+      const directory = path.join(this.project.dir, 'published', 'business', line.id);
       const stock = fs.existsSync(directory) ? fs.readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.endsWith('.json') && !['index.json', 'atlas.json'].includes(entry.name)).length : 0;
       if (!fs.existsSync(directory)) continue;
       this.runtime.stock.set(node, stock);
@@ -561,15 +615,15 @@ export class Factory {
     // Built-in browser selectors call pickByImages directly and still use Pi.
     // A pure installed Claude workflow must not be blocked by an unused Pi key.
     if (runnable.some(node => node.tool && ['curation.breadth', 'curation.proof'].includes(node.tool))) {
-      const selection = piSelection();
-      selected.push({adapter: 'pi', provider: selection.provider, model: selection.id});
+      const selection = this.defaultAgentBinding();
+      if (selection.adapter === 'pi') selected.push(selection);
     }
     const agents = [...new Map(selected.map(binding => [JSON.stringify(binding), binding])).values()];
     const signature = JSON.stringify({nodes: runnable.map(node => node.key), agents});
     if (!force && this.state.preflight?.ok && signature === this.lastPreflightSignature &&
         Date.now() - this.lastPreflight < 10 * 60_000) return this.state.preflight;
     const configuration = JSON.stringify([this.state.agentBindings, this.state.pausedScopes, this.compiled.digest]);
-    const r = await preflight(VAR, this.broker, {network, model, browser, agents});
+    const r = await preflight(this.project.dir, this.broker, {network, model, browser, agents});
     if (configuration !== JSON.stringify([this.state.agentBindings, this.state.pausedScopes, this.compiled.digest])) {
       throw new ControlError(409, 'agent_configuration_changed', '体检期间工位配置或暂停范围已变化，请按当前配置重新体检');
     }
@@ -998,7 +1052,7 @@ export class Factory {
 
   saveSettings(next: Partial<Settings>) {
     this.settings = { ...this.settings, ...next };
-    fs.writeFileSync(path.join(VAR, "settings.json"), JSON.stringify({ ...this.settings, browserCapV2: true }, null, 2));
+    fs.writeFileSync(path.join(this.project.dir, 'settings.json'), JSON.stringify({ ...this.settings, browserCapV2: true }, null, 2));
     Object.assign(this.broker.limits, { browser: this.settings.browser, model: this.settings.model, cpu: this.settings.cpu, http: this.settings.http });
     this.broker.memoryFloorMB = this.settings.memoryFloorMB;
     this.runtime.schedule();
@@ -1015,7 +1069,7 @@ export class Factory {
     const patch: Patch = { ...p, id: `p-${String(this.patches.length + 1).padStart(4, "0")}`, status: "proposed", at: new Date().toISOString() };
     const trial = compile(this.workflowPacks?.packs ?? [pack], [...this.patches, { ...patch, status: "accepted" }]);
     this.patches.push(patch);
-    fs.writeFileSync(path.join(VAR, "patches.json"), JSON.stringify(this.patches, null, 2));
+    fs.writeFileSync(path.join(this.project.dir, 'patches.json'), JSON.stringify(this.patches, null, 2));
     this.journal.append({ kind: "spec.patched", patch: patch.id, summary: patch.summary, status: "proposed" });
     return { patch, issues: trial.issues, nodes: trial.nodes.length, digest: trial.digest };
   }
@@ -1034,7 +1088,7 @@ export class Factory {
       if (this.runtime.running || this.runtime.paused || this.runtime.ending || [...this.runtime.workers.values()].some((pool) => pool.some((w) => w.busy))) throw new ControlError(409, "run_active", "请先结束本轮并等待在途工人退出，再应用规格补丁");
     }
     p.status = accept ? "accepted" : "rejected";
-    fs.writeFileSync(path.join(VAR, "patches.json"), JSON.stringify(this.patches, null, 2));
+    fs.writeFileSync(path.join(this.project.dir, 'patches.json'), JSON.stringify(this.patches, null, 2));
     this.journal.append({ kind: "spec.patched", patch: id, summary: p.summary, status: p.status });
     if (trial) {
       const previous = this.runtime;

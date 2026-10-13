@@ -128,6 +128,7 @@ let pending: UiEvent[] = [];
 let raf = 0;
 
 function touched(e: Stamped, fs: FactoryState): string[] {
+  if (e.kind === 'agent.defaults') return Object.keys(fs.nodes);
   switch (e.kind) {
     case "token.queued": return [e.node, ...(e.from ? [e.from] : [])];
     case "attempt.started": return [e.node];

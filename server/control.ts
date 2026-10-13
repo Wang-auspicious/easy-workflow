@@ -21,6 +21,10 @@ import { workflowEntry } from './workflow-entry.ts';
 const name = () => Type.String({ minLength: 1, maxLength: 200 });
 const choice = (...values: string[]) => Type.Union(values.map((x) => Type.Literal(x)));
 const object = (properties: Parameters<typeof Type.Object>[0]) => Type.Object(properties, { additionalProperties: false });
+const agentBinding = () => Type.Union([
+  object({adapter: Type.Literal('pi'), provider: Type.Optional(name()), model: Type.Optional(name())}),
+  object({adapter: choice('claude-code', 'launcher'), command: Type.Array(Type.String({minLength: 1, maxLength: 4000}), {minItems: 1, maxItems: 32}), model: name(), requestTimeoutMs: Type.Optional(Type.Integer({minimum: 1, maximum: 900000}))}),
+]);
 const patchOp = Type.Union([
   object({ op: Type.Literal("set"), station: name(), field: choice("workers.min", "workers.max", "workers.initial", "workers.policy", "estimateSeconds", "dormant", "name", "blurb"), value: Type.Unknown() }),
   object({ op: Type.Literal("add-station"), line: name(), after: name(), before: Type.Optional(name()), station: object({
@@ -78,6 +82,21 @@ function definitions(f: Factory): Tool[] {
     const files = () => Type.Record(Type.String(), Type.String());
     return [
       {
+        name: 'agent_defaults', label: '项目 Agent 默认配置',
+        description: 'Read this project\'s independently saved station and dispatcher selections. External Pi windows cannot change these selections. Per-station overrides are available through agent_bindings.',
+        parameters: object({}),
+        execute: async () => ok(f.getAgentDefaults(), '读取项目 Agent 默认配置'),
+      },
+      {
+        name: 'set_agent_defaults', label: '设置项目 Agent 默认配置',
+        description: 'User-only project station and dispatcher defaults. Omitted sections stay unchanged. Changes apply to the next station attempt or dispatcher turn; active executions keep their captured selection. The dispatcher currently supports Pi.',
+        parameters: Type.Object({station: Type.Optional(agentBinding()), dispatcher: Type.Optional(agentBinding())}, {additionalProperties: false, minProperties: 1}),
+        execute: async (_id, parameters, actor) => {
+          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '项目模型与主调度模型由用户选择，Agent 不能自行更换');
+          return ok(f.setAgentDefaults(parameters), '已保存项目 Agent 默认配置，下次执行生效');
+        },
+      },
+      {
         name: 'agent_bindings', label: '工位 Agent 配置',
         description: 'Read configured and effective per-station adapters and their capability boundaries. A program station returns no bindings. Actual model is reported separately from the requested model.',
         parameters: object({node: Type.Optional(name())}),
@@ -85,12 +104,8 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'set_agent_binding', label: '设置工位 Agent',
-        description: 'User-only per-station adapter selection. Changes apply to the next attempt. A null binding restores the workflow or project environment default. Credentials and tool scope remain host-managed.',
-        parameters: object({node: name(), binding: Type.Union([
-          Type.Null(),
-          object({adapter: Type.Literal('pi'), provider: Type.Optional(name()), model: Type.Optional(name())}),
-          object({adapter: choice('claude-code', 'launcher'), command: Type.Array(Type.String({minLength: 1, maxLength: 4000}), {minItems: 1, maxItems: 32}), model: name(), requestTimeoutMs: Type.Optional(Type.Integer({minimum: 1, maximum: 900000}))}),
-        ])}),
+        description: 'User-only per-station adapter selection. Changes apply to the next attempt. A null binding restores the workflow or saved project default. Credentials and tool scope remain host-managed.',
+        parameters: object({node: name(), binding: Type.Union([Type.Null(), agentBinding()])}),
         execute: async (_id, parameters, actor) => {
           if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '工位 Agent 配置由用户选择，不能由执行中的 Agent 自行更换');
           return ok(f.setAgentBinding(parameters.node, parameters.binding), parameters.binding ? '已保存工位 Agent 配置，下次尝试生效' : '已恢复继承默认 Agent，下次尝试生效');
@@ -461,7 +476,7 @@ function definitions(f: Factory): Tool[] {
     ];
   }
 
-const READS = new Set(["agent_bindings", "source_list", "workflow_templates", "status", "inspect", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
+const READS = new Set(["agent_defaults", "agent_bindings", "source_list", "workflow_templates", "status", "inspect", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
 
 export class FactoryControl {
   private f: Factory;
@@ -469,7 +484,9 @@ export class FactoryControl {
   constructor(f: Factory) {
     this.f = f;
     this.tools = definitions(f);
-    for (const t of this.tools) t.parameters = Type.Object(t.parameters.properties, { additionalProperties: false });
+    for (const tool of this.tools) {
+      tool.parameters = Type.Object(tool.parameters.properties, {...tool.parameters, additionalProperties: false});
+    }
   }
 
   manifest() {
@@ -491,7 +508,8 @@ export class FactoryControl {
     const revision = `easy-workflow-v1:${this.f.compiled.digest}`;
     const readOnly = process.env.FACTORY_READONLY === "1";
     return {
-      product: "Easy Workflow", protocol: CONTROL_PROTOCOL, revision, readOnly, model: piStatus(),
+      product: "Easy Workflow", protocol: CONTROL_PROTOCOL, revision, readOnly,
+      model: piStatus(this.f.getAgentDefaults().dispatcher), agentDefaults: this.f.getAgentDefaults(),
       instructions: `Easy Workflow 是可直接调用的流水线服务。无需浏览界面、读源码或通读 Spec。\n` +
         `先用 easy_workflow_help 获取能力索引；只为当前任务读取 easy_workflow_help({name}) 的参数，再以 easy_workflow_call({name,arguments}) 调用。客户端若只提供兼容入口，使用它已注册的工具名。read_role({station}) 读取一个节点的 ROLE.md 和异常处理边界。\n` +
         `查询：status 看状态，inspect 查任务/工位/证据，read_case 看一件货的案卷，read_context 看节点 CONTEXT，alerts 看红灯与开跑体检，read_report 看报告，browser 查共享网页/登录提醒及操作标签。给某个节点留长期指示用 note_context。开跑、恢复、投料前会自动体检，体检不过返回 412 和要修的项目。调度：feed_urls/pull_candidates 投料，run_control 启停，workers 配人，correct 纠错。规格：read_spec 按需读，propose_patch 起草，decide_patch 按用户决定接受或拒绝。settings 读写配额。\n` +

@@ -36,6 +36,10 @@ export async function closeNetwork() { const t = transport; transport = undefine
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36";
 let cacheDir: string | null = null;
+const projectCache = new AsyncLocalStorage<{directory: string | null}>();
+export function withNetworkCache<T>(directory: string | null, run: () => Promise<T>): Promise<T> {
+  return projectCache.run({directory}, run);
+}
 let defaultTtl = 6 * 3600_000;
 export function configureNetwork(opts: { cacheDir?: string | null; ttlMs?: number }) {
   if (opts.cacheDir !== undefined) cacheDir = opts.cacheDir;
@@ -86,7 +90,9 @@ export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?
   // Different representations cannot share a cache entry. Authenticated content
   // stays out of the project cache, even when the URL also has a public response.
   const key = crypto.createHash("sha256").update(JSON.stringify([url, [...headers].sort()])).digest("hex");
-  const file = cacheDir && opts.cache !== false && !headers.has('authorization') && !headers.has('cookie') ? path.join(cacheDir, key.slice(0, 2), `${key}.json`) : null;
+  const scope = projectCache.getStore();
+  const directory = scope ? scope.directory : cacheDir;
+  const file = directory && opts.cache !== false && !headers.has('authorization') && !headers.has('cookie') ? path.join(directory, key.slice(0, 2), `${key}.json`) : null;
   const ttl = opts.ttlMs ?? defaultTtl;
   if (file) {
     try {
