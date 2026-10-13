@@ -5,7 +5,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { closeNetwork, configureNetwork, webGet } from '../server/network.ts';
+import { closeNetwork, configureNetwork, webGet, withEvidenceReads, rememberRead, readEvidence, readText } from '../server/network.ts';
+
+test('evidence identity keeps SPA hash routes separate while accepting section anchors', async () => {
+  await withEvidenceReads(async () => {
+    rememberRead('https://fixture.test/#/components/button', 'Button route evidence');
+    rememberRead('https://fixture.test/#/components/dialog', 'Dialog route evidence');
+    rememberRead('https://fixture.test/#!/pricing', 'Pricing route evidence');
+    rememberRead('https://fixture.test/docs#overview', 'Documentation evidence');
+    assert.deepEqual(readEvidence('https://fixture.test/#/components/button').map(page => page.text), ['Button route evidence']);
+    assert.deepEqual(readEvidence('https://fixture.test/#!/pricing').map(page => page.text), ['Pricing route evidence']);
+    assert.equal(readEvidence('https://fixture.test/').length, 0);
+    assert.equal(readEvidence('https://fixture.test/docs#usage')[0].text, 'Documentation evidence');
+    assert.equal(readText('https://fixture.test/#/components/button'), 'Button route evidence');
+  });
+});
 
 test('HTTP admission, backoff and cache respect cancellation and request identity', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-network-'));

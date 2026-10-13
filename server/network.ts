@@ -133,7 +133,15 @@ const reads = new Map<string, string>();
 // Validation must use this attempt's evidence, not another worker's last read of
 // the same URL. Keep all versions: a short follow-up must not erase a full page.
 const evidenceReads = new AsyncLocalStorage<{ url: string; text: string }[]>();
-export const evidenceURL = (url: string) => url.replace(/[#].*$/, "").replace(/\/+$/, "");
+export function evidenceURL(url: string) {
+  try {
+    const parsed = new URL(url);
+    // #/ and #! select actual SPA documents. Only in-page section anchors may
+    // share evidence; a quote from another route cannot substantiate this page.
+    if (!/^#(?:\/|!)/.test(parsed.hash)) parsed.hash = '';
+    return parsed.origin + parsed.pathname.replace(/\/+$/, '') + parsed.search + parsed.hash;
+  } catch { return url; }
+}
 export const withEvidenceReads = <T>(run: () => Promise<T>) => evidenceReads.run([], run);
 export const readEvidence = (url?: string) => (evidenceReads.getStore() ?? []).filter(p => !url || evidenceURL(p.url) === evidenceURL(url));
 export function rememberRead(url: string, text: string) {
@@ -143,7 +151,7 @@ export function rememberRead(url: string, text: string) {
   reads.delete(key); reads.set(key, text.slice(0, 60000));
   while (reads.size > 400) reads.delete(reads.keys().next().value!);
 }
-export function readText(url: string) { return reads.get(url.replace(/[#].*$/, "").replace(/\/+$/, "")); }
+export function readText(url: string) { return reads.get(evidenceURL(url)); }
 
 /** A site that fails through the proxy is tried once directly, only to say which path is
  *  broken. Stations never switch to the direct path on their own (one network exit). */

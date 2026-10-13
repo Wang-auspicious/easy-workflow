@@ -46,6 +46,9 @@ test('arbitration binds its entire quote to the actual source page, including re
     rememberRead('https://site.example/detail?variant=one', 'One rendered component, ready to copy.');
     assert.deepEqual(arbiter.check!({ ...answer, quote: 'One rendered component, ready to copy.', sourceUrl: 'https://site.example/detail?variant=one' }, ctx), []);
     assert.ok(arbiter.check!({ ...answer, quote: 'One rendered component, ready to copy.', sourceUrl: 'https://site.example/detail?variant=two' }, ctx).length);
+    rememberRead('https://site.example/#/components', 'A component-specific routed page.');
+    assert.deepEqual(arbiter.check!({ ...answer, quote: 'A component-specific routed page.', sourceUrl: 'https://site.example/#/components' }, ctx), []);
+    assert.ok(arbiter.check!({ ...answer, quote: 'A component-specific routed page.', sourceUrl: 'https://site.example/#/pricing' }, ctx).length, 'a SPA route is a separate source page');
     assert.deepEqual(arbiter.check!({ ...answer, kind: '', sourceUrl: '' }, ctx), [], 'uncertainty may still be sent to a human');
   });
 });
@@ -62,6 +65,11 @@ test('fact repair reuses the persisted cited text instead of invalidating unrela
     assert.deepEqual(facts.check!(out, ctx), []);
     const result = await facts.after(out, ctx, { rounds: 1, issues: [] });
     assert.ok((result.data!.factPages as { text: string }[]).some(page => page.text === text));
+    rememberRead('https://site.example/#!/license', quote);
+    out.license.sourceUrl = 'https://site.example/#!/license';
+    assert.deepEqual(facts.check!(out, ctx), []);
+    out.license.sourceUrl = 'https://site.example/#!/pricing';
+    assert.ok(facts.check!(out, ctx).length, 'a fact cannot cite a different SPA route from the one read');
   });
 });
 
