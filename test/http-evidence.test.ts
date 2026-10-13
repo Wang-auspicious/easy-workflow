@@ -5,8 +5,61 @@ import os from "node:os";
 import path from "node:path";
 import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import crypto from 'node:crypto';
+import {EvidenceStore} from '../server/evidence.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+test('content-addressed evidence repairs an interrupted file and preserves the damaged bytes for audit', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-evidence-repair-'));
+  try {
+    const store = new EvidenceStore(dir);
+    const content = Buffer.from('Complete immutable evidence bytes');
+    const hash = crypto.createHash('sha256').update(content).digest('hex');
+    const file = path.join(dir, hash.slice(0, 2), `${hash}.json`);
+    fs.mkdirSync(path.dirname(file));
+    fs.writeFileSync(file, content.subarray(0, 6));
+    const saved = store.put(content, 'json');
+    assert.equal(saved.file, file);
+    assert.deepEqual(fs.readFileSync(file), content);
+    const quarantine = fs.readdirSync(path.dirname(file)).find(name => name.includes('.corrupt-'));
+    assert.ok(quarantine);
+    assert.deepEqual(fs.readFileSync(path.join(path.dirname(file), quarantine)), content.subarray(0, 6));
+    const before = fs.statSync(file).mtimeMs;
+    assert.equal(store.put(content, 'json').src, saved.src);
+    assert.equal(fs.statSync(file).mtimeMs, before, 'valid immutable bytes are reused');
+    assert.equal(fs.readdirSync(path.dirname(file)).filter(name => name.endsWith('.tmp')).length, 0);
+  } finally {
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+test('failed evidence replacement preserves the previous file and never returns a partial artifact', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-evidence-disk-'));
+  try {
+    const store = new EvidenceStore(dir);
+    const content = Buffer.from('A complete evidence artifact');
+    const stored = store.put(content, 'txt');
+    const damaged = Buffer.alloc(content.length, 0);
+    fs.writeFileSync(stored.file, damaged);
+    const rename = fs.renameSync;
+    const fault = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+      if (String(from).endsWith('.tmp')) throw new Error('Fixture disk replacement failed');
+      return rename(from, to);
+    });
+    assert.throws(() => store.put(content, 'txt'), /disk replacement failed/);
+    assert.deepEqual(fs.readFileSync(stored.file), damaged);
+    assert.equal(fs.readdirSync(path.dirname(stored.file)).filter(name => name.endsWith('.tmp')).length, 0);
+    fault.mock.restore();
+    assert.equal(store.put(content, 'txt').src, stored.src);
+    assert.deepEqual(fs.readFileSync(stored.file), content);
+    assert.throws(() => store.put(content, '../escape'), /extension/);
+  } finally {
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
 
 test("evidence video seeking handles suffix, open and unsatisfiable ranges without breaking the server", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easy-workflow-media-"));

@@ -14,11 +14,62 @@ export class EvidenceStore {
   /** Writes bytes once; returns the sha256 and the served path. */
   put(buf: Buffer, ext: string): { sha: string; src: string; file: string } {
     if (this.readOnly) throw new Error("Evidence store is read-only");
-    const sha = crypto.createHash("sha256").update(buf).digest("hex");
+    if (!/^[a-z0-9]{1,12}$/.test(ext)) throw new Error('Invalid evidence extension');
+    const sha = crypto.createHash('sha256').update(buf).digest('hex');
     const dir = path.join(this.root, sha.slice(0, 2));
     const file = path.join(dir, `${sha}.${ext}`);
-    if (!fs.existsSync(file)) { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, buf); }
+    fs.mkdirSync(dir, {recursive: true});
+    if (fs.lstatSync(dir).isSymbolicLink()) throw new Error('Evidence directory must not be a link');
+    let damaged = false;
+    if (fs.existsSync(file)) {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Evidence path must be a regular file');
+      if (stat.size === buf.length && this.fileDigest(file) === sha) {
+        return {sha, src: `/evidence/${sha.slice(0, 2)}/${sha}.${ext}`, file};
+      }
+      damaged = true;
+    }
+
+    const id = crypto.randomUUID();
+    const temporary = path.join(dir, `.${sha}.${ext}.${id}.tmp`);
+    const quarantine = path.join(dir, `.${sha}.${ext}.corrupt-${id}`);
+    let quarantined = false;
+    let ownsTemporary = false;
+    try {
+      const descriptor = fs.openSync(temporary, 'wx', 0o600);
+      ownsTemporary = true;
+      try {
+        fs.writeFileSync(descriptor, buf);
+        fs.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      if (damaged) {
+        fs.renameSync(file, quarantine);
+        quarantined = true;
+      }
+      fs.renameSync(temporary, file);
+      ownsTemporary = false;
+    } catch (error) {
+      if (quarantined && !fs.existsSync(file)) fs.renameSync(quarantine, file);
+      throw error;
+    } finally {
+      if (ownsTemporary) fs.unlinkSync(temporary);
+    }
     return { sha, src: `/evidence/${sha.slice(0, 2)}/${sha}.${ext}`, file };
+  }
+
+  private fileDigest(file: string): string {
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const descriptor = fs.openSync(file, 'r');
+    try {
+      let size: number;
+      while ((size = fs.readSync(descriptor, buffer)) > 0) hash.update(buffer.subarray(0, size));
+      return hash.digest('hex');
+    } finally {
+      fs.closeSync(descriptor);
+    }
   }
 
   resolve(served: string): string | null {
