@@ -1,6 +1,7 @@
 import type { Factory } from './factory.ts';
-import { batchSummary, latestBatchTokens, type BatchGoal, type BatchRecovery } from '../shared/batch.ts';
+import { batchSummary, latestBatchTokens, modelRecoveryDelay, type BatchGoal, type BatchRecovery } from '../shared/batch.ts';
 import { ControlError } from './errors.ts';
+import { classifyFailure } from '../shared/failures.ts';
 
 const TRANSIENT = new Set(['network_timeout', 'network_connection', 'network_dns', 'http_server', 'http_rate_limit', 'browser_capture', 'http_forbidden']);
 const REPLAN = new Set(['needs_selection', 'page_unavailable', 'quality_rejected']);
@@ -15,7 +16,7 @@ export class BatchSupervisor {
     factory.journal.subscribe(event => {
       if (factory.importing) return;
       const circuit = factory.state.batch?.modelCircuit;
-      if (event.kind === 'attempt.finished' && event.ok && circuit?.state === 'trial') {
+      if (event.kind === 'attempt.finished' && event.ok && !event.cancelled && !['stale', 'restart'].includes(event.error ?? '') && circuit?.state === 'trial') {
         const attempt = factory.state.attempts[event.attempt];
         if (attempt?.token === circuit.trialToken && attempt.node === circuit.station) this.modelRecovered();
       }
@@ -43,7 +44,21 @@ export class BatchSupervisor {
     const failures = (old?.failures ?? 0) + 1;
     f.broker.recoveryToken = null;
     f.journal.append({ kind: 'batch.configured', batch: { ...goal, modelCircuit: {
-      state: 'open', failures, nextAt: failures <= 3 ? Date.now() + 30000 * 2 ** (failures - 1) : 0,
+      state: 'open', failures, nextAt: Date.now() + modelRecoveryDelay(failures),
+    } } });
+  }
+
+  /** Restore deadlines without a restart shortening a long outage's cooldown. */
+  restoreModelCircuit(now = Date.now()) {
+    const f = this.factory, goal = f.state.batch, circuit = goal?.modelCircuit;
+    if (!goal || goal.runId !== f.state.run.id || !circuit) return;
+    const blocked = Object.values(f.state.alerts).some(alert => alert.kind === 'model' && alert.id !== 'model-transport');
+    const transport = Object.values(f.state.recoveries).some(candidate => candidate.failure?.tag === 'model_transport' && classifyFailure(candidate.failure.message, { stage: 'model', status: candidate.failure.status }).tag !== 'model_unavailable');
+    if (circuit.state === 'open' && (circuit.nextAt > 0 || blocked || !transport)) return;
+    const pending = circuit.trialToken && f.state.tokens[circuit.trialToken]?.status === 'active' ? circuit.trialToken : undefined;
+    f.journal.append({ kind: 'batch.configured', batch: { ...goal, modelCircuit: {
+      ...circuit, state: 'open', trialToken: pending,
+      nextAt: circuit.state === 'trial' ? Math.max(circuit.nextAt, now + modelRecoveryDelay(circuit.failures)) : now + modelRecoveryDelay(4),
     } } });
   }
 
@@ -118,8 +133,21 @@ export class BatchSupervisor {
         const circuit = goal.modelCircuit;
         if (circuit.state === 'trial' || !circuit.nextAt || now < circuit.nextAt || f.broker.used.model > 0) return;
         if (Object.values(f.state.alerts).some(a => a.kind === 'model' && a.id !== 'model-transport')) return;
-        const candidate = recoveryOrder.find(t => t.status === 'parked' && f.state.recoveries[t.item]?.failure?.tag === 'model_transport');
+        const pending = circuit.trialToken ? f.state.tokens[circuit.trialToken] : undefined;
+        if (pending?.status === 'active') {
+          const node = circuit.station && f.runtime.nodes.get(circuit.station);
+          if (!node || f.runtime.scopePaused(node.key)) return;
+          f.broker.recoveryToken = pending.id; f.broker.modelHold = null;
+          f.journal.append({ kind: 'batch.configured', batch: { ...goal, modelCircuit: { ...circuit, state: 'trial' } } });
+          f.runtime.schedule(); return;
+        }
+        const candidate = recoveryOrder.find(t => {
+          const recovery = f.state.recoveries[t.item], failure = recovery?.failure;
+          return t.status === 'parked' && recovery?.token === t.id && recovery.disposition === 'retry' && failure?.tag === 'model_transport' && classifyFailure(failure.message, { stage: 'model', status: failure.status }).tag !== 'model_unavailable';
+        });
         if (!candidate) return;
+        const node = candidate.finishedAtNode && f.runtime.nodes.get(candidate.finishedAtNode);
+        if (!node || f.runtime.scopePaused(node.key)) return;
         // Hold all newly scheduled tasks until retryCandidates returns the new
         // token ID. Existing requests drain naturally and keep their results.
         f.broker.recoveryToken = 'pending-model-trial';

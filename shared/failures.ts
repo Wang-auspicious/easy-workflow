@@ -50,7 +50,8 @@ export function classifyFailure(error:unknown, context:{url?:string;requestedUrl
   const text=`${code??""} ${message} ${e?.cause?.message??""}`;
   const status=context.status??(Number(text.match(/(?:HTTP|httpError:)[ :]*(\d{3})/i)?.[1]??0)||undefined);
   let tag:FailureTag="tool_error",category:Failure["category"]="system";
-  if(context.stage==="model"&&/401|403|quota|insufficient|credit|balance|unauthori[sz]ed|api key|余额|额度/i.test(text)){tag="model_unavailable";category="auth";}
+  if (context.stage === 'model' && isTlsFailure(error)) return withAdvice({ tag: 'model_unavailable', category: 'auth', message, url: context.url, requestedUrl: context.requestedUrl, code, status, retryable: true, owner: 'user', nextAction: '模型连接的 TLS / 证书校验失败：已暂停模型任务；先修复证书或代理配置，再确认恢复。不会忽略证书校验或自动重复请求。' });
+  if(context.stage==="model"&&([401,402,403].includes(status??0)||/401|403|quota|insufficient|credit|balance|unauthori[sz]ed|api key|余额|额度/i.test(text))){tag="model_unavailable";category="auth";}
   else if(context.stage==="model"&&/MODEL_CIRCUIT_OPEN|timeout|timed?[ _]?out|超时|ECONN|ENOTFOUND|EAI_AGAIN|CERT_|ERR_(?:SSL|TLS)_|fetch failed|connection error|socket|terminated|overloaded|temporarily|rate.?limit|\b429\b|\b50[0-9]\b/i.test(text)){tag="model_transport";category="system";}
   else if(context.stage==="url"||/invalid url|无法解析.*网址/i.test(text)){tag="invalid_url";category="invalid";}
   else if(status===404||status===410){tag="http_not_found";category="invalid";}

@@ -126,10 +126,7 @@ export class Factory {
       if(failure.tag!=="tool_error")this.journal.append({kind:"candidate.disposition",candidate:{...c,failure}});
     }
     this.reconcileFailureAlerts();
-    if (this.state.batch?.modelCircuit) {
-      const batch = this.state.batch;
-      this.journal.append({ kind: 'batch.configured', batch: { ...batch, modelCircuit: { ...batch.modelCircuit!, state: 'open', trialToken: undefined, nextAt: batch.modelCircuit!.nextAt ? Date.now() + 30000 : 0 } } });
-    }
+    this.batch.restoreModelCircuit();
     this.broker.modelHold = Object.values(this.state.alerts).find(a => a.kind === 'model')?.message ?? null;
     this.restore();
     this.reconcileManualStock();
@@ -436,6 +433,12 @@ export class Factory {
   }
 
   private recordRecovery(token:Pick<TokenRun,"id"|"item"|"url"|"title"|"source">,failure:Failure) {
+    // Channel children are independent jobs. Their failure must never overwrite
+    // the website parent's recovery record or add fictitious candidate stock.
+    if(this.state.tokens[token.id]?.data.channelDelivery||token.source.startsWith('channel:')){
+      if(!this.state.tokens[token.id]?.data.failure)this.journal.append({kind:'token.data',token:token.id,patch:{failure}});
+      return;
+    }
     const previous=this.state.recoveries[token.item],disposition=failure.retryable?"retry":"removed";
     if(previous?.token===token.id&&previous.disposition===disposition)return;
     if(!this.state.tokens[token.id]?.data.failure)this.journal.append({kind:"token.data",token:token.id,patch:{failure}});
@@ -450,6 +453,7 @@ export class Factory {
     // paths once, without rewriting evidence or rerunning paid model work.
     const latest = new Map(Object.values(this.state.tokens).sort((a,b)=>a.createdAt-b.createdAt).map(t=>[t.item,t]));
     for(const token of latest.values()) {
+      if(token.data.channelDelivery||token.source.startsWith('channel:'))continue;
       if(this.state.recoveries[token.item]||!["rejected","manual","parked"].includes(token.status))continue;
       const attempts=token.attempts.map(id=>this.state.attempts[id]).filter(Boolean);
       const failed=[...attempts].reverse().find(a=>a.ok===false||/^打不开[：:]|^HTTP [45]\d\d/.test(a.summary??""));

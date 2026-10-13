@@ -186,6 +186,8 @@ export interface ChannelDelivery {
   url: string; title?: string; data: Record<string, unknown>;
   status: 'pending' | 'delivered' | 'acknowledged' | 'blocked' | 'failed';
   targetToken?: string; attempts: number; reason?: string;
+  emissions?: number[];
+  inventory?: { node: string; held: boolean };
 }
 export interface SourceSpec {
   id: string; name: string; url: string; platform: string; format: 'rss' | 'json' | 'browser';

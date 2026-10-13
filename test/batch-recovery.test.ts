@@ -120,16 +120,18 @@ test('a shared provider outage stops intake and recovers one real checkpoint bef
   } finally {await close(factory);fs.rmSync(dir,{recursive:true,force:true});}
 });
 
-test('persistent provider failures stop after three real trials without exhausting site repair budgets', async () => {
+test('persistent provider failures enter a slow single-site probe schedule without exhausting site repair budgets', async () => {
   const factory=new Factory();
   try {
     await factory.boot(); factory.catalog=catalog(10);
     factory.runtime.executors=()=>async()=>({ok:false,summary:'模型调用失败',failure:{tag:'model_transport',category:'system',message:'Request timed out.',retryable:true,owner:'system'}});
     factory.batch.configure({target:10,maxInFlight:4,intakeWindow:1}); await factory.runtime.settle();
-    for(let i=0;i<6;i++){factory.batch.pump(Date.now()+3600000);await factory.runtime.settle();}
+    for(let i=0;i<3;i++){factory.batch.pump(factory.state.batch!.modelCircuit!.nextAt);await factory.runtime.settle();}
     assert.equal(batchSummary(factory.state)!.admitted,1);
     assert.equal(factory.runtime.tokens.size,4);
-    assert.equal(factory.state.batch!.modelCircuit?.nextAt,0);
+    assert.ok(factory.state.batch!.modelCircuit!.nextAt >= Date.now() + 14 * 60 * 1000);
+    factory.batch.pump(factory.state.batch!.modelCircuit!.nextAt - 1); await factory.runtime.settle();
+    assert.equal(factory.runtime.tokens.size,4,'the fifteen-minute cooldown cannot create more trials early');
     assert.ok(Object.values(factory.state.tokens).every(t=>!t.data.batchRecovery));
     assert.ok(factory.broker.modelHold);
   } finally {await close(factory);fs.rmSync(dir,{recursive:true,force:true});}

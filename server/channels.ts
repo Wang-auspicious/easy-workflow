@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { ChannelDelivery, Stamped } from '../shared/types.ts';
 import type { Factory } from './factory.ts';
+import type { TokenRun } from './runtime.ts';
 import { ControlError } from './errors.ts';
 
 type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks'>;
@@ -15,42 +16,83 @@ function deliveryId(channel: string, token: string, data: Record<string, unknown
 export class ChannelSupervisor {
   private f: Host;
   private deliveries = new Map<string, ChannelDelivery>();
+  private tokenData = new Map<string, Record<string, unknown>>();
+  private snapshots = new Map<number, Record<string, unknown>>();
+  private tokensByDelivery = new Map<string, Set<string>>();
+  private deliveryByToken = new Map<string, string>();
   private unsubscribe: () => void;
   private scheduled = false;
   private closed = false;
   constructor(factory: Host) {
     this.f = factory;
-    const tokenData = new Map<string, Record<string, unknown>>(), emissions: { event: Extract<Stamped, { kind: 'channel.emitted' }>; data: Record<string, unknown> }[] = [];
+    const emissions: Extract<Stamped, { kind: 'channel.emitted' }>[] = [];
     for (const event of factory.journal.read()) {
-      if (event.kind === 'token.data') tokenData.set(event.token, { ...tokenData.get(event.token), ...structuredClone(event.patch) });
-      if (event.kind === 'channel.delivery') this.deliveries.set(event.delivery.id, event.delivery);
-      if (event.kind === 'channel.emitted') emissions.push({ event, data: channelPayload(tokenData.get(event.token) ?? {}) });
+      this.project(event);
+      if (event.kind === 'channel.emitted') emissions.push(event);
     }
-    this.unsubscribe = process.env.FACTORY_READONLY === '1' ? () => {} : factory.journal.subscribe(event => this.observe(event));
-    if (process.env.FACTORY_READONLY === '1') return;
+    this.unsubscribe = () => {};
+    if (process.env.FACTORY_READONLY === '1') { this.snapshots.clear(); return; }
+    const projection = factory.journal.subscribeProjection(event => this.project(event));
+    const consumer = factory.journal.subscribe(event => this.observe(event));
+    this.unsubscribe = () => { projection(); consumer(); };
     // Recover a crash after emission but before its consumer recorded a delivery.
-    for (const { event, data } of emissions) this.receive(event, data, true);
-    for (const delivery of this.deliveries.values()) if (delivery.targetToken) this.acknowledge(delivery.targetToken);
+    for (const event of emissions) this.receive(event);
+    for (const delivery of this.deliveries.values()) {
+      this.adoptCreated(delivery);
+      const current = this.deliveries.get(delivery.id)!;
+      if (current.targetToken) this.acknowledge(current.targetToken);
+    }
     for (const token of Object.values(factory.state.tokens)) if (token.status === 'published') this.continueComponents(token.id);
     this.schedule();
   }
+  /** Projections run for the complete committed batch before any consumer. This
+   * keeps nested emissions deduplicated and captures data at the emission seq. */
+  private project(event: Stamped) {
+    if (event.kind === 'token.data') {
+      this.tokenData.set(event.token, { ...this.tokenData.get(event.token), ...event.patch });
+      if (typeof event.patch.channelDelivery === 'string') this.bindToken(event.patch.channelDelivery, event.token);
+    }
+    if (event.kind === 'channel.emitted') this.snapshots.set(event.seq, channelPayload(this.tokenData.get(event.token) ?? {}));
+    if (event.kind === 'channel.delivery') {
+      this.deliveries.set(event.delivery.id, event.delivery);
+      if (event.delivery.targetToken) this.bindToken(event.delivery.id, event.delivery.targetToken);
+    }
+  }
+  private bindToken(delivery: string, token: string) {
+    this.deliveryByToken.set(token, delivery);
+    const tokens = this.tokensByDelivery.get(delivery) ?? new Set<string>(); tokens.add(token); this.tokensByDelivery.set(delivery, tokens);
+  }
   status() { return [...this.deliveries.values()].map(delivery => structuredClone(delivery)); }
   private append(delivery: ChannelDelivery) { this.f.journal.append({ kind: 'channel.delivery', delivery: structuredClone(delivery) }); }
-  private receive(event: Extract<Stamped, { kind: 'channel.emitted' }>, data = channelPayload(this.f.state.tokens[event.token]?.data ?? {}), historical = false) {
+  private reservation(delivery: ChannelDelivery) {
+    return delivery.inventory ?? { node: delivery.target, held: ['pending', 'blocked'].includes(delivery.status) && !delivery.targetToken && this.f.runtime.nodes.get(delivery.target)?.kind === 'store' };
+  }
+  private receive(event: Extract<Stamped, { kind: 'channel.emitted' }>) {
+    const data = this.snapshots.get(event.seq);
+    this.snapshots.delete(event.seq);
+    if (!data) return;
     const id = deliveryId(event.channel, event.token, data);
-    if (this.deliveries.has(id)) return;
+    const previous = this.deliveries.get(id);
+    if (previous?.emissions?.includes(event.seq)) return;
     const channel = this.f.compiled.channels.find(channel => channel.id === event.channel), token = this.f.state.tokens[event.token];
     const target = channel ? `${channel.to.line}/${channel.to.station}` : '';
     this.f.runtime.atomicTransition(() => {
-      this.append({ id, channel: event.channel, sourceToken: event.token, target, item: event.item, url: token?.url ?? '', title: token?.title, data, attempts: 0, status: target ? 'pending' : 'blocked', ...(target ? {} : { reason: '信道定义当前不可用，保留原始投递等待修复' }) });
-      if (event.inventory === 'consumer' && this.f.runtime.nodes.get(target)?.kind === 'store') this.f.runtime.stockDelta(target, 1, '信道已持久排队，等待下游领取');
+      if (previous) {
+        // Old emitters added one stock unit for EVERY emission. A duplicate
+        // payload has only one consumer; remove its extra unit once, durably.
+        if (!event.inventory && previous.emissions?.length && this.f.runtime.nodes.get(target)?.kind === 'store') this.f.runtime.stockDelta(target, -1, '旧信道重复事件去重，回收多记库存');
+        this.append({ ...previous, emissions: [...(previous.emissions ?? []), event.seq], inventory: this.reservation(previous) });
+        return;
+      }
+      const held = this.f.runtime.nodes.get(target)?.kind === 'store';
+      if (event.inventory === 'consumer' && held) this.f.runtime.stockDelta(target, 1, '信道已持久排队，等待下游领取');
+      this.append({ id, channel: event.channel, sourceToken: event.token, target, item: event.item, url: token?.url ?? '', title: token?.title, data, attempts: 0, emissions: [event.seq], inventory: { node: target, held }, status: target ? 'pending' : 'blocked', ...(target ? {} : { reason: '信道定义当前不可用，保留原始投递等待修复' }) });
     });
   }
   private observe(event: Stamped) {
     if (this.closed) return;
     if (event.kind === 'channel.emitted') this.receive(event);
     if (event.kind === 'channel.delivery') {
-      this.deliveries.set(event.delivery.id, event.delivery);
       if (event.delivery.targetToken) this.acknowledge(event.delivery.targetToken);
     }
     if (event.kind === 'token.finished') { this.acknowledge(event.token); if (event.status === 'published') this.continueComponents(event.token); }
@@ -70,31 +112,68 @@ export class ChannelSupervisor {
       componentLimit: token.data.componentLimit ?? 20, componentRootToken: root, componentSourceItem: sourceItem,
       parentToken: token.id, input: { ...(token.data.input && typeof token.data.input === 'object' ? channelPayload(token.data.input as Record<string, unknown>) : {}), componentCursor: cursor },
     };
-    this.append({ id, channel: 'components.continuation', sourceToken: token.id, target: 'components/discover', item: `${sourceItem}#components-${cursor}`, url: token.url, title: token.title, data, attempts: 0, status: 'pending' });
+    this.f.runtime.atomicTransition(() => this.append({ id, channel: 'components.continuation', sourceToken: token.id, target: 'components/discover', item: `${sourceItem}#components-${cursor}`, url: token.url, title: token.title, data, attempts: 0, status: 'pending', inventory: { node: 'components/discover', held: false } }));
   }
   private acknowledge(tokenId: string) {
     const token = this.f.state.tokens[tokenId]; if (!token || token.status === 'active') return;
-    for (const delivery of this.deliveries.values()) {
-      if (!delivery.targetToken || delivery.status === 'acknowledged') continue;
+    const id = this.deliveryByToken.get(tokenId), delivery = id && this.deliveries.get(id);
+    if (delivery) {
+      if (!delivery.targetToken || !['delivered', 'failed'].includes(delivery.status)) return;
       let current: typeof token | undefined = token;
       const visited = new Set<string>();
       while (current && current.id !== delivery.targetToken && !visited.has(current.id)) { visited.add(current.id); current = this.f.state.tokens[String(current.data.retryOf ?? '')]; }
-      if (!current || current.id !== delivery.targetToken) continue;
+      if (!current || current.id !== delivery.targetToken) return;
       const status = token.status === 'published' || token.status === 'merged' ? 'acknowledged' : 'failed';
-      if (delivery.status === status && delivery.targetToken === tokenId) continue;
-      this.append({ ...delivery, targetToken: tokenId, status, reason: token.reason });
+      if (delivery.status === status && delivery.targetToken === tokenId) return;
+      this.f.runtime.atomicTransition(() => this.append({ ...delivery, targetToken: tokenId, status, reason: token.reason }));
     }
+  }
+  /** A durable child identity is sufficient to recover an old missing receipt;
+   * URL/item equality is not, because another line may share the same case. */
+  private adoptCreated(delivery: ChannelDelivery) {
+    if (delivery.status === 'acknowledged') return;
+    const tokens = [...(this.tokensByDelivery.get(delivery.id) ?? [])].map(id => this.f.state.tokens[id]).filter(Boolean);
+    const token = tokens.at(-1);
+    if (!token || token.id === delivery.targetToken) return;
+    this.f.runtime.atomicTransition(() => this.append({ ...delivery, targetToken: token.id, attempts: Math.max(delivery.attempts, tokens.length), status: 'delivered', inventory: { ...this.reservation(delivery), held: false } }));
+    this.acknowledge(token.id);
   }
   retry(id: string) {
     if (process.env.FACTORY_READONLY === '1') throw new ControlError(403, 'read_only', '只读项目不能重试信道投递');
+    if (this.closed) throw new ControlError(409, 'channels_closed', '信道调度已关闭');
     const delivery = this.deliveries.get(id);
     if (!delivery) throw new ControlError(404, 'channel_delivery_not_found', '没有这次信道投递');
     if (delivery.status === 'acknowledged' || delivery.targetToken && this.f.state.tokens[delivery.targetToken]?.status === 'active') return structuredClone(delivery);
-    this.f.runtime.atomicTransition(() => {
-      if (delivery.status === 'failed' && this.f.runtime.nodes.get(delivery.target)?.kind === 'store') this.f.runtime.stockDelta(delivery.target, 1, '失败信道投递重新排队');
-      this.append({ ...delivery, status: 'pending', targetToken: undefined, reason: undefined });
-    }); this.pump();
+    if (delivery.status === 'failed') {
+      this.retryPlan(delivery);
+      this.f.runtime.atomicTransition(() => this.append({ ...delivery, status: 'pending', reason: undefined, inventory: { ...this.reservation(delivery), held: false } }));
+    }
+    this.pump();
     return structuredClone(this.deliveries.get(id)!);
+  }
+  private retryPlan(delivery: ChannelDelivery) {
+    const previous = delivery.targetToken && this.f.state.tokens[delivery.targetToken];
+    const saved = previous && previous.data.runtimeCheckpoint as { version?: number; entry?: string; done?: string[] } | undefined;
+    const failedAt = previous && [previous.finishedAtNode, ...previous.attempts.map(id => this.f.state.attempts[id]?.node).reverse()].find(key => key && this.f.runtime.nodes.has(key) && this.f.runtime.runnable(this.f.runtime.nodes.get(key)!));
+    if (!previous || !saved || saved.version !== 1 || !saved.entry || !Array.isArray(saved.done) || !this.f.runtime.nodes.has(saved.entry) || !failedAt || !this.f.runtime.closureOf(saved.entry).has(failedAt)) throw new ControlError(409, 'channel_checkpoint_missing', '信道子任务缺少可恢复的持久检查点；请恢复原流水线包，不能从入口盲目重做');
+    return { previous, saved: structuredClone(previous.data.runtimeCheckpoint), failedAt };
+  }
+  private resumeChild(delivery: ChannelDelivery): TokenRun {
+    const { previous, saved, failedAt } = this.retryPlan(delivery), runtime = this.f.runtime;
+    const data = structuredClone(previous.data);
+    for (const key of ['failure', 'manualReason', 'retriedBy', 'capacityWait', 'browserRecoveries', 'published']) delete data[key];
+    Object.assign(data, { express: true, channelDelivery: delivery.id, retryOf: previous.id, recoveryStation: failedAt });
+    const token = runtime.create(failedAt, { item: previous.item, url: previous.url, title: previous.title, source: previous.source, data });
+    token.data.runtimeCheckpoint = saved; runtime.restoreCheckpoint(token);
+    const invalidated = runtime.descendants(token, failedAt);
+    for (const key of invalidated) token.done.delete(key);
+    runtime.restoreFlow(token); runtime.resumeFrontier(token, failedAt); runtime.checkpoint(token);
+    for (const id of previous.evidence) {
+      const evidence = this.f.state.evidence[id];
+      if (evidence) this.f.journal.append({ kind: 'evidence.added', evidence: { ...evidence, id: `${evidence.id}-${token.id}`, token: token.id, at: Date.now(), meta: { ...evidence.meta, reusedFrom: evidence.id } } });
+    }
+    this.f.journal.append({ kind: 'token.data', token: previous.id, patch: { retriedBy: token.id } });
+    return token;
   }
   schedule() {
     if (this.closed || this.scheduled) return;
@@ -102,9 +181,14 @@ export class ChannelSupervisor {
   }
   pump() {
     const f = this.f;
-    if (this.closed || !f.runtime.running || f.runtime.paused || f.runtime.ending) return;
+    if (this.closed || process.env.FACTORY_READONLY === '1' || !f.runtime.running || f.runtime.paused || f.runtime.ending) return;
+    // The main line owns the resource budget. Historical messages may add only
+    // one live child, even if dozens of downstream workers are available.
+    if ([...this.deliveryByToken.keys()].some(id => f.state.tokens[id]?.status === 'active')) return;
     for (const delivery of this.deliveries.values()) {
       if (!['pending', 'blocked'].includes(delivery.status)) continue;
+      this.adoptCreated(delivery);
+      if (this.deliveries.get(delivery.id)?.status !== delivery.status) return;
       const channel = f.compiled.channels.find(channel => channel.id === delivery.channel);
       const target = channel ? `${channel.to.line}/${channel.to.station}` : delivery.target;
       if (f.runtime.scopePaused(target)) continue;
@@ -113,12 +197,18 @@ export class ChannelSupervisor {
         if (delivery.status !== 'blocked') this.append({ ...delivery, status: 'blocked', reason: '下游工位尚未接线，消息保留等待接入' });
         continue;
       }
+      if (delivery.targetToken) {
+        try { if (f.runtime.scopePaused(this.retryPlan(delivery).failedAt)) continue; }
+        catch (error) { if (delivery.status !== 'blocked') f.runtime.atomicTransition(() => this.append({ ...delivery, status: 'blocked', reason: (error as Error).message })); continue; }
+      }
       const pack = f.workflowPacks?.manifests.find(pack => pack.lines.some(line => line.id === node.line));
       f.runtime.atomicTransition(() => {
-        if (node.kind === 'store') f.runtime.stockDelta(target, -1, '信道消息由下游工位领取');
-        const token = f.runtime.create(target, { item: delivery.item, url: delivery.url, title: delivery.title, source: `channel:${delivery.channel}`, data: { ...channelPayload(delivery.data), express: true, channelDelivery: delivery.id, ...(pack ? { workflowPack: pack.id } : {}) } });
-        this.append({ ...delivery, target, targetToken: token.id, attempts: delivery.attempts + 1, status: 'delivered', reason: undefined });
+        const inventory = this.reservation(delivery);
+        if (inventory.held) f.runtime.stockDelta(inventory.node, -1, '信道消息由下游工位领取');
+        const token = delivery.targetToken ? this.resumeChild(delivery) : f.runtime.create(target, { item: delivery.item, url: delivery.url, title: delivery.title, source: `channel:${delivery.channel}`, data: { ...channelPayload(delivery.data), express: true, channelDelivery: delivery.id, ...(pack ? { workflowPack: pack.id } : {}) } });
+        this.append({ ...delivery, target, targetToken: token.id, attempts: delivery.attempts + 1, status: 'delivered', inventory: { node: inventory.node, held: false }, reason: undefined });
       });
+      return;
     }
   }
   close() { this.closed = true; this.unsubscribe(); }

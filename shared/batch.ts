@@ -25,6 +25,11 @@ export interface BatchRecovery {
   replan: boolean;
 }
 
+/** Fast initial checks become a single, slow probe during a prolonged outage. */
+export function modelRecoveryDelay(failures: number) {
+  return failures <= 3 ? 30000 * 2 ** Math.max(0, failures - 1) : 15 * 60 * 1000;
+}
+
 /** A website goal counts its own roots; downstream deliveries have their own lifecycle. */
 export function latestBatchTokens(s: FactoryState) {
   return latestRunTokens(s).filter(token => !token.data.channelDelivery && !token.data.workflowPack && !token.source.startsWith('channel:') && ['candidates', 'curation'].includes(token.line));
@@ -47,12 +52,12 @@ export function batchSummary(s: FactoryState) {
     : status === 'paused' ? '本轮已暂停；目标和检查点已保存'
     : status === 'stopped' ? '托管已停止；保留已有成果'
     : status === 'recovering' ? '按退避时间自动从检查点继续'
-    : goal.modelCircuit ? `模型服务异常，已停止投料；${goal.modelCircuit.state === 'trial' ? '正在用一个真实工位验证恢复' : goal.modelCircuit.nextAt ? '冷却后用一个工位试恢复' : '三次试恢复未通过，检查代理 / 模型服务后重新检查提醒'}，网站检查点已保留`
+    : goal.modelCircuit ? `模型服务异常，已停止投料；${goal.modelCircuit.state === 'trial' ? '正在用一个真实工位验证恢复' : goal.modelCircuit.nextAt ? goal.modelCircuit.failures > 3 ? '每 15 分钟只用一个真实工位试恢复' : '冷却后用一个真实工位试恢复' : '等待确认模型凭据、额度或证书问题'}，网站检查点已保留`
     : status === 'blocked' ? `${blocked} 件仍未完成${goal.supplyExhausted && remaining ? `；候选库存不足，还缺 ${remaining} 件` : '；已保存具体原因与恢复记录'}`
     : `前段有空位时自动补料，最多 ${goal.maxInFlight} 件同时在途`;
   return { ...goal, status, admitted: items.length, active, completed, blocked, remaining,
     published: items.filter(t => t.status === 'published').length,
     merged: items.filter(t => t.status === 'merged').length,
     rejected: items.filter(t => t.status === 'rejected').length,
-    retrying: recovery.length, nextRetryAt: recovery.length ? Math.min(...recovery.map(r => r.nextAt)) : undefined, reason };
+    retrying: recovery.length, nextRetryAt: goal.modelCircuit?.state === 'open' && goal.modelCircuit.nextAt ? goal.modelCircuit.nextAt : recovery.length ? Math.min(...recovery.map(r => r.nextAt)) : undefined, reason };
 }
