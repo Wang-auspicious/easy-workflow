@@ -15,10 +15,13 @@ const profile = path.resolve(process.env.FACTORY_VAR || "var", "browser");
 const data = desktop ? null : new BrowserData(path.join(profile, "browser.json"));
 const pending = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
 const pageIds = new WeakMap<Page, string>();
-const tabs = new Map<string, { page: Page; owner: "user" | "agent"; leased: boolean; attention?: string; attentionKind?: BrowserAttentionKind; checkSerial?: number; attentionCheck?: Promise<void>; documentUrl?: string; documentStatus?: number; denied?: Set<string>; manualAttention?: boolean }>();
+const tabs = new Map<string, { page: Page; owner: "user" | "agent"; leased: boolean; savedUrl?: string; attention?: string; attentionKind?: BrowserAttentionKind; checkSerial?: number; attentionCheck?: Promise<void>; documentUrl?: string; documentStatus?: number; denied?: Set<string>; manualAttention?: boolean }>();
 let state: BrowserState = { ...emptyBrowser(), ...(data ? { bookmarks: data.bookmarks, history: data.history, retentionDays: data.retentionDays } : {}) };
 let context: Promise<BrowserContext> | null = null;
 let connection: Promise<Browser> | null = null;
+let reservedPages = 0, restoringTabs = false;
+let authTimer: ReturnType<typeof setInterval> | undefined;
+let historyTimer: ReturnType<typeof setInterval> | undefined;
 const titles = new Map<string,string>();
 export const browserEvents = new Set<(state: BrowserState) => void>();
 function publish(next: BrowserState) { state = next; for (const listener of browserEvents) listener(next); }
@@ -101,15 +104,51 @@ function rpc(args: Record<string, unknown>, signal?: AbortSignal): Promise<any> 
   });
 }
 function executable() { return [process.env.CHROME_PATH, "C:/Program Files/Google/Chrome/Application/chrome.exe", "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe", "/usr/bin/google-chrome"].find(p => p && fs.existsSync(p)); }
+function cancellable<T>(operation: Promise<T>, signal?: AbortSignal, discard?: (value: T) => Promise<unknown>): Promise<T> {
+  if (!signal) return operation;
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const abort = () => { if (done) return; done = true; signal.removeEventListener('abort', abort); reject(signal.reason); };
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    operation.then(value => {
+      signal.removeEventListener('abort', abort);
+      if (done) { void discard?.(value).catch(() => {}); return; }
+      done = true; resolve(value);
+    }, error => { signal.removeEventListener('abort', abort); if (!done) { done = true; reject(error); } });
+  });
+}
+function persistHeadlessTabs() {
+  if (desktop || restoringTabs) return;
+  data.tabs = [...tabs.values()].filter(t => t.owner === 'user' && /^https?:/.test(t.savedUrl ?? '')).map(t => ({ url: t.savedUrl }));
+  data.save();
+}
 async function persistent(): Promise<BrowserContext> {
   if (!context) {
     const startup = chromium.launchPersistentContext(path.join(profile, "profile"), { headless: true, executablePath: executable(), viewport: { width: 1280, height: 800 }, args: ["--hide-scrollbars", "--mute-audio"] }).then(async c => {
       c.on("close", () => {
-        if (context === startup) context = null;
+        if (context === startup) { context = null; clearInterval(authTimer); clearInterval(historyTimer); }
         for (const [id, tab] of tabs) if (tab.page.context() === c) { tabs.delete(id); titles.delete(id); }
         update();
       });
       for (const p of c.pages()) if (p.url() === "about:blank") await p.close();
+      const saved = [...data.tabs];
+      restoringTabs = true;
+      try {
+        for (const tab of saved) {
+          let url: string; try { url = webURL(tab.url); } catch { continue; }
+          const restored = await createHeadless('user', undefined, c, url);
+          void restored.page.goto(url, { waitUntil: 'domcontentloaded' }).catch(error => {
+            const current = tabs.get(restored.id); if (!current) return;
+            current.attention = String(error.message ?? '页面加载失败').slice(0, 200);
+            current.attentionKind = browserAttentionKind(current.attention); update();
+          });
+        }
+      } catch (error) { await c.close().catch(() => {}); throw error; }
+      finally { restoringTabs = false; }
+      persistHeadlessTabs();
+      authTimer = setInterval(() => { for (const [id, tab] of tabs) if (!tab.leased && !tab.page.isClosed()) void checkHeadless(id); }, 30000); authTimer.unref();
+      historyTimer = setInterval(() => { data.prune(); data.save(); update(); }, 3600000); historyTimer.unref();
       return c;
     }).catch(error => { if (context === startup) context = null; throw poolFault(error, "start"); });
     context = startup;
@@ -118,18 +157,27 @@ async function persistent(): Promise<BrowserContext> {
 }
 function update() {
   if (desktop) return;
-  publish({ mode: "headless", tabs: [...tabs].map(([id,t]) => ({ id, url:t.page.url(), title:titles.get(id) || "新标签页", loading:false, owner:t.owner, attention:t.attention, attentionKind:t.attentionKind })), active: state.active && tabs.has(state.active) ? state.active : tabs.keys().next().value ?? null, bookmarks:data.bookmarks, history:[...data.history].slice(-200).reverse(), retentionDays:data.retentionDays });
+  publish({ mode: "headless", tabs: [...tabs].map(([id,t]) => ({ id, url:t.page.url() === 'about:blank' ? t.savedUrl ?? t.page.url() : t.page.url(), title:titles.get(id) || "新标签页", loading:false, owner:t.owner, attention:t.attention, attentionKind:t.attentionKind })), active: state.active && tabs.has(state.active) ? state.active : tabs.keys().next().value ?? null, bookmarks:data.bookmarks, history:[...data.history].slice(-200).reverse(), retentionDays:data.retentionDays });
 }
-async function createHeadless(owner: "user" | "agent") {
-  if (tabs.size >= 30) throw new Error("已有 30 个标签页，请先关闭不需要的页面");
-  const c = await persistent(), page = await c.newPage(), id = crypto.randomUUID();
-  tabs.set(id,{page,owner,leased:owner==="agent"}); pageIds.set(page,id); state.active = id;
+async function createHeadless(owner: "user" | "agent", signal?: AbortSignal, restoredContext?: BrowserContext, savedUrl?: string, existingPage?: Page) {
+  const c = restoredContext ?? await cancellable(persistent(), signal);
+  signal?.throwIfAborted();
+  if (tabs.size + reservedPages >= 30) throw new Error("已有 30 个标签页，请先关闭不需要的页面");
+  let page: Page;
+  reservedPages++;
+  try { page = existingPage ?? await cancellable(c.newPage(), signal, late => late.close()); }
+  finally { reservedPages--; }
+  const id = crypto.randomUUID();
+  tabs.set(id,{page,owner,leased:owner==="agent",savedUrl}); pageIds.set(page,id);
+  if (owner === 'user' || !state.active) state.active = id;
   // BrowserContext does not automatically release popup pages with their opener.
   // Background scripts cannot allocate untracked pages outside the quota.
   if (owner === 'agent') {
-    try { await page.addInitScript(() => { window.open = () => null; }); }
+    try { await cancellable(page.addInitScript(() => { window.open = () => null; }), signal); }
     catch (error) { tabs.delete(id); await page.close().catch(() => {}); update(); throw error; }
     page.on('popup', popup => { void popup.close().catch(() => {}); });
+  } else {
+    page.on('popup', popup => { void createHeadless('user', undefined, c, /^https?:/.test(popup.url()) ? popup.url() : undefined, popup).then(() => persistHeadlessTabs()).catch(() => popup.close().catch(() => {})); });
   }
   page.on("close", () => { tabs.delete(id); titles.delete(id); update(); });
   page.on("response", response => {
@@ -139,7 +187,7 @@ async function createHeadless(owner: "user" | "agent") {
       if (noteBrowserResponse(tab, { url: response.url(), status: response.status(), mainFrame: request.isNavigationRequest(), resourceType: request.resourceType() })) { update(); void checkHeadless(id); }
     } catch { /* The response may outlive a detached frame. */ }
   });
-  page.on("framenavigated", frame => { const tab = tabs.get(id); if (tab && frame === page.mainFrame()) tab.checkSerial = (tab.checkSerial ?? 0) + 1; });
+  page.on("framenavigated", frame => { const tab = tabs.get(id); if (tab && frame === page.mainFrame()) { tab.checkSerial = (tab.checkSerial ?? 0) + 1; if (/^https?:/.test(page.url())) { tab.savedUrl = page.url(); if (tab.owner === 'user') persistHeadlessTabs(); } } });
   page.on("domcontentloaded", async () => { const url = page.url(), title = await page.title().catch(() => ""); if (page.isClosed() || page.url() !== url) return; titles.set(id,title); data.visit(url,title); await checkHeadless(id); update(); });
   page.on("crash", () => { const t = tabs.get(id); if (t) { t.attention = "页面进程退出"; t.attentionKind = "crash"; update(); } });
   update(); return { page, context:c, id };
@@ -175,18 +223,18 @@ export async function browserCommand(args: Record<string, any>): Promise<any> {
     return {id:args.id,url:page.url(),title:await page.title(),text:(await page.locator("body").innerText({timeout:5000})).slice(0,30000)};
   }
   if (desktop) return rpc({...args, action});
-  if (action === "state") { data.prune(); update(); return state; }
+  if (action === "state") { if (!context && data.tabs.length) await persistent(); data.prune(); update(); return state; }
   if (action.startsWith("bookmark.") || action === "history.prune") data.change(action,args);
-  else if (action === "open") { const t = await createHeadless("user"); if (args.url) await t.page.goto(args.url, {waitUntil:"domcontentloaded"}); }
+  else if (action === "open") { const t = await createHeadless("user", undefined, undefined, args.url); persistHeadlessTabs(); if (args.url) await t.page.goto(args.url, {waitUntil:"domcontentloaded"}); }
   else { const tab = tabs.get(args.id); if (!tab) throw new Error("标签页已经关闭");
-    if (action === "close") await tab.page.close();
+    if (action === "close") { await tab.page.close(); persistHeadlessTabs(); }
     else if (action === "activate") state.active = args.id;
     else if (action === "navigate") await tab.page.goto(args.url,{waitUntil:"domcontentloaded"});
     else if (action === "back") await tab.page.goBack();
     else if (action === "forward") await tab.page.goForward();
     else if (action === "reload") await tab.page.reload();
     else if (action === "attention.check") await checkHeadless(args.id, true);
-    else if (action === "tab.move") {const entries=[...tabs];const i=entries.findIndex(([id])=>id===args.id);const [item]=entries.splice(i,1);const j=entries.findIndex(([id])=>id===args.before);if(j<0)throw new Error("目标标签不存在");entries.splice(j,0,item);tabs.clear();for(const [id,t] of entries)tabs.set(id,t);}
+    else if (action === "tab.move") {if(args.id!==args.before){const entries=[...tabs];const i=entries.findIndex(([id])=>id===args.id);const [item]=entries.splice(i,1);const j=entries.findIndex(([id])=>id===args.before);if(j<0)throw new Error("目标标签不存在");entries.splice(j,0,item);tabs.clear();for(const [id,t] of entries)tabs.set(id,t);persistHeadlessTabs();}}
   }
   update(); return state;
 }
@@ -194,6 +242,7 @@ export async function browserCommand(args: Record<string, any>): Promise<any> {
 export async function openPage(viewport = { width: 1280, height: 800 }, _locale = "en-US", signal?:AbortSignal): Promise<{ page: Page; context: BrowserContext; close: () => Promise<void> }> {
   signal?.throwIfAborted();
   const scope = attemptScopes.getStore() ?? (signal ? signalScopes.get(signal) : undefined);
+  signal ??= scope?.signal;
   if (scope) { scope.usedBrowser = true; scope.signal.throwIfAborted(); }
   const withCancellation=(page:Page, context:BrowserContext, release:()=>Promise<void>)=>{
     let released = false;
@@ -210,10 +259,11 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
     return {page,context,close:()=>{unwatch();return closing ??= release();}};
   };
   try { if (!desktop) {
-    const t = await createHeadless("agent");
-    try { signal?.throwIfAborted(); await t.page.setViewportSize(viewport); }
+    const t = await createHeadless("agent", signal);
+    try { signal?.throwIfAborted(); await cancellable(t.page.setViewportSize(viewport), signal); signal?.throwIfAborted(); }
     catch (error) { await t.page.close().catch(() => {}); throw error; }
     return withCancellation(t.page,t.context,async () => {
+      if (signal?.aborted) { await t.page.close().catch(() => {}); return; }
       await checkHeadless(t.id, false, true);
       const tab = tabs.get(t.id); if (!tab) return;
       const duplicate = [...tabs.values()].some(other => other !== tab && other.owner === "agent" && !other.leased && attentionKey({...other,url:other.page.url()}) === attentionKey({...tab,url:tab.page.url()}) && retainBrowserAttention(other));
@@ -223,12 +273,12 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
   }
   const lease = await rpc({ action:"lease" }, signal);
   try {
-    if (!connection || !(await connection.catch(() => null))?.isConnected()) connection = chromium.connectOverCDP(lease.endpoint);
-    const b = await connection;
+    if (!connection || !(await cancellable(connection.catch(() => null), signal))?.isConnected()) connection = chromium.connectOverCDP(lease.endpoint);
+    const b = await cancellable(connection, signal);
     let page: Page | undefined;
-    for (let i=0;i<40 && !page;i++) { page = b.contexts().flatMap(c => c.pages()).find(p => p.url() === lease.marker); if (!page) await new Promise(r => setTimeout(r,50)); }
+    for (let i=0;i<40 && !page;i++) { signal?.throwIfAborted(); page = b.contexts().flatMap(c => c.pages()).find(p => p.url() === lease.marker); if (!page) await cancellable(new Promise(r => setTimeout(r,50)), signal); }
     if (!page) throw new Error("无法挂载后台标签页");
-    pageIds.set(page,lease.id); await page.setViewportSize(viewport);
+    pageIds.set(page,lease.id); await cancellable(page.setViewportSize(viewport), signal); signal?.throwIfAborted();
     return withCancellation(page,page.context(),async () => { await rpc({action:"release",id:lease.id,discard:Boolean(scope?.fault || signal?.aborted)}).catch(() => {}); });
   } catch (error) { await rpc({action:"release",id:lease.id,discard:true}).catch(() => {}); throw error; }
   } catch (error) {
@@ -258,7 +308,7 @@ export async function withBrowserFrames<T>(page:Page, capture:()=>Promise<T>):Pr
   finally{await rpc({action:"capture.end",id}).catch(()=>{});}
 }
 export async function closeBrowser() {
-  if (!desktop) await (await context?.catch(() => null))?.close();
+  if (!desktop) { const current = await context?.catch(() => null); if (current) { persistHeadlessTabs(); await current.close(); } clearInterval(authTimer); clearInterval(historyTimer); }
   if (connection) await (await connection.catch(() => null))?.close().catch(() => {});
   connection = null; context = null;
   for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error("浏览器服务已关闭")); } pending.clear();

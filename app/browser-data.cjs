@@ -11,7 +11,7 @@ class BrowserData {
     this.bookmarks = Array.isArray(saved.bookmarks) ? saved.bookmarks : defaults;
     this.history = Array.isArray(saved.history) ? saved.history : [];
     this.retentionDays = Number.isInteger(saved.retentionDays) ? Math.min(365, Math.max(1, saved.retentionDays)) : 30;
-    this.tabs = Array.isArray(saved.tabs) ? saved.tabs.slice(0, 20) : [];
+    this.tabs = Array.isArray(saved.tabs) ? saved.tabs.slice(0, 30) : [];
     this.prune();
   }
   prune(now = Date.now()) { this.history = this.history.filter(h => Number.isFinite(h.at) && now - h.at < this.retentionDays * 86400000).slice(-2000); }

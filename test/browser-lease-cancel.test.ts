@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import path from 'node:path';
+import http from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 
 test('cancelling a desktop lease returns immediately and releases its late native page', {timeout:10000}, async () => {
   const child=fork(path.resolve('test/fixtures/browser-late-lease.mjs'),[],{env:{...process.env,FACTORY_BROWSER_BRIDGE:'1'},windowsHide:true,stdio:['ignore','pipe','pipe','ipc']});
@@ -23,4 +25,36 @@ test('cancelling a desktop lease returns immediately and releases its late nativ
     const code=await new Promise(resolve=>{child.once('exit',resolve);child.once('error',error=>{stderr+=error.message;resolve(-1);});});
     assert.equal(code,0,stderr);assert.equal(releases,1);
   } finally {if(child.exitCode===null)child.kill();}
+});
+
+test('cancellation during CDP connection returns promptly and releases the native lease', { timeout: 10000 }, async () => {
+  let discovery!: () => void, response: http.ServerResponse | undefined;
+  const discovered = new Promise<void>(resolve => { discovery = resolve; });
+  const server = http.createServer((_req, res) => { response = res; discovery(); });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const child = fork(path.resolve('test/fixtures/browser-cdp-cancel.mjs'), [], { env: { ...process.env, FACTORY_BROWSER_BRIDGE: '1' }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  let releases = 0, stderr = '', aborted!: () => void;
+  const cancelled = new Promise<void>(resolve => { aborted = resolve; });
+  const exited = new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject); });
+  child.stderr!.on('data', value => { stderr += value; });
+  child.on('message', (message: any) => {
+    if (message.type === 'test:aborted') aborted();
+    if (message.type !== 'browser:request') return;
+    if (message.args.action === 'lease') child.send({ type: 'browser:reply', id: message.id, result: { id: 'connecting-page', marker: 'about:blank#connecting-page', endpoint } });
+    else if (message.args.action === 'release') {
+      releases++; assert.equal(message.args.id, 'connecting-page'); assert.equal(message.args.discard, true);
+      child.send({ type: 'browser:reply', id: message.id, result: {} });
+    }
+  });
+  try {
+    await discovered; child.send({ type: 'test:cancel' });
+    assert.equal(await Promise.race([cancelled.then(() => true), delay(300, false)]), true);
+    assert.equal(releases, 1);
+    response?.writeHead(503); response?.end('fixture connection stopped');
+    assert.equal(await exited, 0, stderr);
+  } finally {
+    if (child.exitCode === null) { child.kill(); await exited; }
+    server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+  }
 });
