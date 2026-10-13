@@ -330,6 +330,16 @@ test('UI summaries preserve retry and cross-line identities, scheduling, evidenc
   assert.equal(compact.attempts['attempt-ui'].output, undefined);
   assert.equal(compact.attempts['attempt-ui'].metrics?.usageReported, false, 'missing model usage must remain unknown');
   assert.deepEqual(compact.attempts['attempt-ui'].usage, raw.attempts['attempt-ui'].usage);
+  for (const costReported of [false, true]) {
+    const attempt = `native-cost-${costReported}`;
+    emit({kind: 'attempt.started', attempt, token: 'retry', node: 'fixture/work', worker: 'worker-ui', input: ''});
+    const metrics = {execution: {adapter: 'codex', model: 'native-model'}, usageReported: true,
+      tokenUsage: {input: 100, output: 20, cacheRead: 4}, costReported, costComplete: false};
+    emit({kind: 'attempt.finished', attempt, ok: true, summary: 'native receipt', ms: 20, queuedMs: 0,
+      ...(costReported ? {usage: {input: 10, output: 5, cost: 0}} : {}), metrics});
+    assert.deepEqual(compact.attempts[attempt].metrics, metrics, 'SSE retains native tokens and missing or partial prices');
+    assert.deepEqual(uiState(raw).attempts[attempt].metrics, metrics, 'reconnecting retains the same receipt');
+  }
   assert.equal(compact.evidence['e-ui'].meta?.document, undefined);
   assert.equal(raw.evidence['e-ui'].meta?.document, 'full evidence');
   emit({kind: 'case.noted', caseId: 'shared-item', token: 'retry', note: {station: 'fixture/work', section: 'result', text: 'full case', by: 'fixture'}});

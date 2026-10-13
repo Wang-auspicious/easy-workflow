@@ -59,6 +59,7 @@ function attemptMetrics(metrics: AttemptMetrics | undefined): AttemptMetrics | u
   if (!metrics) return undefined;
   const summary = pick(metrics, [
     'execution', 'dependency', 'usageReported', 'usageComplete', 'cacheUsageComplete', 'modelTimeReported',
+    'tokenUsage', 'costReported', 'costComplete',
   ]);
   return Object.keys(summary).length ? summary : undefined;
 }
