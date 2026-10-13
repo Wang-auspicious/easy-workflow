@@ -227,10 +227,10 @@ Journal（只追加日志）：所有以上对象的状态变化
 
 ### 5.2 进程模型（不压垮电脑）
 
-- **一个 Node 进程**承载 Factory Server、全部 agent 工人（async 任务，不是线程或子进程）、主调度会话。agent 工人大部分时间在等模型网络响应，几乎不占 CPU/内存（每个会话 < 20MB）。所以“开 30 个 agent 工人”不是问题。
-- **一个 Chromium 内核**（Electron 自带），页面数由 Broker 控制（≤ 3，含内置浏览器里站长正在看的那一页）。浏览器才是真正吃内存的东西（每页 150–300MB）。采集用的无头页面与内置浏览器共用登录会话分区（§6.5）。
-- **CPU 重活**（ffmpeg 转码、图像哈希）走一个 worker_threads 池，大小 = 逻辑核数 / 4（本机 16 → 4）。
-- 结论：两条甚至三条线同时跑不会让电脑崩溃，前提是**所有线共用同一个 Broker**。真正的上限是浏览器页面数，这个数是全局的，不随线的数量增加。
+- **一个 Node 服务进程**承载 Factory Server、Pi 工位异步会话和主调度；闭源 CLI 执行器使用受控子进程。模型等待可以并发，但上下文、日志投影、图片和工具结果仍占内存，不以固定的“每个 Agent 内存”推导安全并发数。
+- **一个随 Electron 分发的 Chromium 内核**，内置浏览器和后台采集共享会话分区（§6.5）。页面数、模型请求和程序任务都服从 Broker 的当前配置及内存余量；浏览器上限的后续约定见 §30.6，不能按流水线数量倍增。
+- **报告计算**在独立 Worker 中读取日志及序列化，每个项目同一时刻只计算一份报告，相同请求共享计算。取消最后一个读取者后释放计算；媒体和外部命令另受资源名额、时间预算与子进程取消约束，不能把异步函数当成 CPU 隔离。
+- **先限制入场，再增加工人。** 持久待处理队列、在途任务、模型调用、浏览器页面、客户端发送缓冲分别有界。部署并发由实测内存、响应时间和失败情况决定，不宣称任意电脑上开多条线都不会卡死。
 
 ---
 
@@ -788,11 +788,13 @@ packs/
 
 ## 11. 数据与持久化
 
-- **Journal 表**（SQLite，WAL）：`seq, at, lineId, kind, subjectId, payload(json), actor`。kind 包括：token.created / attempt.started / attempt.finished / review.verdict / correction.created / worker.forked / worker.retired / spec.patched / channel.emitted / channel.consumed。
+- **Journal 表**（SQLite，WAL）：`seq, at, run, kind, body(json)`；任务、工位、操作者等身份在事件正文中。kind 包括：token.created / attempt.started / attempt.finished / review.verdict / correction.created / worker.forked / worker.retired / spec.patched / channel.emitted / channel.delivery / operation.recorded。同步状态转换先原子落盘，再更新投影和通知。
 - **物化视图**：tokens、attempts、workers、stations_stats（滚动中位数等），由 journal 投影，可随时重建。
 - **Evidence Store**：`evidence/<sha256[0:2]>/<sha256>.<ext>` + 索引表（类型、尺寸、来源 attempt）。
 - **发布产物**：策展线发布 = 生成 VisLexicon 的源条目 JSON（字段与其 `content-samples/approved-v3` 一致）+ WebP 证据，写入 VisLexicon 仓库的指定目录（只追加，不覆盖已发布条目；覆盖需站长确认）。
-- **事件流到前端**：Server-Sent Events，按 seq 增量；前端断线重连带上最后 seq。
+- **事件流到前端**：Server-Sent Events，按 seq 分批追赶，批次之间让出事件循环。发送缓冲未排空时暂停读取日志，慢连接超时释放，客户端以 `Last-Event-ID` 恢复；实时聊天快照不能覆盖更新的状态。
+- **历史与案卷**：报告、回放以固定 `through` 序号读取，新增事件不延长一次导出。案卷常驻索引只保存事件序号，正文按需从 SQLite 读取；界面可以合并相邻像素的时间区间显示，原始事件和准确时间边界必须保留。
+- **外部副作用**：有写入语义的 HTTP、CLI、MCP 操作先记录稳定身份及 `started`，取得完整结果后记录 `completed`。重试复用完成回执；已开始但结果未知的操作记录 `uncertain`，单项保留待核查，不能自动重发或伪装成功。只读调用与本地尚未执行的配置错误不进入未知副作用状态。
 
 ---
 
@@ -800,11 +802,12 @@ packs/
 
 | 情况 | 处理 |
 |---|---|
-| 工位工具抛错 | 该 Attempt 失败，自动重试 1 次（换一个工人）；仍失败 → 待人工，令牌停在工位旁 |
-| 输出不符合 I/O 契约 | 把校验错误回给工人修复 1 次；仍不合格 → 待人工 |
+| 工位工具抛错 | 按结构化失败原因区分可恢复系统故障、输入无效、可修复质量问题和需要外部信息的问题；保留检查点与证据，按已配置预算重试，不把所有错误直接交人工 |
+| 输出不符合 I/O 契约 | 把具体校验错误回给原工位，默认修复 1 次，可声明 0–2 次；共用该次工位的绝对截止时间。修复和确定性裁剪仍必须重新通过原 schema 与程序门禁 |
+| 外部写操作回执丢失 | 保留为结果未知并停止该项，允许其他任务继续；核实远端结果前不自动重发，不计为无效网址或已发布 |
 | 模型额度用完 | 该资源池暂停发放；已完成的结果保留；不降级成关键词判断；主调度通知站长 |
 | 浏览器崩溃 | Broker 重启浏览器实例；在途页面的 Attempt 判为失败并重试 |
-| 进程被杀 | 重启后从 journal 重放；`started` 但没有 `finished` 的 Attempt 重新排队 |
+| 进程被杀 | 重启后从 journal 恢复已完成分支和待执行前沿；执行器支持时复用签名匹配的工位会话。重新派工仍必须检查外部操作回执，不能因缺少 Attempt 完成事件就重复已生效的写入 |
 | 站长纠错与自动审查冲突 | 站长纠错优先；被纠错的货不再自动通过同一审查点，直到重新处理 |
 
 ---
