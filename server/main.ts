@@ -12,7 +12,7 @@ import { publishConnection } from "./discovery.ts";
 import { readReportJson, closeReportReaders } from './report-reader.ts';
 import { setImmediate as yieldLoop } from 'node:timers/promises';
 import { JournalEventStream } from './event-stream.ts';
-import {uiEvent, uiState} from '../shared/client-view.ts';
+import {serializeUiState, uiEvent} from '../shared/client-view.ts';
 import { closeBrowser, browserCommand, browserEvents } from "./browser.ts";
 import { closeNetwork } from "./network.ts";
 import { layoutFactory } from "../shared/layout.ts";
@@ -146,8 +146,15 @@ const server = http.createServer(async (req, res) => {
       throw new ControlError(400, 'invalid_view', 'view 只支持 raw 或 ui-v1');
     }
     if (p === '/api/state') {
-      const state = view === 'ui-v1' ? uiState(factory.state) : factory.state;
-      return send(res, 200, {...state, dispatcher: dispatcher.status});
+      const state = {...factory.state, dispatcher: dispatcher.status};
+      if (view === 'ui-v1') {
+        const text = serializeUiState(state);
+        res.writeHead(200, {'Content-Type': 'application/json; charset=utf-8',
+          'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store'});
+        res.end(text);
+        return;
+      }
+      return send(res, 200, state);
     }
     if (p === "/api/browser" && req.method === "GET") return send(res, 200, await browserCommand({action:"state"}));
     if (p === "/api/events") {

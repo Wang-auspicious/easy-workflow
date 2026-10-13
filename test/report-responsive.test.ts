@@ -14,7 +14,7 @@ import { readReportJson, closeReportReaders } from '../server/report-reader.ts';
 import { compile } from '../server/spec/compile.ts';
 import { line, station, type Pack } from '../server/spec/dsl.ts';
 import {apply, initialState, latestRunTokens, tokenWorkKey} from '../shared/project.ts';
-import {applyUiEvent, isUiState, uiEvent, uiState} from '../shared/client-view.ts';
+import {applyUiEvent, isUiState, serializeUiState, uiEvent, uiState} from '../shared/client-view.ts';
 import {batchSummary} from '../shared/batch.ts';
 import type {JournalEvent, Stamped} from '../shared/types.ts';
 import type { Factory } from '../server/factory.ts';
@@ -340,6 +340,8 @@ test('UI summaries preserve retry and cross-line identities, scheduling, evidenc
   assert.equal(Object.keys(compact.consults).length, 1, 'consults still contribute to node counts');
   const fullBefore = JSON.stringify(raw);
   const snapshot = uiState(raw);
+  const serialized = serializeUiState(raw);
+  assert.equal(serialized, JSON.stringify(snapshot), 'synchronous serialization preserves the detached snapshot body');
   assert.ok(isUiState(snapshot));
   assert.equal(isUiState(raw), false);
   assert.equal(isUiState(null), false);
@@ -347,6 +349,7 @@ test('UI summaries preserve retry and cross-line identities, scheduling, evidenc
   const queued = {kind: 'token.queued', token: 'child', node: 'fixture/work', seq: sequence + 1, at: 2000, run: 'run-client-view'} as const;
   applyUiEvent(snapshot, queued);
   applyUiEvent(snapshot, queued);
+  assert.equal(JSON.parse(serialized).seq, sequence, 'later events cannot change an already serialized response');
   assert.equal(snapshot.nodes['fixture/work'].queue.filter(id => id === 'child').length, 1);
   assert.equal(JSON.stringify(raw), fullBefore, 'applying a detached UI snapshot must not mutate backend state');
   assert.equal(events.find(event => event.kind === 'token.data')?.kind, 'token.data');

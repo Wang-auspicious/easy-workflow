@@ -67,9 +67,8 @@ function evidenceSummary(evidence: EvidenceRef): EvidenceRef {
   return {...evidence, meta: pick(evidence.meta, ['role', 'href', 'content', 'framing'])};
 }
 
-/** A detached transport snapshot. The authoritative recovery projection is unchanged. */
-export function uiState(state: FactoryState): FactoryState & {view: 'ui-v1'} {
-  return structuredClone({
+function projectUiState(state: FactoryState): FactoryState & {view: 'ui-v1'} {
+  return {
     ...state,
     view: 'ui-v1' as const,
     tokens: Object.fromEntries(Object.entries(state.tokens).map(([id, token]) =>
@@ -80,7 +79,17 @@ export function uiState(state: FactoryState): FactoryState & {view: 'ui-v1'} {
       [id, evidenceSummary(evidence)])),
     cases: {},
     contextNotes: {},
-  });
+  };
+}
+
+/** A detached transport snapshot. The authoritative recovery projection is unchanged. */
+export function uiState(state: FactoryState): FactoryState & {view: 'ui-v1'} {
+  return structuredClone(projectUiState(state));
+}
+
+/** Serialize in the same synchronous turn, without retaining shared references. */
+export function serializeUiState(state: FactoryState): string {
+  return JSON.stringify(projectUiState(state));
 }
 
 export function isUiState(state: unknown): state is FactoryState & {view: 'ui-v1'} {

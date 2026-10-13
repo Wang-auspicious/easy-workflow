@@ -10,7 +10,7 @@ import h2Extension from "../integrations/pi/h2-factory.ts";
 import {Journal} from '../server/journal.ts';
 import type {SourceSpec} from '../shared/types.ts';
 import type {AttemptState, FactoryState} from '../shared/project.ts';
-import type {UiEvent} from '../shared/client-view.ts';
+import {uiState, type UiEvent} from '../shared/client-view.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const secret = "factory-test-only";
@@ -36,7 +36,7 @@ async function start(dir: string, readOnly = false) {
     const response = await fetch(url + route, { method: body === undefined ? "GET" : "POST",
       headers: { authorization: `Bearer ${secret}`, "content-type": "application/json", ...headers },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(10000) });
-    return { status: response.status, body: await response.json() as any };
+    return { status: response.status, body: await response.json() as any, headers: response.headers };
   };
   const tool = (name: string, args: unknown = {}) => request(`/api/tools/${name}`, args);
   return { child, url, request, tool };
@@ -73,7 +73,13 @@ test('UI snapshot and SSE opt-in preserve raw APIs and expose exact attempt deta
   try {
     server = await start(dir, true);
     const raw = (await server.request('/api/state')).body as FactoryState & {view?: string};
-    const compact = (await server.request('/api/state?view=ui-v1')).body as FactoryState & {view?: string};
+    const compactResponse = await server.request('/api/state?view=ui-v1');
+    const compact = compactResponse.body as FactoryState & {view?: string};
+    assert.equal(compactResponse.status, 200);
+    assert.equal(compactResponse.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.equal(compactResponse.headers.get('access-control-allow-origin'), '*');
+    assert.equal(compactResponse.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(compact, JSON.parse(JSON.stringify(uiState(raw))), 'HTTP serialization keeps the complete prior UI body, including dispatcher state');
     assert.equal(raw.view, undefined);
     assert.equal(compact.view, 'ui-v1');
     assert.equal(compact.seq, raw.seq);
