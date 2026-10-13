@@ -51,6 +51,8 @@ interface Consultation {
   current?: Fix & { id: string };
   chain: string[];
   replies: string[];
+  /** Current owner and intermediary replies survive checkpoints independently. */
+  responses?: {station: string; reply: string}[];
   open: string[];
   /** An intermediate reviewer must approve its own repair before this chain resumes. */
   parent?: Consultation;
@@ -1147,6 +1149,7 @@ export class Runtime {
       return;
     }
     c.current = fix;
+    c.responses = [];
     c.chain = [fix.station, ...(fix.via ?? [])];
     this.redoAt(t, fix.station, `${this.nodes.get(c.reviewer)?.name} 要求修改字段 ${fix.fields.join("、")}：${fix.problem}`);
     this.enqueue(t, fix.station, c.reviewer, true);
@@ -1163,12 +1166,20 @@ export class Runtime {
 
   private consultStep(t: TokenRun, n: CompiledNode, res: StationResult) {
     const c = t.consult!;
+    const response = typeof res.data?.reply === 'string' && res.data.reply.trim()
+      ? res.data.reply : res.summary;
+    (c.responses ??= []).push({station: n.key, reply: response});
     c.chain.shift();
-    if (c.chain.length) { this.redoAt(t, c.chain[0], `上游 ${n.name} 已按审核意见修改，请据此更新`); this.enqueue(t, c.chain[0], n.key, true); return; }
+    if (c.chain.length) {
+      this.redoAt(t, c.chain[0], `上游 ${n.name} 已按审核意见修改，请据此更新。回复：${response}`);
+      this.enqueue(t, c.chain[0], n.key, true);
+      return;
+    }
     const fix = c.current!;
-    const reply = String((res.data as { reply?: string } | undefined)?.reply ?? res.summary);
+    const reply = c.responses.map((value, index) => index === 0 && value.station === fix.station
+      ? value.reply : `${this.nodes.get(value.station)?.name ?? value.station}：${value.reply}`).join('；');
     c.replies.push(`${this.nodes.get(fix.station)?.name}：${reply}`);
-    this.journal.append({ kind: "consult.replied", consult: fix.id, token: t.id, owner: fix.station, reply, ok: res.ok });
+    this.journal.append({kind: 'consult.replied', consult: fix.id, token: t.id, owner: fix.station, reply, ok: res.ok});
     this.nextConsult(t);
   }
 
@@ -1213,6 +1224,9 @@ export class Runtime {
     do {
       const c = t.consult;
       for (const id of c?.open ?? []) this.journal.append({ kind: "consult.closed", consult: id, token: t.id, outcome, reason });
+      if (outcome === 'resolved' && c?.parent && c.replies.length) {
+        (c.parent.responses ??= []).push({station: c.reviewer, reply: `修复往来：${c.replies.join('；')}`});
+      }
       t.consult = c?.parent;
     } while (outcome === "manual" && t.consult);
     if (outcome === "manual") t.pendingConsults = [];

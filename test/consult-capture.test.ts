@@ -67,7 +67,8 @@ test("preview counting deduplicates overlapping selectors and excludes offscreen
   assert.deepEqual(breadthPreviewIssues("component-source", 4), []);
 });
 
-async function runConsult(recheck: (calls: number) => StationResult, extra?: (key: string, call: number) => Promise<StationResult | undefined>) {
+async function runConsult(recheck: (calls: number) => StationResult,
+  extra?: (key: string, call: number, context: StationContext, runtime: Runtime) => Promise<StationResult | undefined>) {
   const journal = new Journal(":memory:");
   const broker = new Broker({ model: 8, browser: 8, http: 8, cpu: 4 }, 0);
   const calls: Record<string, number> = {};
@@ -75,10 +76,10 @@ async function runConsult(recheck: (calls: number) => StationResult, extra?: (ke
   const runtime = new Runtime(compiled, journal, broker, {
     shots: () => true, video: () => false, needsProof: () => true, noProof: () => false,
     complete: () => true, incomplete: () => false,
-  }, n => async () => {
+  }, n => async context => {
     calls[n.key] = (calls[n.key] ?? 0) + 1;
     order.push(n.key);
-    const additional = await extra?.(n.key, calls[n.key]);
+    const additional = await extra?.(n.key, calls[n.key], context, runtime);
     if (additional) return additional;
     if (n.key === "curation/style" && calls[n.key] === 1) return {
       ok: true, summary: "subject missing", verdict: { verdict: "fix", reason: "subject missing", fixes: [{ station: "curation/proof", fields: ["shots.proof"], problem: "subject missing", via: ["curation/process", "curation/shot-review"] }] },
@@ -110,14 +111,49 @@ test("a return inside the repair chain reshoots and rechecks before the original
   assert.ok(result.events.filter(e => e.kind === "consult.closed").every(e => e.outcome === "resolved"));
 });
 
+test('owner repair explanations survive a checkpoint and intermediary processing', async () => {
+  const reply = 'Reframed the actual component and removed the offscreen card claim.';
+  let restored = false;
+  let reviewerNote = '';
+  const result = await runConsult(() => ({
+    ok: true, summary: 'The intermediate image check passed.',
+    verdict: {verdict: 'pass', reason: 'The visible component is correct.'},
+  }), async (key, call, context, runtime) => {
+    if (key === 'curation/proof' && call === 2) {
+      return {ok: true, summary: 'Owner repair completed.', data: {reply}};
+    }
+    if (key === 'curation/process' && call === 2) {
+      const token = runtime.tokens.get(context.token.id)!;
+      token.data.runtimeCheckpoint = JSON.parse(JSON.stringify(token.data.runtimeCheckpoint));
+      token.consult = undefined;
+      runtime.restoreCheckpoint(token);
+      restored = true;
+      return {ok: true, summary: 'Images assembled.'};
+    }
+    if (key === 'curation/style' && call === 2) reviewerNote = context.redo?.reason ?? '';
+    return undefined;
+  });
+  assert.ok(restored);
+  assert.ok(reviewerNote.includes(reply), 'the original reviewer receives the owner explanation after reconstruction');
+  const replied = result.events.find(event => event.kind === 'consult.replied');
+  assert.ok(replied?.kind === 'consult.replied' && replied.reply.includes(reply));
+  assert.equal(result.calls['curation/proof'], 2, 'restoration cannot rerun the completed owner');
+  assert.equal(result.calls['curation/style'], 2);
+});
+
 test("an intermediary fix retains the parent consultation until both reviews pass", async () => {
   const result = await runConsult(calls => calls === 2
     ? { ok: true, summary: "fix framing", verdict: { verdict: "fix", reason: "wrong frame", fixes: [{ station: "curation/proof", fields: ["shots.proof"], problem: "crop the preview", via: ["curation/process"] }] } }
-    : { ok: true, summary: "fixed", verdict: { verdict: "pass", reason: "framing correct" } });
+    : { ok: true, summary: "fixed", verdict: { verdict: "pass", reason: "framing correct" } },
+  async (key, call) => key === 'curation/proof' && call > 1
+    ? {ok: true, summary: 'Frame repaired.', data: {reply: `Specific framing repair ${call}.`}} : undefined);
   assert.equal(result.calls["curation/shot-review"], 3);
   assert.equal(result.calls["curation/style"], 2);
   const opened = result.events.filter(e => e.kind === "consult.opened");
   assert.deepEqual(opened.map(e => e.reviewer), ["curation/style", "curation/shot-review"]);
+  const parentReply = result.events.find(event => event.kind === 'consult.replied' && event.consult === opened[0].consult);
+  assert.ok(parentReply?.kind === 'consult.replied' && parentReply.reply.includes('Specific framing repair 3.'),
+    'the parent sees the later nested correction, not only the first owner response');
   assert.equal(result.events.filter(e => e.kind === "consult.closed").length, 2);
   assert.equal(result.finished.kind === "token.finished" && result.finished.status, "published");
 });
