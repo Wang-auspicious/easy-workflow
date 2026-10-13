@@ -34,7 +34,7 @@ assert.equal(JSON.parse(disallowed.result.content[0].text).ok, false);
 const help = await call("env_help", {});
 assert.equal(JSON.parse(help.result.content[0].text).ok, true);
 assert.ok((await call("submit", { score: "not a number" })).error);
-const score = request.messages.length > 1 ? 1 : 0;
+const score = request.model === 'fixture-two-repairs' ? Math.min(2, Math.floor((request.messages.length - 1) / 2)) : request.messages.length > 1 ? 1 : 0;
 const result = await call("submit", { score });
 assert.equal(result.result.content[0].text, "received");
 assert.equal((await call("submit", { score: 9 })).result.isError, true);

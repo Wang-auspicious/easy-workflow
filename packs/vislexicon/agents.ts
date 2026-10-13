@@ -514,10 +514,11 @@ const BANNED = /精美|高级感|极致|强大的|一站式|赋能|海量|顶级
 const imagesFor = (store: EvidenceStore) => (ctx: StationContext) => publicationImages(data(ctx), store).map((im) => ({ file: store.resolve(im.card)!, label: `${im.role}: ${im.href}` }));
 
 export const copy = (store: EvidenceStore): AgentStationDef<CopyOut> => ({
+  repairAttempts: 2,
   system: `按 VisLexicon 编辑语气写六样东西（细则见你的 ROLE.md）：
 - name：官方写法的名称。
 - takeawayZh：不超过 28 字，回答"我从这里拿走什么"，不含数字。
-- noteZh：编辑手记 120–180 字、2–4 句，用"我们"，依次写进去看到了什么 → 先点开哪里、为什么 → 适合谁或要注意什么；不用感叹号。
+- noteZh：编辑手记验收范围 120–180 字，写作目标控制在 140–155 字以留计数余量；2–4 句，用"我们"，依次写进去看到了什么 → 先点开哪里、为什么 → 适合谁或要注意什么；不用感叹号。长度包括中英文、标点和空格；超长时只精简这段，不重写已通过的其他字段。
 - rationale.identity / breadth / proof：每条不超过 40 字，写成导览。
 - alt.identity / breadth / proof：画面里实际有什么，不是模板句。
 - 录屏路线只提供 identity 封面，只填写 identity 的导览和 alt；不得杜撰 breadth / proof 画面。静态截图路线必须填写三张图。
@@ -544,7 +545,7 @@ export const copy = (store: EvidenceStore): AgentStationDef<CopyOut> => ({
     const issues: string[] = [];
     const len = (s: string | undefined) => [...(s ?? "")].length;
     if (len(o.takeawayZh) > 28 || len(o.takeawayZh) < 6 || /\d/.test(o.takeawayZh)) issues.push(`takeawayZh 有 ${len(o.takeawayZh)} 字，需 6–28 字且不含数字`);
-    if (len(o.noteZh) < 120 || len(o.noteZh) > 180) issues.push(`noteZh 有 ${len(o.noteZh)} 字，需 120–180`);
+    if (len(o.noteZh) < 120 || len(o.noteZh) > 180) issues.push(`noteZh 有 ${len(o.noteZh)} 字，需 120–180；请改到 140–155 字，保留页面观察、操作建议与适用限制`);
     if (/[!！]/.test(o.noteZh)) issues.push("noteZh 不用感叹号");
     if (!o.noteZh.includes("我们")) issues.push("noteZh 用第一人称复数“我们”");
     for (const k of (data(ctx).mode === "video" ? ["identity"] : ["identity", "breadth", "proof"]) as ("identity" | "breadth" | "proof")[]) {

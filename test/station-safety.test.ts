@@ -13,7 +13,7 @@ import type { Journal } from '../server/journal.ts';
 import type { StationContext } from '../server/runtime.ts';
 import { closeNetwork } from '../server/network.ts';
 
-test('station input and salvage retain the same quality contract as a normal submission', { timeout: 30000 }, async t => {
+test('station input and salvage retain the same quality contract as a normal submission', { timeout: 60000 }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-station-safety-'));
   const prior = Object.fromEntries(['FACTORY_STATION_COMMAND', 'FACTORY_STATION_MODEL'].map(key => [key, process.env[key]]));
   process.env.FACTORY_STATION_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL('./fixtures/closed-agent-launcher.mjs', import.meta.url))]);
@@ -48,6 +48,20 @@ test('station input and salvage retain the same quality contract as a normal sub
       assert.equal(result.ok, false); assert.equal(result.failure?.tag, 'missing_artifact');
       assert.match(result.failure?.nextAction ?? '', /证据|恢复/);
       assert.equal(result.metrics?.time?.modelCalls ?? 0, 0); assert.equal(accepted, 1);
+    });
+    await t.test('a station can finish a bounded second local correction without restarting its work', async () => {
+      process.env.FACTORY_STATION_MODEL = 'fixture-two-repairs';
+      const before = accepted;
+      const result = await runAgentStation({ ...definition, repairAttempts: 2 }, ctx);
+      assert.equal(result.ok, true, 'the second local correction must get the opportunity to satisfy the same contract');
+      assert.equal(result.data?.score, 2); assert.equal(accepted, before + 1);
+      assert.equal(result.metrics?.time?.modelCalls, 3);
+    });
+    await t.test('additional local corrections stay bounded and never accept an invalid result', async () => {
+      const before = accepted;
+      const result = await runAgentStation({ ...definition, check: () => ['cannot pass'], repairAttempts: 2 }, ctx);
+      assert.equal(result.ok, false); assert.equal(accepted, before);
+      assert.equal(result.metrics?.time?.modelCalls, 3);
     });
   } finally {
     for (const [key, value] of Object.entries(prior)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
