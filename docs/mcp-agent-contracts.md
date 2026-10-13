@@ -29,7 +29,7 @@ launcher 在 `<项目>/work/<token>/` 中运行，标准输入接收 JSON。使�
 | `messages` | 本次完整对话历史，重答时包含此前提交与检查反馈 |
 | `mcpServers` | 平台生成的本次工位 MCP 配置，包含启动命令和私有连接信息；按传入值使用 |
 
-以上仅说明字段结构；实际 `messages` 包含完整 `firstMessage`，重答时继续包含先前提交与程序检查反馈。图片以标准 image 内容块加入第一条输入。**launcher 必须把 `firstMessage` 作为该厂商会话的第一条用户消息，并把后续 `messages` 顺序原样映射到同一对话历史。** 厂商 CLI/API 的调用方式由 launcher 负责；Easy Workflow 没有猜测 Claude、Codex 等工具的命令行参数，也没有完成这些厂商的实际模型兼容性验证。
+以上仅说明字段结构；实际 `messages` 包含完整 `firstMessage`，重答时继续包含先前提交与程序检查反馈。图片以标准 image 内容块加入第一条输入。**launcher 必须把 `firstMessage` 作为该厂商会话的第一条用户消息，并把后续 `messages` 顺序原样映射到同一对话历史。** 未指定 `FACTORY_STATION_ADAPTER` 时使用这份通用 launcher 契约；原有接入方式保持兼容。Claude Code 的显式适配见下节；其他厂商仍由其 launcher 翻译官方协议。
 
 `mcpServers` 中的工位连接仅服务于本次回答。它使用单独随机凭据，只公开：
 
@@ -50,6 +50,22 @@ launcher 完成后 stdout 返回一份 JSON，不输出额外日志：
 ```
 
 `usage` 和 `time` 可省略；省略表示客户端没有报告，不能补造估计值冒充实测。`input` 指不含缓存读写的输入量，缓存单独报告；缺报缓存量保持未知。stderr 不转发到 Easy Workflow 日志，以免厂商输出混入提示词或凭据。MCP 成功响应与错误都会检查并移除连接凭据；含凭据的提交参数被拒绝，launcher 回报的模型名也不能夹带凭据。实际结果只能经 MCP `submit` 交回，stdout 不能绕过 schema 提交业务结果。
+
+失败时可以返回 `error: {type: "transport" | "credentials" | "quota" | "tls" | "contract"}`，并以非零退出码结束。平台按结构化类别处理，不把厂商原始诊断或 stderr 写入日志。若失败前已经回报模型与用量，保留这部分消耗；未回报模型的启动/鉴权失败不能伪造模型名称。可单独回报 `modelCalls`，无需为此伪造首字和输出耗时。`FACTORY_STATION_TIMEOUT_MS` 限制一次 launcher 回答的整个生命周期，默认 180000 毫秒，可配置 1–900000；到期终止本次进程树并撤销 MCP。
+
+### Claude Code 适配
+
+显式配置 `FACTORY_STATION_ADAPTER=claude-code`，`FACTORY_STATION_COMMAND` 是本机 Claude Code 可执行文件的 JSON argv 数组，例如 `["claude"]`；`FACTORY_STATION_MODEL` 是请求的模型或厂商支持的别名。它使用 Claude Code 自己已有的认证方式，平台不读取或迁移其认证文件。
+
+适配器采用官方 `--print`、`stream-json` 输入输出及 `--resume`，把首条用户消息、图片和本次 MCP 连接转换成厂商协议。它禁用原生工具、技能、用户/项目设置和 hooks，仅加载本次 `h2_station` MCP；权限模式为 `dontAsk`，不使用跳过权限检查选项。启动时最多等待 10 秒让本地 MCP 就绪；初始化回执若缺少 `submit`、出现其他工具或 MCP 服务，任务立即失败。一次回答最多 12 轮；外层工位的工具调用预算、超时和结构化提交检查仍生效。
+
+平台自己的会话检查点保存在当前项目，绑定工位、角色内容与版本、项目约束、工具范围、验证试验、请求模型、输出 schema、输入和返工原因的签名。滚动案卷与运行记录不参与签名；恢复时仍发送当前工位消息。重启或从失败工位重试时恢复厂商 session ID、已读证据和累计工具调用预算；签名改变时不复用。停止或结束本轮只持久化这些主机生成的会话元数据，丢弃被取消的业务输出；纠错换代后的旧会话元数据同样丢弃。任务成功后清除平台工位检查点，不删除厂商自己的会话历史。
+
+官方支持按 UUID 从其他目录 `--resume`：先查当前项目与 worktree，再查本机其他项目；跨项目仅唯一匹配成功。平台不读取厂商 transcript，也不接受会话引用携带的任意工作目录。此跨目录行为依据厂商契约；本地跨 token 恢复回归使用协议 fixture，尚未用付费模型验证持久会话恢复。
+
+实际模型取自结构化回执。token 量取当前轮 usage；Claude 的 `total_cost_usd` 在恢复会话后包含此前累计费用，因此仅记与上次检查点之差。错误回执若将费用归零，保留先前基线和真实错误类别，将本次用量标为未知。该费用是厂商客户端报告的**估计费用**，不是账单核验值。多个内容块共用同一 assistant message ID 时只计一次模型调用；没有位置与时间证据时，首字和输出耗时继续标为未知。
+
+协议依据：[非交互调用](https://code.claude.com/docs/en/headless)、[会话恢复](https://code.claude.com/docs/en/sessions)、[费用和用量](https://code.claude.com/docs/en/agent-sdk/cost-tracking)、[MCP 启动等待](https://code.claude.com/docs/en/agent-sdk/mcp)。Claude Code 2.1.220 已通过一次隔离的真实 `runAgentStation` 验收：仅 `submit` 可用，`2 + 2` 经 MCP 提交 4，schema 与程序检查通过；实际模型 `claude-haiku-4-5-20251001`，无权限拒绝，8.58 秒，客户端估算费用 0.003904 美元。预算上限 0.10 美元、总截止 90 秒，未改变生产默认。此前一次裸适配器调用未提交；其诊断记录不足以确认原因，不能当作成功。真实验收覆盖该版本的单次工位契约；失败、取消和会话恢复仍由明确标识的协议 fixture 验证，不能外推为其他版本或完整业务线已经验收。
 
 ## 报告
 

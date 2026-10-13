@@ -440,6 +440,14 @@ export class Docs {
     const trial = caseId && scope && !this.readOnly ? this.lessons?.validationContext(key, caseId, scope) : "";
     if (trial) parts.push(trial);
     if (tools?.length) parts.push(`---\n# 能力箱\n你可以调用 env_help 查看工具说明（带 name 看参数），用 env_call({name, arguments}) 执行。本工位可用：${tools.join("、")}。工具返回 ok:false 时读 failure.nextAction 和 failure.owner：owner=agent 按建议换方法，owner=user 或 system 就在提交里如实写明卡在哪，不要重复同一个调用。`);
-    return { text: parts.join("\n\n"), role: role.revision, sizes: { role: role.content.length, project: project.length, context: parts[2].length, caseFile: caseId ? parts[3].length : 0 } };
+    // Running history changes after every attempt. It must not invalidate a
+    // resumable conversation, unlike a changed role, project or capability scope.
+    const sessionPolicy = hash(JSON.stringify({
+      project: { name: this.name, text: project },
+      role: { revision: role.revision, content: role.content },
+      tools: [...new Set(tools ?? [])].sort(),
+      validation: trial ?? '',
+    }));
+    return { text: parts.join("\n\n"), role: role.revision, sessionPolicy, sizes: { role: role.content.length, project: project.length, context: parts[2].length, caseFile: caseId ? parts[3].length : 0 } };
   }
 }

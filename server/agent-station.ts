@@ -18,7 +18,7 @@ import { readRole } from "./roles.ts";
 import { ClosedStationAgent, closedAgentConfig } from "./mcp-station.ts";
 import { StationActivity } from "./activity.ts";
 import { withEvidenceReads, readEvidence, rememberRead } from "./network.ts";
-import { classifyFailure } from "../shared/failures.ts";
+import { classifyFailure, type Failure } from "../shared/failures.ts";
 import { loadStationSession, saveStationSession, sessionSignature, type SessionRef } from './station-session.ts';
 export { models, MODEL_ID, apiKeyPresent } from "./pi.ts";
 
@@ -93,7 +93,7 @@ const TRANSIENT = /timeout|timed? ?out|超时|connection error|ECONNRESET|ECONNR
 
 function throwStationAbort(signal: AbortSignal, partial: StationResult): never {
   const error = signal.reason instanceof Error ? signal.reason : new DOMException("Station attempt cancelled", "AbortError");
-  Object.assign(error, { usage: partial.usage, metrics: partial.metrics });
+  Object.assign(error, { usage: partial.usage, metrics: partial.metrics, sessionCheckpoint: partial.sessionCheckpoint });
   throw error;
 }
 
@@ -200,7 +200,8 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     } else usageMissing = true;
     if (reply.usage?.cacheRead === undefined || reply.usage.cacheWrite === undefined) cacheUsageMissing = true;
     modelTimeReported = (externalReplies++ === 0 || modelTimeReported) && !!reply.time;
-    if (reply.time) { firstTokenMs += reply.time.firstTokenMs; outputMs += reply.time.outputMs; modelCalls += reply.time.modelCalls; }
+    if (reply.time) { firstTokenMs += reply.time.firstTokenMs; outputMs += reply.time.outputMs; }
+    modelCalls += reply.modelCalls ?? reply.time?.modelCalls ?? 0;
     ctx.progress(`闭源 Agent 返回；实际模型 ${reply.model}`, { tool: "model", text: reply.usage ? "已接收接口用量" : "客户端未报告用量；保持未知" });
   }) : new Agent({
     initialState: { systemPrompt: `${env.text}\n\n${contract}`, model: selection!.model, thinkingLevel: "off", tools },
@@ -234,7 +235,37 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   const redo = ctx.redo ? `\n\nTHIS IS A REDO. ${ctx.redo.byHuman ? "The human owner corrected" : "A reviewer sent back"} this work: ${ctx.redo.reason}${ctx.redo.note ? ` (${ctx.redo.note})` : ""}. Change only what is named; keep everything else as it was, and say in your submission what you changed.` : "";
   const sessionRoot = docs?.dir;
   const sessions = (ctx.token.data?.stationSessions ?? {}) as Record<string, SessionRef>;
-  const signature = sessionSignature({ node: ctx.node.key, model: modelId, role: role.revision, contract: def.system, schema: def.schema, input: input.text + redo, images: input.images });
+  const closedSessions = (ctx.token.data?.closedStationSessions ?? {}) as Record<string, unknown>;
+  const signature = sessionSignature({
+    node: ctx.node.key, model: modelId, role: role.revision, contract: def.system,
+    schema: def.schema, input: input.text + redo, images: input.images,
+    ...(external ? { policy: 'sessionPolicy' in env ? env.sessionPolicy : env.text, tools: [...allowed].sort() } : {}),
+  });
+  if (agent instanceof ClosedStationAgent) {
+    agent.configureSession(ctx.node.key, signature, closedSessions[ctx.node.key], () => ({ calls: envCalls, evidence: readEvidence() }));
+    const restored = agent.sessionReference()?.context;
+    if (restored && Number.isSafeInteger(restored.calls) && restored.calls >= 0 && Array.isArray(restored.evidence)) {
+      envCalls = restored.calls;
+      for (const evidence of restored.evidence) if (typeof evidence.url === 'string' && typeof evidence.text === 'string') rememberRead(evidence.url, evidence.text);
+      ctx.progress('恢复闭源 Agent 的本工位会话和已读证据，保留原工具调用预算', { tool: 'recover', text: '' });
+    }
+  }
+  const closedCheckpoint = () => {
+    const reference = agent instanceof ClosedStationAgent ? agent.sessionReference() : undefined;
+    return reference ? { closedStationSessions: { ...closedSessions, [ctx.node.key]: reference } } : undefined;
+  };
+  const sessionCheckpoint = (): StationResult['sessionCheckpoint'] => {
+    if (agent instanceof ClosedStationAgent) {
+      const closed = agent.sessionReference();
+      return closed ? { closed } : undefined;
+    }
+    if (!sessionRoot) return;
+    const messages = [...agent.state.messages];
+    const last = messages.at(-1);
+    if (last?.role === 'assistant' && ['error', 'aborted'].includes(last.stopReason)) messages.pop();
+    if (!['user', 'toolResult'].includes(messages.at(-1)?.role ?? '')) return;
+    return { pi: saveStationSession(sessionRoot, signature, { messages, evidence: readEvidence(), calls: envCalls }) };
+  };
   const saved = sessionRoot && agent instanceof Agent ? loadStationSession(sessionRoot, sessions[ctx.node.key], signature) : undefined;
   if (saved && agent instanceof Agent) {
     agent.state.messages = saved.messages as typeof agent.state.messages;
@@ -243,7 +274,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     ctx.progress('恢复本工位已经完成的工具读取与对话，从中断的模型请求继续', {tool:'recover',text:'不重复打开页面或重做已完成的工具调用'});
   }
   const metrics = (): AttemptMetrics => ({
-    usageReported, modelTimeReported: modelTimeReported && (!external || externalReplies === promptCalls), execution: { adapter: external ? "closed-command" : "pi", model: external && !externalReplies ? "unreported" : modelId },
+    usageReported, modelTimeReported: modelTimeReported && (!external || externalReplies === promptCalls), execution: { adapter: external ? external.adapter === 'claude-code' ? 'claude-code' : "closed-command" : "pi", model: external && !externalReplies ? "unreported" : modelId },
     usageComplete: usageReported && !usageMissing && usageResponses === (external ? promptCalls : activity.count("model_request")),
     cacheUsageComplete: usageReported && !usageMissing && !cacheUsageMissing && usageResponses === (external ? promptCalls : activity.count("model_request")),
     activity: activity.snapshot(),
@@ -259,16 +290,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   let continued = false;
   const modelError = () => requestTimedOut ? `模型单次请求超时（${requestTimeoutMs}ms）${continued ? "；本工位的原地续答次数已用完" : ""}` : agent.state.errorMessage && redactModelError(agent.state.errorMessage);
   const modelFailure = (error: string, summary: string): StationResult => {
-    let data: Record<string, unknown> | undefined;
-    if (sessionRoot && agent instanceof Agent) {
-      const messages = [...agent.state.messages];
-      const last = messages.at(-1);
-      if (last?.role === 'assistant' && ['error','aborted'].includes(last.stopReason)) messages.pop();
-      if (['user','toolResult'].includes(messages.at(-1)?.role ?? '')) {
-        const ref = saveStationSession(sessionRoot, signature, {messages,evidence:readEvidence(),calls:envCalls});
-        data = {stationSessions:{...sessions,[ctx.node.key]:ref}};
-      }
-    }
+    let data: Record<string, unknown> | undefined = closedCheckpoint();
+    const checkpoint = sessionCheckpoint();
+    if (checkpoint?.pi) data = { stationSessions: { ...sessions, [ctx.node.key]: checkpoint.pi } };
     return {ok:false,summary,error:error.slice(0,240),failure:classifyFailure(error,{stage:'model'}),data,usage:usageReported?usage:undefined,metrics:metrics()};
   };
   const invoke = async (run: () => Promise<void>) => {
@@ -302,7 +326,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   }
   const error = modelError();
   if (error && !submitted) return modelFailure(error, "模型调用失败");
-  if (!submitted) return { ok: false, summary: "模型没有提交结果", error: "no submit", usage: usageReported ? usage : undefined, metrics: metrics() };
+  if (!submitted) return { ok: false, summary: "模型没有提交结果", error: "no submit", data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics() };
   let out = submitted as T;
   if (def.describe) ctx.progress(def.describe(out), { tool: "submit", text: "", ok: true });
   let issues = def.check?.(out, ctx) ?? [];
@@ -325,7 +349,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     if (!saved) {
       return {
         ok: false, summary: `重答后仍不合格：${issues[0]}`,
-        error: issues.join('; '), usage: usageReported ? usage : undefined, metrics: metrics(),
+        error: issues.join('; '), data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics(),
       };
     }
     // Salvage is a deterministic correction, never an exemption from the
@@ -335,7 +359,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     if (remaining.length) {
       return {
         ok: false, summary: `修剪后仍不合格：${remaining[0]}`,
-        error: remaining.join('; '), usage: usageReported ? usage : undefined, metrics: metrics(),
+        error: remaining.join('; '), data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics(),
       };
     }
     ctx.progress(`逐项修剪后保留可用部分（丢弃：${issues.slice(0, 3).join('；')}）`, {
@@ -349,14 +373,19 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   const res = await def.after(out, { ...ctx, signal: sessionSignal }, { rounds, issues });
   sessionSignal.throwIfAborted();
   const remainingSessions = {...sessions}; delete remainingSessions[ctx.node.key];
-  return { ...res, data: {...res.data,...(sessions[ctx.node.key] ? {stationSessions:remainingSessions} : {})}, usage: usageReported ? usage : undefined, metrics: metrics() };
+  const closedData = res.ok && agent instanceof ClosedStationAgent ? (() => {
+    agent.clearSession();
+    const remaining = { ...closedSessions }; delete remaining[ctx.node.key];
+    return closedSessions[ctx.node.key] ? { closedStationSessions: remaining } : undefined;
+  })() : closedCheckpoint();
+  return { ...res, data: {...res.data,...(sessions[ctx.node.key] ? {stationSessions:remainingSessions} : {}), ...closedData}, usage: usageReported ? usage : undefined, metrics: metrics() };
   } catch (err) {
     const awaitingModel = activity.snapshot().spans.some(span => span.kind === 'model_request' && span.status === 'running');
     activity.close(ctx.signal.aborted || ["AbortError", "TimeoutError"].includes((err as Error)?.name) ? "cancelled" : "failed");
-    if (ctx.signal.aborted) throwStationAbort(ctx.signal, { ok: false, summary: "模型调用已取消", usage: usageReported ? usage : undefined, metrics: metrics() });
+    if (ctx.signal.aborted) throwStationAbort(ctx.signal, { ok: false, summary: "模型调用已取消", usage: usageReported ? usage : undefined, metrics: metrics(), sessionCheckpoint: sessionCheckpoint() });
     if (sessionSignal.aborted && awaitingModel) return modelFailure(`工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留`, '工位工作预算已用完');
     const failure = sessionSignal.aborted ? sessionSignal.reason : err;
-    return { ok: false, summary: sessionSignal.aborted ? "工位工作预算已用完" : "模型调用失败", error: sessionSignal.aborted ? `工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留` : failure instanceof Error ? failure.message : String(failure), usage: usageReported ? usage : undefined, metrics: metrics() };
+    return { ok: false, summary: sessionSignal.aborted ? "工位工作预算已用完" : "模型调用失败", error: sessionSignal.aborted ? `工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留` : failure instanceof Error ? failure.message : String(failure), failure: (failure as { failure?: Failure })?.failure ?? classifyFailure(failure, { stage: 'model' }), data: closedCheckpoint(), usage: usageReported ? usage : undefined, metrics: metrics() };
   } finally { activity.close("failed"); narration.flush(); }
 }
 

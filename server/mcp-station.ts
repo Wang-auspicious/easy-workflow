@@ -12,16 +12,21 @@ import type { TSchema } from "typebox";
 import type { Usage } from "../shared/types.ts";
 import { mcpText, type McpTool } from "./mcp-protocol.ts";
 import { factorySecrets, launcherEnvironment, redactText, redactValue } from "./mcp-security.ts";
+import { ClaudeCodeProtocol, validClaudeSession, type ClaudeSessionReference } from './claude-code.ts';
+import { classifyFailure, type Failure } from '../shared/failures.ts';
 
 export interface StationTool {
   name: string; label: string; description: string; parameters: TSchema;
   execute: (id: string, args: any, signal?: AbortSignal) => Promise<{ content: { type: "text"; text: string }[] }>;
 }
-export interface ClosedAgentConfig { command: string[]; model: string; cwd: string }
+export interface ClosedAgentConfig { command: string[]; model: string; cwd: string; adapter?: 'launcher' | 'claude-code'; requestTimeoutMs?: number }
 export interface ClosedAgentReply {
   model: string;
   usage?: Usage;
+  modelCalls?: number;
   time?: { firstTokenMs: number; outputMs: number; modelCalls: number };
+  error?: { type: 'transport' | 'credentials' | 'quota' | 'tls' | 'contract' };
+  failure?: Failure;
 }
 type Message = { role: "user" | "assistant"; content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] };
 
@@ -31,8 +36,12 @@ export function closedAgentConfig(cwd: string): ClosedAgentConfig | null {
   try { command = JSON.parse(process.env.FACTORY_STATION_COMMAND); } catch { throw new Error("FACTORY_STATION_COMMAND must be a JSON argv array."); }
   if (!Array.isArray(command) || !command.length || command.some(x => typeof x !== "string" || !x.trim())) throw new Error("FACTORY_STATION_COMMAND must be a nonempty JSON argv array.");
   if (!process.env.FACTORY_STATION_MODEL?.trim()) throw new Error("Set FACTORY_STATION_MODEL to the launcher's requested model.");
+  const adapter = process.env.FACTORY_STATION_ADAPTER?.trim() || 'launcher';
+  if (!['launcher', 'claude-code'].includes(adapter)) throw new Error('FACTORY_STATION_ADAPTER must be launcher or claude-code.');
+  const requestTimeoutMs = Number(process.env.FACTORY_STATION_TIMEOUT_MS ?? 180000);
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 900000) throw new Error('FACTORY_STATION_TIMEOUT_MS must be an integer from 1 to 900000.');
   if (factorySecrets().some(secret => command.some(x => x.includes(secret)) || process.env.FACTORY_STATION_MODEL!.includes(secret))) throw new Error("Do not pass Easy Workflow control credentials to a station launcher.");
-  return { command, model: process.env.FACTORY_STATION_MODEL, cwd };
+  return { command, model: process.env.FACTORY_STATION_MODEL, cwd, adapter: adapter as ClosedAgentConfig['adapter'], requestTimeoutMs };
 }
 
 export async function openStationMcp(tools: StationTool[], signal: AbortSignal) {
@@ -106,20 +115,74 @@ export class ClosedStationAgent {
   private messages: Message[] = [];
   private controller?: AbortController;
   private onReply: (reply: ClosedAgentReply) => void;
+  private session?: ClaudeSessionReference;
+  private sessionFile?: string;
+  private signature = '';
+  private readContext?: () => NonNullable<ClaudeSessionReference['context']>;
   constructor(config: ClosedAgentConfig, envelope: string, tools: StationTool[], onReply: (reply: ClosedAgentReply) => void) { this.config = config; this.envelope = redactText(envelope, factorySecrets()); this.tools = tools; this.onReply = onReply; }
   abort() { this.controller?.abort(); }
+  configureSession(station: string, signature: string, saved?: unknown, readContext?: () => NonNullable<ClaudeSessionReference['context']>) {
+    if (this.config.adapter !== 'claude-code') return;
+    this.signature = signature;
+    this.readContext = readContext;
+    this.session = undefined;
+    this.sessionFile = path.join(this.config.cwd, 'closed-sessions', `${crypto.createHash('sha256').update(station).digest('hex').slice(0, 24)}.json`);
+    if (validClaudeSession(saved, this.config.model, signature)) {
+      this.session = structuredClone(saved);
+    } else {
+      try {
+        const local: unknown = JSON.parse(fs.readFileSync(this.sessionFile, 'utf8'));
+        if (validClaudeSession(local, this.config.model, signature)) this.session = local;
+      } catch {
+        // A new station has no saved vendor session.
+      }
+    }
+  }
+  sessionReference() {
+    return this.session && structuredClone(this.session);
+  }
+  clearSession() {
+    this.session = undefined;
+    if (this.sessionFile) fs.rmSync(this.sessionFile, { force: true });
+  }
+  private saveSession(session: ClaudeSessionReference) {
+    this.session = { ...session, ...(this.readContext ? { context: this.readContext() } : {}) };
+    if (!this.sessionFile) return;
+    fs.mkdirSync(path.dirname(this.sessionFile), { recursive: true });
+    const temporary = `${this.sessionFile}.${crypto.randomUUID()}.tmp`;
+    try {
+      fs.writeFileSync(temporary, JSON.stringify(this.session), { flag: 'wx', mode: 0o600 });
+      fs.renameSync(temporary, this.sessionFile);
+    } finally {
+      fs.rmSync(temporary, { force: true });
+    }
+  }
   async prompt(text: string, images?: { type: "image"; data: string; mimeType: string }[]) {
     this.state.errorMessage = undefined;
     const first = this.messages.length === 0;
     this.messages.push({ role: "user", content: [{ type: "text", text: redactText(first ? `${this.envelope}\n\n---\n# 本次输入\n${text}` : text, factorySecrets()) }, ...(images ?? [])] });
     this.controller = new AbortController();
-    const scopedTools = this.tools.map(t => t.name === "submit" ? { ...t, execute: async (id: string, args: any, signal?: AbortSignal) => { const result = await t.execute(id, args, signal); this.messages.push({ role: "assistant", content: [{ type: "text", text: `submit: ${JSON.stringify(args)}` }] }); return result; } } : t);
+    const scopedTools = this.tools.map(tool => ({
+      ...tool,
+      execute: async (id: string, args: unknown, signal?: AbortSignal) => {
+        try {
+          const result = await tool.execute(id, args, signal);
+          if (tool.name === 'submit') this.messages.push({ role: 'assistant', content: [{ type: 'text', text: `submit: ${JSON.stringify(args)}` }] });
+          return result;
+        } finally {
+          if (this.session) this.saveSession(this.session);
+        }
+      },
+    }));
     const session = await openStationMcp(scopedTools, this.controller.signal);
     try {
-      const reply = await runLauncher(this.config, { product: "Easy Workflow", protocol: "h2-closed-agent/1", model: this.config.model, firstMessage: this.messages[0], messages: this.messages, mcpServers: { h2_station: session.config } }, this.controller.signal);
+      const request = { product: "Easy Workflow", protocol: "h2-closed-agent/1", model: this.config.model, firstMessage: this.messages[0], messages: this.messages, mcpServers: { h2_station: session.config } };
+      const vendor = this.config.adapter === 'claude-code' ? new ClaudeCodeProtocol(this.config.model, this.signature, this.session, reference => this.saveSession(reference)) : undefined;
+      const reply = await runLauncher(this.config, request, this.controller.signal, vendor);
       const safe = session.redact(reply);
       if (safe.model !== reply.model) throw new Error("Launcher metadata contained credentials; it was not logged.");
       this.onReply(safe);
+      if (safe.failure) throw Object.assign(new Error(safe.failure.message), { failure: safe.failure });
     } catch (err) {
       this.state.errorMessage = err instanceof Error ? err.message : "Closed agent launcher failed";
       // A submit alone does not certify a completed launcher or its actual model.
@@ -128,36 +191,73 @@ export class ClosedStationAgent {
   }
 }
 
-async function runLauncher(config: ClosedAgentConfig, request: unknown, signal: AbortSignal): Promise<ClosedAgentReply> {
+async function runLauncher(config: ClosedAgentConfig, request: { messages: Message[]; mcpServers: Record<string, unknown> }, signal: AbortSignal, vendor?: ClaudeCodeProtocol): Promise<ClosedAgentReply> {
   signal.throwIfAborted();
   fs.mkdirSync(config.cwd, { recursive: true });
-  const child = spawn(config.command[0], config.command.slice(1), { cwd: config.cwd, env: launcherEnvironment(), shell: false, windowsHide: true,
+  const command = vendor ? vendor.argv(config.command, request.mcpServers) : config.command;
+  const child = spawn(command[0], command.slice(1), { cwd: config.cwd, env: { ...launcherEnvironment(), ...(vendor ? {
+    ENABLE_TOOL_SEARCH: 'false', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    // Older CLI versions can emit init before their local MCP tools are ready.
+    // Wait for this one scoped server instead of spending a turn without submit.
+    MCP_CONNECTION_NONBLOCKING: '0', MCP_CONNECT_TIMEOUT_MS: '10000', MCP_TIMEOUT: '10000',
+  } : {}) }, shell: false, windowsHide: true,
     detached: process.platform !== "win32", stdio: ["pipe", "pipe", "pipe"] });
   return new Promise<ClosedAgentReply>((resolve, reject) => {
     let output = "", size = 0, done = false, failure: Error | undefined;
     let stopping: Promise<void> | undefined;
-    const finish = (error?: Error, reply?: ClosedAgentReply) => { if (done) return; done = true; signal.removeEventListener("abort", abort); error ? reject(error) : resolve(reply!); };
+    const finish = (error?: Error, reply?: ClosedAgentReply) => { if (done) return; done = true; clearTimeout(timeout); signal.removeEventListener("abort", abort); error ? reject(error) : resolve(reply!); };
     const stop = (error: Error) => { failure ??= error; stopping ??= stopLauncher(child); void stopping.finally(() => finish(failure)); };
     const abort = () => stop(new Error("Closed agent cancelled"));
+    const timeout = setTimeout(() => stop(new Error('Closed agent request timed out; its process tree and station scope were cancelled.')), config.requestTimeoutMs ?? 180000);
+    timeout.unref();
     signal.addEventListener("abort", abort, { once: true });
-    child.stdout.on("data", chunk => { size += chunk.length; if (size > 1024 * 1024) stop(new Error("Closed agent launcher response exceeds 1 MiB")); else output += chunk; });
+    child.stdout.setEncoding('utf8');
+    child.stdout.on("data", (chunk: string) => {
+      size += Buffer.byteLength(chunk); if (size > (vendor ? 16 : 1) * 1024 * 1024) return stop(new Error('Closed agent launcher response exceeded its bounded output budget'));
+      output += chunk;
+      if (!vendor) return;
+      let end: number;
+      try {
+        while ((end = output.indexOf('\n')) !== -1) { vendor.accept(output.slice(0, end)); output = output.slice(end + 1); }
+        if (Buffer.byteLength(output) > 1024 * 1024) stop(new Error('Claude Code stream line exceeded 1 MiB'));
+      } catch { stop(new Error('Claude Code stream violated the station protocol or capability scope')); }
+    });
     // Vendor logs may contain prompts or authentication; do not forward them to Easy Workflow logs.
     child.stderr.resume();
     child.once("error", () => finish(new Error("Closed agent launcher could not start; check the configured executable.")));
     child.stdin.on("error", () => stop(new Error("Closed agent launcher did not accept its input document.")));
     child.once("close", code => {
       if (failure) return;
-      if (code !== 0) return finish(new Error(`Closed agent launcher exited (${code ?? "signal"}).`));
       let reply: ClosedAgentReply;
-      try { reply = JSON.parse(output); } catch { return finish(new Error("Closed agent launcher must return one JSON result.")); }
+      try {
+        if (vendor) { if (output.trim()) vendor.accept(output); reply = vendor.finish(); }
+        else reply = JSON.parse(output);
+      } catch (error) { return finish(vendor && error instanceof Error ? error : new Error(code !== 0 ? `Closed agent launcher exited (${code ?? 'signal'}); no structured failure was reported.` : 'Closed agent launcher must return one JSON result.')); }
+      if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return finish(new Error('Closed agent launcher returned an invalid result document.'));
+      let reportedFailure: Failure | undefined = vendor ? reply.failure : undefined;
+      if (!vendor && reply.error !== undefined) {
+        const messages = {
+          transport: 'Closed agent provider connection error',
+          credentials: 'Closed agent API key or authentication unavailable',
+          quota: 'Closed agent provider balance or quota unavailable',
+          tls: 'Closed agent TLS certificate validation failed',
+          contract: 'Closed agent could not complete the station contract',
+        };
+        const category = reply.error?.type;
+        if (!Object.hasOwn(messages, category)) return finish(new Error('Invalid structured launcher failure category.'));
+        reportedFailure = classifyFailure(messages[category], { stage: 'model' });
+      }
+      if (reportedFailure && !reply.model) return finish(Object.assign(new Error(reportedFailure.message), { failure: reportedFailure }));
+      if (code !== 0 && !reportedFailure) return finish(new Error(`Closed agent launcher exited (${code ?? 'signal'}).`));
       const nonnegative = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0;
       const tokenCount = (v: unknown) => nonnegative(v) && Number.isSafeInteger(v);
       if (!reply || typeof reply.model !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._/:@+ -]{0,199}$/.test(reply.model)) return finish(new Error("Closed agent launcher must report a valid actual model id."));
       if (reply.usage && (![reply.usage.input, reply.usage.output].every(tokenCount) || !nonnegative(reply.usage.cost) || [reply.usage.cacheRead, reply.usage.cacheWrite].some(v => v !== undefined && !tokenCount(v)))) return finish(new Error("Invalid launcher usage metrics."));
       if (reply.time && (![reply.time.firstTokenMs, reply.time.outputMs].every(nonnegative) || !tokenCount(reply.time.modelCalls))) return finish(new Error("Invalid launcher timing metrics."));
-      finish(undefined, { model: reply.model, ...(reply.usage ? { usage: reply.usage } : {}), ...(reply.time ? { time: reply.time } : {}) });
+      if (reply.modelCalls !== undefined && !tokenCount(reply.modelCalls)) return finish(new Error('Invalid launcher model call count.'));
+      finish(undefined, { model: reply.model, ...(reply.usage ? { usage: reply.usage } : {}), ...(reply.time ? { time: reply.time } : {}), ...(reply.modelCalls === undefined ? {} : { modelCalls: reply.modelCalls }), ...(reportedFailure ? { failure: reportedFailure } : {}) });
     });
-    child.stdin.end(JSON.stringify(request));
+    child.stdin.end(vendor ? vendor.input(request.messages.at(-1)!) : JSON.stringify(request));
     if (signal.aborted) abort();
   });
 }

@@ -13,6 +13,8 @@ import { readRole } from "./roles.ts";
 import type { Broker, Lease } from "./broker.ts";
 import type { Journal } from "./journal.ts";
 import { browserAttemptScope, withBrowserAttempt, type BrowserPoolFault } from "./browser.ts";
+import type { SessionRef } from './station-session.ts';
+import type { ClaudeSessionReference } from './claude-code.ts';
 
 export interface TokenRun {
   id: string;
@@ -84,6 +86,8 @@ export interface StationResult {
   data?: Record<string, unknown>;
   usage?: Usage;
   metrics?: AttemptMetrics;
+  /** Host session metadata survives cancellation; business data never does. */
+  sessionCheckpoint?: { pi?: SessionRef; closed?: ClaudeSessionReference };
   /** Structured notes for the item's case file (Spec §33). */
   caseNotes?: { section: string; text: string }[];
   error?: string;
@@ -527,8 +531,8 @@ export class Runtime {
       })));
     } catch (err) {
       const failure=(err as {failure?:Failure})?.failure ?? classifyFailure(err,{url:t.url});
-      const observed = err as { usage?: Usage; metrics?: AttemptMetrics };
-      res = { ok: false, summary: "工具出错", error: failure.message, failure, usage: observed?.usage, metrics: observed?.metrics };
+      const observed = err as Pick<StationResult, 'usage' | 'metrics' | 'sessionCheckpoint'>;
+      res = { ok: false, summary: "工具出错", error: failure.message, failure, usage: observed?.usage, metrics: observed?.metrics, sessionCheckpoint: observed?.sessionCheckpoint };
     } finally {
       lease.release();
       this.aborts.delete(attempt);
@@ -585,6 +589,19 @@ export class Runtime {
       return;
     }
     if (ctrl.signal.aborted || (t.nodeEpochs?.get(n.key)??0) !== epoch || t.finished) {
+      if (ctrl.signal.aborted && (t.nodeEpochs?.get(n.key) ?? 0) === epoch && res.sessionCheckpoint) {
+        const patch: Record<string, unknown> = {};
+        if (res.sessionCheckpoint.pi) {
+          patch.stationSessions = { ...(t.data.stationSessions as Record<string, SessionRef> ?? {}), [n.key]: res.sessionCheckpoint.pi };
+        }
+        if (res.sessionCheckpoint.closed) {
+          patch.closedStationSessions = { ...(t.data.closedStationSessions as Record<string, ClaudeSessionReference> ?? {}), [n.key]: res.sessionCheckpoint.closed };
+        }
+        if (Object.keys(patch).length) {
+          Object.assign(t.data, patch);
+          this.journal.append({ kind: 'token.data', token: t.id, patch });
+        }
+      }
       this.journal.append({ kind: "attempt.finished", attempt, ok: false, cancelled:true, summary: "已取消：任务已退回或本轮已结束", ms, queuedMs, usage: res.usage, metrics: res.metrics, error: "stale" });
       if((t.nodeEpochs?.get(n.key)??0)===epoch)t.inflight.delete(n.key);
       this.schedule();
