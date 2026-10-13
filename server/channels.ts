@@ -4,7 +4,7 @@ import type { Factory } from './factory.ts';
 import type { TokenRun } from './runtime.ts';
 import { ControlError } from './errors.ts';
 
-type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks'>;
+type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'sources'>;
 const internal = new Set(['runtimeCheckpoint', 'checkpointDone', 'recoveryRoot', 'recoveryStation', 'retryOf', 'retriedBy', 'retryTag', 'batchRecovery', 'capacityWait', 'browserRecoveries', 'published', 'gate', 'digest', 'failure', 'manualReason', 'accessVerified', 'workflowPack', 'channelDelivery', 'sourceCandidate']);
 /** A delivery transfers business data, never its parent's scheduler identity. */
 export function channelPayload(data: Record<string, unknown>) {
@@ -190,16 +190,23 @@ export class ChannelSupervisor {
     if (this.closed || this.scheduled) return;
     this.scheduled = true; queueMicrotask(() => { this.scheduled = false; if (!this.closed) try { this.pump(); } catch (error) { console.error('channel delivery', error); } });
   }
-  pump() {
+  pump(): number {
     const f = this.f;
-    if (this.closed || process.env.FACTORY_READONLY === '1' || !f.runtime.running || f.runtime.paused || f.runtime.ending) return;
+    if (this.closed || process.env.FACTORY_READONLY === '1' || !f.runtime.running || f.runtime.paused || f.runtime.ending) return 0;
     // The main line owns the resource budget. Historical messages may add only
     // one live child, even if dozens of downstream workers are available.
-    if ([...this.deliveryByToken.keys()].some(id => f.state.tokens[id]?.status === 'active')) return;
+    if ([...this.deliveryByToken.keys()].some(id => f.state.tokens[id]?.status === 'active')) return 0;
+    // An unmanaged run shares its next free intake slot with new sources. This
+    // direct admission does not call SourceSupervisor.pump, so neither feeder
+    // can recursively delegate or yield to a peer that did not create a task.
+    if (!f.sources?.channelHasNextTurn()) {
+      const admitted = f.sources?.admitUnmanaged(1) ?? 0;
+      if (admitted) return admitted;
+    }
     for (const delivery of this.deliveries.values()) {
       if (!['pending', 'blocked'].includes(delivery.status)) continue;
       this.adoptCreated(delivery);
-      if (this.deliveries.get(delivery.id)?.status !== delivery.status) return;
+      if (this.deliveries.get(delivery.id)?.status !== delivery.status) return 0;
       const channel = f.compiled.channels.find(channel => channel.id === delivery.channel);
       const target = channel ? `${channel.to.line}/${channel.to.station}` : delivery.target;
       if (f.runtime.scopePaused(target)) continue;
@@ -219,8 +226,9 @@ export class ChannelSupervisor {
         const token = delivery.targetToken ? this.resumeChild(delivery) : f.runtime.create(target, { item: delivery.item, url: delivery.url, title: delivery.title, source: `channel:${delivery.channel}`, data: { ...channelPayload(delivery.data), express: true, channelDelivery: delivery.id, ...(pack ? { workflowPack: pack.id } : {}) } });
         this.append({ ...delivery, target, targetToken: token.id, attempts: delivery.attempts + 1, status: 'delivered', inventory: { node: inventory.node, held: false }, reason: undefined });
       });
-      return;
+      return 1;
     }
+    return 0;
   }
   close() { this.closed = true; this.unsubscribe(); }
 }

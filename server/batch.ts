@@ -118,6 +118,19 @@ export class BatchSupervisor {
     queueMicrotask(() => { this.scheduled = false; this.pump(); });
   }
 
+  private sourceHasNextTurn() {
+    const state = this.factory.state;
+    for (let i = state.tokenOrder.length - 1; i >= 0; i--) {
+      const token = state.tokens[state.tokenOrder[i]];
+      if (!token || token.createdAt < state.run.startedAt || token.data.retryOf ||
+          token.data.channelDelivery || token.data.workflowPack ||
+          !['candidates', 'curation'].includes(token.line)) continue;
+      if (token.data.sourceCandidate || token.source.startsWith('source:')) return false;
+      if (token.source === 'candidates/pool') return true;
+    }
+    return true;
+  }
+
   pump(now = Date.now()) {
     const f = this.factory, goal = f.state.batch;
     if (this.pumping || !goal || goal.runId !== f.state.run.id || goal.mode !== 'running' || !f.runtime.running || f.runtime.paused || f.runtime.ending || process.env.FACTORY_READONLY === '1') return;
@@ -195,8 +208,24 @@ export class BatchSupervisor {
       const upstream = latest.filter(t => t.status === 'active' && !f.runtime.tokens.get(t.id)?.done.has('curation/plan')).length;
       const want = Math.max(0, Math.min(goal.target - latest.length, goal.maxInFlight - active, goal.intakeWindow - upstream));
       if (want && !f.broker.modelHold && !f.broker.blocked('browser')) {
-        const got = f.pull(want, { category: goal.category, query: goal.query });
-        if ((got.length < want) !== Boolean(goal.supplyExhausted)) f.journal.append({ kind: 'batch.configured', batch: { ...goal, supplyExhausted: got.length < want } });
+        let catalogChecked = false;
+        let admittedTotal = 0;
+        for (let slot = 0; slot < want; slot++) {
+          // Both feeders share this admission decision. Merely reversing their
+          // journal subscriptions would starve the catalog instead of sources.
+          let admitted = this.sourceHasNextTurn() ? f.sources?.admitManaged(1) ?? 0 : 0;
+          if (!admitted && !f.runtime.scopePaused('candidates/route')) {
+            admitted = f.pull(1, {category: goal.category, query: goal.query}).length;
+            catalogChecked = true;
+          }
+          if (!admitted) admitted = f.sources?.admitManaged(1) ?? 0;
+          if (!admitted) break;
+          admittedTotal += admitted;
+        }
+        const supplyExhausted = admittedTotal < want;
+        if ((catalogChecked || admittedTotal > 0) && supplyExhausted !== Boolean(goal.supplyExhausted)) {
+          f.journal.append({kind: 'batch.configured', batch: {...goal, supplyExhausted}});
+        }
       }
     } finally { this.pumping = false; }
   }

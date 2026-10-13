@@ -6,9 +6,9 @@ import { classifyFailure } from '../shared/failures.ts';
 import { webGetBytes } from './network.ts';
 import { workflowValue } from './workflow-packs.ts';
 import { workflowEntry } from './workflow-entry.ts';
-import { batchSummary } from '../shared/batch.ts';
+import { batchSummary, latestBatchTokens } from '../shared/batch.ts';
 
-type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'toolbox' | 'settings' | 'broker'>;
+type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'toolbox' | 'settings' | 'broker' | 'batch' | 'channels'>;
 type Poll = { nextAt: number; count: number; duplicates: number; invalid?: number; attention?: string; failure?: ReturnType<typeof classifyFailure> };
 type Incoming = { url: string; title?: string; author?: string; publishedAt?: string; excerpt?: string; images?: string[] };
 const MAX_BACKLOG = 500;
@@ -491,18 +491,65 @@ export class SourceSupervisor {
     const goal = f.state.batch?.runId === f.state.run.id ? batchSummary(f.state) : null;
     if (goal && (goal.mode !== 'running' || goal.modelCircuit || goal.remaining <= 0)) return '当前托管目标已暂停、阻塞或已领取足够任务';
     if (goal && (source.target !== 'candidates/tidy' || goal.category || goal.query)) return '保留候选，等待不受当前托管筛选范围限制的轮次';
-    const limit = Math.max(1, Math.min(goal?.maxInFlight ?? 1, goal?.intakeWindow ?? 1));
+    if (goal) {
+      if (goal.active >= goal.maxInFlight) return `已达到 ${goal.maxInFlight} 件托管在途任务的入场上限`;
+      const upstream = latestBatchTokens(f.state).filter(token => token.status === 'active' &&
+        !f.runtime.tokens.get(token.id)?.done.has('curation/plan')).length;
+      if (upstream >= goal.intakeWindow) return `已达到 ${goal.intakeWindow} 件前段任务的入场上限`;
+      return;
+    }
+    const limit = 1;
     const inFlight = [...f.runtime.tokens.values()].filter(token => !token.finished).length;
     if (inFlight >= limit) return `已达到 ${limit} 件执行或排队任务的入场上限，等待现有任务让出名额`;
   }
 
-  pump() {
+  /** The batch owns managed admission so subscriber order cannot take its slot. */
+  pump(): number {
+    if (this.closed || process.env.FACTORY_READONLY === '1') return 0;
+    if (this.f.state.batch?.runId === this.f.state.run.id) {
+      this.f.batch.schedule();
+      return 0;
+    }
+    const vacant = ![...this.f.runtime.tokens.values()].some(token => !token.finished);
+    if (vacant && this.channelHasNextTurn()) {
+      const admitted = this.f.channels?.pump() ?? 0;
+      if (admitted) return admitted;
+    }
+    return this.admitUnmanaged(1);
+  }
+
+  /** A retry keeps its original place; only a new automatic root changes turns. */
+  channelHasNextTurn() {
+    const state = this.f.state;
+    for (let i = state.tokenOrder.length - 1; i >= 0; i--) {
+      const token = state.tokens[state.tokenOrder[i]];
+      if (!token || token.createdAt < state.run.startedAt || token.data.retryOf) continue;
+      if (token.data.channelDelivery || token.source.startsWith('channel:')) return false;
+      if (token.data.sourceCandidate || token.source.startsWith('source:')) return true;
+    }
+    return false;
+  }
+
+  admitManaged(limit: number) {
+    if (this.f.state.batch?.runId !== this.f.state.run.id) return 0;
+    return this.admit(limit);
+  }
+
+  /** Called directly by the channel consumer, without delegating back to it. */
+  admitUnmanaged(limit: number) {
+    if (this.f.state.batch?.runId === this.f.state.run.id) return 0;
+    return this.admit(limit);
+  }
+
+  private admit(limit: number) {
     const f = this.f;
-    if (this.closed || process.env.FACTORY_READONLY === '1') return;
+    if (this.closed || process.env.FACTORY_READONLY === '1') return 0;
+    let admitted = 0;
     const queued = [...this.candidates.values()]
       .filter(candidate => ['pending', 'blocked'].includes(candidate.status))
       .sort((a, b) => this.reputation(b) - this.reputation(a) || a.discoveredAt - b.discoveredAt);
     for (const candidate of queued) {
+      if (admitted >= limit) break;
       const source = this.definitions.get(candidate.source);
       if (!source || this.deliveryHold(source)) continue;
       let input: Record<string, unknown>;
@@ -541,7 +588,9 @@ export class SourceSupervisor {
           ...candidate, status: 'delivered', targetToken: token.id, reason: undefined,
         }});
       });
+      admitted++;
     }
+    return admitted;
   }
 
   async close() {

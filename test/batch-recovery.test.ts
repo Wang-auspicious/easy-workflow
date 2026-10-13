@@ -11,8 +11,10 @@ process.env.FACTORY_HTTP_CACHE = '0';
 process.env.VISLEXICON_ROOT = path.join(dir, 'unconnected');
 const { Factory: BaseFactory } = await import('../server/factory.ts');
 const { FactoryControl } = await import('../server/control.ts');
+const { SourceSupervisor } = await import('../server/sources.ts');
 const { batchSummary } = await import('../shared/batch.ts');
 const close = async (factory: InstanceType<typeof Factory>) => {
+  await factory.sources?.close(); factory.channels?.close();
   await factory.runtime.close(); factory.docs.flush(); factory.lessons.close(); factory.journal.close();
 };
 const catalog = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `site-${i}`, name: `Site ${i}`, canonicalUrl: `https://site-${i}.example/` }));
@@ -298,4 +300,109 @@ test('late review recovery gets the available slot before another early reading 
     assert.equal(batchSummary(factory.state)?.admitted, 2);
     assert.equal(batchSummary(factory.state)?.completed, 1);
   } finally { await close(factory); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('single-slot managed admission alternates durable sources and catalog across restart', async () => {
+  let factory = new Factory();
+  const order: string[] = [];
+  let peak = 0;
+  const execute = () => {
+    factory.runtime.executors = () => async ctx => {
+      order.push(ctx.token.source.startsWith('source:') ? 'source' : 'catalog');
+      peak = Math.max(peak, [...factory.runtime.tokens.values()].filter(token => !token.finished).length);
+      return {ok: true, summary: 'Fixture publication', finish: {status: 'published', reason: 'fixture'}};
+    };
+  };
+  try {
+    await factory.boot();
+    await factory.sources.close();
+    factory.sources = new SourceSupervisor(factory);
+    factory.sources.configure({
+      id: 'fresh', name: 'Fresh source', url: 'https://feed.fixture.test/items',
+      platform: 'fixture', format: 'json', target: 'candidates/tidy',
+      intervalMs: 86400000, enabled: true,
+    });
+    factory.journal.append({kind: 'source.polled', source: 'fresh', nextAt: Date.now() + 86400000, count: 0, duplicates: 0});
+    for (let i = 0; i < 4; i++) {
+      factory.journal.append({kind: 'source.candidate', candidate: {
+        id: `fresh-${i}`, source: 'fresh', platform: 'fixture', sourceUrl: 'https://feed.fixture.test/items',
+        url: `https://fresh-${i}.fixture.test/`, title: `Fresh ${i}`, discoveredAt: Date.now(), status: 'pending',
+      }});
+    }
+    factory.catalog = catalog(12);
+    execute();
+    const unsubscribe = factory.journal.subscribe(event => {
+      if (event.kind === 'token.finished' && order.length === 1) factory.runtime.pause();
+    });
+    factory.batch.configure({target: 6, maxInFlight: 1, intakeWindow: 1});
+    await factory.runtime.settle();
+    assert.deepEqual(order, ['source'], 'an already queued source must get a real admission');
+    unsubscribe();
+    await close(factory);
+    factory = new Factory();
+    await factory.boot();
+    factory.catalog = catalog(12);
+    execute();
+    assert.equal(factory.runtime.paused, true);
+    factory.runtime.resume();
+    await factory.runtime.settle();
+    assert.deepEqual(order, ['source', 'catalog', 'source', 'catalog', 'source', 'catalog']);
+    assert.equal(peak, 1);
+    assert.equal(batchSummary(factory.state)?.admitted, 6);
+    assert.equal(batchSummary(factory.state)?.completed, 6);
+    assert.equal(factory.sources.list()[0].counts.pending, 1, 'the target remains a hard bound');
+  } finally {
+    await close(factory);
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+test('managed feeder rotation preserves filters, disabled sources, intake limits and empty-side fallback', async () => {
+  for (const scenario of ['category', 'query', 'disabled', 'source-only', 'local-pause'] as const) {
+    const factory = new Factory();
+    const origins: string[] = [];
+    let peak = 0;
+    try {
+      await factory.boot();
+      await factory.sources.close();
+      factory.sources = new SourceSupervisor(factory);
+      factory.sources.configure({
+        id: 'fresh', name: 'Fresh source', url: 'https://feed.fixture.test/items',
+        platform: 'fixture', format: 'json', target: 'candidates/tidy',
+        intervalMs: 86400000, enabled: scenario !== 'disabled',
+      });
+      for (let i = 0; i < 3; i++) factory.journal.append({kind: 'source.candidate', candidate: {
+        id: `fresh-${i}`, source: 'fresh', platform: 'fixture', sourceUrl: 'https://feed.fixture.test/items',
+        url: `https://fresh-${i}.fixture.test/`, title: `Fresh ${i}`, discoveredAt: Date.now(), status: 'pending',
+      }});
+      factory.catalog = scenario === 'source-only' ? [] : catalog(6).map(entry => ({...entry, category: 'fixture', name: 'Wanted ' + entry.id}));
+      factory.runtime.executors = () => async ctx => {
+        origins.push(ctx.token.source.startsWith('source:') ? 'source' : 'catalog');
+        peak = Math.max(peak, [...factory.runtime.tokens.values()].filter(token => !token.finished).length);
+        return {ok: true, summary: 'Fixture publication', finish: {status: 'published', reason: 'fixture'}};
+      };
+      if (scenario === 'local-pause') factory.runtime.setScopePaused({scope: 'line', key: 'candidates', paused: true, reason: 'Fixture pause'});
+      factory.batch.configure({target: 2, maxInFlight: 3, intakeWindow: 1,
+        ...(scenario === 'category' ? {category: 'fixture'} : {}),
+        ...(scenario === 'query' ? {query: 'Wanted'} : {}),
+      });
+      await factory.runtime.settle();
+      if (scenario === 'local-pause') {
+        assert.equal(Object.keys(factory.state.tokens).length, 0, 'both feeders honor the paused entry line');
+        factory.runtime.setScopePaused({scope: 'line', key: 'candidates', paused: false, reason: 'Fixture resumes'});
+        await new Promise<void>(resolve => setImmediate(resolve));
+        await factory.runtime.settle();
+      }
+      assert.deepEqual(origins, scenario === 'source-only' ? ['source', 'source']
+        : scenario === 'local-pause' ? ['source', 'catalog'] : ['catalog', 'catalog'], scenario);
+      assert.equal(peak, 1, 'intakeWindow remains binding even when maxInFlight is larger');
+      assert.equal(batchSummary(factory.state)?.admitted, 2);
+      assert.equal(batchSummary(factory.state)?.completed, 2);
+      assert.equal(Boolean(batchSummary(factory.state)?.supplyExhausted), false, 'successful source intake is available supply even if the catalog is empty');
+      if (scenario === 'disabled') assert.equal(factory.sources.list()[0].enabled, false);
+    } finally {
+      await close(factory);
+      fs.rmSync(dir, {recursive: true, force: true});
+    }
+  }
 });

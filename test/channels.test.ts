@@ -21,7 +21,7 @@ const { SourceSupervisor } = await import('../server/sources.ts');
 const { latestRunTokens } = await import('../shared/project.ts');
 
 before(async () => {
-  const definitions = [['parent', ['prepare']], ['child', ['prepare', 'paid', 'review']], ['components', ['discover']]] as const;
+  const definitions = [['parent', ['prepare']], ['child', ['prepare', 'paid', 'review']], ['components', ['discover']], ['source-work', ['prepare', 'paid']]] as const;
   const bindings: WorkflowManifest['bindings'] = {}, files: Record<string, string> = {};
   const lines = definitions.map(([id, programs]) => {
     for (const program of programs) {
@@ -294,6 +294,86 @@ const sourceItem = (id: string): SourceCandidate => ({
   id, source: 'fixture-source', platform: 'feed.fixture.test',
   sourceUrl: 'https://feed.fixture.test/items', url: `https://resource.fixture.test/${id}`,
   title: id, author: 'Fixture author', discoveredAt: Date.now(), status: 'pending',
+});
+
+test('unmanaged source and channel backlogs both progress through the single available slot', async () => {
+  const order: string[] = [];
+  let peak = 0;
+  const factory = await boot(async ctx => {
+    order.push(ctx.token.source.startsWith('source:') ? 'source' : 'channel');
+    peak = Math.max(peak, [...factory.runtime.tokens.values()].filter(token => !token.finished).length);
+    return {ok: true, summary: 'Fixture publication', finish: {status: 'published', reason: 'fixture'}};
+  });
+  try {
+    await factory.sources.close();
+    factory.sources = new SourceSupervisor(factory);
+    const original = factory.runtime.create('parent/published', {
+      item: 'prior-parent', url: 'https://fixture.test/prior-parent', source: 'manual', data: {revision: 0},
+    });
+    for (let revision = 1; revision < 3; revision++) {
+      factory.journal.append({kind: 'token.data', token: original.id, patch: {revision}});
+      emit(factory, original.id);
+    }
+    factory.sources.configure(sourceSpec({enabled: true}));
+    for (let i = 0; i < 2; i++) factory.journal.append({kind: 'source.candidate', candidate: sourceItem(`fair-${i}`)});
+    factory.runtime.start('Continuous sources alongside historical channel deliveries');
+    await settle(factory);
+    assert.deepEqual(order, ['source', 'channel', 'source', 'channel', 'channel']);
+    assert.equal(peak, 1, 'fairness cannot be achieved by admitting concurrent extra work');
+    assert.equal(factory.sources.list()[0].counts.acknowledged, 2);
+    assert.ok(factory.channels!.status().every(delivery => delivery.status === 'acknowledged'));
+  } finally {
+    await close(factory);
+  }
+});
+
+test('source failure classification survives restart and retry reuses its completed upstream checkpoint', async () => {
+  const calls: {item: string; node: string}[] = [];
+  const execute: Executor = async ctx => {
+    calls.push({item: ctx.token.item, node: ctx.node.key});
+    if (ctx.node.key === 'source-work/prepare') {
+      ctx.addEvidence({id: `evidence-${ctx.token.item}`, kind: 'text', label: 'Completed preparation'});
+      return {ok: true, summary: 'Prepared once', data: {preparedArtifact: 'preserve this result'}};
+    }
+    assert.equal(ctx.token.data.preparedArtifact, 'preserve this result');
+    if (ctx.token.item === 'needs-retry' && !ctx.token.data.retryOf) {
+      return {ok: false, summary: 'Fixture request timed out', failure: {
+        tag: 'network_timeout', category: 'network', message: 'Fixture request timed out', retryable: true, owner: 'system',
+      }};
+    }
+    return {ok: true, summary: 'Downstream completed'};
+  };
+  let factory = await boot(execute);
+  try {
+    await factory.sources.close();
+    factory.sources = new SourceSupervisor(factory);
+    factory.sources.configure(sourceSpec({target: 'source-work/inbox', enabled: true}));
+    factory.journal.append({kind: 'source.polled', source: 'fixture-source', nextAt: Date.now() + 86400000, count: 0, duplicates: 0});
+    for (const id of ['needs-retry', 'healthy-next']) factory.journal.append({kind: 'source.candidate', candidate: sourceItem(id)});
+    factory.runtime.start('Source failure keeps the next item moving');
+    await settle(factory);
+    assert.equal(factory.sources.list()[0].counts.failed, 1);
+    assert.equal(factory.sources.list()[0].counts.acknowledged, 1);
+    const recovery = factory.candidateFailures({tag: 'network_timeout', disposition: 'retry'})[0];
+    assert.equal(recovery.item, 'needs-retry');
+    assert.equal(factory.state.tokens[recovery.token].status, 'parked');
+    factory.runtime.pause();
+    await close(factory);
+    factory = await boot(execute);
+    factory.runtime.resume();
+    const [retry] = factory.retryCandidates({tag: 'network_timeout', items: ['needs-retry'], count: 1});
+    await settle(factory);
+    assert.equal(factory.state.tokens[retry.id].status, 'published');
+    assert.equal(retry.data.retryOf, recovery.token);
+    assert.equal(retry.data.preparedArtifact, 'preserve this result');
+    assert.equal(calls.filter(call => call.item === 'needs-retry' && call.node === 'source-work/prepare').length, 1);
+    assert.equal(calls.filter(call => call.item === 'needs-retry' && call.node === 'source-work/paid').length, 2);
+    assert.ok(factory.state.tokens[retry.id].evidence.some(id => factory.state.evidence[id].meta?.reusedFrom === 'evidence-needs-retry'));
+    assert.equal(factory.sources.list()[0].counts.acknowledged, 2);
+    assert.equal(factory.sources.list()[0].candidates.find(candidate => candidate.id === 'needs-retry')?.targetToken, retry.id);
+  } finally {
+    await close(factory);
+  }
 });
 
 test('sources reject middle stations, terminal stores, connected lines and fractional rate limits', async () => {
