@@ -188,6 +188,9 @@ export type JournalEvent =
   | { kind: "run.paused"; runId: string }
   | { kind: "run.resumed"; runId: string }
   | { kind: "run.ended"; runId: string; manual: boolean }
+  | { kind: "scope.paused"; scope: "line" | "station"; key: string; paused: boolean; reason: string }
+  | { kind: "measurement.proposed"; proposal: { id: string; runId: string; sampleItems: number; at: number; stations: Array<{ node: string; samples: number; serviceSeconds: number; lambda: number; need: number; allocated: number; resource: string; measured: boolean }> } }
+  | { kind: "measurement.decided"; id: string; accepted: boolean }
   | { kind: "batch.configured"; batch: import("./batch.ts").BatchGoal }
   | { kind: "stock.set"; node: string; stock: number; note?: string }
   | { kind: "token.created"; token: string; line: string; item: string; url: string; title?: string; source: string; category?: string }
@@ -207,7 +210,8 @@ export type JournalEvent =
   | { kind: "worker.forked"; node: string; worker: string; label: string; reason: string }
   | { kind: "worker.locked"; node: string; locked: boolean; reason: string }
   | { kind: "control.executed"; tool: string; actor: "agent" | "dispatcher" | "user"; summary: string }
-  | { kind: "correction.created"; correction: string; evidence?: string; token: string; node: string; reason: string; note?: string }
+  | { kind: "correction.created"; correction: string; evidence?: string; token: string; node: string; reason: string; note?: string; snapshot?: Record<string, unknown> }
+  | { kind: "correction.reverted"; correction: string; token: string; snapshot: Record<string, unknown> }
   | { kind: "channel.emitted"; channel: string; token: string; item: string }
   | { kind: "dispatch.note"; text: string; node?: string; tone?: "info" | "fork" | "warn" }
   | { kind: "chat.user"; id: string; text: string; attachments: Attachment[] }

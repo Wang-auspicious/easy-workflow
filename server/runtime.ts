@@ -5,7 +5,8 @@
 import crypto from "node:crypto";
 import { withModelAdmission } from './model-requests.ts';
 import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
-import { median } from "../shared/project.ts";
+import { median, type FactoryState } from "../shared/project.ts";
+import { allocateResource } from './allocation.ts';
 import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
 import { ControlError } from "./errors.ts";
 import { readRole } from "./roles.ts";
@@ -122,6 +123,11 @@ export class Runtime {
   backlogSince = new Map<string, number>();
   lastAdjust = new Map<string, number>();
   locked = new Set<string>();
+  pausedLines = new Set<string>();
+  pausedStations = new Set<string>();
+  measurement: FactoryState['measurement'];
+  sampleItems = new Set<string>();
+  roleResolver: typeof readRole = readRole;
   waiting: Record<string, string> = {};
   paused = false;
   running = false;
@@ -200,6 +206,7 @@ export class Runtime {
     this.journal.append({ kind: "run.started", runId, title });
     this.running = true; this.paused = false; this.runStartedAt = Date.now();
     this.arrivals.clear(); this.durations.clear();
+    this.sampleItems.clear(); this.measurement = undefined;
     this.backlogSince.clear(); this.lastAdjust.clear();
     for (const pool of this.workers.values()) for (const w of pool) if (!w.busy) w.idleSince = this.runStartedAt;
     this.tick();
@@ -273,6 +280,22 @@ export class Runtime {
     this.journal.append({ kind: "worker.locked", node: key, locked, reason });
     if (locked) this.locked.add(key); else this.locked.delete(key);
     return true;
+  }
+
+  setScopePaused(options: { scope: 'line' | 'station'; key: string; paused: boolean; reason: string }) {
+    this.requireStorage();
+    const exists = options.scope === 'line' ? this.f.lines.some(line => line.id === options.key && line.wired) : !!this.nodes.get(options.key) && this.runnable(this.nodes.get(options.key)!);
+    if (!exists) throw new ControlError(404, 'scope_not_found', '没有这个可执行流水线或工位');
+    const scopes = options.scope === 'line' ? this.pausedLines : this.pausedStations;
+    if (scopes.has(options.key) === options.paused) return false;
+    this.journal.append({ kind: 'scope.paused', ...options });
+    if (options.paused) scopes.add(options.key); else scopes.delete(options.key);
+    this.schedule();
+    return true;
+  }
+
+  scopePaused(key: string) {
+    return this.pausedStations.has(key) || this.pausedLines.has(this.nodes.get(key)?.line ?? '');
   }
 
   /* -------------------------------------------------------------- tokens */
@@ -391,6 +414,7 @@ export class Runtime {
     if (status === "published") t.data.published = true;
     this.journal.append({ kind: "token.finished", token: t.id, status, node: n.key, reason: status === "published" ? "通过发布闸门" : String(t.data.manualReason ?? "等候处理") });
     this.stockDelta(n.key, +1);
+    if (status === 'published' || status === 'manual') { this.sampleItems.add(t.item); this.measurementProposal(); }
   }
 
   private cancelTokenWork(t: TokenRun) {
@@ -426,12 +450,15 @@ export class Runtime {
     const keys = [...this.queues.keys()].filter((k) => this.queues.get(k)!.length)
       .sort((a, b) => lines.get(this.nodes.get(a)!.line)! - lines.get(this.nodes.get(b)!.line)! || (this.nodes.get(b)!.kind === "review" ? 1 : 0) - (this.nodes.get(a)!.kind === "review" ? 1 : 0));
     const waiting: Record<string, string> = {};
+    const allocation = this.resourceAllocations();
     for (const key of keys) {
       const n = this.nodes.get(key)!;
       const q = this.queues.get(key)!;
+      if (this.scopePaused(key)) { waiting[key] = this.pausedLines.has(n.line) ? '这条流水线已暂停；在途任务保留结果' : '这个工位已暂停；输入保留排队'; continue; }
       for (const w of this.workers.get(key)!) {
         if (!q.length) break;
         if (w.busy) continue;
+        if (n.resource !== 'none' && this.workers.get(key)!.filter(worker => worker.busy).length >= (allocation.get(key) ?? 0)) { waiting[key] = `按到达率 × 服务时间分配 ${allocation.get(key) ?? 0} 个 ${n.resource} 名额`; continue; }
         const index = this.broker.recoveryToken ? q.indexOf(this.broker.recoveryToken) : 0;
         if (index < 0) { waiting[key] = "模型恢复验证中，其他任务保留检查点等待"; continue; }
         const queuedToken = this.tokens.get(q[index]);
@@ -481,7 +508,7 @@ export class Runtime {
     try {
       const exec = this.executors(n);
       if (!exec) throw new Error(`工位 ${n.key} 没有执行器`);
-      const role=readRole(n.key);
+      const role=this.roleResolver(n.key);
       this.journal.append({kind:"attempt.progress",attempt,text:`按 ${n.name} 的 ROLE.md 执行`,step:{tool:"role",text:`${role.path} @ ${role.revision}`}});
       res = await withModelAdmission(() => this.broker.modelHold || (this.broker.recoveryToken && this.broker.recoveryToken !== t.id ? '正在用一个工位验证模型恢复' : null), () => withBrowserAttempt(browserScope, () => exec({
         token: t, node: n, attempt, worker: w, signal: ctrl.signal, redo: t.notes.get(n.key),
@@ -520,6 +547,11 @@ export class Runtime {
 
   private requireStorage() {
     if (this.storageFault) throw this.storageFault;
+  }
+
+  private commitTransition(action: () => void) {
+    try { this.journal.atomic(action); }
+    catch (error) { this.haltForStorage(); throw error; }
   }
 
   private haltForStorage() {
@@ -577,6 +609,7 @@ export class Runtime {
       t.finished = true;
       this.cancelTokenWork(t);
       this.journal.append({ kind: "token.finished", token: t.id, status: res.finish.status, node: n.key, reason: res.finish.reason });
+      if (['published', 'merged', 'rejected', 'manual'].includes(res.finish.status)) { this.sampleItems.add(t.item); this.measurementProposal(); }
     } else if (t.consult && (t.consult.chain[0] === n.key || t.consult.reviewer === n.key)) {
       this.consultResult(t, n, res);
     } else if (res.verdict) {
@@ -856,10 +889,51 @@ export class Runtime {
     const n = this.nodes.get(target.node);
     if (!n || !this.runnable(n) || !t.closure.has(target.node)) return { ok: false, message: "纠错目标必须是这件货经过的可执行工位" };
     const correction = `c-${short()}`;
+    const history = [...this.journal.read()].filter(event => 'token' in event && event.token === t.id);
+    const last = history.findLast(event => event.kind === 'token.finished');
+    const touched = history.findLast(event => event.kind === 'token.queued' || event.kind === 'token.created');
+    const snapshot = { data: structuredClone(t.data), checkpoint: { version: 1, entry: t.entry, done: [...t.done], rounds: { ...t.rounds }, notes: [...t.notes], consult: structuredClone(t.consult), pendingConsults: structuredClone(t.pendingConsults) },
+      finished: t.finished, finishedStore: t.finishedStore, status: t.finished && last?.kind === 'token.finished' ? last.status : 'active',
+      at: [...new Set([...t.inflight, ...[...this.queues].filter(([, queue]) => queue.includes(t.id)).map(([key]) => key)])],
+      touchedAt: touched?.at, finishedAt: last?.at, finishedAtNode: last?.kind === 'token.finished' ? last.node : undefined, reason: last?.kind === 'token.finished' ? last.reason : undefined };
     if (!this.running) this.start("纠错重做");
-    this.journal.append({ kind: "correction.created", correction, evidence: target.evidence, token: t.id, node: target.node, reason, note });
-    const ok = this.returnToken(t, "human", target.node, note ? `${reason}：${note}` : reason, true, note);
-    return { ok, message: ok ? `已退回 ${this.nodes.get(target.node)?.name}` : "已超过纠错轮数，转待人工" };
+    let ok = false;
+    this.commitTransition(() => {
+      this.journal.append({ kind: "correction.created", correction, evidence: target.evidence, token: t.id, node: target.node, reason, note, snapshot });
+      ok = this.returnToken(t, "human", target.node, note ? `${reason}：${note}` : reason, true, note);
+    });
+    return { ok, correction, message: ok ? `已退回 ${this.nodes.get(target.node)?.name}` : "已超过纠错轮数，转待人工" };
+  }
+
+  undoCorrection(id: string) {
+    this.requireStorage();
+    const events = [...this.journal.read()];
+    const correction = events.find(event => event.kind === 'correction.created' && event.correction === id);
+    if (correction?.kind !== 'correction.created' || !correction.snapshot) throw new ControlError(409, 'correction_not_reversible', '该纠错没有可撤销的持久快照');
+    const savedSnapshot = correction.snapshot;
+    const token = this.tokens.get(correction.token);
+    if (!token) throw new ControlError(404, 'token_not_found', '找不到纠错任务');
+    const later = events.filter(event => event.seq > correction.seq);
+    const changed = later.some(event => event.kind === 'attempt.started' && event.token === token.id
+      || event.kind === 'correction.created' && event.token === token.id
+      || event.kind === 'correction.reverted' && event.correction === id
+      || event.kind === 'attempt.finished' && !event.cancelled && event.error !== 'stale' && events.some(start => start.kind === 'attempt.started' && start.attempt === event.attempt && start.token === token.id));
+    if (changed || [...this.attemptTokens.values()].includes(token.id)) throw new ControlError(409, 'correction_already_executed', '纠错后已有工位执行或任务仍在途，不能撤销已执行的工作；请创建新的纠错');
+    const snapshot = correction.snapshot as { data: Record<string, unknown>; checkpoint: RuntimeCheckpoint; finished: boolean; finishedStore?: string; at: string[] };
+    this.commitTransition(() => {
+      for (const queue of this.queues.values()) for (let i = queue.length - 1; i >= 0; i--) if (queue[i] === token.id) queue.splice(i, 1);
+      if (token.finishedStore && token.finishedStore !== snapshot.finishedStore) this.stockDelta(token.finishedStore, -1, '撤销尚未执行的纠错');
+      const previousStore = token.finishedStore;
+      token.data = structuredClone(snapshot.data); token.data.runtimeCheckpoint = structuredClone(snapshot.checkpoint);
+      this.restoreCheckpoint(token); this.restoreFlow(token);
+      token.finished = snapshot.finished; token.finishedStore = snapshot.finishedStore; token.inflight.clear(); token.epoch++;
+      this.journal.append({ kind: 'correction.reverted', correction: id, token: token.id, snapshot: savedSnapshot });
+      if (snapshot.finishedStore && previousStore !== snapshot.finishedStore) this.stockDelta(snapshot.finishedStore, 1, '撤销尚未执行的纠错，恢复原库存');
+      if (!token.finished) for (const key of snapshot.at) if (this.nodes.has(key)) this.enqueue(token, key, undefined, true);
+      this.checkpoint(token);
+    });
+    this.schedule();
+    return { ok: true, correction: id, token: token.id, message: '已撤销尚未执行的纠错，原结果与检查点已恢复' };
   }
 
   /* -------------------------------------------------------------- balancing */
@@ -871,10 +945,64 @@ export class Runtime {
     const arr = (this.arrivals.get(key) ?? []).filter((t) => now - t <= window);
     const lambda = arr.length / (window / 1000);
     const ds = this.durations.get(key) ?? [];
-    const s = (ds.length >= 3 ? median(ds.slice(-50)) : n.estimateSeconds * 1000) / 1000;
+    const s = (ds.length >= 10 ? median(ds.slice(-50)) : n.estimateSeconds * 1000) / 1000;
     const pool = this.workers.get(key)!;
     const need = Math.min(n.workers.max, Math.max(n.workers.min, Math.ceil((lambda * s) / RHO) || n.workers.min));
-    return { lambda, s, need, workers: pool.length, queue: this.queues.get(key)!.length, takt: s / Math.max(1, pool.length), measured: ds.length >= 3 };
+    return { lambda, s, need, samples: ds.length, workers: pool.length, queue: this.queues.get(key)!.length, takt: s / Math.max(1, pool.length), measured: ds.length >= 10 };
+  }
+
+  resourceAllocations(recommendation = false) {
+    const result = new Map<string, number>();
+    for (const resource of ['browser', 'model', 'cpu', 'http']) {
+      const nodes = this.f.nodes.filter(node => this.runnable(node) && node.resource === resource && !this.scopePaused(node.key)
+        && (!this.broker.recoveryToken || this.queues.get(node.key)?.includes(this.broker.recoveryToken) || this.workers.get(node.key)?.some(worker => worker.busy && this.attemptTokens.get(worker.busy) === this.broker.recoveryToken)));
+      const demands = nodes.map(node => {
+        const numbers = this.stationNumbers(node.key), pool = this.workers.get(node.key)!;
+        const work = numbers.lambda * numbers.s;
+        const demand = recommendation ? numbers.need : Math.min(pool.length, numbers.queue + pool.filter(worker => worker.busy).length);
+        return { key: node.key, work, max: demand, review: node.kind === 'review' };
+      }).filter(demand => demand.max > 0);
+      const capacity = resource === 'browser' ? this.broker.effectiveBrowser() : this.broker.limits[resource] ?? 1;
+      for (const [key, value] of allocateResource(capacity, demands, resource === 'model')) result.set(key, value);
+    }
+    return result;
+  }
+
+  measurementProposal() {
+    if (this.measurement?.runId === this.journal.run) return this.measurement;
+    if (this.sampleItems.size < 10 || !this.running) return null;
+    const allocation = this.resourceAllocations(true);
+    const proposal = { id: `measurement-${short()}`, runId: this.journal.run, sampleItems: this.sampleItems.size, at: Date.now(),
+      stations: this.f.nodes.filter(node => this.runnable(node)).map(node => {
+        const numbers = this.stationNumbers(node.key);
+        return { node: node.key, samples: numbers.samples, serviceSeconds: numbers.s, lambda: numbers.lambda, need: numbers.need,
+          allocated: node.resource === 'none' ? numbers.need : allocation.get(node.key) ?? 0, resource: node.resource, measured: numbers.measured };
+      }) };
+    this.journal.append({ kind: 'measurement.proposed', proposal });
+    this.measurement = { ...proposal, status: 'proposed' };
+    this.journal.append({ kind: 'dispatch.note', tone: 'info', text: `已完成前 ${proposal.sampleItems} 件的测量，配员建议已保存，等待站长确认；不足 10 次样本的工位仍明确采用规格估计。` });
+    return this.measurement;
+  }
+
+  decideMeasurement(id: string, accepted: boolean) {
+    this.requireStorage();
+    const proposal = this.measurement;
+    if (!proposal || proposal.id !== id || proposal.runId !== this.journal.run || proposal.status !== 'proposed') throw new ControlError(409, 'measurement_not_pending', '没有这份待确认的本轮测量建议');
+    this.commitTransition(() => {
+      this.journal.append({ kind: 'measurement.decided', id, accepted });
+      proposal.status = accepted ? 'accepted' : 'rejected';
+      if (!accepted) return;
+      for (const row of proposal.stations) {
+        const node = this.nodes.get(row.node);
+        if (!node || this.locked.has(row.node) || node.workers.policy === 'fixed') continue;
+        const target = Math.min(node.workers.max, Math.max(node.workers.min, 1, Math.min(row.need, row.allocated)));
+        const pool = this.workers.get(row.node)!;
+        while (pool.length < target) this.fork(row.node, `站长确认前 ${proposal.sampleItems} 件的测量：λ=${row.lambda.toFixed(3)}/s，s=${row.serviceSeconds.toFixed(1)}s，资源份额 ${row.allocated}`);
+        while (pool.length > target && this.retire(row.node, '站长确认测量后的配员建议')) { /* active workers finish naturally */ }
+      }
+    });
+    this.schedule();
+    return proposal;
   }
 
   lineTakt(line: string) {
@@ -895,8 +1023,9 @@ export class Runtime {
     if (!this.running || this.paused) return;
     // Retry resource waits when memory recovers even if no worker releases a lease.
     this.schedule();
+    const allocated = this.resourceAllocations(true);
     for (const n of this.f.nodes) {
-      if (!this.runnable(n) || n.workers.policy === "fixed" || this.locked.has(n.key)) continue;
+      if (!this.runnable(n) || this.scopePaused(n.key) || n.workers.policy === "fixed" || this.locked.has(n.key)) continue;
       const x = this.stationNumbers(n.key);
       const pool = this.workers.get(n.key)!;
       const since = this.lastAdjust.get(n.key) ?? 0;
@@ -905,7 +1034,7 @@ export class Runtime {
       const backlog = this.backlogSince.get(n.key);
       const free = n.resource === "none" || (this.broker.used[n.resource] ?? 0) < (this.broker.limits[n.resource] ?? 1) - (n.resource === "model" ? 1 : 0);
       const busyEnough = n.resource !== "browser" || pool.filter((w) => w.busy).length >= pool.length;
-      if (backlog && now - backlog >= FORK_BACKLOG_MS && pool.length < n.workers.max && free && busyEnough && now - since >= DEBOUNCE_MS) {
+      if (backlog && now - backlog >= FORK_BACKLOG_MS && pool.length < x.need && pool.length < (n.resource === 'none' ? n.workers.max : allocated.get(n.key) ?? 0) && free && busyEnough && now - since >= DEBOUNCE_MS) {
         const lt = this.lineTakt(n.line);
         const res = n.resource === "none" ? "" : `（${n.resource} ${this.broker.used[n.resource]}/${this.broker.limits[n.resource]}）`;
         const w = this.spawn(n, `队列 ${x.queue} ≥ 2×工人数 ${pool.length} 持续 ${Math.round((now - backlog) / 1000)}s；中位耗时 ${x.s.toFixed(1)}s、需要 ${x.need} 人`, true);

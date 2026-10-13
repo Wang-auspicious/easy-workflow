@@ -71,6 +71,7 @@ export class BatchSupervisor {
 
   configure(options: { target: number; maxInFlight?: number; intakeWindow?: number; category?: string; query?: string }) {
     const f = this.factory;
+    if (!f.runtime.nodes.has('candidates/route') || !f.runtime.nodes.has('candidates/pool')) throw new ControlError(409, 'candidate_pack_unavailable', '网站批次需要策展候选包；请从当前项目的工作流入口投料');
     if (f.runtime.ending) throw new ControlError(409, 'run_ending', '正在结束上一轮，请等待报告');
     if (!Number.isSafeInteger(options.target) || options.target < 1 || options.target > 10000) throw new ControlError(400, 'invalid_target', '目标必须是 1–10000 个网站');
     const admitted = f.runtime.running ? latestRunTokens(f.state).length : 0;

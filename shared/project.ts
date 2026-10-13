@@ -2,7 +2,7 @@
 // materialized view, the dashboard keeps another fed by SSE, and offline replay feeds
 // a recorded journal through the very same function (Spec §10.11, §11).
 import type {
-  Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, PreflightCheck, Stamped, StepDetail, TokenStatus, Usage,
+  Alert, AttemptMetrics, Attachment, CaseNote, CompiledFactory, EvidenceRef, JournalEvent, PreflightCheck, Stamped, StepDetail, TokenStatus, Usage,
 } from "./types.ts";
 import { legacyReply, type ConversationEntry } from "./conversation.ts";
 import { mergeActivity } from "./activity.ts";
@@ -112,6 +112,8 @@ export interface ChatMessage {
 export interface Transfer { seq: number; at: number; token: string; from: string; to: string; returned: boolean }
 
 export interface FactoryState {
+  pausedScopes?: { lines: string[]; stations: string[] };
+  measurement?: Extract<JournalEvent, { kind: 'measurement.proposed' }>['proposal'] & { status: 'proposed' | 'accepted' | 'rejected' };
   batch?: import('./batch.ts').BatchGoal;
   seq: number;
   digest: string;
@@ -164,7 +166,7 @@ export function initialState(factory?: CompiledFactory): FactoryState {
     totals: { usage: zeroUsage(), published: 0, manual: 0, failed: 0, rejected: 0, merged: 0, returned: 0, corrections: 0 },
     resources: { used: {}, limits: {}, freeMemMB: 0, at: 0, waiting: {} },
     transfers: [], patches: [], reportReady: null, lockedStations: [],
-    alerts: {}, preflight: null, cases: {}, contextNotes: {}, consults: {},
+    alerts: {}, preflight: null, cases: {}, contextNotes: {}, consults: {}, pausedScopes: { lines: [], stations: [] },
   };
 }
 
@@ -186,6 +188,19 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
   s.seq = e.seq;
   const node = (key: string) => (s.nodes[key] ??= emptyNode(key));
   switch (e.kind) {
+    case 'scope.paused': {
+      const scopes = s.pausedScopes ??= { lines: [], stations: [] };
+      const list = e.scope === 'line' ? scopes.lines : scopes.stations;
+      if (e.paused && !list.includes(e.key)) list.push(e.key);
+      else if (!e.paused) remove(list, e.key);
+      break;
+    }
+    case 'measurement.proposed':
+      s.measurement = { ...e.proposal, status: 'proposed' };
+      break;
+    case 'measurement.decided':
+      if (s.measurement?.id === e.id) s.measurement.status = e.accepted ? 'accepted' : 'rejected';
+      break;
     case 'batch.configured':
       s.batch = e.batch;
       break;
@@ -379,6 +394,18 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
     }
     case "correction.created": {
       s.totals.corrections++;
+      break;
+    }
+    case 'correction.reverted': {
+      const token = s.tokens[e.token];
+      if (!token) break;
+      const snapshot = e.snapshot as { data: Record<string, unknown>; checkpoint: { rounds: Record<string, number> }; status: TokenStatus; at: string[]; touchedAt?: number; finishedAt?: number; finishedAtNode?: string; reason?: string };
+      for (const station of Object.values(s.nodes)) remove(station.queue, token.id);
+      token.data = structuredClone(snapshot.data); token.rounds = { ...snapshot.checkpoint.rounds };
+      token.status = snapshot.status; token.at = snapshot.status === 'active' ? [...snapshot.at] : [];
+      token.touchedAt = snapshot.touchedAt; token.finishedAt = snapshot.status === 'active' ? undefined : snapshot.finishedAt;
+      token.finishedAtNode = snapshot.status === 'active' ? undefined : snapshot.finishedAtNode; token.reason = snapshot.reason;
+      for (const key of token.at) if (!node(key).queue.includes(token.id)) node(key).queue.push(token.id);
       break;
     }
     case "dispatch.note":
