@@ -227,6 +227,30 @@ test('network recovery waits, pauses, attempts and completion remain separate fr
   assert.equal(tokenStatus(state.tokens.retry, state, 6000).label, '已发布');
 });
 
+test('website batch state does not hide or pause independent pack and channel recovery', () => {
+  const {state, emit, create} = statusFixture();
+  for (const [id, patch] of [['pack', {workflowPack: 'fixture'}], ['channel', {channelDelivery: 'delivery-fixture'}]] as const) {
+    create(id);
+    emit({kind: 'token.data', token: id, patch: {...patch, __runtimeRecovery: {
+      version: 1, runId: state.run.id, kind: 'network', state: 'waiting', station: 'curation/capture',
+      nextAt: 5000, networkAttempts: 1, modelFailures: 0, failureAttempt: `${id}-failure`,
+    }}});
+    emit({kind: 'token.finished', token: id, node: 'curation/capture', status: 'parked', reason: 'Network failure'});
+  }
+  for (const mode of ['running', 'paused', 'stopped'] as const) {
+    emit({kind: 'batch.configured', batch: {runId: state.run.id, target: 100, maxInFlight: 3,
+      intakeWindow: 1, maxRecoveries: 2, mode, startedAt: state.run.startedAt}});
+    const compact = uiState(state);
+    for (const id of ['pack', 'channel']) {
+      assert.equal(tokenStatus(compact.tokens[id], compact, 1000).label, '等待自动恢复');
+    }
+    assert.equal(runStatus(compact, 1000).label, '等待自动恢复');
+  }
+  emit({kind: 'run.paused', runId: state.run.id});
+  assert.equal(tokenStatus(state.tokens.pack, state, 1000).label, '恢复已暂停');
+  assert.equal(runStatus(state, 1000).label, '已暂停');
+});
+
 test('model trial, blocked and exhausted recovery preserve reasons without reviving old or completed work', () => {
   const {state, emit, create} = statusFixture();
   const node = {key: 'curation/reader', line: 'curation', kind: 'agent' as const, resource: 'model' as const};

@@ -1,4 +1,4 @@
-import { batchSummary, type BatchRecovery } from '../../../shared/batch.ts';
+import {batchSummary, isBatchToken, type BatchRecovery} from '../../../shared/batch.ts';
 import { latestRunTokens, type AttemptState, type FactoryState, type Light, type TokenState } from '../../../shared/project.ts';
 import type { CompiledNode, ModelDependency, StationAgentBinding } from '../../../shared/types.ts';
 
@@ -93,7 +93,7 @@ function runtimeRecovery(token: TokenState, state: FactoryState): RuntimeRecover
       typeof dependency.key !== 'string' || typeof dependency.model !== 'string' ||
       !['pi', 'claude-code', 'opencode', 'codex', 'launcher'].includes(String(dependency.adapter)) ||
       dependency.provider !== undefined && typeof dependency.provider !== 'string')) return;
-  if (state.batch?.runId === state.run.id && !dependency) return;
+  if (state.batch?.runId === state.run.id && !dependency && (isBatchToken(token) || plan.kind === 'model')) return;
   if (plan.version !== 1 || plan.runId !== state.run.id ||
       !['network', 'model'].includes(String(plan.kind)) ||
       !['waiting', 'trial', 'completed', 'exhausted', 'blocked'].includes(String(plan.state)) ||
@@ -130,9 +130,11 @@ function runtimeRecoveryStatus(token: TokenState, state: FactoryState, now: numb
   if (state.run.status === 'ended' || state.run.status === 'idle') {
     return {label: '自动恢复已停止', detail: `本轮未运行，自动恢复不会继续。${detail}`, light: 'yellow'};
   }
-  const paused = state.run.status === 'paused' || state.pausedScopes?.stations.includes(plan.station) ||
+  const batch = state.batch?.runId === state.run.id && isBatchToken(token) ? state.batch : undefined;
+  const paused = state.run.status === 'paused' || batch?.mode === 'paused' || state.pausedScopes?.stations.includes(plan.station) ||
     state.pausedScopes?.lines.includes(plan.station.split('/')[0]);
   if (paused) return {label: '恢复已暂停', detail: `领取已暂停，恢复计划和检查点保留；继续后仍需资源空位。${detail}`, light: 'yellow'};
+  if (batch?.mode === 'stopped') return {label: '自动恢复已停止', detail: `网站托管已停止，不再自动领取恢复尝试。${detail}`, light: 'yellow'};
   if (circuit?.state === 'blocked') return {label: '模型服务待处理', detail, light: 'red'};
   if (circuit?.state === 'trial' && circuit.trialToken !== token.id) {
     return {label: '等待服务验证', detail: `同一模型服务正由另一件任务验证，当前任务保留检查点等待。${detail}`, light: 'yellow'};
@@ -208,7 +210,7 @@ export function runStatus(state: FactoryState, now: number) {
   const allActiveRecovering = items.every(token => token.status !== 'active' || Boolean(runtimeRecovery(token, state)));
   if (state.run.status === 'idle') presentation = { label: '尚未运行', light: 'idle', detail: '本轮尚未开始。' };
   else if (state.run.status === 'ended') presentation = { label: '已结束', light: unresolved ? 'yellow' : 'idle', detail: unresolved ? `运行已结束，仍有 ${unresolved} 件未完成。` : '运行已结束。' };
-  else if (state.run.status === 'paused' || batch?.status === 'paused') presentation = { label: executing ? '已暂停 · 收尾中' : '已暂停', light: 'yellow', detail: '停止领取新任务；已开始的处理继续，结果与检查点保留。' };
+  else if (state.run.status === 'paused') presentation = { label: executing ? '已暂停 · 收尾中' : '已暂停', light: 'yellow', detail: '停止领取新任务；已开始的处理继续，结果与检查点保留。' };
   else if (recovery) presentation = recovery;
   else if (automatic?.pulse) presentation = automatic;
   else if (automatic && !executing && (!counts.active || allActiveRecovering && automatic.light !== 'red')) presentation = automatic;

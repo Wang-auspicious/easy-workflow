@@ -7,6 +7,8 @@ import http from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { classifyFailure, candidateFailure } from "../shared/failures.ts";
 import type { Executor, StationContext } from "../server/runtime.ts";
+import {line, station} from '../server/spec/dsl.ts';
+import {installWorkflowPack, type WorkflowManifest} from '../server/workflow-packs.ts';
 
 // Every database, catalogue and report belongs to this test process.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-recovery-"));
@@ -19,6 +21,7 @@ const { endRun, readReport } = await import("../server/report.ts");
 const { TOOLS, canonical, httpGet } = await import("../packs/vislexicon/tools.ts");
 const { closeNetwork } = await import("../server/network.ts");
 const { SourceSupervisor } = await import('../server/sources.ts');
+const {pack} = await import('../packs/vislexicon/pack.ts');
 
 test("failed fetches, durable candidate recovery, tagged retry and paused-run termination", {timeout:30000}, async t => {
   let factory:InstanceType<typeof Factory>|undefined;
@@ -428,5 +431,175 @@ test('unmanaged recovery rejects broken channel checkpoints and ambiguous item o
     factory.journal.close();
     assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
     fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+test('native workflow and channel recovery belong to their tokens rather than an unrelated website batch', {timeout: 30000}, async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  for (const origin of ['manual', 'channel', 'source'] as const) {
+    for (const mode of ['running', 'stopped', 'paused'] as const) await t.test(`${origin} with ${mode} website batch`, async () => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'h2-native-recovery-'));
+      const schema = {type: 'object', properties: {text: {type: 'string'}}, required: ['text'], additionalProperties: false};
+      const role = '# Native fixture role\nPreserve the provided text and original preparation. A transient local fixture error must resume only the failed stage; never repeat completed upstream work.';
+      const bindings: WorkflowManifest['bindings'] = {};
+      for (const id of ['prepare', 'work']) bindings[`native-fixture/${id}`] = {
+        role: 'roles/worker/ROLE.md', inputSchema: 'text', outputSchema: 'text',
+        input: {text: {path: id === 'prepare' ? 'input.text' : 'prepared.text'}},
+        outputKey: id === 'prepare' ? 'prepared' : 'result',
+        execute: {kind: 'node', module: 'tools/worker.mjs', export: id},
+      };
+      const manifest: WorkflowManifest = {
+        format: 1, id: 'native-fixture', name: 'Native recovery fixture', version: '1', blurb: 'No network or model',
+        entry: 'native-fixture/prepare', inputSchema: 'text', schemas: {text: schema}, bindings,
+        resources: {model: 1, browser: 1, cpu: 2, http: 1}, links: [], conditions: {},
+        lines: [line({id: 'native-fixture', name: 'Native fixture', layer: 3, priority: 'mid', wired: true,
+          blurb: 'Native module checkpoint fixture', stations: [
+            ...['prepare', 'work'].map(id => station({id, name: id, kind: 'program', role: 'process', resource: 'cpu',
+              input: 'text', output: 'text', accept: ['Return the unchanged fixture text'],
+              workers: {min: 1, max: 1, initial: 1, policy: 'fixed'}})),
+            station({id: 'published', name: 'Done', kind: 'store', role: 'store'}),
+          ], edges: [['prepare', 'work'], ['work', 'published']]})],
+        channels: origin === 'channel' ? [{id: 'fixture.native', from: {line: 'curation', station: 'published'},
+          to: {line: 'native-fixture', station: 'prepare'}, label: 'Independent native child'}] : [],
+      };
+      const request = {manifest, builtins: ['vislexicon'], files: {
+        'roles/worker/ROLE.md': role,
+        'tools/worker.mjs': `const calls = new Map();
+export function prepare(input) { return input; }
+export async function work(input, context) {
+  const count = (calls.get(context.item) ?? 0) + 1;
+  calls.set(context.item, count);
+  const failure = input.text === 'auth' ? {tag:'auth_required',category:'auth',owner:'user',retryable:true,message:'loginWall fixture'}
+    : input.text === 'uncertain' ? {tag:'tool_error',category:'system',owner:'user',retryable:false,code:'EXTERNAL_OPERATION_UNKNOWN',message:'External write outcome unknown'} : null;
+  if (failure) throw Object.assign(new Error(failure.message), {failure});
+  if (input.text === 'cancel') await new Promise((_, reject) => {
+    context.signal.addEventListener('abort', () => reject(context.signal.reason), {once:true});
+  });
+  if (count === 1 || input.text === 'exhausted') throw Object.assign(new Error('Controlled native timeout'), {code: 'ETIMEDOUT'});
+  return input;
+}
+`,
+      }};
+      const factory = new Factory(directory);
+      const settle = async () => {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        await factory.runtime.settle();
+        await new Promise<void>(resolve => setImmediate(resolve));
+      };
+      const attemptsAt = (node: string) => Object.values(factory.state.attempts).filter(attempt => attempt.node === node).length;
+      const latest = () => Object.values(factory.state.tokens).findLast(token => token.line === 'native-fixture' && !token.data.retriedBy)!;
+      try {
+        await installWorkflowPack(directory, request, {running: false}, [pack]);
+        await factory.boot();
+        factory.broker.memoryFloorMB = 0;
+        factory.catalog = [];
+        const originalExecutor = factory.runtime.executors;
+        factory.runtime.executors = node => node.key === 'curation/reader' ? async () => ({ok: false,
+          summary: 'Website checkpoint waits for its own batch', failure: {
+            tag: 'network_timeout', category: 'network', owner: 'system', retryable: true, message: 'Website fixture timeout',
+          }}) : originalExecutor(node);
+        if (origin === 'source') {
+          await factory.sources.close();
+          factory.sources = new SourceSupervisor(factory);
+          factory.sources.configure({id: 'native-source', name: 'Native source', url: 'https://never-polled.example/items',
+            format: 'json', platform: 'fixture', target: manifest.entry, intervalMs: 86400000,
+            enabled: true, constants: {text: 'retained native input'}});
+        }
+        factory.runtime.start('Native recovery with website batch');
+        factory.batch.configure({target: 1, maxInFlight: 1, intakeWindow: 1});
+        if (mode === 'stopped') factory.batch.setMode('stopped');
+        const item = `native-${origin}`;
+        if (origin === 'channel') {
+          const parent = factory.runtime.create('curation/published', {item, url: '', source: 'manual', data: {input: {text: 'retained native input'}}});
+          factory.journal.append({kind: 'channel.emitted', channel: 'fixture.native', token: parent.id, item, inventory: 'consumer'});
+        } else {
+          factory.runtime.create(manifest.entry, {item, url: '', source: origin === 'source' ? 'source:native-source' : 'manual',
+            data: {workflowPack: manifest.id, input: {text: 'retained native input'},
+              ...(origin === 'source' ? {sourceCandidate: item, sourceRecord: {source: 'native-source'}} : {})}});
+        }
+        await settle();
+        assert.equal(attemptsAt('native-fixture/work'), 1);
+        assert.equal(latest().status, 'parked');
+        const plan = latest().data.__runtimeRecovery as {state: string; nextAt: number};
+        assert.equal(plan?.state, 'waiting', 'an unrelated website goal cannot suppress this native checkpoint plan');
+        if (mode === 'paused') factory.batch.setMode('paused');
+        factory.runtime.pause();
+        t.mock.timers.tick(60000);
+        factory.recovery.pump();
+        await settle();
+        assert.equal(attemptsAt('native-fixture/work'), 1, 'global pause always wins');
+        factory.runtime.setScopePaused({scope: 'station', key: 'native-fixture/work', paused: true, reason: 'Inspect native retry'});
+        factory.runtime.resume();
+        factory.recovery.pump();
+        await settle();
+        assert.equal(attemptsAt('native-fixture/work'), 1, 'the failed station pause always wins');
+        if (origin === 'source') factory.sources.setEnabled('native-source', false);
+        factory.runtime.setScopePaused({scope: 'station', key: 'native-fixture/work', paused: false, reason: 'Native retry ready'});
+        factory.recovery.pump();
+        await settle();
+        if (origin === 'source') {
+          assert.equal(attemptsAt('native-fixture/work'), 1, 'a disabled source cannot resume its failed candidate');
+          factory.sources.setEnabled('native-source', true);
+          factory.recovery.pump();
+          await settle();
+        }
+        assert.equal(attemptsAt('native-fixture/work'), 2);
+        assert.equal(attemptsAt('native-fixture/prepare'), 1, 'completed native preparation is not executed again');
+        assert.equal(latest().status, 'published');
+        assert.deepEqual(latest().data.result, {text: 'retained native input'});
+        assert.equal((latest().data.__runtimeRecovery as {state: string}).state, 'completed');
+        if (origin === 'channel') assert.equal(factory.channels!.status().find(delivery => delivery.channel === 'fixture.native')?.status, 'acknowledged');
+        if (mode !== 'running') {
+          const website = factory.runtime.create('curation/reader', {item: 'stopped-website', url: '', source: 'candidates/pool'});
+          await settle();
+          t.mock.timers.tick(60000);
+          factory.batch.pump();
+          factory.recovery.pump();
+          await settle();
+          assert.equal(factory.state.tokens[website.id].status, 'parked');
+          assert.equal(attemptsAt('curation/reader'), 1, 'the paused or stopped website goal still owns and holds its own retry');
+        }
+        if (origin === 'manual' && mode === 'stopped') {
+          const attemptsFor = (item: string, node = 'native-fixture/work') => Object.values(factory.state.attempts)
+            .filter(attempt => attempt.node === node && factory.state.tokens[attempt.token]?.item === item).length;
+          for (const boundary of ['auth', 'uncertain', 'exhausted', 'cancel'] as const) {
+            const item = `boundary-${boundary}`;
+            const token = factory.runtime.create(manifest.entry, {item, url: '', source: 'manual',
+              data: {workflowPack: manifest.id, input: {text: boundary}}});
+            if (boundary === 'cancel') {
+              for (let i = 0; i < 100 && !attemptsFor(item); i++) await new Promise<void>(resolve => setImmediate(resolve));
+              assert.equal(attemptsFor(item), 1);
+              factory.runtime.end();
+              await settle();
+              factory.runtime.start('A new run cannot revive a cancelled native attempt');
+            } else await settle();
+            for (let i = 0; i < 4; i++) {
+              t.mock.timers.tick(60000);
+              factory.recovery.pump();
+              await settle();
+            }
+            const current = Object.values(factory.state.tokens).findLast(value => value.item === item && !value.data.retriedBy)!;
+            assert.equal(attemptsFor(item), boundary === 'exhausted' ? 3 : 1,
+              'auth, unknown effects and cancellation are never automatic retries; transient retries stop at two');
+            assert.equal(attemptsFor(item, 'native-fixture/prepare'), 1);
+            if (boundary === 'exhausted') assert.equal((current.data.__runtimeRecovery as {state: string}).state, 'exhausted');
+            if (boundary === 'uncertain') {
+              assert.equal(factory.state.tokens[token.id].status, 'manual');
+              assert.equal(factory.state.recoveries[item], undefined);
+            }
+          }
+        }
+      } finally {
+        factory.recovery?.close();
+        await factory.sources?.close();
+        factory.channels?.close();
+        await factory.runtime?.close();
+        factory.docs?.flush();
+        factory.lessons?.close();
+        factory.journal.close();
+        assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+        fs.rmSync(directory, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+      }
+    });
   }
 });

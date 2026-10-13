@@ -1,4 +1,4 @@
-import type { FactoryState } from './project.ts';
+import type {FactoryState, TokenState} from './project.ts';
 import { latestRunTokens } from './project.ts';
 import type {CompiledFactory} from './types.ts';
 
@@ -141,9 +141,15 @@ export function modelRecoveryDelay(failures: number) {
   return failures <= 3 ? 30000 * 2 ** Math.max(0, failures - 1) : 15 * 60 * 1000;
 }
 
+/** Website goals own their roots, not independent packs or channel deliveries. */
+export function isBatchToken(token: Pick<TokenState, 'data' | 'source' | 'line'>): boolean {
+  return !token.data.channelDelivery && !token.data.workflowPack && !token.source.startsWith('channel:') &&
+    ['candidates', 'curation'].includes(token.line);
+}
+
 /** A website goal counts its own roots; downstream deliveries have their own lifecycle. */
 export function latestBatchTokens(s: FactoryState) {
-  return latestRunTokens(s).filter(token => !token.data.channelDelivery && !token.data.workflowPack && !token.source.startsWith('channel:') && ['candidates', 'curation'].includes(token.line));
+  return latestRunTokens(s).filter(isBatchToken);
 }
 
 export function batchSummary(s: FactoryState) {

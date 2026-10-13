@@ -4,7 +4,7 @@ import type {TokenState} from '../shared/project.ts';
 import type {ModelDependency, Stamped} from '../shared/types.ts';
 import {latestRunTokens} from '../shared/project.ts';
 import {classifyFailure, type Failure} from '../shared/failures.ts';
-import {modelRecoveryDelay} from '../shared/batch.ts';
+import {isBatchToken, modelRecoveryDelay} from '../shared/batch.ts';
 import {ControlError} from './errors.ts';
 
 const KEY = '__runtimeRecovery';
@@ -59,7 +59,7 @@ export class UnmanagedRecoverySupervisor {
       for (const token of this.tokens()) {
         const plan = this.plan(token);
         if (plan?.kind !== 'model' || plan.state !== 'trial') continue;
-        if (this.managed() && !plan.dependency) continue;
+        if (this.delegated(token, plan.kind, plan.dependency)) continue;
         if (token.status === 'active') {
           this.save(token.id, {...plan, state: 'waiting',
             nextAt: plan.dependency ? this.factory.modelCircuits.get(plan.dependency)?.nextAt ?? plan.nextAt
@@ -73,9 +73,17 @@ export class UnmanagedRecoverySupervisor {
     this.schedule();
   }
 
-  private managed() {
+  private managed(token: TokenState) {
     const f = this.factory;
-    return f.state.batch?.runId === f.state.run.id;
+    return f.state.batch?.runId === f.state.run.id && isBatchToken(token);
+  }
+
+  private delegated(token: TokenState, kind: RecoveryPlan['kind'], dependency?: ModelDependency) {
+    const f = this.factory;
+    if (f.state.batch?.runId !== f.state.run.id) return false;
+    // An unidentified legacy model outage still belongs to the global batch
+    // circuit. Known model keys use this supervisor; website network work does not.
+    return kind === 'model' ? !dependency : isBatchToken(token);
   }
 
   private writable() {
@@ -84,8 +92,7 @@ export class UnmanagedRecoverySupervisor {
 
   private running() {
     const runtime = this.factory.runtime;
-    return this.writable() && runtime.running && !runtime.paused && !runtime.ending &&
-      (!this.managed() || this.factory.state.batch?.mode === 'running');
+    return this.writable() && runtime.running && !runtime.paused && !runtime.ending;
   }
 
   private tokens() {
@@ -158,17 +165,19 @@ export class UnmanagedRecoverySupervisor {
         failure.tag === 'model_unavailable' && circuit?.state === 'open';
       const localTool = failure.tag === 'tool_error' && failure.category === 'system' && failure.owner === 'system';
       if (failure.owner === 'user' && !model || !model && !TRANSIENT.has(failure.tag) && !localTool) continue;
-      if (this.managed() && !(dependency && (model || old?.kind === 'model'))) continue;
       if (old?.failureAttempt === attempt.id && old.state !== 'trial') continue;
-      const station = this.checkpoint(token);
       const verifying = old?.kind === 'model' && old.state === 'trial' &&
         Boolean(old.dependency ? f.modelCircuits.get(old.dependency) : f.state.alerts['model-transport'] || f.broker.modelHold);
+      const kind = model || verifying ? 'model' : 'network';
+      const recoveryDependency = model ? dependency : verifying ? old.dependency : undefined;
+      if (this.delegated(token, kind, recoveryDependency)) continue;
+      const station = this.checkpoint(token);
       const plan: RecoveryPlan = {
-        version: 1, runId: f.state.run.id, kind: model || verifying ? 'model' : 'network',
+        version: 1, runId: f.state.run.id, kind,
         state: station ? 'waiting' : 'blocked', station: station ?? token.finishedAtNode ?? '',
         nextAt: 0, networkAttempts: old?.networkAttempts ?? 0,
         modelFailures: circuit?.failures ?? (old?.modelFailures ?? 0) + Number(model), failureAttempt: attempt.id,
-        dependency: model ? dependency : verifying ? old.dependency : undefined,
+        dependency: recoveryDependency,
         modelStation: model ? station : verifying ? old.modelStation ?? old.station : undefined,
         networkRetry: !model,
       };
@@ -223,7 +232,7 @@ export class UnmanagedRecoverySupervisor {
       };
     }
     if (!old) return;
-    if (this.managed() && !old.dependency) return;
+    if (this.delegated(previous, old.kind, old.dependency)) return;
     const verifying = old.kind === 'model' && Boolean(old.dependency
       ? f.modelCircuits.get(old.dependency) : f.state.alerts['model-transport'] || f.broker.modelHold);
     if (verifying && old.dependency) f.modelCircuits.requested(old.dependency);
@@ -245,7 +254,7 @@ export class UnmanagedRecoverySupervisor {
     this.prepare(Date.now());
     const token = this.tokens().find(value => {
       const plan = this.plan(value);
-      return plan?.kind === 'model' && plan.state === 'waiting';
+      return plan?.kind === 'model' && plan.state === 'waiting' && !this.delegated(value, plan.kind, plan.dependency);
     });
     if (token) this.save(token.id, {...this.plan(token)!, nextAt: Date.now()});
     this.schedule();
@@ -261,7 +270,7 @@ export class UnmanagedRecoverySupervisor {
       const attempt = f.state.attempts[event.attempt];
       const token = attempt && f.state.tokens[attempt.token];
       const plan = token && this.plan(token);
-      if (this.managed() && !plan?.dependency) return;
+      if (token && this.delegated(token, plan?.kind ?? 'network', plan?.dependency)) return;
       if (token && plan?.state === 'trial' &&
           [plan.station, plan.modelStation].includes(attempt.node) &&
           !event.cancelled && !['stale', 'restart'].includes(event.error ?? '')) {
@@ -312,7 +321,7 @@ export class UnmanagedRecoverySupervisor {
       const token = f.state.tokens[event.token];
       const plan = token && this.plan(token);
       if (plan?.state === 'trial' && plan.kind === 'model') {
-        if (this.managed() && !plan.dependency) return;
+        if (this.delegated(token, plan.kind, plan.dependency)) return;
         if (!plan.dependency) {
           f.broker.recoveryToken = null;
           f.broker.modelHold ??= '模型恢复验证尚未通过，已保留检查点';
@@ -372,7 +381,8 @@ export class UnmanagedRecoverySupervisor {
       const waiting = tokens.filter(token => {
         const plan = this.plan(token);
         const circuit = plan?.dependency && f.modelCircuits.get(plan.dependency);
-        return plan?.state === 'waiting' && (!this.managed() || plan.dependency) &&
+        return plan?.state === 'waiting' && !this.delegated(token, plan.kind, plan.dependency) &&
+          (!this.managed(token) || f.state.batch?.mode === 'running') &&
           (circuit ? circuit.state === 'open' && circuit.nextAt <= now && (!circuit.trialToken || circuit.trialToken === token.id) : plan.nextAt <= now) &&
           (!modelHold || plan.kind === 'model' && !plan.dependency) && !f.runtime.scopePaused(plan.station) &&
           (token.status === 'active' || this.sourceEnabled(token));
