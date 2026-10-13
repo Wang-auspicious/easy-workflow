@@ -181,6 +181,25 @@ export interface Alert { id: string; level: "red"; kind: "tls" | "auth" | "model
 export interface PreflightCheck { id: string; label: string; ok: boolean; detail: string; fix?: string; ms: number }
 export interface CaseNote { station: string; section: string; text: string; by: string }
 
+export interface ChannelDelivery {
+  id: string; channel: string; sourceToken: string; target: string; item: string;
+  url: string; title?: string; data: Record<string, unknown>;
+  status: 'pending' | 'delivered' | 'acknowledged' | 'blocked' | 'failed';
+  targetToken?: string; attempts: number; reason?: string;
+}
+export interface SourceSpec {
+  id: string; name: string; url: string; platform: string; format: 'rss' | 'json' | 'browser';
+  target: string; enabled: boolean; intervalMs: number;
+  perMinute?: number; perDay?: number; limit?: number; externalLinksOnly?: boolean;
+  input?: Record<string, string>; constants?: Record<string, unknown>;
+}
+export interface SourceCandidate {
+  id: string; source: string; platform: string; sourceUrl: string; url: string; title: string;
+  author?: string; publishedAt?: string; excerpt?: string; images?: string[];
+  discoveredAt: number; status: 'pending' | 'delivered' | 'acknowledged' | 'blocked' | 'failed';
+  targetToken?: string; reason?: string;
+}
+
 export type JournalEvent =
   | import("./lessons.ts").LessonEvent
   | { kind: "factory.loaded"; digest: string; specVersion: string }
@@ -212,7 +231,13 @@ export type JournalEvent =
   | { kind: "control.executed"; tool: string; actor: "agent" | "dispatcher" | "user"; summary: string }
   | { kind: "correction.created"; correction: string; evidence?: string; token: string; node: string; reason: string; note?: string; snapshot?: Record<string, unknown> }
   | { kind: "correction.reverted"; correction: string; token: string; snapshot: Record<string, unknown> }
-  | { kind: "channel.emitted"; channel: string; token: string; item: string }
+  | { kind: "channel.emitted"; channel: string; token: string; item: string; inventory?: 'consumer' }
+  | { kind: 'channel.delivery'; delivery: ChannelDelivery }
+  | { kind: 'source.configured'; source: SourceSpec }
+  | { kind: 'source.requested'; source: string; platform: string; requestedAt: number; nextRequestAt?: number }
+  | { kind: 'source.polled'; source: string; nextAt: number; count: number; duplicates: number; attention?: string; failure?: import('./failures.ts').Failure }
+  | { kind: 'source.candidate'; candidate: SourceCandidate }
+  | { kind: 'source.reputation'; platform: string; author: string; accepted: number; rejected: number }
   | { kind: "dispatch.note"; text: string; node?: string; tone?: "info" | "fork" | "warn" }
   | { kind: "chat.user"; id: string; text: string; attachments: Attachment[] }
   | { kind: "chat.assistant"; id: string; text: string; tools: { name: string; summary: string }[]; usage?: Usage }

@@ -23,7 +23,9 @@ test('an unexecuted correction can be undone after restart, restoring its public
     const correction = factory.runtime.correct({ token: token.id, node: 'curation/facts' }, 'Verify a detail again', 'check the original source');
     assert.equal(correction.ok, true); assert.ok(correction.correction); assert.equal(factory.state.nodes['curation/published'].stock, 0);
     await close(factory); factory = new Factory(); await factory.boot(); useFixture(factory);
+    assert.equal(factory.state.corrections?.[correction.correction!].status, 'pending');
     factory.runtime.undoCorrection(correction.correction!);
+    assert.equal(factory.state.corrections?.[correction.correction!].status, 'reverted');
     assert.equal(factory.state.tokens[token.id].status, 'published');
     assert.equal(factory.state.nodes['curation/published'].stock, 1);
     assert.deepEqual([...factory.runtime.tokens.get(token.id)!.done], originalDone);
@@ -33,6 +35,7 @@ test('an unexecuted correction can be undone after restart, restoring its public
     assert.throws(() => factory.runtime.undoCorrection(correction.correction!), /已有工位执行/);
     const executed = factory.runtime.correct({ token: token.id, node: 'curation/facts' }, 'Perform the correction');
     factory.runtime.resume(); await factory.runtime.settle();
+    assert.equal(factory.state.corrections?.[executed.correction!].status, 'executed');
     assert.throws(() => factory.runtime.undoCorrection(executed.correction!), /已有工位执行/);
   } finally { await close(factory); fs.rmSync(dir, { recursive: true, force: true }); }
 });

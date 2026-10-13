@@ -84,7 +84,7 @@ export async function buildDesktop() {
   for (const folder of ['server', 'shared', 'packs']) {
     for (const file of walk(path.join(root, folder))) {
       const rel = path.relative(root, file);
-      if (!/\.(ts|md|json)$/.test(file)) continue;
+      if (!/\.(ts|md|json|py)$/.test(file)) continue;
       const target = path.join(output, rel.replace(/\.ts$/, '.js'));
       fs.mkdirSync(path.dirname(target), { recursive: true });
       if (file.endsWith('.ts')) {

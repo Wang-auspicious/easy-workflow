@@ -30,7 +30,7 @@ export interface TranscriptActor {
 export type TranscriptPart =
   | { type: "text"; text: string }
   | { type: "thinking"; text: string; streaming: boolean }
-  | { type: "tool"; id: string; name: string; label: string; args: string; result?: string; status: "pending" | "done" | "error"; detail?: string }
+  | { type: "tool"; id: string; name: string; label: string; args: string; result?: string; status: "pending" | "done" | "error"; detail?: string; correction?: string }
   | { type: "failure"; label: string; detail: string }
   | { type: "attachments"; items: Attachment[] };
 
@@ -57,7 +57,17 @@ const TOOL_LABEL: Record<string, string> = {
   status: "查看运行状态", inspect: "查看详情", run_control: "控制运行", feed_urls: "投料",
   pull_candidates: "取候选", workers: "调整工位", correct: "纠错", propose_patch: "起草规格补丁",
   settings: "工作设置", journal: "读取过程", report: "读取报告", read_report: "读取报告", candidates: "查询候选",
+  undo_correction: '撤销纠错', workflow_templates: '查看工作流模板', workflow_feed: '提交工作流任务', business_feed: '提交业务任务', allocation_plan: '实测配员建议',
 };
+
+export function correctionReceipt(name: string, args: Record<string, unknown>, output: string): string | undefined {
+  const target = name === 'easy_workflow_call' || name === 'h2_call' ? args.name ?? args.tool : name;
+  if (target !== 'correct') return;
+  try {
+    const value = JSON.parse(output), result = value.result ?? value;
+    if (value.ok !== false && result.ok !== false && typeof result.correction === 'string') return result.correction;
+  } catch { /* A textual tool result is still displayed as text; do not invent an action. */ }
+}
 
 export function toolLabel(name: string, args?: Record<string, unknown>): string {
   const target = (args?.name ?? args?.tool) as string | undefined;
@@ -151,6 +161,7 @@ export function buildTranscript(input: BuildTranscriptInput): TranscriptItem[] {
         parts.push({
           type: "tool", id: chunk.id, name: chunk.name, label: toolLabel(chunk.name, chunk.arguments),
           args: pretty(chunk.arguments), result: result ? pretty(output) || "(无输出)" : undefined,
+          correction: result && !result.isError ? correctionReceipt(chunk.name, chunk.arguments, output) : undefined,
           status: result?.isError ? "error" : result ? "done" : pending ? "pending" : "error",
           // 没有结果又不是当前这轮在跑的调用：如实说明它没有返回，供卡片折叠时显示一行原因。
           detail: !result && !pending

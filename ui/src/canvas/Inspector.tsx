@@ -4,15 +4,18 @@
 // A token card shows that item's evidence chain from URL to publication.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
-import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, CircleMinus, Check, AlertTriangle, Loader2, ExternalLink } from "lucide-react";
+import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, CircleMinus, Check, AlertTriangle, Loader2, ExternalLink, Play, Pause } from "lucide-react";
 import type { CompiledNode, EvidenceRef } from "../../../shared/types.ts";
 import { median, quantile, type AttemptState, type TokenState } from "../../../shared/project.ts";
 import { roleColors } from "../../../shared/palette.ts";
 import { attach, getState, setState, useStore, type Inspector } from "../store.ts";
-import { actions, api } from "../api.ts";
+import { actions, api, boot } from "../api.ts";
+import { workflowCall } from '../views/workflows.ts';
+import '../views/workflows.css';
 import { StationIcon } from "./StationIcon.tsx";
 import { fmt, secs } from "./Node.tsx";
 import { openCorrection } from "../board/Correction.tsx";
+import { CorrectionUndo } from '../board/CorrectionUndo.tsx';
 import type { Geometry } from "./geometry.ts";
 import type { Camera } from "./Canvas.tsx";
 import { toggleInspector } from "./Canvas.tsx";
@@ -94,6 +97,8 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
   const now = useNow(1000);
   const [tab, setTab] = useState<"work" | "metrics" | "spec">("work");
   const [attemptSel, setAttemptSel] = useState<string | null>(null);
+  const [scopeBusy, setScopeBusy] = useState(false);
+  const stationPaused = useStore(s => s.fs.pausedScopes?.stations.includes(insp.key) ?? false);
   const s = getState();
   const node = s.factory!.nodes.find((n) => n.key === insp.key) as CompiledNode;
   const n = s.fs.nodes[insp.key];
@@ -108,6 +113,12 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
   const durations = n?.durations ?? [];
   const locked = useStore((s) => s.fs.lockedStations.includes(insp.key));
   const lineWired = s.factory!.lines.find((l) => l.id === node.line)?.wired;
+  const linePaused = s.fs.pausedScopes?.lines.includes(node.line) ?? false;
+  const togglePause = async () => {
+    setScopeBusy(true);
+    try { await workflowCall('run_control', { action: stationPaused ? 'resume' : 'pause', station: node.key, reason: '用户在工位详情调整领取状态' }); await boot(); }
+    catch { /* The API reports the failure without changing the displayed scope. */ } finally { setScopeBusy(false); }
+  };
   return (
     <>
       <Head onDrag={onDrag} onClose={onClose} onPin={onPin} pinned={insp.pinned}>
@@ -126,8 +137,10 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
         <Stat k="token" v={fmt((n?.usage.input ?? 0) + (n?.usage.output ?? 0))} />
       </div>
       {s.fs.resources.waiting?.[node.key] && <div className="insp-wait"><Loader2 size={12} className="spin-i" /> 等待：{s.fs.resources.waiting[node.key]}</div>}
+      {(stationPaused || linePaused) && <div className="scope-notice">{stationPaused ? '此工位已暂停领取新任务。' : '所属流水线已暂停领取新任务。'}已开始的处理继续，其他工位保持原状态。</div>}
       <div className="insp-actions">
         {node.kind !== "store" && node.kind !== "source" && <>
+          <button className="btn btn--sm" disabled={scopeBusy || Boolean(s.replay) || !s.connected || !lineWired} onClick={() => void togglePause()}>{scopeBusy ? <Loader2 size={12} className="spin-i" /> : stationPaused ? <Play size={12} /> : <Pause size={12} />}{stationPaused ? '恢复此工位' : '暂停此工位'}</button>
           <button className="btn btn--sm" onClick={() => actions.workers(node.key, "fork").then((r: any) => !r.ok && toast("没有 fork：已到人数上限"))} data-tip={`上限 ${node.workers.max}`}><GitFork size={13} />加一个人</button>
           <button className="btn btn--sm" onClick={() => actions.workers(node.key, "retire").then((r: any) => !r.ok && toast("没有撤：已到下限或都在忙"))}><UserMinus size={13} />撤一个</button>
           <button className="btn btn--sm btn--ghost" onClick={() => void actions.workers(node.key, locked ? "unlock" : "lock").then(() => toast(locked ? "已解锁人数：恢复自动伸缩" : "已锁定人数：不再自动伸缩")).catch(() => {})}>{locked ? <Unlock size={13} /> : <Lock size={13} />}{locked ? "解锁人数" : "锁定人数"}</button>
@@ -391,8 +404,9 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
       </div>
       <div className="insp-actions">
         <button className="btn btn--sm" onClick={() => attach({ type: "token", id: t.id, label: t.item, tone: t.status === "manual" ? "warn" : undefined })}><MessageSquarePlus size={13} />加到对话</button>
-        <button className="btn btn--sm" onClick={(e) => openCorrection([{ token: t.id, node: steps.filter((x) => x.a.ok).slice(-1)[0]?.node ?? "curation/classify", label: t.item }], e.currentTarget, true)}>纠错退回…</button>
+        <button className="btn btn--sm" disabled={!steps.length} onClick={(e) => openCorrection([{ token: t.id, node: steps.filter((x) => x.a.ok).slice(-1)[0]?.node ?? steps[0]?.node, label: t.item }], e.currentTarget, true)}>纠错退回…</button>
       </div>
+      {Object.values(s.fs.corrections ?? {}).some(correction => correction.token === t.id) && <div className="token-corrections">{Object.values(s.fs.corrections ?? {}).filter(correction => correction.token === t.id).slice(-5).reverse().map(correction => <CorrectionUndo key={correction.id} id={correction.id} />)}</div>}
     </>
   );
 }

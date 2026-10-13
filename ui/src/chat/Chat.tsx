@@ -255,6 +255,7 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
     setSending(true);
     setSendError("");
     setPalette(false);
+    setWalk(null);
     if (!preserveDraft) setState({ draft: "", attachments: [] });
     remember(text);
     try { await actions.chat(text, attachments, { requestId: pendingSend.current.requestId, mode: live ? mode : "steer" }); pendingSend.current = null; }
@@ -293,7 +294,7 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send(); return; }
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); return; }
     if ((e.key === "ArrowUp" || e.key === "ArrowDown") && history.length && !draft.includes("\n")) {
-      if (walk === null && (draft || e.key === 'ArrowDown')) return;
+      if ((draft && (walk === null || draft !== history[walk])) || (walk === null && e.key === 'ArrowDown')) return;
       e.preventDefault();
       const next = e.key === "ArrowUp" ? (walk === null ? 0 : Math.min(walk + 1, history.length - 1)) : walk === null || walk <= 0 ? null : walk - 1;
       setWalk(next);

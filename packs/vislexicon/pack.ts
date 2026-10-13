@@ -186,14 +186,20 @@ const curation = line({
   ],
 });
 
-/* ------------------------------------------------------------------ layer 3 · other lines (drawn, not wired yet) */
+/* ------------------------------------------------------------------ layer 3 · resource publication lines */
 
 const simple = (id: string, name: string, priority: "high" | "mid" | "low", blurb: string, steps: [string, string, Parameters<typeof station>[0]["role"], Parameters<typeof station>[0]["kind"], string?][]) =>
   line({
-    id, name, layer: 3, priority, wired: false, blurb,
+    id, name, layer: 3, priority, wired: true, blurb,
     stations: [
       station({ id: "inbox", name: "收件箱", role: "channel", kind: "store", blurb: "等候分流或信道投递" }),
-      ...steps.map(([sid, sname, role, kind, sblurb]) => station({ id: sid, name: sname, role, kind, blurb: sblurb, resource: kind === "agent" || kind === "review" ? "model" : "none" })),
+      ...steps.map(([sid, sname, role, kind, sblurb]) => station({ id: sid, name: sname, role, kind, blurb: sblurb,
+        tool: kind === "program" || kind === "gate" ? `${id}.${sid}` : undefined,
+        resource: kind === "agent" || kind === "review" ? "model" : ["discover", "stage"].includes(sid) ? "browser" : ["fetch-file", "fetch-deck", "fx-code"].includes(sid) ? "http" : "cpu",
+        input: `${id}:resource`, output: `${id}:resource`,
+        accept: ["真实来源与持久产物通过本站契约校验", "没有未处理的审查问题"], rules: id === "components" ? [`${V}#4`] : ["spec:§6.1"],
+        workers: {min:1,max:id === "atlas-feed"?1:3,initial:1,policy:id === "atlas-feed"?"fixed":"auto"},
+      })),
       station({ id: "published", name: "已发布", role: "store", kind: "store" }),
     ],
     edges: chain("inbox", ...steps.map((s) => s[0]), "published"),

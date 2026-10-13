@@ -14,6 +14,8 @@ import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { KIND_ZH, PREVIEW_RULES, loadPublished } from "./env.ts";
 import { scout } from "./scout.ts";
 import { publicationImages, videoPreview } from "./preview.ts";
+import { COMPONENT_TOOLS } from "./components.ts";
+import { MEDIA_TOOLS } from "./media-lines.ts";
 import { repoOf } from "../../server/repo.ts";
 import { ALL_AXES, CHOSEN_AXES, derivedFacets, loadTaxonomy, validateV3, webpSize } from "./v3.ts";
 import {
@@ -716,6 +718,7 @@ const gate: Tool = async (ctx, svc) => {
 };
 
 export const TOOLS: Record<string, Tool> = {
+  ...COMPONENT_TOOLS, ...MEDIA_TOOLS,
   "candidates.tidy": tidy, "candidates.extract": extract, "candidates.index": index, "candidates.route": route,
   "curation.dedupe": dedupe, "curation.fetch": fetchHome, "curation.scout": (ctx, svc) => scout(ctx, svc), "curation.kind-join": kindJoin, "curation.assemble": assemble,
   "curation.plan": plan, "curation.identity": identity,

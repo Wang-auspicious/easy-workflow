@@ -4,13 +4,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { legacyReply, type ConversationEntry } from "../../shared/conversation.ts";
 import { emptyLive, idleDispatcher, type LiveChat, type DispatcherStatus } from "../src/chat/live.ts";
-import { buildTranscript, dispatcherState, toolLabel } from "../src/chat/transcript.ts";
+import { buildTranscript, correctionReceipt, dispatcherState, toolLabel } from "../src/chat/transcript.ts";
 import type { CompiledFactory, CompiledNode } from "../../shared/types.ts";
 import { botFor } from "../../shared/palette.ts";
 
 const dispatcher = (patch: Partial<DispatcherStatus> = {}): DispatcherStatus => ({ ...idleDispatcher(), ...patch });
 const live = (patch: Partial<LiveChat> = {}): LiveChat => ({ ...emptyLive(), ...patch });
 const assistant = (text: string) => legacyReply(text, 1000);
+
+test('撤销只绑定真实纠错回执，不把任意输出中的 correction 当成按钮', () => {
+  assert.equal(correctionReceipt('correct', {}, JSON.stringify({ ok: true, correction: 'c-direct' })), 'c-direct');
+  assert.equal(correctionReceipt('easy_workflow_call', { name: 'correct' }, JSON.stringify({ ok: true, result: { ok: true, correction: 'c-wrapped' } })), 'c-wrapped');
+  for (const output of ['plain text', JSON.stringify({ ok: false, correction: 'c-bad' }), JSON.stringify({ ok: true, result: { ok: false, correction: 'c-failed' } })]) assert.equal(correctionReceipt('correct', {}, output), undefined);
+  assert.equal(correctionReceipt('inspect', {}, JSON.stringify({ correction: 'c-unrelated' })), undefined);
+});
 
 test("状态判定：没消息时空闲，收到任务先思考，吐字时说话，跑工具时执行", () => {
   assert.equal(dispatcherState(live(), dispatcher()), "idle");

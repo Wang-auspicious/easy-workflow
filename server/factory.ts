@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CompiledFactory, CompiledNode, Stamped } from "../shared/types.ts";
-import { apply, initialState, latestRunTokens, type FactoryState } from "../shared/project.ts";
+import { apply, initialState, latestRunTokens, tokenWorkKey, type FactoryState } from "../shared/project.ts";
 import { compile, type Patch } from "./spec/compile.ts";
 import { Journal } from "./journal.ts";
 import { Broker } from "./broker.ts";
@@ -19,7 +19,7 @@ import { loadCatalog, loadPublished, type CatalogEntry } from "../packs/vislexic
 import { ControlError } from "./errors.ts";
 import { classifyFailure, type Failure } from "../shared/failures.ts";
 import { readRole } from "./roles.ts";
-import { ensureProject, projectPaths, type ProjectInfo } from "./workspace.ts";
+import { ensureProject, projectPaths, synchronizeProjectPacks, type ProjectInfo } from "./workspace.ts";
 import { configureNetwork } from "./network.ts";
 import { Docs } from "./docs.ts";
 import { Lessons } from "./lessons.ts";
@@ -30,6 +30,9 @@ import type { Alert } from "../shared/types.ts";
 import type { BrowserState } from "../shared/browser.ts";
 import { BatchSupervisor } from './batch.ts';
 import { browserCommand } from './browser.ts';
+import { loadWorkflowPacks, type LoadedWorkflowPacks } from './workflow-packs.ts';
+import { flushAtlas } from '../packs/vislexicon/components.ts';
+import { ChannelSupervisor } from './channels.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -54,6 +57,9 @@ export class Factory {
   lessons!: Lessons;
   toolbox!: Toolbox;
   batch!: BatchSupervisor;
+  workflowPacks?: LoadedWorkflowPacks;
+  channels?: ChannelSupervisor;
+  private services!: Services;
 
   constructor() {
     const readOnly = process.env.FACTORY_READONLY === "1";
@@ -72,8 +78,10 @@ export class Factory {
   private readJson<T>(file: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; } catch { return fallback; } }
 
   async boot() {
-    this.compiled = compile([pack], this.patches);
+    this.workflowPacks = await this.loadWorkflowPacks();
+    this.compiled = compile(this.workflowPacks.packs, this.patches);
     if (this.compiled.issues.length) throw new ControlError(422, "invalid_spec", "规格校验失败，未启动运行时", this.compiled.issues);
+    if (process.env.FACTORY_READONLY !== '1') this.project = synchronizeProjectPacks(VAR, this.workflowPacks.packs.map(entry => entry.id));
     this.state = initialState(this.compiled);
     for (const e of this.journal.read(0)) apply(this.state, e);
     this.journal.subscribeProjection((e) => apply(this.state, e));
@@ -83,29 +91,34 @@ export class Factory {
     this.lessons = new Lessons(this, VAR);
     this.toolbox = new Toolbox({ journal: this.journal, broker: this.broker, docs: () => this.docs });
     configureAgentStations({ docs: () => this.docs, toolbox: () => this.toolbox });
-    const defs = agentDefs(this.store);
     const services: Services = {
       store: this.store, workDir: path.join(VAR, "work"), publishDir: path.join(VAR, "published"),
       tryBrowser:()=>this.broker.tryAcquire("browser"),
       acquireBrowser:(signal,timeoutMs)=>this.broker.acquire("browser",{signal,timeoutMs}),
       inFlight: (self) => new Set([...this.runtime.tokens.values()].filter((t) => !t.finished && t.id !== self && t.data.key).map((t) => String(t.data.key))),
     };
+    this.services = services;
+    const defs = agentDefs(this.store, services);
     const executors = (n: CompiledNode): Executor | null => {
+      const installed = this.workflowPacks?.executor(n);
+      if (installed) return installed;
       if (n.tool && TOOLS[n.tool]) return (ctx) => TOOLS[n.tool!](ctx, services);
       const def = defs[n.key];
       return def ? (ctx) => runAgentStation(def, ctx) : null;
     };
-    this.runtime = new Runtime(this.compiled, this.journal, this.broker, pack.conditions, executors);
+    this.runtime = new Runtime(this.compiled, this.journal, this.broker, this.workflowPacks.conditions, executors);
+    this.runtime.roleResolver = key => this.workflowPacks?.role(key) ?? readRole(key);
     this.batch = new BatchSupervisor(this);
-    this.runtime.onTick = () => { this.resumeVerifiedCandidates(); this.batch.pump(); };
+    this.runtime.onTick = () => this.maintainRuntime();
     this.wireRecovery();
-    if (process.env.FACTORY_READONLY === "1") { this.catalog = loadCatalog(); return; }
+    if (process.env.FACTORY_READONLY === "1") { this.catalog = this.runtime.nodes.has('candidates/pool') ? loadCatalog() : []; this.channels = new ChannelSupervisor(this); return; }
+    this.wireStock();
     this.wireDocs();
     try { this.lessons.recoverApproved(); } catch (error) { this.lessonIssue(error); }
     const completedRuns = [...new Set([...this.journal.read()].filter(e => e.kind === "run.ended").map(e => e.runId))];
     for (const run of completedRuns) { try { this.lessons.draftRun(run); } catch (error) { this.lessonIssue(error); } }
     try { this.lessons.write(); } catch (error) { this.lessonIssue(error); }
-    void warmStyleLib();
+    if (this.runtime.nodes.has('curation/style')) void warmStyleLib();
     this.loadStock();
     this.recoverLegacyFailures();
     for(const c of Object.values(this.state.recoveries))if(c.failure?.tag==="tool_error") {
@@ -119,6 +132,9 @@ export class Factory {
     }
     this.broker.modelHold = Object.values(this.state.alerts).find(a => a.kind === 'model')?.message ?? null;
     this.restore();
+    this.reconcileManualStock();
+    this.reconcileBusinessStock();
+    this.channels = new ChannelSupervisor(this);
     this.runtime.tick();
     this.batch.schedule();
   }
@@ -126,12 +142,16 @@ export class Factory {
   /* -------------------------------------------------------------- stock (候选层 / 已发布) */
 
   private loadStock() {
+    if (!this.runtime.nodes.has('candidates/pool')) {
+      for (const [key, node] of Object.entries(this.state.nodes)) if (this.runtime.nodes.has(key)) this.runtime.stock.set(key, node.stock);
+      return;
+    }
     this.catalog = loadCatalog();
     const publishedHosts = new Set(loadPublished().map((p) => p.domain.replace(/^www\./, "")));
     for (const t of Object.values(this.state.tokens)) if (t.source === "candidates/pool") this.taken.add(t.item);
     const left = this.catalog.filter((c) => !this.taken.has(c.id) && !publishedHosts.has(this.hostOf(c.canonicalUrl)));
     const pool = "candidates/pool";
-    const localPublished = fs.existsSync(path.join(VAR, "published")) ? fs.readdirSync(path.join(VAR, "published")).length : 0;
+    const localPublished = fs.existsSync(path.join(VAR, "published")) ? fs.readdirSync(path.join(VAR, "published"), { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.endsWith('.json')).length : 0;
     const deferred=Object.values(this.state.recoveries).filter(c=>c.disposition==="retry").length;
     const want: Record<string, number> = { [pool]: left.length+deferred, "curation/published": publishedHosts.size + localPublished };
     for (const [node, stock] of Object.entries(want)) {
@@ -142,6 +162,77 @@ export class Factory {
   }
 
   private hostOf(u: string) { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return u; } }
+
+  private loadWorkflowPacks() {
+    return loadWorkflowPacks(VAR, { builtins: [pack], services: {
+      runAgent: (definition, context) => runAgentStation(definition, context),
+      callCapability: (name, args, context) => this.toolbox.call([name], name, args, { node: context.node.key, token: context.token.id, caseId: context.token.item, signal: context.signal, progress: context.progress }),
+    } });
+  }
+
+  async reloadWorkflowPacks() {
+    if (this.runtime.running || this.runtime.paused || this.runtime.ending || [...this.runtime.workers.values()].some(pool => pool.some(worker => worker.busy))) throw new ControlError(409, 'run_active', '请先结束本轮并等待在途工人退出，再加载流水线包');
+    const loaded = await this.loadWorkflowPacks();
+    const compiled = compile(loaded.packs, this.patches);
+    if (compiled.issues.length) throw new ControlError(422, 'invalid_spec', '已安装流水线包未通过编译', compiled.issues);
+    const previous = this.runtime;
+    previous.dispose();
+    for (const pool of previous.workers.values()) for (const worker of pool) this.journal.append({ kind: 'worker.retired', node: worker.node, worker: worker.id, reason: '流水线包更新，按新规格配员' });
+    this.workflowPacks = loaded; this.compiled = compiled;
+    this.project = synchronizeProjectPacks(VAR, loaded.packs.map(entry => entry.id));
+    this.runtime = new Runtime(compiled, this.journal, this.broker, loaded.conditions, previous.executors);
+    this.runtime.roleResolver = key => loaded.role(key) ?? readRole(key);
+    this.runtime.onTick = () => this.maintainRuntime();
+    this.wireRecovery(); this.restore(); this.loadStock(); this.reconcileManualStock(); this.runtime.tick();
+    this.journal.append({ kind: 'factory.loaded', digest: compiled.digest, specVersion: compiled.specVersion });
+    this.lastPreflight = 0;
+    return { digest: compiled.digest, packs: loaded.manifests, lines: compiled.lines };
+  }
+
+  private maintainRuntime() {
+    this.resumeVerifiedCandidates(); this.batch.pump();
+    if (this.compiled.lines.some(line => line.id === 'atlas-feed' && line.wired)) flushAtlas(this.services);
+    this.reconcileBusinessStock();
+  }
+
+  private reconcileBusinessStock() {
+    for (const line of this.compiled.lines.filter(line => !['sources', 'candidates', 'curation'].includes(line.id))) {
+      const node = `${line.id}/published`;
+      if (this.runtime.nodes.get(node)?.kind !== 'store') continue;
+      const directory = path.join(VAR, 'published', 'business', line.id);
+      const stock = fs.existsSync(directory) ? fs.readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.endsWith('.json') && !['index.json', 'atlas.json'].includes(entry.name)).length : 0;
+      if (!fs.existsSync(directory)) continue;
+      this.runtime.stock.set(node, stock);
+      if (this.state.nodes[node]?.stock !== stock) this.journal.append({ kind: 'stock.set', node, stock, note: '按当前业务发布文件校准库存，不混入网站发布计数' });
+    }
+  }
+
+  private stockReconcileScheduled = false;
+  private wireStock() {
+    this.journal.subscribe(event => {
+      if (!['token.finished', 'token.returned', 'candidate.disposition'].includes(event.kind) && !(event.kind === 'token.data' && event.patch.retriedBy)) return;
+      if (this.stockReconcileScheduled) return;
+      this.stockReconcileScheduled = true;
+      queueMicrotask(() => { this.stockReconcileScheduled = false; this.reconcileManualStock(); });
+    });
+  }
+
+  /** Manual stock is a current queue, while `plus` remains its historical arrivals.
+   * Older migrations moved failures to recovery without removing this inventory. */
+  reconcileManualStock() {
+    const latest = new Map<string, FactoryState['tokens'][string]>();
+    for (const id of this.state.tokenOrder) {
+      const token = this.state.tokens[id];
+      if (!token || typeof token.data.retriedBy === 'string' && this.state.tokens[token.data.retriedBy]?.item === token.item) continue;
+      const key = tokenWorkKey(token), previous = latest.get(key);
+      if (!previous || (token.touchedAt ?? token.createdAt) >= (previous.touchedAt ?? previous.createdAt)) latest.set(key, token);
+    }
+    for (const node of this.compiled.nodes.filter(node => node.kind === 'store' && node.key.endsWith('/manual'))) {
+      const stock = [...latest.values()].filter(token => token.status === 'manual' && token.finishedAtNode === node.key).length;
+      this.runtime.stock.set(node.key, stock);
+      if (this.state.nodes[node.key]?.stock !== stock) this.journal.append({ kind: 'stock.set', node: node.key, stock, note: '按当前未解决任务校准待人工库存；历史到达与处置记录保留' });
+    }
+  }
 
   /* -------------------------------------------------------------- documents, alerts, preflight (Spec §30–§31) */
 
@@ -312,7 +403,12 @@ export class Factory {
   async ensureReady(force = false) {
     if (process.env.FACTORY_PREFLIGHT === "0" || process.env.FACTORY_READONLY === "1") return null;
     if (!force && this.state.preflight?.ok && Date.now() - this.lastPreflight < 10 * 60_000) return this.state.preflight;
-    const r = await preflight(VAR, this.broker);
+    const runnable = this.compiled.nodes.filter(node => this.runtime.runnable(node));
+    const executions = (this.workflowPacks?.manifests ?? []).flatMap(manifest => Object.entries(manifest.bindings).filter(([key]) => runnable.some(node => node.key === key)).map(([, binding]) => binding.execute));
+    const browser = runnable.some(node => node.resource === 'browser') || executions.some(execution => execution.kind === 'builtin' && execution.name === 'page-text' || execution.kind === 'agent' && execution.tools?.some(name => ['page_text', 'page_find'].includes(name)));
+    const model = runnable.some(node => node.resource === 'model' || node.kind === 'agent' || node.kind === 'review') || executions.some(execution => execution.kind === 'agent');
+    const network = browser || model || runnable.some(node => node.resource === 'http');
+    const r = await preflight(VAR, this.broker, { network, model, browser });
     this.lastPreflight = Date.now();
     this.journal.append({ kind: "preflight.checked", ok: r.ok, checks: r.checks });
     if (!r.ok) {
@@ -345,10 +441,11 @@ export class Factory {
     if(!this.state.tokens[token.id]?.data.failure)this.journal.append({kind:"token.data",token:token.id,patch:{failure}});
     this.journal.append({kind:"candidate.disposition",candidate:{item:token.item,token:token.id,url:token.url,title:token.title||token.item,source:token.source,category:this.state.tokens[token.id]?.category,disposition,failure}});
     const delta=Number(disposition==="retry")-Number(previous?.disposition==="retry");
-    if(delta)this.runtime.stockDelta("candidates/pool",delta,`${token.item}：${disposition==="retry"?"退回待重试":"移除无效网址"}`);
+    if(delta && this.runtime.nodes.has('candidates/pool'))this.runtime.stockDelta("candidates/pool",delta,`${token.item}：${disposition==="retry"?"退回待重试":"移除无效网址"}`);
   }
 
   private recoverLegacyFailures() {
+    if (!this.runtime.nodes.has('candidates/pool')) return;
     // Repair the old "fetch failed → successful rejection" and exhausted capture
     // paths once, without rewriting evidence or rerunning paid model work.
     const latest = new Map(Object.values(this.state.tokens).sort((a,b)=>a.createdAt-b.createdAt).map(t=>[t.item,t]));
@@ -392,7 +489,9 @@ export class Factory {
       const previous=this.state.tokens[c.token];
       const legacy:Record<string,string>={"curation/fetch":"curation/scout"};
       const failedAt=filter.replan?'curation/reader':filter.preview?`curation/${filter.preview.role}`:previous?.finishedAtNode&&(legacy[previous.finishedAtNode]??previous.finishedAtNode);
-      const checkpoint=previous?.data.canonical&&failedAt&&this.compiled.nodes.some(n=>n.key===failedAt&&this.runtime.runnable(n))?failedAt:"candidates/tidy";
+      const legacyCandidate = !previous?.data.workflowPack && (previous?.line === 'candidates' || previous?.line === 'curation');
+      const checkpoint=(!legacyCandidate || previous?.data.canonical)&&failedAt&&this.compiled.nodes.some(n=>n.key===failedAt&&this.runtime.runnable(n))?failedAt:legacyCandidate?'candidates/tidy':String((previous?.data.runtimeCheckpoint as {entry?:string})?.entry ?? previous?.at[0] ?? '');
+      if (!this.runtime.nodes.has(checkpoint)) throw new ControlError(409, 'recovery_station_missing', '原检查点已不在当前流水线包中，请先恢复对应包版本');
       const data:Record<string,unknown>=checkpoint==="candidates/tidy"?(previous?.data.rerunPublished === true ? { rerunPublished: true } : {}):structuredClone(previous.data);
       delete data.failure;delete data.gate;delete data.digest;
       delete data.accessVerified;
@@ -408,7 +507,7 @@ export class Factory {
       const recoveryRoot=String(previous?.data.recoveryRoot??(previous&&this.state.attempts[previous.attempts[0]]?.node)??checkpoint);
       const completed=new Map((previous?.attempts??[]).map(id=>this.state.attempts[id]).filter(Boolean).map(a=>[a.node,a.ok]));
       const saved = previous?.data.runtimeCheckpoint as { version?: number; done: string[]; rounds: Record<string, number>; notes: [string, { reason: string; note?: string; byHuman: boolean }][] } | undefined;
-      const t=this.runtime.create(checkpoint,{item:c.item,url:c.url,title:c.title,source:"candidates/pool",category:c.category,data:{...data,express:true,retryOf:c.token,retryTag:c.failure?.tag,recoveryStation:checkpoint,recoveryRoot}});
+      const t=this.runtime.create(checkpoint,{item:c.item,url:c.url,title:c.title,source:legacyCandidate?'candidates/pool':c.source,category:c.category,data:{...data,express:true,retryOf:c.token,retryTag:c.failure?.tag,recoveryStation:checkpoint,recoveryRoot}});
       if(checkpoint!=="candidates/tidy") {
         t.entry=recoveryRoot;t.closure=this.runtime.closureOf(recoveryRoot);
         const invalidated=this.runtime.descendants(t,checkpoint);
@@ -427,11 +526,12 @@ export class Factory {
       }
       this.journal.append({kind:"dispatch.note",node:checkpoint,tone:"info",text:`${c.title} 从${this.compiled.nodes.find(n=>n.key===checkpoint)?.name??checkpoint}继续，保留此前成果`});
       this.journal.append({kind:"candidate.disposition",candidate:{...c,token:t.id,disposition:"claimed"}});
-      this.runtime.stockDelta("candidates/pool",-1,`${c.item} 已取出重试`);return t;
+      if (this.runtime.nodes.has('candidates/pool')) this.runtime.stockDelta("candidates/pool",-1,`${c.item} 已取出重试`);return t;
     });
   }
 
   pull(count: number, filter: { category?: string; query?: string; includeRepos?: boolean } = {}) {
+    if (!this.runtime.nodes.has('candidates/route')) throw new ControlError(409, 'candidate_pack_unavailable', '当前项目未启用策展候选包；请从本项目流水线入口投料');
     const publishedHosts = new Set(loadPublished().map((p) => p.domain.replace(/^www\./, "")));
     const q = filter.query?.toLowerCase();
     const pick = this.catalog.filter((c) => !this.taken.has(c.id) && !publishedHosts.has(this.hostOf(c.canonicalUrl))
@@ -459,6 +559,7 @@ export class Factory {
 
   /** Hand-pasted URLs enter the candidate layer at 整理 and pass the pool express. */
   feed(urls: string[], opts: { rerunPublished?: boolean } = {}) {
+    if (!this.runtime.nodes.has('candidates/tidy')) throw new ControlError(409, 'candidate_pack_unavailable', '当前项目未启用策展候选包；请从本项目流水线入口投料');
     const clean = [...new Set(urls.map((u) => u.trim()).filter(Boolean))];
     if (!clean.length) return [];
     if (!this.runtime.running) this.runtime.start(`手贴 × ${clean.length}`);
@@ -470,6 +571,10 @@ export class Factory {
   private restore() {
     const rt = this.runtime;
     rt.locked = new Set(this.state.lockedStations);
+    rt.pausedLines = new Set(this.state.pausedScopes?.lines ?? []);
+    rt.pausedStations = new Set(this.state.pausedScopes?.stations ?? []);
+    rt.measurement = this.state.measurement?.runId === this.state.run.id ? structuredClone(this.state.measurement) : undefined;
+    for (const [key, node] of Object.entries(this.state.nodes)) if (rt.nodes.has(key)) rt.durations.set(key, [...node.durations]);
     const live = Object.values(this.state.workers).filter((w) => !w.retiredAt);
     rt.ensureWorkers(live.map((w) => ({ node: w.node, worker: w.id, label: w.label })));
     const run = this.state.run;
@@ -482,6 +587,12 @@ export class Factory {
     const notes=new Map<string,TokenRun["notes"]>();
     const checkpointed = new Set<string>();
     for (const e of this.journal.read(0)) {
+      if (e.run === run.id && e.kind === 'token.queued') {
+        const arrivals = rt.arrivals.get(e.node) ?? []; arrivals.push(e.at); rt.arrivals.set(e.node, arrivals);
+      }
+      if (e.run === run.id && e.kind === 'token.finished' && ['published', 'manual', 'merged', 'rejected'].includes(e.status)) {
+        const item = this.state.tokens[e.token]?.item; if (item) rt.sampleItems.add(item);
+      }
       if (e.kind === 'token.data' && (e.patch.runtimeCheckpoint as { version?: number } | undefined)?.version === 1) {
         const checkpoint = e.patch.runtimeCheckpoint as { done: string[]; notes: [string, { reason: string; note?: string; byHuman: boolean }][] };
         done.set(e.token, new Set(checkpoint.done));
@@ -552,6 +663,7 @@ export class Factory {
       if (checkpointed.has(t.id)) rt.resumeFrontier(t, t.entry);
     }
     if (requeued || voided) this.journal.append({ kind: "dispatch.note", tone: "warn", text: `重启后从日志续跑：${requeued} 件货重新排队，${voided} 次中断的处理作废重做；已完成的工位结果不重做` });
+    rt.measurementProposal();
     rt.schedule();
   }
 
@@ -574,7 +686,7 @@ export class Factory {
 
   proposePatch(p: Omit<Patch, "status" | "at" | "id">) {
     const patch: Patch = { ...p, id: `p-${String(this.patches.length + 1).padStart(4, "0")}`, status: "proposed", at: new Date().toISOString() };
-    const trial = compile([pack], [...this.patches, { ...patch, status: "accepted" }]);
+    const trial = compile(this.workflowPacks?.packs ?? [pack], [...this.patches, { ...patch, status: "accepted" }]);
     this.patches.push(patch);
     fs.writeFileSync(path.join(VAR, "patches.json"), JSON.stringify(this.patches, null, 2));
     this.journal.append({ kind: "spec.patched", patch: patch.id, summary: patch.summary, status: "proposed" });
@@ -586,13 +698,13 @@ export class Factory {
     if (!p || p.status !== "proposed") throw new ControlError(409, "patch_not_proposed", "补丁不存在或已处理");
     let trial: CompiledFactory | undefined;
     if (accept) {
-      trial = compile([pack], this.patches.map((x) => x.id === id ? { ...x, status: "accepted" as const } : x));
+      trial = compile(this.workflowPacks?.packs ?? [pack], this.patches.map((x) => x.id === id ? { ...x, status: "accepted" as const } : x));
       if (trial.issues.length) throw new ControlError(422, "invalid_spec", "补丁校验未通过", trial.issues);
       const missing = trial.nodes.filter((n) => n.kind !== "source" && n.kind !== "store" && !n.dormant && trial!.lines.find((l) => l.id === n.line)?.wired && !this.runtime.executors(n));
       if (missing.length) throw new ControlError(422, "missing_executor", "新增工位缺少执行器，不能生效", missing.map((n) => n.key));
-      const missingRoles=trial.nodes.filter(n=>{try{readRole(n.key);return false;}catch{return true;}});
+      const missingRoles=trial.nodes.filter(n=>{try{this.runtime.roleResolver(n.key);return false;}catch{return true;}});
       if(missingRoles.length)throw new ControlError(422,"missing_role","节点缺少 ROLE.md 职责契约，不能生效",missingRoles.map(n=>n.key));
-      if (this.runtime.running || [...this.runtime.workers.values()].some((pool) => pool.some((w) => w.busy))) throw new ControlError(409, "run_active", "请先结束本轮并等待在途工人退出，再应用规格补丁");
+      if (this.runtime.running || this.runtime.paused || this.runtime.ending || [...this.runtime.workers.values()].some((pool) => pool.some((w) => w.busy))) throw new ControlError(409, "run_active", "请先结束本轮并等待在途工人退出，再应用规格补丁");
     }
     p.status = accept ? "accepted" : "rejected";
     fs.writeFileSync(path.join(VAR, "patches.json"), JSON.stringify(this.patches, null, 2));
@@ -602,13 +714,16 @@ export class Factory {
       previous.dispose();
       for (const pool of previous.workers.values()) for (const w of pool) this.journal.append({ kind: "worker.retired", node: w.node, worker: w.id, reason: "规格新版本生效，重新配员" });
       this.compiled = trial;
-      this.runtime = new Runtime(trial, this.journal, this.broker, pack.conditions, previous.executors);
-      this.runtime.onTick = () => { this.resumeVerifiedCandidates(); this.batch.pump(); };
+      this.runtime = new Runtime(trial, this.journal, this.broker, this.workflowPacks?.conditions ?? pack.conditions, previous.executors);
+      this.runtime.roleResolver = previous.roleResolver;
+      this.runtime.onTick = () => this.maintainRuntime();
       this.wireRecovery();
       this.runtime.stock = previous.stock;
       this.runtime.tokens = previous.tokens;
       for (const t of this.runtime.tokens.values()) t.closure = this.runtime.closureOf(t.entry);
       this.runtime.locked = new Set([...previous.locked].filter((key) => this.runtime.nodes.has(key)));
+      this.runtime.pausedLines = new Set(previous.pausedLines); this.runtime.pausedStations = new Set(previous.pausedStations);
+      this.lastPreflight = 0;
       this.journal.append({ kind: "factory.loaded", digest: trial.digest, specVersion: trial.specVersion });
       this.runtime.ensureWorkers([]);
       this.runtime.tick();

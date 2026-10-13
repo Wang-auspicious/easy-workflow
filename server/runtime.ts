@@ -413,6 +413,7 @@ export class Runtime {
     const status: TokenStatus = n.key.endsWith("/published") ? "published" : n.key.endsWith("/manual") ? "manual" : "parked";
     if (status === "published") t.data.published = true;
     this.journal.append({ kind: "token.finished", token: t.id, status, node: n.key, reason: status === "published" ? "通过发布闸门" : String(t.data.manualReason ?? "等候处理") });
+    if (status === 'published') for (const channel of this.channelsOut.get(n.key) ?? []) this.emitChannel(t, channel);
     this.stockDelta(n.key, +1);
     if (status === 'published' || status === 'manual') { this.sampleItems.add(t.item); this.measurementProposal(); }
   }
@@ -552,6 +553,11 @@ export class Runtime {
   private commitTransition(action: () => void) {
     try { this.journal.atomic(action); }
     catch (error) { this.haltForStorage(); throw error; }
+  }
+
+  atomicTransition(action: () => void) {
+    this.requireStorage();
+    this.commitTransition(action);
   }
 
   private haltForStorage() {
@@ -706,8 +712,7 @@ export class Runtime {
     const ch = this.f.channels.find((c) => `${c.from.line}/${c.from.station}` === e.from && `${c.to.line}/${c.to.station}` === e.to);
     if (!ch) return;
     if (ch.id === "curation.component-source.confirmed" && !(t.data.kind === "component-source" && t.data.kindAgreed)) return;
-    this.journal.append({ kind: "channel.emitted", channel: ch.id, token: t.id, item: t.item });
-    this.stockDelta(e.to, +1, `${t.item} 经信道 ${ch.label} 投递`);
+    this.journal.append({ kind: "channel.emitted", channel: ch.id, token: t.id, item: t.item, inventory: 'consumer' });
   }
 
   toManual(t: TokenRun, at: CompiledNode, reason: string) {

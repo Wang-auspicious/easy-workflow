@@ -17,11 +17,13 @@ import { Avatar, STATE_TEXT, grokShape } from "./Avatar.tsx";
 import { buildTranscript, DISPATCHER_HUE, type AvatarState, type TranscriptItem, type TranscriptPart } from "./transcript.ts";
 import { USER_AVATARS, userAvatarSrc } from "./user-avatars.ts";
 import { useNow } from "../util/useNow.ts";
+import { CorrectionUndo } from '../board/CorrectionUndo.tsx';
 import type { DispatcherStatus, LiveChat } from "./live.ts";
 import "./PiBlocks.ts";
 import base from "./pi-conversation.css?inline";
 import styles from "./transcript.css?inline";
 import avatar from "./avatar.css?inline";
+import correctionStyles from '../board/correction.css?inline';
 
 export function Transcript({ entries, live, dispatcher, onResize }: {
   entries: ConversationEntry[]; live: LiveChat; dispatcher: DispatcherStatus; onResize: () => void;
@@ -46,7 +48,7 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
     const el = host.current!;
     const shadow = el.shadowRoot ?? el.attachShadow({ mode: "open" });
     const sheet = document.createElement("style");
-    sheet.textContent = `${base}\n${styles}\n${avatar}`;
+    sheet.textContent = `${base}\n${styles}\n${avatar}\n${correctionStyles}`;
     const slot = document.createElement("div");
     slot.className = "tr-root";
     shadow.replaceChildren(sheet, slot);
@@ -193,6 +195,7 @@ function ToolCard({ part, toolsOpen }: { part: Extract<TranscriptPart, { type: "
       </details>
       {/* 收起时也要能看到原因，所以放在 details 外面（details 收起时内容不显示）。 */}
       {reason && !isOpen ? <p className="tr-tool-reason">{reason}</p> : null}
+      {part.correction && <CorrectionUndo id={part.correction} />}
     </div>
   );
 }

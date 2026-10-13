@@ -1,0 +1,41 @@
+.workflows .view-head { align-items: flex-start; gap: 20px; }
+.workflows .view-sub { max-width: 640px; line-height: 1.7; }
+.workflows .lib-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); }
+.workflows .lib-line { padding: 18px; border: 1px solid #e4e8ef; border-radius: 11px; box-shadow: 0 2px 6px #24375104; gap: 12px; }
+.workflows .lib-line-head { flex-wrap: wrap; gap: 7px; }
+.workflows .lib-line-blurb { margin: 0; font-size: 12px; line-height: 1.75; color: #718095; }
+.workflows .lib-line-foot { flex-wrap: wrap; gap: 6px; padding-top: 2px; }
+.workflow-line-meta { color: #9aa5b3; font-size: 11px; }
+.workflow-notice, .workflow-error, .workflow-receipt { margin: 0 0 18px; padding: 11px 13px; border-radius: 7px; font-size: 12px; line-height: 1.65; }
+.workflow-notice { color: #778499; background: #f1f4f8; }
+.workflow-error { color: #9a542e; background: #fff4e9; overflow-wrap: anywhere; }
+.workflow-receipt { color: #477d6b; background: #edf7f2; }
+.workflow-form, .allocation-proposal { margin: 0 0 28px; padding: 20px; border: 1px solid #cfdcf0; border-radius: 11px; background: #fbfcfe; }
+.workflow-form-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 15px; }
+.workflow-form-head h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; font-weight: 550; color: #3d506c; }
+.workflow-form-head > span { color: #9a8261; font-size: 11px; white-space: nowrap; }
+.workflow-form p, .allocation-proposal p { font-size: 12px; line-height: 1.7; color: #778399; }
+.workflow-form label { display: flex; flex-direction: column; gap: 7px; margin: 15px 0; color: #62738b; font-size: 12px; }
+.workflow-form input:not([type=checkbox]), .workflow-form textarea, .workflow-form select { width: 100%; min-width: 0; padding: 10px 11px; border: 1px solid #dde4ee; border-radius: 7px; background: #fff; color: #344054; font: inherit; font-size: 12px; line-height: 1.6; outline: 0; }
+.workflow-form textarea { resize: vertical; min-height: 60px; max-height: 380px; }
+.workflow-form input:focus, .workflow-form textarea:focus, .workflow-form select:focus { border-color: #9fbde6; box-shadow: 0 0 0 2px #3274ea0b; }
+.workflow-form input::placeholder, .workflow-form textarea::placeholder { color: #b0b8c5; }
+.workflow-form small { color: #99a3b2; font-size: 11px; line-height: 1.6; }
+.workflow-form .workflow-check { flex-direction: row; align-items: center; gap: 7px; }
+.workflow-form-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.workflow-mode { display: flex; flex-wrap: wrap; gap: 5px; padding-bottom: 5px; }
+.workflow-mode button { padding: 6px 10px; border-radius: 6px; color: #8290a3; font-size: 11px; }
+.workflow-mode button.is-on { background: #eaf1fb; color: #4d76ae; }
+.workflow-installed { border-top: 1px solid #e6eaf0; }
+.workflow-installed > div { display: flex; align-items: center; justify-content: space-between; gap: 15px; padding: 14px 0; border-bottom: 1px solid #e6eaf0; }
+.workflow-installed b { font-size: 13px; font-weight: 500; }
+.workflow-installed small { display: block; margin-top: 4px; color: #99a4b3; font-size: 11px; }
+.allocation-proposal { border-color: #d5e3ed; background: #f6fafe; }
+.allocation-proposal summary { cursor: pointer; color: #6283a5; font-size: 12px; padding: 6px 0; }
+.allocation-table { overflow: auto; max-height: 330px; }
+.allocation-table table { width: 100%; border-collapse: collapse; font-size: 11px; white-space: nowrap; }
+.allocation-table th, .allocation-table td { padding: 9px 8px; text-align: left; border-bottom: 1px solid #e1e9f1; color: #6e8097; }
+.allocation-table th { font-weight: 500; color: #91a0b2; }
+.allocation-shortcut { display: inline-flex; flex: none; align-items: center; gap: 6px; padding: 5px 8px; border: 1px solid #d9e4f1; border-radius: 6px; background: #f4f8fe; color: #5f82b0; font-size: 11px; white-space: nowrap; }
+.scope-notice { padding: 8px 15px; color: #9a7b4c; background: #fff9ef; font-size: 11px; line-height: 1.6; }
+@media (max-width: 1100px) { .workflows .view-head { flex-direction: column; } }

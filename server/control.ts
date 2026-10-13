@@ -13,6 +13,10 @@ import { readRole } from "./roles.ts";
 import { fileURLToPath } from "node:url";
 import { CONTROL_PROTOCOL, CONTROL_HELP, CONTROL_CALL } from "./agent-connection.ts";
 import { batchSummary } from '../shared/batch.ts';
+import { installWorkflowPack, addWorkflowLine, assertWorkflowIdle } from './workflow-packs.ts';
+import { listWorkflowTemplates, instantiateWorkflowTemplate } from './templates.ts';
+import { pack } from '../packs/vislexicon/pack.ts';
+import { workflowEntry } from './workflow-entry.ts';
 
 const name = () => Type.String({ minLength: 1, maxLength: 200 });
 const choice = (...values: string[]) => Type.Union(values.map((x) => Type.Literal(x)));
@@ -64,7 +68,47 @@ export const ROLE_AUTHORING = {
 
 function definitions(f: Factory): Tool[] {
     const nodeName = (k: string) => f.compiled.nodes.find((n) => n.key === k)?.name ?? k;
+    const idleState = () => ({ running: f.runtime.running, paused: f.runtime.paused, ending: f.runtime.ending, inflight: [...f.runtime.workers.values()].flat().filter(w => w.busy).length });
+    const guard = () => ({ ...idleState(), assertIdle: () => assertWorkflowIdle(idleState()) });
+    const structuralUser = (actor?: string) => {
+      if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '安装和变更工作流须由用户在界面确认；调度员可以提交完整包供审阅');
+      assertWorkflowIdle(guard());
+    };
+    const dictionary = () => Type.Record(Type.String(), Type.Unknown());
+    const files = () => Type.Record(Type.String(), Type.String());
     return [
+      { name:'business_feed',label:'资料流水线投料',description:'Feed a structured resource into components, skills, sci-figure, ppt, or image-fx. Scientific figures require supplied numeric series; image effects require a real source image and an explicit supported recipe. All original files and review gates remain mandatory.',parameters:object({line:choice('components','skills','sci-figure','ppt','image-fx'),item:name(),url:name(),data:Type.Optional(dictionary())}),execute:async(_id,p)=>{
+        let parsed:URL;try{parsed=new URL(p.url);}catch{throw new ControlError(400,'invalid_url','需要完整来源网址');}
+        if(!['http:','https:'].includes(parsed.protocol)||parsed.username||parsed.password)throw new ControlError(400,'invalid_url','需要不含凭据的HTTP(S)来源网址');
+        if(!f.compiled.lines.find(line=>line.id===p.line)?.wired)throw new ControlError(409,'line_not_wired','本项目未启用这条业务线');
+        if(f.runtime.paused)throw new ControlError(409,'run_paused','请先继续或结束暂停轮次');
+        if(!f.runtime.running){await f.ensureReady();f.runtime.start(`${p.line} 资料入库`);}
+        const token=f.runtime.create(`${p.line}/inbox`,{item:p.item,url:p.url,source:'manual',data:{...(p.data??{}),canonical:p.url,express:true}});
+        return ok({token:token.id,item:token.item,line:p.line},'资料已进入独立流水线');
+      }},
+      { name: 'workflow_templates', label: '工作流与模板', description: 'List runnable workflow templates and installed project packs with their declared input schemas.', parameters: object({}), execute: async () => ok({ templates: listWorkflowTemplates(), installed: f.workflowPacks?.manifests ?? [] }, '读取可运行工作流模板') },
+      { name: 'workflow_template', label: '从模板创建工作流', description: 'Instantiate a complete runnable template, including roles, schemas and executors. User-only; requires an ended, idle run.', parameters: object({ templateId: name(), id: name(), name: name(), includeBuiltins: Type.Optional(Type.Boolean()) }), execute: async (_id,p,actor) => {
+        structuralUser(actor); const manifest = await instantiateWorkflowTemplate(f.project.dir,p,guard(),[pack]); await f.reloadWorkflowPacks();
+        return ok({ manifest, digest: f.compiled.digest }, `已创建 ${manifest.name}`);
+      } },
+      { name: 'workflow_install', label: '安装工作流包', description: 'Validate and atomically install a versioned local workflow pack with real roles, contracts, and executors. User-only; requires an idle project.', parameters: object({ directory: Type.Optional(name()), manifest: Type.Optional(dictionary()), files: Type.Optional(files()), replace: Type.Optional(Type.Boolean()), builtins: Type.Optional(Type.Array(name())) }), execute: async (_id,p,actor) => {
+        structuralUser(actor); const manifest=await installWorkflowPack(f.project.dir,p,guard(),[pack]); await f.reloadWorkflowPacks();
+        return ok({manifest,digest:f.compiled.digest},`已安装 ${manifest.name}`);
+      } },
+      { name: 'workflow_line', label: '添加可执行流水线', description: 'Add a validated line and complete bindings, schemas, role files and tools to an installed workflow pack. User-only and idle project required.', parameters: object({ packId: name(), line: dictionary(), bindings: dictionary(), schemas: dictionary(), files: files(), tools: Type.Optional(dictionary()), conditions: Type.Optional(dictionary()) }), execute: async (_id,p,actor) => {
+        structuralUser(actor); const {packId,...addition}=p; const manifest=await addWorkflowLine(f.project.dir,packId,addition,guard(),[pack]); await f.reloadWorkflowPacks();
+        return ok({manifest,digest:f.compiled.digest},`已添加流水线 ${p.line.name}`);
+      } },
+      { name: 'workflow_feed', label: '工作流投料', description: 'Validate input against an installed workflow schema and enqueue at the pack entry or a selected independent line\'s unique entry. Middle stations and connected downstream lines cannot be selected.', parameters: object({ packId: name(), line:Type.Optional(name()), item: name(), input: dictionary() }), execute: async (_id,p) => {
+        const manifest=f.workflowPacks?.manifests.find(m=>m.id===p.packId);
+        if (!manifest) throw new ControlError(404,'workflow_pack_not_found','工作流包未安装');
+        const entry=workflowEntry(manifest,p.input,p.line);
+        if(p.line&&f.compiled.edges.some(edge=>edge.kind==='flow'&&edge.to===entry))throw new ControlError(422,'workflow_entry_connected','这条线已有上游输入，不能绕过上游直接投料');
+        if (f.runtime.paused) throw new ControlError(409,'run_paused','请先继续或结束当前暂停轮次');
+        if (!f.runtime.running) { await f.ensureReady(); f.runtime.start(manifest.name); }
+        const token=f.runtime.create(entry,{item:p.item,url:typeof p.input.url==='string'?p.input.url:'',source:'manual',data:{input:p.input,workflowPack:manifest.id,express:true}});
+        return ok({token:token.id,item:token.item,entry,runId:f.state.run.id},'输入已验证并进入工作流');
+      } },
       {name:'adopt_verified_result',label:'接回已验收成果',description:'Import one actually published item from another local project. Verifies journal, record digest and immutable evidence, then runs the current publication gate. Requires an idle paused run and preserves that pause; does not repeat model work.',parameters:object({sourceProject:name(),item:name()}),execute:async(_id,p)=>{
         const {adoptVerifiedResult}=await import('./verified-import.ts');
         const result=await adoptVerifiedResult(f,p.sourceProject,p.item);
@@ -72,7 +116,7 @@ function definitions(f: Factory): Tool[] {
       }},
       {name:"read_role",label:"查看节点职责",description:"Read one node's ROLE.md: task identity, evidence, situation-specific recovery and handoff. Use dispatcher for the coordinator.",parameters:object({station:name()}),execute:async(_id,p)=>{
         if(p.station!=="dispatcher"&&!f.compiled.nodes.some(n=>n.key===p.station))throw new ControlError(404,"station_not_found","没有这个节点");
-        return ok(readRole(p.station),`读取 ${p.station} 职责与异常处理契约`);
+        return ok(f.runtime.roleResolver(p.station),`读取 ${p.station} 职责与异常处理契约`);
       }},
       {
         name: "status", label: "查看工厂状态", description: "Current run, per-station queue/workers/takt/processed/returns, bottleneck, totals.",
@@ -138,8 +182,13 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: "run_control", label: "启停本轮", description: "start | pause | resume | end. 'end' finishes the run manually and builds the run report.",
-        parameters: Type.Object({ action: Type.Union(["start", "pause", "resume", "end"].map((x) => Type.Literal(x))), title: Type.Optional(Type.String()) }),
+        parameters: object({ action: choice("start", "pause", "resume", "end"), title: Type.Optional(Type.String()), line: Type.Optional(name()), station: Type.Optional(name()), reason: Type.Optional(Type.String()) }),
         execute: async (_id, p) => {
+          if (p.line || p.station) {
+            if (p.line && p.station || !['pause','resume'].includes(p.action)) throw new ControlError(400,'invalid_scope_control','局部控制须选择一条线或一个工位，操作为 pause / resume');
+            const result=f.runtime.setScopePaused({scope:p.line?'line':'station',key:p.line??p.station,paused:p.action==='pause',reason:p.reason??'用户或主调度调整'});
+            return ok(result,`${p.line??p.station}：${p.action}`);
+          }
           if (p.action === "start") { if (!f.runtime.running) await f.ensureReady(); f.runtime.start(p.title ?? "新一轮"); }
           else if (p.action === "pause") f.runtime.pause();
           else if (p.action === "resume") { await f.ensureReady(); if (f.state.batch?.runId === f.state.run.id && f.state.batch.mode === 'paused') f.batch.setMode('running'); else f.runtime.resume(); }
@@ -147,6 +196,13 @@ function definitions(f: Factory): Tool[] {
           return ok({ ...f.state.run }, `本轮：${p.action}`);
         },
       },
+      { name:'allocation_plan',label:'实测配员建议',description:'Inspect the first ten-item measurement proposal. Only the user may accept or reject the suggested worker allocation; existing locks and limits are preserved.',parameters:object({action:choice('status','accept','reject'),id:Type.Optional(name())}),execute:async(_id,p,actor)=>{
+        if(p.action==='status')return ok({proposal:f.runtime.measurementProposal(),sampleItems:f.runtime.sampleItems.size},'读取实测配员建议');
+        if(actor!=='user')throw new ControlError(403,'owner_decision_required','实测配员建议由用户确认');
+        if(!p.id)throw new ControlError(400,'missing_measurement','需要建议 id');
+        return ok(f.runtime.decideMeasurement(p.id,p.action==='accept'),'已记录配员决定');
+      }},
+      { name:'undo_correction',label:'撤销尚未执行的纠错',description:'Restore the durable snapshot of a correction before any new attempt has run. Executed corrections are rejected; all audit events are retained.',parameters:object({correction:name()}),execute:async(_id,p)=>ok(f.runtime.undoCorrection(p.correction),'已撤销未执行的纠错') },
       {
         name:"candidate_failures",label:"候选失败库",description:"Read durable failed candidates by reason tag or disposition: retry, removed, claimed, resolved. Network/system errors are retained; invalid URLs and HTTP 404/410 are excluded from active inventory.",
         parameters:object({tag:Type.Optional(name()),disposition:Type.Optional(choice("retry","removed","claimed","resolved"))}),
@@ -339,7 +395,7 @@ function definitions(f: Factory): Tool[] {
     ];
   }
 
-const READS = new Set(["status", "inspect", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
+const READS = new Set(["workflow_templates", "status", "inspect", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
 
 export class FactoryControl {
   private f: Factory;
@@ -391,7 +447,7 @@ export class FactoryControl {
 
   mutates(tool: string, input: unknown) {
     const args = (input ?? {}) as { action?: string; values?: unknown };
-    return !READS.has(tool) && !(tool === 'run_batch' && args.action === 'status')
+    return !READS.has(tool) && !(['run_batch', 'allocation_plan'].includes(tool) && args.action === 'status')
       && !(tool === 'settings' && !args.values)
       && !(tool === 'browser' && ['state','read'].includes(args.action ?? ''))
       && !(tool === 'alerts' && !['clear','recheck','preflight'].includes(args.action ?? 'list'));

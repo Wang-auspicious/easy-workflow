@@ -22,7 +22,7 @@ export class EvidenceStore {
   }
 
   resolve(served: string): string | null {
-    const m = /^\/evidence\/([0-9a-f]{2})\/([0-9a-f]{64})\.(webp|mp4|json|txt|jpg|png)$/.exec(served);
+    const m = /^\/evidence\/([0-9a-f]{2})\/([0-9a-f]{64})\.(webp|mp4|json|txt|jpg|png|md|pptx|pdf|zip|py)$/.exec(served);
     return m ? path.join(this.root, m[1], `${m[2]}.${m[3]}`) : null;
   }
 

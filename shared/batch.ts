@@ -25,10 +25,15 @@ export interface BatchRecovery {
   replan: boolean;
 }
 
+/** A website goal counts its own roots; downstream deliveries have their own lifecycle. */
+export function latestBatchTokens(s: FactoryState) {
+  return latestRunTokens(s).filter(token => !token.data.channelDelivery && !token.data.workflowPack && !token.source.startsWith('channel:') && ['candidates', 'curation'].includes(token.line));
+}
+
 export function batchSummary(s: FactoryState) {
   const goal = s.batch;
   if (!goal || goal.runId !== s.run.id) return null;
-  const items = latestRunTokens(s);
+  const items = latestBatchTokens(s);
   const active = items.filter(t => t.status === 'active').length;
   const completed = items.filter(t => ['published', 'merged', 'rejected'].includes(t.status)).length;
   const blocked = items.filter(t => ['manual', 'parked', 'failed'].includes(t.status)).length;

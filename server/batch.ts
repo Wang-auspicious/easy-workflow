@@ -1,6 +1,5 @@
 import type { Factory } from './factory.ts';
-import { latestRunTokens } from '../shared/project.ts';
-import { batchSummary, type BatchGoal, type BatchRecovery } from '../shared/batch.ts';
+import { batchSummary, latestBatchTokens, type BatchGoal, type BatchRecovery } from '../shared/batch.ts';
 import { ControlError } from './errors.ts';
 
 const TRANSIENT = new Set(['network_timeout', 'network_connection', 'network_dns', 'http_server', 'http_rate_limit', 'browser_capture', 'http_forbidden']);
@@ -74,7 +73,7 @@ export class BatchSupervisor {
     if (!f.runtime.nodes.has('candidates/route') || !f.runtime.nodes.has('candidates/pool')) throw new ControlError(409, 'candidate_pack_unavailable', '网站批次需要策展候选包；请从当前项目的工作流入口投料');
     if (f.runtime.ending) throw new ControlError(409, 'run_ending', '正在结束上一轮，请等待报告');
     if (!Number.isSafeInteger(options.target) || options.target < 1 || options.target > 10000) throw new ControlError(400, 'invalid_target', '目标必须是 1–10000 个网站');
-    const admitted = f.runtime.running ? latestRunTokens(f.state).length : 0;
+    const admitted = f.runtime.running ? latestBatchTokens(f.state).length : 0;
     if (options.target < admitted) throw new ControlError(409, 'target_below_admitted', `本轮已经领取 ${admitted} 个，目标不能少于已领取数`);
     if (!f.runtime.running) f.runtime.start(`候选 × ${options.target}`);
     const goal: BatchGoal = { runId: f.state.run.id, target: options.target, maxInFlight: options.maxInFlight ?? 12,
@@ -109,7 +108,7 @@ export class BatchSupervisor {
     if (this.pumping || !goal || goal.runId !== f.state.run.id || goal.mode !== 'running' || !f.runtime.running || f.runtime.paused || f.runtime.ending || process.env.FACTORY_READONLY === '1') return;
     this.pumping = true;
     try {
-      const items = latestRunTokens(f.state);
+      const items = latestBatchTokens(f.state);
       let active = items.filter(t => t.status === 'active').length;
       // Reuse late-stage evidence first instead of filling every recovery slot
       // with early reading attempts while downstream review stations sit idle.
@@ -163,7 +162,7 @@ export class BatchSupervisor {
         const got = f.retryCandidates({ items: [token.item], count: 1, automatic: true, replan: recovery.replan });
         active += got.length;
       }
-      const latest = latestRunTokens(f.state);
+      const latest = latestBatchTokens(f.state);
       active = latest.filter(t => t.status === 'active').length;
       const upstream = latest.filter(t => t.status === 'active' && !f.runtime.tokens.get(t.id)?.done.has('curation/plan')).length;
       const want = Math.max(0, Math.min(goal.target - latest.length, goal.maxInFlight - active, goal.intakeWindow - upstream));

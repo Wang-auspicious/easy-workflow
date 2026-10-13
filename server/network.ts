@@ -127,6 +127,32 @@ export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?
   throw Object.assign(new Error(`request failed twice: ${url}`), { tried });
 }
 
+/** Binary originals use the same proxy, host quota and cancellation as text reads.
+ * Never decode/re-encode them: their content digest is the provenance contract. */
+export async function webGetBytes(url: string, opts: { signal?: AbortSignal; timeout?: number; maxBytes?: number } = {}) {
+  const target = new URL(url);
+  if (!["http:", "https:"].includes(target.protocol) || target.username || target.password) throw new Error("Only credential-free HTTP(S) sources are allowed");
+  const limit = opts.maxBytes ?? 64 * 1024 * 1024;
+  for (let round = 0; round < 2; round++) {
+    const signal = AbortSignal.any([...(opts.signal ? [opts.signal] : []), AbortSignal.timeout(opts.timeout ?? 60000)]);
+    const release = await slot(target.host, signal);
+    try {
+      const response = await networkFetch(url, { signal, headers: { "User-Agent": UA }, redirect: "follow" });
+      if (Number(response.headers.get("content-length") ?? 0) > limit) { await response.body?.cancel(); throw new Error(`Original exceeds ${limit} bytes`); }
+      if (!response.ok) { await response.body?.cancel(); if (!round && transient(response.status)) continue; throw new Error(`HTTP ${response.status}: ${url}`); }
+      const parts: Buffer[] = []; let size = 0;
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("Source has no body");
+      try { while (true) { signal.throwIfAborted(); const next = await reader.read(); if (next.done) break; size += next.value.length; if (size > limit) throw new Error(`Original exceeds ${limit} bytes`); parts.push(Buffer.from(next.value)); } }
+      finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+      return { bytes: Buffer.concat(parts), finalUrl: response.url || url, contentType: response.headers.get("content-type") ?? "", etag: response.headers.get("etag") };
+    } catch (error) { signal.throwIfAborted(); if (round || !transientNetworkError(error)) throw error; }
+    finally { release(); }
+    await delay(800, undefined, { signal: opts.signal });
+  }
+  throw new Error(`Original download failed twice: ${url}`);
+}
+
 /* Pages an agent actually read during recent work, so checks can verify quotes against
  * what was read through the toolbox, not only against pre-fetched excerpts. */
 const reads = new Map<string, string>();

@@ -61,3 +61,19 @@ test('moving a manual item back to recovery removes its stock once and preserves
     assert.equal(factory.state.nodes['curation/manual'].stock, 0);
   } finally { await close(factory); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('an independent channel child cannot hide its unresolved parent manual inventory', async () => {
+  const factory = new Factory();
+  try {
+    await factory.boot();
+    factory.journal.append({ kind: 'token.created', token: 'manual-parent', item: 'shared-item', url: '', line: 'curation', source: 'manual' });
+    factory.journal.append({ kind: 'token.finished', token: 'manual-parent', node: 'curation/manual', status: 'manual', reason: 'Unresolved website review' });
+    factory.journal.append({ kind: 'token.created', token: 'active-child', item: 'shared-item', url: '', line: 'components', source: 'channel:components' });
+    factory.journal.append({ kind: 'token.data', token: 'active-child', patch: { channelDelivery: 'delivery-manual-stock' } });
+    factory.journal.append({ kind: 'token.queued', token: 'active-child', node: 'components/discover' });
+    factory.reconcileManualStock();
+    assert.equal(factory.state.nodes['curation/manual'].stock, 1);
+    assert.equal(factory.state.tokens['manual-parent'].status, 'manual');
+    assert.equal(factory.state.tokens['active-child'].status, 'active');
+  } finally { await close(factory); fs.rmSync(dir, { recursive: true, force: true }); }
+});

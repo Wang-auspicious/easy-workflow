@@ -9,6 +9,7 @@ import { useNow } from "../util/useNow.ts";
 import { fmt, secs } from "./Node.tsx";
 import { toggleInspector } from "./Canvas.tsx";
 import { toast } from "../shell/Toasts.tsx";
+import { AllocationShortcut } from '../views/AllocationProposal.tsx';
 
 const CATEGORIES = ["UI 组件与设计系统", "灵感与案例", "视觉素材与字体", "设计创作与原型", "前端开发与动效", "AI 设计工具", "UX 研究与学习", "协作与效率", "品牌与营销"];
 
@@ -28,7 +29,7 @@ export function Hud() {
   const [open, setOpen] = useState(false);
   const [pull, setPull] = useState(false);
   const [ending,setEnding]=useState(false),[endConfirm,setEndConfirm]=useState(false),[endError,setEndError]=useState("");
-  const finishRun=async()=>{if(ending)return;setEnding(true);setEndError("");try{const result=await actions.run("end") as {runId:string};if(!result.runId)throw new Error("结束请求未返回运行编号");setEndConfirm(false);setState({reportRun:result.runId,view:"report"});}catch(error){setEndError((error as Error).message);}finally{setEnding(false);}};
+  const finishRun=async()=>{if(ending)return;setEnding(true);setEndError("");try{const result=await actions.run("end") as {runId?:string;run?:{id:string};result?:{id:string}};const runId=result.runId??result.run?.id??result.result?.id;if(!runId)throw new Error("结束请求未返回运行编号");setEndConfirm(false);setState({reportRun:runId,view:"report"});}catch(error){setEndError((error as Error).message);}finally{setEnding(false);}};
   const s = getState();
   const run = s.fs.run;
   const t = replay ? replay.at : now;
@@ -73,6 +74,7 @@ export function Hud() {
             <span className="hud-done">处理结束 <b>{displayDone}/{displayTotal}</b></span>{deferred>0&&<span className="has-failures">待重试 {deferred}</span>}{invalid>0&&<span className="has-failures">无效 {invalid}</span>}<span className="metric-dot">·</span><span className="hud-clock">{displayTime}</span><span className="metric-dot">·</span><span>{displayTok} tok</span><ChevronDown size={12} />
           </button>
           {selected.length > 0 && <button className="inspect-selection" onClick={() => toggleInspector(selected[0])}>查看所选</button>}
+          <AllocationShortcut />
         </div>
       </div>
       {pull && <PullCard onClose={() => setPull(false)} />}

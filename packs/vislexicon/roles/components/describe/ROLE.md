@@ -31,4 +31,4 @@
 
 ## 当前可用性
 
-当前来源/业务线尚未接入或处于休眠。以上是职责契约，不代表执行能力已实现；只接收/展示待办，不调用模型假跑，不自动激活。
+已接入视觉 Agent。实际舞台图与来源按 id 配对；submit.items 中每个 id 恰好出现一次，交 type、descriptionZh、interaction。type 必须属于输入词表 vocab.componentTypes；只描述可见内容，未知交互明确说明。修改时保留其余组件，不杜撰新实例。

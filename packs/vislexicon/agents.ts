@@ -16,6 +16,9 @@ import { dossierText, type Dossier } from "./scout.ts";
 import { breadthPreviewIssues } from "./capture.ts";
 import { CHOSEN_AXES, KIND_CATEGORIES, loadTaxonomy, ownerOf, editableFields, taxonomyLoaded } from "./v3.ts";
 import { publicationImages } from "./preview.ts";
+import { componentAgents } from "./components.ts";
+import { mediaAgents } from "./media-lines.ts";
+import type { Services } from "./tools.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const prompt = (name: string) => fs.readFileSync(path.join(HERE, "stations", name), "utf8");
@@ -594,8 +597,9 @@ export const audit = (store: EvidenceStore): AgentStationDef<ReviewOut> => {
   };
 };
 
-export function agentDefs(store: EvidenceStore): Record<string, AgentStationDef> {
+export function agentDefs(store: EvidenceStore, services?: Services): Record<string, AgentStationDef> {
   return {
+    ...(services ? { ...componentAgents(services), ...mediaAgents(services) } : {}),
     "curation/reader": reader, "curation/classify": classify, "curation/classify-review": classifyReview, "curation/arbiter": arbiter,
     "curation/catalog": catalog, "curation/shot-review": shotReview(store), "curation/style": style(store), "curation/facts": facts,
     "curation/fact-review": factReview, "curation/copy": copy(store), "curation/copy-review": copyReview(store), "curation/audit": audit(store),

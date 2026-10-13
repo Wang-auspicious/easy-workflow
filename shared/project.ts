@@ -112,6 +112,7 @@ export interface ChatMessage {
 export interface Transfer { seq: number; at: number; token: string; from: string; to: string; returned: boolean }
 
 export interface FactoryState {
+  corrections?: Record<string, { id: string; token: string; node: string; at: number; seq: number; status: 'pending' | 'executed' | 'reverted' }>;
   pausedScopes?: { lines: string[]; stations: string[] };
   measurement?: Extract<JournalEvent, { kind: 'measurement.proposed' }>['proposal'] & { status: 'proposed' | 'accepted' | 'rejected' };
   batch?: import('./batch.ts').BatchGoal;
@@ -166,7 +167,7 @@ export function initialState(factory?: CompiledFactory): FactoryState {
     totals: { usage: zeroUsage(), published: 0, manual: 0, failed: 0, rejected: 0, merged: 0, returned: 0, corrections: 0 },
     resources: { used: {}, limits: {}, freeMemMB: 0, at: 0, waiting: {} },
     transfers: [], patches: [], reportReady: null, lockedStations: [],
-    alerts: {}, preflight: null, cases: {}, contextNotes: {}, consults: {}, pausedScopes: { lines: [], stations: [] },
+    alerts: {}, preflight: null, cases: {}, contextNotes: {}, consults: {}, corrections: {}, pausedScopes: { lines: [], stations: [] },
   };
 }
 
@@ -262,6 +263,7 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       break;
     }
     case "attempt.started": {
+      for (const correction of Object.values(s.corrections ?? {})) if (correction.token === e.token && correction.status === 'pending') correction.status = 'executed';
       const n = node(e.node);
       remove(n.queue, e.token);
       n.active.push(e.attempt);
@@ -292,11 +294,14 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       if (!a) break;
       const ok = e.ok && !/^(打不开[：:]|HTTP [45]\d\d|网址无法解析)/.test(e.summary);
       a.cancelled = e.cancelled || e.error === "stale";
+      if (!a.cancelled) for (const correction of Object.values(s.corrections ?? {})) if (correction.token === a.token && correction.status === 'pending') correction.status = 'executed';
       const activity = mergeActivity(a.metrics?.activity, e.metrics?.activity);
       a.endedAt = e.at; a.ok = ok; a.summary = e.summary; a.error = e.error; a.ms = e.ms; a.queuedMs = e.queuedMs; a.output = e.output; a.metrics = activity ? { ...e.metrics, activity } : e.metrics;
       addUsage(a.usage, e.usage);
       const n = node(a.node);
       remove(n.active, a.id);
+      const token = s.tokens[a.token];
+      if (token && !n.queue.includes(a.token) && !n.active.some(id => s.attempts[id]?.token === a.token)) remove(token.at, a.node);
       addUsage(n.usage, e.usage);
       addUsage(s.totals.usage, e.usage);
       if(ok) pushCap(n.durations, e.ms);
@@ -394,9 +399,12 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
     }
     case "correction.created": {
       s.totals.corrections++;
+      for (const correction of Object.values(s.corrections ?? {})) if (correction.token === e.token && correction.status === 'pending') correction.status = 'executed';
+      (s.corrections ??= {})[e.correction] = { id: e.correction, token: e.token, node: e.node, at: e.at, seq: e.seq, status: e.snapshot ? 'pending' : 'executed' };
       break;
     }
     case 'correction.reverted': {
+      const correction = s.corrections?.[e.correction]; if (correction) correction.status = 'reverted';
       const token = s.tokens[e.token];
       if (!token) break;
       const snapshot = e.snapshot as { data: Record<string, unknown>; checkpoint: { rounds: Record<string, number> }; status: TokenStatus; at: string[]; touchedAt?: number; finishedAt?: number; finishedAtNode?: string; reason?: string };
@@ -498,12 +506,17 @@ export function nodeLight(n: NodeState | undefined, dormant: boolean, now: numbe
   return "idle";
 }
 
-/** A retry is another attempt at the same item, not another unresolved item. */
+/** A cross-line delivery is independent work; its retries retain that identity. */
+export function tokenWorkKey(t: TokenState) {
+  return JSON.stringify([t.data.channelDelivery ?? '', t.data.workflowPack ?? '', ['candidates', 'curation'].includes(t.line) ? 'curation' : t.line, t.item]);
+}
+
+/** A retry is another attempt at the same work, not another unresolved item. */
 export function latestRunTokens(s:FactoryState) {
   const latest=new Map<string,TokenState>();
   for(const id of s.tokenOrder){const t=s.tokens[id];if(!t||(t.touchedAt??t.createdAt)<s.run.startedAt)continue;
     if (typeof t.data.retriedBy === 'string' && s.tokens[t.data.retriedBy]?.item === t.item) continue;
-    const prior=latest.get(t.item);if(!prior||(t.touchedAt??t.createdAt)>=(prior.touchedAt??prior.createdAt))latest.set(t.item,t);
+    const key=tokenWorkKey(t),prior=latest.get(key);if(!prior||(t.touchedAt??t.createdAt)>=(prior.touchedAt??prior.createdAt))latest.set(key,t);
   }
   return [...latest.values()];
 }

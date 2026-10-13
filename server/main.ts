@@ -27,7 +27,7 @@ const dispatcher = new Dispatcher(factory, control);
 browserEvents.add(state => { factory.emit({ kind: "browser.state", state }); void factory.resumeVerified(state); });
 let chatTask: Promise<unknown> | null = null;
 
-const MIME: Record<string, string> = { ".webp": "image/webp", ".mp4": "video/mp4", ".json": "application/json", ".js": "text/javascript", ".css": "text/css", ".html": "text/html; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8" };
+const MIME: Record<string, string> = { ".webp": "image/webp", ".mp4": "video/mp4", ".json": "application/json", ".js": "text/javascript", ".css": "text/css", ".html": "text/html; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8", ".py": "text/plain; charset=utf-8", ".pdf": "application/pdf", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".zip": "application/zip" };
 
 function send(res: http.ServerResponse, status: number, body: unknown) {
   const text = JSON.stringify(body);
@@ -168,6 +168,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST") {
       const b = await body(req);
       switch (p) {
+        case "/api/workflows/template": return send(res, 200, await control.execute("workflow_template", b, "user"));
+        case "/api/workflows/install": return send(res, 200, await control.execute("workflow_install", b, "user"));
+        case "/api/workflows/line": return send(res, 200, await control.execute("workflow_line", b, "user"));
+        case "/api/workflows/feed": return send(res, 200, await control.execute("workflow_feed", b, "user"));
+        case "/api/allocation-plan": return send(res, 200, await control.execute("allocation_plan", b, "user"));
+        case "/api/correct/undo": return send(res, 200, await control.execute("undo_correction", b, "user"));
+        case "/api/business/feed": return send(res, 200, await control.execute("business_feed", b, "user"));
         case "/api/browser": return send(res, 200, (await control.execute("browser", b, "user")).result);
         case "/api/chat/abort": dispatcher.abort(); return send(res, 200, { ok: true });
         case "/api/chat/continue": {
@@ -244,6 +251,7 @@ const shutdown = async () => {
   if (stopping) return; stopping = true;
   removeConnection();
   clearInterval(ping);
+  factory.channels?.close();
   factory.runtime.paused = true;
   dispatcher.interrupt();
   for (const c of clients) c.end();

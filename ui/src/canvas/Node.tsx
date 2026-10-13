@@ -39,6 +39,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const open = useStore((s) => s.inspectors.some((i) => i.key === node.key));
   const trail = useStore((s) => s.trail);
   const now = useNow(5000);
+  const scopePaused = useStore(s => Boolean(s.fs.pausedScopes?.stations.includes(node.key) || s.fs.pausedScopes?.lines.includes(node.line)));
   const s = getState();
   const n = s.fs.nodes[node.key];
   const waiting = s.fs.resources.waiting?.[node.key];
@@ -89,7 +90,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         <div className="node-metric"><span>{shape === "store" ? "本轮流入" : "进行中"}</span><b>{fmt(shape === "store" ? n?.plus ?? 0 : n?.active.length ?? 0)}<small> 件</small></b></div>
       </div>}
       <div className="node-footer">
-        <span className="node-status" data-tip={counts.resource ? counts.detail : n?.summary || waiting || lightTip(light, waiting)}><i className={`light light--${light} ${n?.active.length ? "is-pulse" : ""}`} />{dormant ? "待接入" : counts.resource ? '资源库' : n?.active.length ? "处理中" : n?.queue.length ? "排队中" : light === "red" ? "需要检查" : n?.failed ? "有异常" : n?.processed ? "已完成" : "待命"}</span>
+        <span className="node-status" data-tip={counts.resource ? counts.detail : scopePaused ? '已暂停领取新任务，已开始的处理继续。' : n?.summary || waiting || lightTip(light, waiting)}><i className={`light light--${scopePaused && !counts.resource ? 'yellow' : light} ${n?.active.length ? "is-pulse" : ""}`} />{dormant ? "待接入" : counts.resource ? '资源库' : n?.active.length ? "处理中" : scopePaused ? '已暂停' : n?.queue.length ? "排队中" : light === "red" ? "需要检查" : n?.failed ? "有异常" : n?.processed ? "已完成" : "待命"}</span>
         <span className={`node-staff num ${!counts.resource && n?.failed ? 'has-failures' : ''}`} data-tip={`${counts.resource ? '' : `${workers} 位工人 · `}${counts.detail}`}>{counts.footer}</span>
       </div>
     </div>

@@ -1,0 +1,9 @@
+.correction { max-height: calc(100vh - 24px); overflow-y: auto; }
+.correction-receipts > div { padding: 9px 0; border-bottom: 1px solid #e7ebf0; }
+.correction-receipts b { font-size: 12px; font-weight: 500; }
+.correction-receipts p { font-size: 11px; line-height: 1.6; margin: 5px 0; color: #718095; }
+.correction-error, .correction-undo p { color: #aa6138 !important; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.correction-undo button { padding: 5px 8px; border: 1px solid #d9e2ef; border-radius: 5px; background: #f7f9fc; color: #5374a0; font: inherit; font-size: 11px; cursor: pointer; }
+.correction-undo button:disabled { color: #9ba8b9; cursor: default; }
+.correction-undo-note { color: #8a97a8; font-size: 11px; line-height: 1.6; }
+.token-corrections { display: grid; gap: 7px; padding: 12px 16px; border-top: 1px solid #e6eaf0; }
