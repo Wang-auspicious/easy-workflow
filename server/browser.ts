@@ -144,9 +144,9 @@ async function createHeadless(owner: "user" | "agent") {
   page.on("crash", () => { const t = tabs.get(id); if (t) { t.attention = "页面进程退出"; t.attentionKind = "crash"; update(); } });
   update(); return { page, context:c, id };
 }
-async function checkHeadless(id:string, manualCheck = false) {
+async function checkHeadless(id:string, manualCheck = false, requireFresh = false) {
   const tab=tabs.get(id);if(!tab)return;
-  if (tab.attentionCheck) { await tab.attentionCheck; if (!manualCheck) return; }
+  if (tab.attentionCheck) { await tab.attentionCheck; if (!manualCheck && !requireFresh) return; }
   const check = (tab.attentionCheck ?? Promise.resolve()).catch(() => {}).then(async () => {
     if (!tabs.has(id) || tab.page.isClosed()) return;
     const serial = tab.checkSerial = (tab.checkSerial ?? 0) + 1, url = tab.page.url();
@@ -214,7 +214,7 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
     try { signal?.throwIfAborted(); await t.page.setViewportSize(viewport); }
     catch (error) { await t.page.close().catch(() => {}); throw error; }
     return withCancellation(t.page,t.context,async () => {
-      await checkHeadless(t.id);
+      await checkHeadless(t.id, false, true);
       const tab = tabs.get(t.id); if (!tab) return;
       const duplicate = [...tabs.values()].some(other => other !== tab && other.owner === "agent" && !other.leased && attentionKey({...other,url:other.page.url()}) === attentionKey({...tab,url:tab.page.url()}) && retainBrowserAttention(other));
       tab.leased = false;

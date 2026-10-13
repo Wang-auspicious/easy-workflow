@@ -5,12 +5,31 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { Agent as DirectAgent, EnvHttpProxyAgent, fetch as proxyFetch } from "undici";
 import { isTlsFailure } from "../shared/failures.ts";
 
 let transport: EnvHttpProxyAgent | undefined;
+const noProxy = () => ["localhost", "127.0.0.1", "::1", process.env.NO_PROXY ?? process.env.no_proxy ?? ""].join(",");
+/** Describe the actual DNS hop without exposing proxy credentials or URL paths. */
+export function networkRoute(url: string): { proxy: boolean; hostname: string; label: string } {
+  const target = new URL(url), host = target.hostname.replace(/^\[(.*)\]$/, '$1').replace(/\.$/, '').toLowerCase();
+  const port = Number(target.port) || (target.protocol === 'https:' ? 443 : 80);
+  const bypass = noProxy().split(/[,\s]+/).filter(Boolean).some(value => {
+    const bracketed = value.match(/^\[(.+)\](?::(\d+))?$/);
+    const separated = !bracketed && (value.match(/:/g) ?? []).length === 1 ? value.match(/^(.+):(\d+)$/) : null;
+    const hostname = (bracketed?.[1] ?? separated?.[1] ?? value).replace(/^\*?\./, '').replace(/\.$/, '').toLowerCase();
+    const entryPort = Number(bracketed?.[2] ?? separated?.[2]);
+    return (!entryPort || entryPort === port) && (hostname === '*' || (!value.startsWith('*') && host === hostname) || host.endsWith(`.${hostname}`));
+  });
+  const httpProxy = process.env.http_proxy ?? process.env.HTTP_PROXY;
+  const configured = (target.protocol === 'https:' ? process.env.https_proxy ?? process.env.HTTPS_PROXY : '') || httpProxy;
+  if (bypass || !configured) return { proxy: false, hostname: host, label: `直连 ${target.host}` };
+  try { const endpoint = new URL(configured); return { proxy: true, hostname: endpoint.hostname.replace(/^\[(.*)\]$/, '$1'), label: `代理 ${endpoint.protocol}//${endpoint.host}` }; }
+  catch { throw new Error('代理地址格式无效；请检查 HTTP_PROXY / HTTPS_PROXY 配置'); }
+}
 export const networkFetch: typeof globalThis.fetch = (input, init) => {
-  transport ??= new EnvHttpProxyAgent({ noProxy: ["localhost", "127.0.0.1", "::1", process.env.NO_PROXY ?? process.env.no_proxy ?? ""].join(",") });
+  transport ??= new EnvHttpProxyAgent({ noProxy: noProxy() });
   return proxyFetch(input as Parameters<typeof proxyFetch>[0], { ...init, dispatcher: transport } as Parameters<typeof proxyFetch>[1]) as unknown as Promise<Response>;
 };
 export async function closeNetwork() { const t = transport; transport = undefined; await t?.destroy(); }
@@ -25,15 +44,32 @@ export function configureNetwork(opts: { cacheDir?: string | null; ttlMs?: numbe
 }
 
 /* per-host pacing: at most 2 requests in flight and 250ms between starts */
-const hosts = new Map<string, { inFlight: number; last: number; queue: (() => void)[] }>();
-async function slot(host: string) {
-  const h = hosts.get(host) ?? hosts.set(host, { inFlight: 0, last: 0, queue: [] }).get(host)!;
-  while (h.inFlight >= 2) await new Promise<void>((r) => h.queue.push(r));
-  h.inFlight++;
+interface HostQueue { inFlight: number; last: number; queue: { grant: () => void }[]; timer?: ReturnType<typeof setTimeout> }
+const hosts = new Map<string, HostQueue>();
+function pump(host: string, h: HostQueue) {
+  clearTimeout(h.timer); h.timer = undefined;
+  if (!h.queue.length) {
+    if (!h.inFlight) h.timer = setTimeout(() => { if (hosts.get(host) === h) hosts.delete(host); }, Math.max(0, h.last + 250 - Date.now())).unref();
+    return;
+  }
+  if (h.inFlight >= 2) return;
   const wait = h.last + 250 - Date.now();
-  h.last = Math.max(Date.now(), h.last + 250);
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-  return () => { h.inFlight--; h.queue.shift()?.(); };
+  if (wait > 0) { h.timer = setTimeout(() => pump(host, h), wait); return; }
+  h.inFlight++; h.last = Date.now(); h.queue.shift()!.grant();
+  pump(host, h);
+}
+function slot(host: string, signal?: AbortSignal): Promise<() => void> {
+  signal?.throwIfAborted();
+  const h = hosts.get(host) ?? hosts.set(host, { inFlight: 0, last: 0, queue: [] }).get(host)!;
+  return new Promise((resolve, reject) => {
+    const abort = () => { const i = h.queue.indexOf(waiter); if (i < 0) return; h.queue.splice(i, 1); signal?.removeEventListener('abort', abort); reject(signal!.reason); pump(host, h); };
+    const waiter = { grant: () => {
+      signal?.removeEventListener('abort', abort);
+      let released = false;
+      resolve(() => { if (released) return; released = true; h.inFlight--; pump(host, h); });
+    } };
+    h.queue.push(waiter); signal?.addEventListener('abort', abort, { once: true }); pump(host, h);
+  });
 }
 
 export interface WebResult { status: number; finalUrl: string; body: string; contentType: string; via: "http" | "cache"; tried: string[] }
@@ -44,8 +80,13 @@ export const transientNetworkError = (e: unknown) => !isTlsFailure(e) && /timeou
 
 /** GET a URL as text. Throws the underlying error (classified by callers) after one retry. */
 export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?: number; ttlMs?: number; cache?: boolean; accept?: string; headers?: Record<string, string> } = {}): Promise<WebResult> {
-  const key = crypto.createHash("sha1").update(url).digest("hex");
-  const file = cacheDir && opts.cache !== false ? path.join(cacheDir, key.slice(0, 2), `${key}.json`) : null;
+  opts.signal?.throwIfAborted();
+  const headers = new Headers({ "User-Agent": UA, "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.6", ...(opts.accept ? { Accept: opts.accept } : {}) });
+  for (const [name, value] of Object.entries(opts.headers ?? {})) headers.set(name, value);
+  // Different representations cannot share a cache entry. Authenticated content
+  // stays out of the project cache, even when the URL also has a public response.
+  const key = crypto.createHash("sha256").update(JSON.stringify([url, [...headers].sort()])).digest("hex");
+  const file = cacheDir && opts.cache !== false && !headers.has('authorization') && !headers.has('cookie') ? path.join(cacheDir, key.slice(0, 2), `${key}.json`) : null;
   const ttl = opts.ttlMs ?? defaultTtl;
   if (file) {
     try {
@@ -58,30 +99,30 @@ export async function webGet(url: string, opts: { signal?: AbortSignal; timeout?
   const tried: string[] = [];
   for (let round = 0; round < 2; round++) {
     opts.signal?.throwIfAborted();
-    const release = await slot(host);
-    let retry = false;
+    const release = await slot(host, opts.signal);
+    let retryDelay = 800;
     try {
+      opts.signal?.throwIfAborted();
       tried.push(round ? "http-retry" : "http");
       const signal = AbortSignal.any([...(opts.signal ? [opts.signal] : []), AbortSignal.timeout(opts.timeout ?? 20000)]);
-      const res = await networkFetch(url, { redirect: "follow", signal, headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.6", ...(opts.accept ? { Accept: opts.accept } : {}), ...(opts.headers ?? {}) } });
+      const res = await networkFetch(url, { redirect: "follow", signal, headers });
       const body = await res.text();
+      opts.signal?.throwIfAborted();
       const out: WebResult = { status: res.status, finalUrl: res.url || url, body, contentType: res.headers.get("content-type") ?? "", via: "http", tried };
-      if (round === 0 && transient(res.status)) retry = true;
+      if (round === 0 && transient(res.status)) retryDelay = res.status === 429 ? 3000 : 800;
       else {
-        if (file && res.status < 300 && body.length < 5_000_000) {
+        if (file && res.status >= 200 && res.status < 300 && body.length < 5_000_000 && !/(?:^|,)\s*(?:no-store|no-cache|private)(?:\s|,|=|$)/i.test(res.headers.get('cache-control') ?? '') && !res.headers.has('set-cookie') && res.headers.get('vary')?.trim() !== '*') {
           fs.mkdirSync(path.dirname(file), { recursive: true });
           fs.writeFileSync(file, JSON.stringify({ ...out, at: Date.now() }));
         }
         return out;
       }
-      if (retry) { release(); await new Promise((r) => setTimeout(r, res.status === 429 ? 3000 : 800)); continue; }
     } catch (err) {
       opts.signal?.throwIfAborted();
-      if (round === 0 && transientNetworkError(err)) { retry = true; }
-      else { (err as { tried?: string[] }).tried = tried; throw err; }
-    } finally { if (!retry) release(); }
-    release();
-    await new Promise((r) => setTimeout(r, 800));
+      if (round !== 0 || !transientNetworkError(err)) { (err as { tried?: string[] }).tried = tried; throw err; }
+    } finally { release(); }
+    try { await delay(retryDelay, undefined, { signal: opts.signal }); }
+    catch (error) { opts.signal?.throwIfAborted(); throw error; }
   }
   throw Object.assign(new Error(`request failed twice: ${url}`), { tried });
 }

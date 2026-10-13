@@ -5,7 +5,7 @@ import dns from "node:dns/promises";
 import fs from "node:fs";
 import path from "node:path";
 import type { PreflightCheck } from "../shared/types.ts";
-import { networkFetch } from "./network.ts";
+import { networkFetch, networkRoute } from "./network.ts";
 import { openPage, browserCommand } from "./browser.ts";
 import { probeModelConnection } from "./pi.ts";
 import { imageStats } from "./evidence.ts";
@@ -33,6 +33,40 @@ export function checkMemoryCapacity(broker: Broker) {
   return {ok,detail:`空闲 ${free}MB，浏览器有效上限 ${broker.effectiveBrowser()}/${broker.limits.browser}${ok?'':'（低于底线，暂停领取新页面）'}`,fix:ok?undefined:`可用内存低于 ${broker.memoryFloorMB}MB；释放不用的页面或应用后重新体检，等待期间保留工作检查点`};
 }
 
+export async function checkDnsProxy(url = 'https://github.com/', timeoutMs = 6000) {
+  const route = networkRoute(url);
+  await within(timeoutMs, dns.lookup(route.hostname));
+  return { ok: true, detail: `${route.label}；${route.proxy ? '代理主机可解析，目标域名由代理解析' : '域名可解析'}` };
+}
+
+export async function checkBrowserCapture(broker: Broker, options: { open?: typeof openPage; timeoutMs?: number } = {}) {
+  const resource = broker.tryAcquire('browser');
+  if (!resource) return { ok: false, detail: `暂时不能验证后台截图：${broker.blocked('browser') ?? '没有浏览器名额'}`, fix: '等待页面释放或内存恢复后重新体检；没有做截图验证，不能报告截图正常' };
+  const controller = new AbortController(), timeoutMs = options.timeoutMs ?? 40000;
+  let timer: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => {
+    const error = new Error(`后台截图检查超过 ${timeoutMs / 1000}s`);
+    controller.abort(error); reject(error);
+  }, timeoutMs); });
+  const capture = (async () => {
+    try {
+      const { page, close } = await (options.open ?? openPage)({ width: 640, height: 400 }, 'en-US', controller.signal);
+      try {
+        controller.signal.throwIfAborted();
+        await page.goto("data:text/html,<body style='margin:0;background:%23fff'><div style='font:bold 64px sans-serif;padding:40px;color:%23123'>Easy Workflow preflight ■■■</div></body>", { timeout: timeoutMs });
+        controller.signal.throwIfAborted();
+        const { withBrowserFrames } = await import('./browser.ts');
+        const png = await withBrowserFrames(page, () => page.screenshot({ timeout: timeoutMs }));
+        controller.signal.throwIfAborted();
+        const stats = imageStats(png);
+        return { ok: stats.content > 0.01, detail: `内容占比 ${(stats.content * 100).toFixed(1)}%`, fix: stats.content > 0.01 ? undefined : '后台页没有画面帧：重启应用；仍不行请报告给系统' };
+      } finally { await close(); }
+    } finally { resource.release(); }
+  })();
+  try { return await Promise.race([capture, deadline]); }
+  finally { clearTimeout(timer!); }
+}
+
 /** One unavailable third-party probe must not be mistaken for a total Internet outage. */
 export async function checkExternalAccess(urls = ["https://api.github.com/zen", "https://example.com/"], timeoutMs = 10000): Promise<{ ok: boolean; detail: string; fix?: string }> {
   const tried: string[] = [];
@@ -42,7 +76,7 @@ export async function checkExternalAccess(urls = ["https://api.github.com/zen", 
       const response = await networkFetch(url, { signal: AbortSignal.timeout(timeoutMs) });
       await response.body?.cancel();
       tried.push(`${host} HTTP ${response.status}`);
-      if (response.status < 500) return { ok: true, detail: tried.join("；") };
+      if (response.status < 500 && response.status !== 407) return { ok: true, detail: tried.join("；") };
     } catch (error) {
       const cause = (error as { cause?: { code?: string } })?.cause?.code;
       tried.push(`${host} ${cause ?? String((error as Error)?.message ?? "连接失败").slice(0, 100)}`);
@@ -52,28 +86,11 @@ export async function checkExternalAccess(urls = ["https://api.github.com/zen", 
 }
 
 export async function preflight(dir: string, broker: Broker): Promise<{ ok: boolean; checks: PreflightCheck[] }> {
-  const proxy = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy ?? "";
   const checks = await Promise.all([
-    check("dns", "DNS 与代理", async () => {
-      await within(6000, dns.lookup("github.com"));
-      return { ok: true, detail: proxy ? `走代理 ${proxy.replace(/\/\/[^@]*@/, "//")}` : "直连（未设置代理环境变量）" };
-    }),
+    check("dns", "DNS 与代理", () => checkDnsProxy()),
     check("web", "外网可达", () => checkExternalAccess()),
     check("model", "模型凭据与接口", () => checkModelEndpoint()),
-    check("browser", "后台页能截出画面", async () => {
-      const lease = broker.tryAcquire("browser");
-      if (!lease) return { ok: false, detail: `暂时不能验证后台截图：${broker.blocked('browser')??'没有浏览器名额'}`,fix:'等待页面释放或内存恢复后重新体检；没有做截图验证，不能报告截图正常' };
-      try {
-        const { page, close } = await within(25000, openPage({ width: 640, height: 400 }, "en-US"));
-        try {
-          await page.goto("data:text/html,<body style='margin:0;background:%23fff'><div style='font:bold 64px sans-serif;padding:40px;color:%23123'>Easy Workflow preflight ■■■</div></body>");
-          const { withBrowserFrames } = await import("./browser.ts");
-          const png = await within(15000, withBrowserFrames(page, () => page.screenshot()));
-          const stats = imageStats(png);
-          return { ok: stats.content > 0.01, detail: `内容占比 ${(stats.content * 100).toFixed(1)}%`, fix: stats.content > 0.01 ? undefined : "后台页没有画面帧：重启应用；仍不行请报告给系统" };
-        } finally { await close(); }
-      } finally { lease.release(); }
-    }),
+    check("browser", "后台页能截出画面", () => checkBrowserCapture(broker)),
     check("disk", "项目文件夹可写", async () => {
       const probe = path.join(dir, `.preflight-${process.pid}`);
       fs.writeFileSync(probe, "ok"); fs.rmSync(probe);

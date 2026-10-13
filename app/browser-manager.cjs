@@ -166,8 +166,8 @@ class BrowserManager {
     if (parent.owner === 'user') { try { this.create(url, 'user'); } catch {} }
     return { action: 'deny' };
   }
-  async check(t, manualCheck = false) {
-    if (t.attentionCheck) { await t.attentionCheck; if (!manualCheck) return; }
+  async check(t, manualCheck = false, requireFresh = false) {
+    if (t.attentionCheck) { await t.attentionCheck; if (!manualCheck && !requireFresh) return; }
     const check = (t.attentionCheck || Promise.resolve()).catch(() => {}).then(async () => {
       const wc = t.view.webContents; if (!this.tabs.has(t.id) || t.crashed || wc.isDestroyed() || !/^https?:/.test(wc.getURL())) return;
       const serial=t.checkSerial=(t.checkSerial||0)+1, url=wc.getURL();
@@ -234,7 +234,9 @@ class BrowserManager {
     else if (action === 'release') {
       if (args.discard || t.crashed) { this.discardAgent(t); return this.snapshot(); }
       if(t.captureDepth){wc.endFrameSubscription();t.captureDepth=0;}
-      await this.check(t);
+      // A navigation can invalidate an earlier probe while release is waiting.
+      // Inspect the current document before deciding whether its scene is disposable.
+      await this.check(t, false, true);
       if (t.owner === 'agent') {
         const duplicate = [...this.tabs.values()].some(other => other !== t && other.owner === 'agent' && other.leased === false && attentionKey(other) === attentionKey(t) && retainBrowserAttention(other));
         t.leased = false;
