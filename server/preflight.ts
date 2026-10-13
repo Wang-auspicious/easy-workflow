@@ -28,6 +28,11 @@ export async function checkModelEndpoint(timeoutMs = 20000): Promise<{ ok: boole
   return probeModelConnection(timeoutMs);
 }
 
+export function checkMemoryCapacity(broker: Broker) {
+  const free=broker.freeMemMB(),ok=free>=broker.memoryFloorMB;
+  return {ok,detail:`空闲 ${free}MB，浏览器有效上限 ${broker.effectiveBrowser()}/${broker.limits.browser}${ok?'':'（低于底线，暂停领取新页面）'}`,fix:ok?undefined:`可用内存低于 ${broker.memoryFloorMB}MB；释放不用的页面或应用后重新体检，等待期间保留工作检查点`};
+}
+
 /** One unavailable third-party probe must not be mistaken for a total Internet outage. */
 export async function checkExternalAccess(urls = ["https://api.github.com/zen", "https://example.com/"], timeoutMs = 10000): Promise<{ ok: boolean; detail: string; fix?: string }> {
   const tried: string[] = [];
@@ -57,7 +62,7 @@ export async function preflight(dir: string, broker: Broker): Promise<{ ok: bool
     check("model", "模型凭据与接口", () => checkModelEndpoint()),
     check("browser", "后台页能截出画面", async () => {
       const lease = broker.tryAcquire("browser");
-      if (!lease) return { ok: true, detail: "浏览器名额都在使用中（已在工作，跳过）" };
+      if (!lease) return { ok: false, detail: `暂时不能验证后台截图：${broker.blocked('browser')??'没有浏览器名额'}`,fix:'等待页面释放或内存恢复后重新体检；没有做截图验证，不能报告截图正常' };
       try {
         const { page, close } = await within(25000, openPage({ width: 640, height: 400 }, "en-US"));
         try {
@@ -76,10 +81,7 @@ export async function preflight(dir: string, broker: Broker): Promise<{ ok: bool
       const freeGB = (st.bavail * st.bsize) / 1073741824;
       return { ok: freeGB > 1, detail: `可写，剩余 ${freeGB.toFixed(1)}GB`, fix: freeGB > 1 ? undefined : "磁盘剩余不足 1GB，清理后再开跑" };
     }),
-    check("memory", "内存", async () => {
-      const free = broker.freeMemMB();
-      return { ok: true, detail: `空闲 ${free}MB，浏览器有效上限 ${broker.effectiveBrowser()}/${broker.limits.browser}${free < broker.memoryFloorMB ? "（低于底线，暂停领取新页面）" : ""}` };
-    }),
+    check("memory", "内存", async () => checkMemoryCapacity(broker)),
     check("auth", "共享浏览器登录状态", async () => {
       const st = await within(8000, browserCommand({ action: "state" })) as { tabs?: { attention?: string; title?: string }[] };
       const need = (st.tabs ?? []).filter((t) => t.attention);
