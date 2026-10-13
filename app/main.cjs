@@ -8,7 +8,7 @@ const { copyProjectSnapshot } = require('./project-data.cjs');
 const { PRODUCT_NAME, userDataDirectory, projectLocations, activeProjectDirectory, recentProjectDirectories } = require('./branding.cjs');
 
 const root = path.resolve(__dirname, '..');
-const profileDirectory = userDataDirectory({ appData: app.getPath('appData'), explicitProfile: process.env.FACTORY_PROFILE });
+const profileDirectory = userDataDirectory({ appData: process.env.FACTORY_PROFILE ? undefined : app.getPath('appData'), explicitProfile: process.env.FACTORY_PROFILE });
 app.setName(PRODUCT_NAME);
 fs.mkdirSync(profileDirectory, { recursive: true });
 app.setPath('userData', profileDirectory);
@@ -26,7 +26,7 @@ const saveConfig = (patch) => fs.writeFileSync(configFile(), JSON.stringify({ ..
 
 /* Existing projects keep their exact folder and configuration. New projects default to
  * Documents/Easy Workflow/Projects; isolated test profiles retain their own projects. */
-const projectPaths = () => projectLocations({ documents: app.getPath('documents'), userData: app.getPath('userData'), explicitProfile: process.env.FACTORY_PROFILE });
+const projectPaths = () => projectLocations({ documents: process.env.FACTORY_PROFILE ? undefined : app.getPath('documents'), userData: app.getPath('userData'), explicitProfile: process.env.FACTORY_PROFILE });
 const defaultProject = () => projectPaths().defaultProject;
 function activeProject() {
   return activeProjectDirectory(projectPaths(), config(), process.env.FACTORY_PROJECT);
