@@ -11,10 +11,10 @@ import { piStatus, closeModelTransport } from "./pi.ts";
 import { publishConnection } from "./discovery.ts";
 import { readReportJson, closeReportReaders } from './report-reader.ts';
 import { setImmediate as yieldLoop } from 'node:timers/promises';
+import { JournalEventStream } from './event-stream.ts';
 import { closeBrowser, browserCommand, browserEvents } from "./browser.ts";
 import { closeNetwork } from "./network.ts";
 import { layoutFactory } from "../shared/layout.ts";
-import type { Stamped } from "../shared/types.ts";
 import { FactoryControl } from "./control.ts";
 import { ControlError } from "./errors.ts";
 
@@ -25,7 +25,12 @@ const factory = new Factory();
 await factory.boot();
 const control = new FactoryControl(factory);
 const dispatcher = new Dispatcher(factory, control);
-browserEvents.add(state => { factory.emit({ kind: "browser.state", state }); void factory.resumeVerified(state); });
+let latestBrowserState: import('../shared/browser.ts').BrowserState | undefined;
+browserEvents.add(state => {
+  latestBrowserState = state;
+  factory.emit({kind: 'browser.state', state});
+  void factory.resumeVerified(state);
+});
 let chatTask: Promise<unknown> | null = null;
 
 const MIME: Record<string, string> = { ".webp": "image/webp", ".mp4": "video/mp4", ".json": "application/json", ".js": "text/javascript", ".css": "text/css", ".html": "text/html; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8", ".py": "text/plain; charset=utf-8", ".pdf": "application/pdf", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".zip": "application/zip" };
@@ -101,10 +106,13 @@ function serveFile(res: http.ServerResponse, file: string, req: http.IncomingMes
   stream.pipe(res);
 }
 
-const clients = new Set<http.ServerResponse>();
-factory.journal.subscribe((e: Stamped) => { const line = `id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`; for (const c of clients) c.write(line); });
-factory.ephemeral.add((e) => { const line = `event: live\ndata: ${JSON.stringify(e)}\n\n`; for (const c of clients) c.write(line); });
-const ping = setInterval(() => { for (const c of clients) c.write(": ping\n\n"); }, 15000);
+const clients = new Set<JournalEventStream>();
+factory.ephemeral.add(event => {
+  for (const client of clients) client.sendLive(event);
+});
+const ping = setInterval(() => {
+  for (const client of clients) client.ping();
+}, 15000);
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -139,15 +147,19 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isSafeInteger(since) || since < 0) throw new ControlError(400, "invalid_cursor", "since 必须是非负整数");
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "Access-Control-Allow-Origin": "*" });
       res.flushHeaders();
-      for (const e of factory.journal.read(since)) res.write(`id: ${e.seq}\ndata: ${JSON.stringify(e)}\n\n`);
-      clients.add(res);
-      if (dispatcher.busy) {
-        res.write(`event: live\ndata: ${JSON.stringify({ kind: "chat.start", id: dispatcher.status.turn })}\n\n`);
-        if (dispatcher.live) res.write(`event: live\ndata: ${JSON.stringify({ kind: "chat.pi", ...dispatcher.live })}\n\n`);
-      }
-      // Reconnecting after chat.end must clear the client's stale busy state too.
-      res.write(`event: live\ndata: ${JSON.stringify({ kind: "chat.status", ...dispatcher.status })}\n\n`);
-      req.on("close", () => clients.delete(res));
+      const client = new JournalEventStream(factory.journal, res, since, () => {
+        const snapshot: unknown[] = [{kind: 'chat.reset', turn: dispatcher.status.turn}];
+        if (dispatcher.busy) {
+          snapshot.push({kind: 'chat.start', id: dispatcher.status.turn});
+          if (dispatcher.live) snapshot.push({kind: 'chat.pi', ...dispatcher.live});
+        }
+        // Reconnecting after chat.end clears the client's stale busy state too.
+        snapshot.push({kind: 'chat.status', ...dispatcher.status});
+        if (latestBrowserState) snapshot.push({kind: 'browser.state', state: latestBrowserState});
+        return snapshot;
+      });
+      clients.add(client);
+      res.once('close', () => clients.delete(client));
       return;
     }
     if (p === "/api/journal") {
@@ -312,7 +324,7 @@ const shutdown = async () => {
   closeReportReaders();
   factory.runtime.paused = true;
   dispatcher.interrupt();
-  for (const c of clients) c.end();
+  for (const client of clients) client.close();
   server.close(); server.closeAllConnections();
   await Promise.all([factory.runtime.close(), chatTask]);
   await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]); factory.docs.flush(); factory.lessons.close(); factory.journal.close(); process.exit(0);

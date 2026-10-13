@@ -35,6 +35,12 @@ test("状态判定：恢复中是等待，中断后是失败，不把失败说�
   assert.equal(dispatcherState(live(), dispatcher({ status: "aborted" }), aborted), "fail");
 });
 
+test('completed authoritative status stays idle while partial messages await journal projection', () => {
+  const retained = live({ id: null, message: assistant('Completed reply'), tools: [{ name: 'lost-end', status: 'start' }] });
+  assert.equal(dispatcherState(retained, dispatcher({ turn: 'turn-1', status: 'completed', busy: false })), 'idle');
+  assert.equal(retained.message?.role, 'assistant');
+});
+
 test("工具标签与服务端渲染器用同一份中文名", () => {
   assert.equal(toolLabel("easy_workflow_call", { name: "status" }), "查看运行状态");
   assert.equal(toolLabel("easy_workflow_call", { name: "unknown" }), "调用 Easy Workflow · unknown");

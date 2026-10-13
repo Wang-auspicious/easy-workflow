@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
+import {EventEmitter} from 'node:events';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import type { Worker } from 'node:worker_threads';
 import { Journal } from '../server/journal.ts';
+import {JournalEventStream} from '../server/event-stream.ts';
 import { readReportJson, closeReportReaders } from '../server/report-reader.ts';
 import { compile } from '../server/spec/compile.ts';
 import { line, station, type Pack } from '../server/spec/dsl.ts';
@@ -141,5 +144,129 @@ test('run-filtered pagination is complete across unrelated sequence ranges and r
     for (const limit of [0, -1, 501, 1.5, NaN, Infinity]) assert.throws(() => j.readPage({ limit }), RangeError);
     assert.throws(() => j.readPage({ since: 3, through: 2 }), RangeError);
     assert.equal(j.readPage({ limit: 500 }).events.length, 4);
+    assert.deepEqual([...j.readSequences([1, 4])].map(event => event.seq), [1, 4]);
+    assert.throws(() => [...j.readSequences([2, 1])], RangeError);
+    assert.throws(() => [...j.readSequences([1, 1])], RangeError);
+    assert.throws(() => [...j.readSequences([5])], /event is missing/);
   } finally { j.close(); }
+});
+
+test('SSE catches up without blocking HTTP, retains ordering during appends, and reconnects from the last received event', {timeout: 20000}, async t => {
+  const streams = new Set<JournalEventStream>();
+  const server = http.createServer((req, res) => {
+    if (req.url === '/health') { res.end('ok'); return; }
+    res.writeHead(200, {'Content-Type': 'text/event-stream'});
+    res.flushHeaders();
+    const stream = new JournalEventStream(journal, res, Number(req.headers['last-event-id'] ?? 0), () => [{kind: 'ready'}]);
+    streams.add(stream);
+    res.on('close', () => streams.delete(stream));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  async function receiveThrough(last: number): Promise<number[]> {
+    const decoder = new TextDecoder();
+    const received: number[] = [];
+    let pending = '';
+    while ((received.at(-1) ?? 0) < last) {
+      const chunk = await reader!.read();
+      assert.equal(chunk.done, false);
+      pending += decoder.decode(chunk.value, {stream: true});
+      let boundary: number;
+      while ((boundary = pending.indexOf('\n\n')) >= 0) {
+        const frame = pending.slice(0, boundary);
+        pending = pending.slice(boundary + 2);
+        const id = /^id: (\d+)/.exec(frame);
+        if (id) received.push(Number(id[1]));
+      }
+    }
+    return received;
+  }
+  try {
+    const response = await fetch(url);
+    reader = response.body!.getReader();
+    const appended = journal.append({kind: 'dispatch.note', tone: 'info', text: 'Appended during streaming catch-up'});
+    const started = performance.now();
+    assert.equal(await (await fetch(url + '/health')).text(), 'ok');
+    const heartbeatMs = performance.now() - started;
+    assert.ok(heartbeatMs < 500, `concurrent HTTP request stalled ${heartbeatMs.toFixed(1)} ms`);
+    const received = await receiveThrough(appended.seq);
+    assert.deepEqual(received, Array.from({length: appended.seq}, (_, i) => i + 1));
+    await reader.cancel();
+    const next = journal.append({kind: 'dispatch.note', tone: 'info', text: 'Appended after disconnect'});
+    reader = (await fetch(url, {headers: {'last-event-id': String(appended.seq)}})).body!.getReader();
+    assert.deepEqual(await receiveThrough(next.seq), [next.seq]);
+    t.diagnostic(`streamed=${received.length}; concurrent HTTP=${heartbeatMs.toFixed(1)}ms`);
+  } finally {
+    await reader?.cancel();
+    for (const stream of streams) stream.close();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('a non-reading SSE socket has bounded output buffering and is released after the drain deadline', {timeout: 10000}, async t => {
+  let stream: JournalEventStream | undefined;
+  let peakBuffered = 0;
+  let stopped!: () => void;
+  const closed = new Promise<void>(resolve => { stopped = resolve; });
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, {'Content-Type': 'text/event-stream'});
+    res.flushHeaders();
+    stream = new JournalEventStream(journal, res, 0, () => [], 100);
+    const sample = setInterval(() => { peakBuffered = Math.max(peakBuffered, res.writableLength); }, 1);
+    res.once('close', () => { clearInterval(sample); stopped(); });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
+  const request = http.get(url, response => response.pause());
+  request.on('error', () => {});
+  try {
+    await closed;
+    assert.ok(peakBuffered > 0);
+    assert.ok(peakBuffered < 256 * 1024, `slow reader retained ${peakBuffered} bytes in its output buffer`);
+    t.diagnostic(`slow socket peak writable buffer=${peakBuffered} bytes`);
+  } finally {
+    request.destroy();
+    stream?.close();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('a live update arriving during snapshot drain cannot be overwritten by the older snapshot', async () => {
+  class SlowResponse extends EventEmitter {
+    readonly frames: string[] = [];
+    writableNeedDrain = false;
+
+    write(frame: string) {
+      this.frames.push(frame);
+      if (this.frames.length === 1) this.writableNeedDrain = true;
+      return !this.writableNeedDrain;
+    }
+
+    destroy() { this.emit('close'); }
+  }
+  const empty = new Journal(':memory:');
+  const response = new SlowResponse();
+  let revision = 1;
+  const stream = new JournalEventStream(empty, response as unknown as http.ServerResponse, 0, () => [
+    {kind: 'chat.status', busy: false}, {kind: 'browser.state', revision},
+  ]);
+  try {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(response.writableNeedDrain, true);
+    response.writableNeedDrain = false;
+    response.emit('drain');
+    revision = 2;
+    stream.sendLive({kind: 'browser.state', revision});
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const revisions = response.frames.map(frame => JSON.parse(frame.split('data: ')[1]))
+      .filter(event => event.kind === 'browser.state').map(event => event.revision);
+    assert.equal(revisions.at(-1), 2);
+    assert.deepEqual(revisions, [...revisions].sort());
+  } finally {
+    stream.close();
+    empty.close();
+  }
 });

@@ -93,6 +93,7 @@ export function dispatcherState(live: LiveChat, dispatcher: DispatcherStatus, la
   const failed = last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted");
   if (dispatcher.status === "recovering" || dispatcher.status === "interrupted") return "wait";
   if (failed && !dispatcher.busy) return "fail";
+  if (!dispatcher.busy) return "idle";
   if (live.tools.some((t) => t.status === "start")) return "work";
   const streaming = Boolean(live.message) || Boolean(live.text);
   if (streaming) return live.text && !live.message ? "thinking" : "speaking";
