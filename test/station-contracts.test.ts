@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { arbiter, audit, classify, facts, factReview, FACT_FIELDS, shotReview, style } from '../packs/vislexicon/agents.ts';
+import { arbiter, audit, classify, copy, facts, factReview, FACT_FIELDS, shotReview, style } from '../packs/vislexicon/agents.ts';
 import { KINDS } from '../packs/vislexicon/env.ts';
 import { rememberRead, withEvidenceReads } from '../server/network.ts';
 import {runFfmpeg, type EvidenceStore} from '../server/evidence.ts';
@@ -100,6 +100,38 @@ test('final audit receives the complete record and the persisted source material
   const input = await audit(store).input(context({ draftV3: record, factPages: [{ url: 'https://site.example/license', text: source }] }));
   assert.ok(input.text.includes(JSON.stringify(record, null, 1)), 'never cut a JSON record in the middle of a field');
   assert.ok(input.text.includes(source), 'reviewers need the source, not only the producer’s quote');
+});
+
+test('copy numbers require complete source values after normalizing counting punctuation', () => {
+  const definition = copy(store);
+  const answer = {
+    name: 'Email library', takeawayZh: '查找可参考的邮件版式', noteZh: '我们'.padEnd(130, '看'),
+    rationale: {identity: '先看首页的邮件目录', breadth: '再看目录中的邮件分类', proof: '打开具体邮件查看版式'},
+    alt: {identity: '邮件目录和筛选按钮', breadth: '多种邮件的预览网格', proof: '完整邮件和图片区域'},
+    descriptionZh: '', descriptionEn: 'A directory of email examples.',
+    reasons: [{statement: '提供邮件版式参考', evidenceUrl: 'https://site.example/'}], reply: '',
+  };
+  const check = (source: string, claim: string) => definition.check!(
+    {...answer, descriptionZh: `目录包含 ${claim} 封邮件案例。`}, context({dossier: {text: source}}));
+  for (const [source, claim] of [
+    ['With 19,000+ curated emails and counting.', '19,000+'],
+    ['With 19,000+ curated emails and counting.', '19000+'],
+    ['已有 １９，０００＋ 封邮件。', '19,000+'],
+    ['With 19\u202f000+ curated emails.', '１９，０００＋'],
+    ['With 1,900 curated emails.', '1900'],
+    ['Measured value: 19,000.5.', '19000.5'],
+  ]) assert.deepEqual(check(source, claim), [], `${claim} is supported by the complete normalized source value`);
+  for (const source of ['190', '1900', '19000', '190001']) {
+    for (const claim of ['190', '1900', '19000', '190001']) {
+      if (source === claim) assert.deepEqual(check(`There are ${source} examples.`, claim), []);
+      else assert.ok(check(`There are ${source} examples.`, claim).some(issue => issue.includes('数字')),
+        `${source} must not support a shorter prefix or longer invented number ${claim}`);
+    }
+  }
+  for (const [source, claim] of [['19,000', '19000+'], ['19000', '19000%'], ['19.00', '1900'], ['1,90', '190']]) {
+    assert.ok(check(`Source value: ${source}.`, claim).some(issue => issue.includes('数字')),
+      'normalization must preserve qualifiers, decimals and malformed grouping');
+  }
 });
 
 test('style validation reuses only its own completed pixel statistics and never accepts absent preparation', async () => {

@@ -597,7 +597,18 @@ export const copy = (store: EvidenceStore): AgentStationDef<CopyOut> => ({
     const all = o.takeawayZh + o.noteZh + o.descriptionZh;
     if (BANNED.test(all)) issues.push(`禁用词：${all.match(BANNED)![0]}`);
     const hay = JSON.stringify(data(ctx).dossier ?? {}) + JSON.stringify(data(ctx).facts ?? {});
-    for (const num of (o.descriptionZh + o.noteZh).match(/\d[\d,.]*\+?/g) ?? []) if (!hay.includes(num.replace(/[+,]/g, "").slice(0, 4))) issues.push(`数字 ${num} 在资料里找不到`);
+    const numbers = (text: string) => text.normalize('NFKC').match(/[+-]?\d(?:[\d,.]*\d)?(?: \d{3})*(?:\+|%)?/g) ?? [];
+    const numberKey = (value: string) => {
+      const suffix = value.match(/[+%]$/)?.[0] ?? '';
+      const digits = suffix ? value.slice(0, -1) : value;
+      // Normalize grouping only; preserve the full value, decimal and qualifier.
+      return /^[+-]?\d{1,3}(?:[, ]\d{3})+(?:\.\d+)?$/.test(digits)
+        ? digits.replace(/[, ]/g, '') + suffix : value;
+    };
+    const supportedNumbers = new Set(numbers(hay).map(numberKey));
+    for (const num of numbers(o.descriptionZh + '\n' + o.noteZh)) {
+      if (!supportedNumbers.has(numberKey(num))) issues.push(`数字 ${num} 在资料里找不到`);
+    }
     const price = data(ctx).facts?.pricing?.value;
     if ((!price || price === "unknown") && /免费|free/i.test(o.descriptionZh + o.noteZh + o.takeawayZh)) issues.push("价格未知时不能写免费");
     for (const r of o.reasons) if (!isHttp(r.evidenceUrl)) issues.push("reasons 的 evidenceUrl 必须是完整网址");
