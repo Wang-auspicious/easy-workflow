@@ -464,7 +464,8 @@ export class Runtime {
         if (!q.length) break;
         if (w.busy) continue;
         if (n.resource !== 'none' && this.workers.get(key)!.filter(worker => worker.busy).length >= (allocation.get(key) ?? 0)) { waiting[key] = `按到达率 × 服务时间分配 ${allocation.get(key) ?? 0} 个 ${n.resource} 名额`; continue; }
-        const index = this.broker.recoveryToken ? q.indexOf(this.broker.recoveryToken) : 0;
+        const index = n.resource === 'model' && this.broker.recoveryToken
+          ? q.indexOf(this.broker.recoveryToken) : 0;
         if (index < 0) { waiting[key] = "模型恢复验证中，其他任务保留检查点等待"; continue; }
         const queuedToken = this.tokens.get(q[index]);
         const capacityWait = queuedToken?.data.capacityWait as Record<string, number> | undefined;
@@ -991,7 +992,7 @@ export class Runtime {
     const result = new Map<string, number>();
     for (const resource of ['browser', 'model', 'cpu', 'http']) {
       const nodes = this.f.nodes.filter(node => this.runnable(node) && node.resource === resource && !this.scopePaused(node.key)
-        && (!this.broker.recoveryToken || this.queues.get(node.key)?.includes(this.broker.recoveryToken) || this.workers.get(node.key)?.some(worker => worker.busy && this.attemptTokens.get(worker.busy) === this.broker.recoveryToken)));
+        && (resource !== 'model' || !this.broker.recoveryToken || this.queues.get(node.key)?.includes(this.broker.recoveryToken) || this.workers.get(node.key)?.some(worker => worker.busy && this.attemptTokens.get(worker.busy) === this.broker.recoveryToken)));
       const demands = nodes.map(node => {
         const numbers = this.stationNumbers(node.key), pool = this.workers.get(node.key)!;
         const work = numbers.lambda * numbers.s;

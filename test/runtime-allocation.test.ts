@@ -7,12 +7,13 @@ import { Broker } from '../server/broker.ts';
 import { compile } from '../server/spec/compile.ts';
 import { line, station, type Pack } from '../server/spec/dsl.ts';
 import { apply, initialState } from '../shared/project.ts';
+import {checkModelAdmission} from '../server/model-requests.ts';
 
 const pack: Pack = { id: 'test-allocation', name: 'Allocation fixture', blurb: 'Fixture work', version: '1', resources: { browser: 0, model: 0, http: 0, cpu: 4 }, lines: ['fast', 'slow'].map((id, index) => line({ id, name: id, layer: 3, priority: 'mid', wired: true, blurb: 'Fixture work',
   stations: [station({ id: 'work', name: id, role: 'process', kind: 'program', resource: 'cpu', accept: ['Fixture result exists'], estimateSeconds: index ? 3 : 1, workers: { min: 1, max: 4, initial: 4, policy: 'auto' } }), station({ id: 'published', name: 'done', role: 'store', kind: 'store' })], edges: [['work', 'published']] })), channels: [], links: [], conditions: {}, order: ['fast', 'slow'], collapsed: [], hints: {} };
-function setup() {
-  const compiled = compile([pack]); assert.deepEqual(compiled.issues, []);
-  const journal = new Journal(':memory:'), broker = new Broker({ cpu: 4 }, 0);
+function setup(fixturePack = pack, limits: Record<string, number> = {cpu: 4}) {
+  const compiled = compile([fixturePack]); assert.deepEqual(compiled.issues, []);
+  const journal = new Journal(':memory:'), broker = new Broker(limits, 0);
   const state = initialState(compiled); journal.subscribeProjection(event => apply(state, event));
   const runtime = new Runtime(compiled, journal, broker, {}, () => async () => ({ ok: true, summary: 'fixture' }));
   runtime.roleResolver = key => ({ station: key, path: `fixture/${key}/ROLE.md`, revision: 'fixture', content: 'Complete the fixture work.' });
@@ -74,4 +75,60 @@ test('ten independent completed items produce one durable proposal without chang
     assert.equal([...journal.read()].filter(event => event.kind === 'measurement.proposed').length, 1);
     assert.throws(() => runtime.decideMeasurement(proposal.id, true), /待确认/);
   } finally { await runtime.close(); journal.close(); }
+});
+
+test('a model recovery trial keeps unrelated local work flowing and still honors global pause', async () => {
+  const resources = ['model', 'cpu', 'http'] as const;
+  const fixturePack: Pack = {...pack, lines: resources.map(resource => line({
+    id: resource, name: resource, layer: 3, priority: 'mid', wired: true, blurb: 'Independent resource work',
+    stations: [station({id: 'work', name: 'Work', role: 'process',
+      kind: resource === 'model' ? 'agent' : 'program', resource, accept: ['Fixture receipt exists'],
+      workers: {min: 1, max: 1, initial: 1, policy: 'fixed'}}),
+    station({id: 'published', name: 'Done', role: 'store', kind: 'store'})],
+    edges: [['work', 'published']],
+  })), order: [...resources]};
+  const {runtime, broker, journal, state} = setup(fixturePack, {model: 2, cpu: 1, http: 1});
+  const modelCalls: string[] = [];
+  let release!: () => void;
+  const held = new Promise<void>(resolve => {release = resolve;});
+  runtime.executors = node => async ctx => {
+    if (node.resource === 'model') {
+      modelCalls.push(ctx.token.id);
+      await held;
+    } else {
+      assert.throws(checkModelAdmission, /MODEL_CIRCUIT_OPEN/,
+        'local work cannot bypass the model trial by calling a model helper');
+    }
+    return {ok: true, summary: 'Fixture finished'};
+  };
+  try {
+    runtime.pause();
+    const waiting = runtime.create('model/work', {item: 'waiting', url: '', source: 'fixture'});
+    const trial = runtime.create('model/work', {item: 'trial', url: '', source: 'fixture'});
+    const local = ['cpu', 'http'].map(resource => runtime.create(`${resource}/work`, {
+      item: resource, url: '', source: 'fixture',
+    }));
+    broker.recoveryToken = trial.id;
+    runtime.resume();
+    for (let i = 0; i < 4; i++) await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(modelCalls, [trial.id], 'only the selected model task may probe recovery');
+    assert.deepEqual(local.map(token => state.tokens[token.id].status), ['published', 'published']);
+    assert.equal(state.tokens[waiting.id].status, 'active');
+    assert.equal(broker.used.model, 1);
+    runtime.pause();
+    release();
+    await runtime.settle();
+    broker.recoveryToken = null;
+    runtime.schedule();
+    await runtime.settle();
+    assert.deepEqual(modelCalls, [trial.id], 'global pause still holds work after the trial finishes');
+    runtime.resume();
+    await runtime.settle();
+    assert.equal(state.tokens[waiting.id].status, 'published');
+    assert.deepEqual(modelCalls, [trial.id, waiting.id]);
+  } finally {
+    release();
+    await runtime.close();
+    journal.close();
+  }
 });
