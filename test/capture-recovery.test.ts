@@ -1,7 +1,19 @@
-import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import http from 'node:http';
+import test, {after} from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import http from 'node:http';
 import {compile} from '../server/spec/compile.ts';import {pack} from '../packs/vislexicon/pack.ts';import {readRole} from '../server/roles.ts';
-import {findStage,links,pageKey,shoot} from '../packs/vislexicon/capture.ts';import {TOOLS} from '../packs/vislexicon/tools.ts';import {EvidenceStore} from '../server/evidence.ts';import type {StationContext} from '../server/runtime.ts';
-import {facts,factReview,shotReview} from '../packs/vislexicon/agents.ts';
+import {EvidenceStore} from '../server/evidence.ts';import type {StationContext} from '../server/runtime.ts';
+
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),'h2-capture-recovery-'));
+const previousProject=process.env.FACTORY_VAR;process.env.FACTORY_VAR=dir;
+const {findStage,links,pageKey,shoot}=await import('../packs/vislexicon/capture.ts');
+const {TOOLS}=await import('../packs/vislexicon/tools.ts');
+const {facts,factReview,shotReview}=await import('../packs/vislexicon/agents.ts');
+after(async()=>{
+ const {closeBrowser}=await import('../server/browser.ts');const {closeNetwork}=await import('../server/network.ts');
+ await closeBrowser();await closeNetwork();
+ if(previousProject===undefined)delete process.env.FACTORY_VAR;else process.env.FACTORY_VAR=previousProject;
+ assert.equal(path.dirname(path.resolve(dir)),path.resolve(os.tmpdir()));assert.ok(path.basename(dir).startsWith('h2-capture-recovery-'));
+ fs.rmSync(dir,{recursive:true,force:true});
+});
 
 test('every node has a role handbook; curation roles are handwritten and teach the toolbox',()=>{
  const f=compile([pack]);
@@ -36,11 +48,11 @@ test('facts and reviewer share the same evidence; reframing does not blacklist a
 });
 
 test('capture chooses a bounded demo, keeps SPA routes and survives review reshoots',{timeout:30000},async t=>{
- const dir=fs.mkdtempSync(path.join(os.tmpdir(),'h2-capture-recovery-'));process.env.FACTORY_VAR=dir;
  const {openPage,closeBrowser}=await import('../server/browser.ts');
  const fixture=http.createServer((req,res)=>{if(req.url==='/index.json'){res.setHeader('content-type','application/json');return res.end(JSON.stringify({entries:{button:{id:'button--primary',title:'Button',name:'Primary',type:'story'},docs:{id:'button--docs',title:'Button',name:'Docs',type:'docs'}}}));}res.end('<!doctype html><title>Storybook fixture</title><div class="example-tabset" style="height:5000px"><div class="bd-example" style="width:400px;height:200px;background:#caf"><svg width="350" height="150"><rect width="140" height="80" fill="red"/><circle cx="220" cy="90" r="50" fill="blue"/></svg></div><pre>source code</pre></div>');});
  await new Promise<void>(r=>fixture.listen(0,'127.0.0.1',r));
  try{const {page,close}=await openPage();try{
+   assert.ok(fs.existsSync(path.join(dir,'browser','profile')),'browser profile belongs to this isolated test project');
    await page.goto(`http://127.0.0.1:${(fixture.address() as {port:number}).port}`);
    await t.test('5000px document wrapper cannot win over the rendered component',async()=>{const stage=await findStage(page);assert.equal(stage?.sel,'.bd-example');assert.ok(stage!.h<=200);});
    await t.test('Storybook index exposes docs and real iframe examples without losing query identity',async()=>{const l=await links(page);assert.ok(l.some(x=>x.href.includes('path=%2Fdocs%2Fbutton--docs')));assert.ok(l.some(x=>x.href.includes('iframe.html?id=button--primary')));assert.notEqual(pageKey('https://x.test/?path=/docs/a'),pageKey('https://x.test/?path=/docs/b'));});
@@ -59,5 +71,5 @@ test('capture chooses a bounded demo, keeps SPA routes and survives review resho
      (ctx.token.data.shots as any).identity.file=original;
      assert.equal((await TOOLS['curation.process'](ctx,svc)).ok,true,'legacy deleted PNG references recover from the same evidence WebP');
    });
- }finally{await close();}}finally{await closeBrowser();fixture.closeAllConnections();await new Promise<void>(r=>fixture.close(()=>r()));fs.rmSync(dir,{recursive:true,force:true});}
+ }finally{await close();}}finally{await closeBrowser();fixture.closeAllConnections();await new Promise<void>(r=>fixture.close(()=>r()));}
 });

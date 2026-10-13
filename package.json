@@ -18,8 +18,8 @@
     "desktop:projects": "node scripts/desktop-project-smoke.mjs",
     "pi:install": "node scripts/install-pi.mjs",
     "check:canvas": "node scripts/check-canvas.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p ui/tsconfig.json --noEmit",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
     "test:ui": "node --test \"ui/test/*.test.ts\"",
     "test:ui:browser": "node ui/test/chat-browser.mjs && node ui/test/inspector-browser.mjs"
   },

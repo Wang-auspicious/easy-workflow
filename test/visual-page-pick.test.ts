@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -6,6 +6,21 @@ import path from "node:path";
 import http from "node:http";
 import type { StationContext } from "../server/runtime.ts";
 import type { EvidenceStore } from "../server/evidence.ts";
+
+// The first pure-contract test also imports capture -> browser. Configure the
+// project before that import, not only before the later browser test.
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-visual-pick-'));
+const previousProject = process.env.FACTORY_VAR;
+process.env.FACTORY_VAR = root;
+after(async () => {
+  const { closeBrowser } = await import('../server/browser.ts');
+  const { closeNetwork } = await import('../server/network.ts');
+  await closeBrowser(); await closeNetwork();
+  if (previousProject === undefined) delete process.env.FACTORY_VAR; else process.env.FACTORY_VAR = previousProject;
+  assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
+  assert.ok(path.basename(root).startsWith('easy-workflow-visual-pick-'));
+  fs.rmSync(root, { recursive: true, force: true });
+});
 
 const pass = { perImage: [], verdict: "pass" as const, reason: "all visible" };
 const hidden = { subjectVisible: false, mixed: false, styles: [], signatureZh: "" };
@@ -29,9 +44,7 @@ test("a catalogue confirmed by eye is not vetoed by the element count", async ()
 });
 
 test("the catalogue page is chosen by comparing screenshots, including pages the count calls empty", { timeout: 120000 }, async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "easy-workflow-visual-pick-"));
-  const saved = Object.fromEntries(["FACTORY_VAR", "PI_CODING_AGENT_DIR", "FACTORY_MODEL", "FACTORY_PROVIDER", "FACTORY_STATION_COMMAND", "FACTORY_STATION_MODEL"].map((k) => [k, process.env[k]]));
-  process.env.FACTORY_VAR = root;
+  const saved = Object.fromEntries(["PI_CODING_AGENT_DIR", "FACTORY_MODEL", "FACTORY_PROVIDER", "FACTORY_STATION_COMMAND", "FACTORY_STATION_MODEL"].map((k) => [k, process.env[k]]));
   process.env.PI_CODING_AGENT_DIR = root;
   for (const key of ["FACTORY_MODEL", "FACTORY_PROVIDER", "FACTORY_STATION_COMMAND", "FACTORY_STATION_MODEL"]) delete process.env[key];
   const nav = '<nav><a href="/docs/components">Components</a> <a href="/showcase">Showcase</a> <a href="/gallery">Gallery</a></nav>';
@@ -95,6 +108,7 @@ test("the catalogue page is chosen by comparing screenshots, including pages the
     await t.test("the model sees every candidate and the CSS-only gallery wins over a name list and a customer showcase", async () => {
       const { result, progress } = await run("pick");
       assert.equal(result.ok, true, progress.join("\n"));
+      assert.ok(fs.existsSync(path.join(root, 'browser', 'profile')), 'browser profile belongs to this isolated test project');
       const breadth = (result.data!.shots as Record<string, { href: string; previews: number; visual?: { basis: string; compared: number } }>).breadth;
       assert.equal(new URL(breadth.href).pathname, "/gallery");
       assert.equal(breadth.visual?.basis, "rendered-items");
