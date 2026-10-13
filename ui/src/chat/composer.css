@@ -1,0 +1,38 @@
+/* A compact writing surface. Fixed action sizes stay usable in a 320px sidebar. */
+.chat .composer { flex: none; min-width: 0; padding: 10px 12px 11px; border: 0; background: #fff; }
+.chat .composer-box { position: relative; min-width: 0; padding: 10px 10px 8px; border: 1px solid #dfe5ee; border-radius: 12px; background: #fff; box-shadow: 0 2px 7px #25385806; transition: border-color 140ms var(--ease), box-shadow 140ms var(--ease); }
+.chat .composer-box:focus-within { border-color: #aac4eb; box-shadow: 0 0 0 2px #3274ea0b, 0 2px 7px #25385806; }
+.chat .composer textarea { display: block; box-sizing: border-box; width: 100%; min-height: 42px; max-height: 180px; margin: 0; padding: 2px 2px 8px; border: 0; resize: none; outline: 0; background: transparent; color: #344054; font-size: 12.5px; font-weight: 400; line-height: 1.6; }
+.chat .composer textarea::placeholder { color: #939daa; opacity: 1; }
+.chat .composer textarea:disabled { cursor: default; }
+.chat .composer-foot { display: flex; align-items: center; min-width: 0; gap: 8px; padding: 0; }
+.chat .composer-tools, .chat .composer-actions { display: flex; flex: none; align-items: center; gap: 4px; }
+.chat .composer-actions { margin-left: auto; gap: 6px; }
+.chat .composer-foot svg { flex: none; }
+.chat .composer-attach, .chat .composer-cmd { display: inline-flex; flex: none; align-items: center; justify-content: center; height: 28px; border-radius: 7px; color: #7a8798; }
+.chat .composer-attach { width: 28px; padding: 0; }
+.chat .composer-cmd { gap: 5px; min-width: 57px; padding: 0 8px; border: 1px solid transparent; background: transparent; font-size: 11px; line-height: 1; white-space: nowrap; }
+.chat .composer-cmd:hover, .chat .composer-cmd.is-open, .chat .composer-attach:hover { color: #336aaf; border-color: #dfe8f5; background: #f2f6fc; }
+.chat .composer .composer-delivery { flex: 0 1 112px; width: 112px; min-width: 0; height: 28px; padding: 0 4px; border: 0; border-radius: 6px; background: #f7f8fa; color: #748194; font-size: 10.5px; line-height: 1.2; text-overflow: ellipsis; }
+.chat .composer .send { flex: none; width: 30px; height: 30px; padding: 0; border-radius: 8px; box-shadow: none; }
+.chat .composer .send--stop { width: 28px; height: 28px; color: #6c7b8e; background: #f0f3f7; }
+.chat .composer .send--stop:hover { color: #43556e; background: #e6edf6; }
+.chat .composer .send:disabled { color: #aab4c1; background: #eef1f5; opacity: 1; }
+.chat .composer button:focus-visible { outline: 2px solid #3274ea80; outline-offset: 2px; }
+.chat .composer .att-strip { gap: 5px; max-height: 104px; overflow-y: auto; padding: 0 0 8px; }
+.chat .composer .att-strip:empty { display: none; }
+.chat .composer .att { max-width: 100%; min-width: 0; height: 27px; color: #617b9e; }
+.chat .composer-feedback { margin: 0 2px 8px; color: #8d5c28; font-size: 11px; line-height: 1.6; }
+.chat .composer-meta { display: flex; justify-content: space-between; align-items: center; gap: 10px; min-height: 20px; padding: 6px 3px 0; color: #9ca5b1; font-size: 10px; line-height: 1.3; }
+.chat .composer-meta > span { white-space: nowrap; }
+.chat .composer-meta kbd { color: #8a95a4; font: inherit; }
+.chat .composer-meta i { padding: 0 5px; color: #c5ccd5; font-style: normal; }
+.chat .composer-history-hint { color: #a9b1bd; }
+.chat .cmd-palette { position: absolute; z-index: 6; left: 0; right: 0; bottom: calc(100% + 8px); max-height: min(320px, 50vh); overflow-y: auto; padding: 5px; border: 1px solid #dfe5ee; border-radius: 10px; background: #fff; box-shadow: 0 8px 28px #25385812, 0 2px 6px #25385808; }
+.chat .cmd-palette button { display: grid; grid-template-columns: 72px minmax(0, 1fr); grid-template-rows: auto auto; gap: 2px 8px; width: 100%; padding: 7px 8px; border-radius: 6px; text-align: left; color: #4d5c70; }
+.chat .cmd-palette button.is-on { background: #f0f5fc; }
+.chat .cmd-palette button:disabled { opacity: .4; cursor: default; }
+.chat .cmd-palette code { font: 10.5px/1.6 var(--mono); color: #6984a8; white-space: nowrap; }
+.chat .cmd-title { align-self: center; font-size: 11.5px; line-height: 1.5; }
+.chat .cmd-hint { grid-column: 2; font-size: 10px; line-height: 1.45; color: #a0a9b5; }
+@media (prefers-reduced-motion: reduce) { .chat .composer-box { transition: none; } }

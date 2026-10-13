@@ -5,7 +5,7 @@
 // 顶部原来那块（批次卡片 / 注意力提示 / 运行记录）已去掉：批次控制在工作区工具条上，
 // 工位的提示与去向已经作为对话行出现在转录里，不再重复一份。
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowUp, Square, PanelRightClose, PanelRightOpen, X, Image as ImageIcon, Box, Package, ScrollText, RotateCw, Info, Loader2, CornerDownLeft } from "lucide-react";
+import { ArrowUp, Square, PanelRightClose, PanelRightOpen, X, Image as ImageIcon, Box, Package, ScrollText, RotateCw, Info, Loader2, Slash } from "lucide-react";
 import type { Attachment } from "../../../shared/types.ts";
 import { detach, getState, setState, useStore } from "../store.ts";
 import { actions } from "../api.ts";
@@ -15,6 +15,7 @@ import { Avatar } from "./Avatar.tsx";
 import { dispatcherState, DISPATCHER_HUE } from "./transcript.ts";
 import { useNow } from "../util/useNow.ts";
 import "./activity.css";
+import "./composer.css";
 
 const SUGGEST = [
   "从候选库取 10 个「UI 组件与设计系统」开始入库",
@@ -209,7 +210,7 @@ export function AttChip({ a, onRemove }: { a: Attachment; onRemove?: () => void 
     <span className="att" data-tip={a.label}>
       {a.thumb ? <img src={a.thumb} alt="" /> : <span className="att-ico"><Icon size={13} /></span>}
       <span className="att-label">{a.label}</span>
-      {onRemove && <button className="att-x" onClick={onRemove}><X size={12} /></button>}
+      {onRemove && <button className="att-x" aria-label={`移除附件：${a.label}`} onClick={onRemove}><X size={12} /></button>}
     </span>
   );
 }
@@ -224,6 +225,7 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
   const [expanded, setExpanded] = useState(false);
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [commandBusy, setCommandBusy] = useState(false);
   const [mode, setMode] = useState<"steer" | "followUp">("steer");
   const [sendError, setSendError] = useState("");
   const [palette, setPalette] = useState(false);
@@ -238,21 +240,22 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
     el.style.height = "0px";
     el.style.height = `${Math.min(180, el.scrollHeight)}px`;
   }, [draft]);
-  const matches = draft.startsWith("/") && !draft.includes(" ") && !draft.includes("\n")
+  const typedCommand = draft.startsWith("/") && !draft.includes(" ") && !draft.includes("\n");
+  const matches = typedCommand
     ? COMMANDS.filter((c) => c.cmd.startsWith(draft.toLowerCase()) || c.title.includes(draft.slice(1)))
-    : [];
+    : COMMANDS;
   const showPalette = palette && matches.length > 0;
   const remember = (text: string) => setState((s) => ({ history: [text, ...s.history.filter((h) => h !== text)].slice(0, 40) }));
-  const send = async (override?: string) => {
+  const send = async (override?: string, preserveDraft = false) => {
     const text = (override ?? draft).trim();
-    if (!text || replay || sending || !connected) return;
-    const attachments = getState().attachments;
+    if (!text || replay || sending || commandBusy || !connected) return;
+    const attachments = preserveDraft ? [] : getState().attachments;
     const serialized = JSON.stringify(attachments);
     if (!pendingSend.current || pendingSend.current.text !== text || pendingSend.current.attachments !== serialized) pendingSend.current = { requestId: crypto.randomUUID(), text, attachments: serialized };
     setSending(true);
     setSendError("");
     setPalette(false);
-    setState({ draft: "", attachments: [] });
+    if (!preserveDraft) setState({ draft: "", attachments: [] });
     remember(text);
     try { await actions.chat(text, attachments, { requestId: pendingSend.current.requestId, mode: live ? mode : "steer" }); pendingSend.current = null; }
     catch {
@@ -261,9 +264,12 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
     } finally { setSending(false); }
   };
   const run = async (command: Command) => {
+    const local = command.run === 'steer' || command.run === 'followUp' || command.run === 'clear';
+    if (sending || commandBusy || (!local && (!connected || replay))) return;
     setPalette(false);
-    setState({ draft: "" });
-    if (command.send) { await send(command.send); return; }
+    if (command.send) { await send(command.send, !typedCommand); return; }
+    if (typedCommand) setState({ draft: "" });
+    setCommandBusy(true);
     try {
       if (command.run === "abort") await actions.abortChat();
       else if (command.run === "continue") await actions.continueChat();
@@ -272,21 +278,24 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
       else if (command.run === "steer") setMode("steer");
       else if (command.run === "followUp") setMode("followUp");
       else if (command.run === "clear") setState({ draft: "", attachments: [] });
-    } catch { /* 接口失败会自己弹提示 */ }
+    } catch { if (typedCommand) setState(s => ({ draft: s.draft || draft })); }
+    finally { setCommandBusy(false); }
   };
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (showPalette) {
       if (e.key === "ArrowDown") { e.preventDefault(); setCursor((c) => (c + 1) % matches.length); return; }
       if (e.key === "ArrowUp") { e.preventDefault(); setCursor((c) => (c - 1 + matches.length) % matches.length); return; }
       if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) { e.preventDefault(); void run(matches[Math.min(cursor, matches.length - 1)]); return; }
       if (e.key === "Escape") { e.preventDefault(); setPalette(false); return; }
     }
-    if (e.key === "Escape") { if (draft || atts.length) { e.preventDefault(); setState({ draft: "", attachments: [] }); } return; }
+    if (e.key === "Escape") return;
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void send(); return; }
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); void send(); return; }
     if ((e.key === "ArrowUp" || e.key === "ArrowDown") && history.length && !draft.includes("\n")) {
+      if (walk === null && (draft || e.key === 'ArrowDown')) return;
       e.preventDefault();
-      const next = e.key === "ArrowUp" ? (walk === null ? 0 : Math.min(walk + 1, history.length - 1)) : walk === null ? null : walk - 1;
+      const next = e.key === "ArrowUp" ? (walk === null ? 0 : Math.min(walk + 1, history.length - 1)) : walk === null || walk <= 0 ? null : walk - 1;
       setWalk(next);
       setState({ draft: next === null ? "" : history[next] ?? "" });
     }
@@ -300,10 +309,11 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
       {sendError && <p className="composer-feedback" role="status">{sendError}</p>}
       <div className="composer-box">
         {showPalette && (
-          <div className="cmd-palette" role="listbox" aria-label="命令">
+          <div id="composer-commands" className="cmd-palette" role="listbox" aria-label="命令">
             {matches.map((c, i) => (
               <button key={c.cmd} role="option" aria-selected={i === Math.min(cursor, matches.length - 1)}
                 className={i === Math.min(cursor, matches.length - 1) ? "is-on" : ""}
+                disabled={sending || commandBusy || ((!connected || Boolean(replay)) && !['steer', 'followUp', 'clear'].includes(c.run ?? ''))}
                 onMouseEnter={() => setCursor(i)} onClick={() => void run(c)}>
                 <code>{c.cmd}</code>
                 <span className="cmd-title">{c.title}</span>
@@ -319,7 +329,7 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
                 <span className="att att--group" onClick={() => setExpanded(true)} data-tip="展开逐张移除">
                   <span className="stack">{evidence.slice(0, 3).map((a) => a.thumb ? <img key={a.id} src={a.thumb} alt="" /> : null)}</span>
                   <span className="att-label">证据卡 ×{evidence.length}</span>
-                  <button className="att-x" onClick={(e) => { e.stopPropagation(); setState({ attachments: others }); }}><X size={12} /></button>
+                  <button className="att-x" aria-label="移除全部证据附件" onClick={(e) => { e.stopPropagation(); setState({ attachments: others }); }}><X size={12} /></button>
                 </span>
               ) : evidence.map((a) => <AttChip key={a.id} a={a} onRemove={() => detach(a.type, a.id)} />)}
               {others.map((a) => <AttChip key={`${a.type}:${a.id}`} a={a} onRemove={() => detach(a.type, a.id)} />)}
@@ -329,22 +339,29 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
         <textarea
           ref={ta}
           value={draft}
-          placeholder={replay ? "回放中：对话只读" : live ? "可补充要求，或安排完成后跟进…（输入 / 看命令）" : "描述任务，或选择画布内容后提问…（输入 / 看命令）"}
+          placeholder={replay ? "回放中的对话只读" : live ? "补充要求，或安排后续任务…" : "给主调度布置任务…"}
+          aria-label="给主调度的消息"
+          aria-describedby="composer-shortcuts"
           disabled={Boolean(replay)}
           onChange={(e) => { setState({ draft: e.target.value }); setPalette(e.target.value.startsWith("/")); setCursor(0); setWalk(null); }}
           onKeyDown={onKeyDown}
           rows={1}
         />
         <div className="composer-foot">
-          <button className="icon-btn" data-tip="从证据板选择附件" onClick={() => setState({ view: "board" })}><ImageIcon size={16} /></button>
-          <button className="composer-cmd" onClick={() => { setState({ draft: "/" }); setPalette(true); ta.current?.focus(); }} data-tip="命令（也可以直接输入 /）"><CornerDownLeft size={12} />命令</button>
-          {live
-            ? <select className="composer-delivery" aria-label="消息送达方式" value={mode} onChange={e => setMode(e.target.value as "steer" | "followUp")}><option value="steer">立即补充</option><option value="followUp">完成后跟进</option></select>
-            : <span className="composer-hint">Shift + Enter 换行 · ↑ 回溯 · Esc 清空</span>}
-          <span className="grow" />
-          {live && <button className="send send--stop" disabled={stopping || !connected || Boolean(replay)} onClick={() => void stop()} aria-label="停止当前回答" data-tip="停止当前回答，流水线任务保留">{stopping ? <Loader2 size={13} className="spin-i" /> : <Square size={13} />}</button>}
-          {(!live || draft.trim() || sending) && <button className="send" disabled={!draft.trim() || Boolean(replay) || sending || !connected} onClick={() => void send()} aria-label={live ? mode === "steer" ? "发送补充要求" : "安排后续跟进" : "发送消息"} data-tip={live ? mode === "steer" ? "发送补充要求" : "安排后续跟进" : "发送"}>{sending ? <Loader2 size={15} className="spin-i" /> : <ArrowUp size={16} />}</button>}
+          <div className="composer-tools">
+            <button className="icon-btn composer-attach" disabled={Boolean(replay)} aria-label="选择证据附件" data-tip="从证据板选择附件" onClick={() => setState({ view: "board" })}><ImageIcon size={15} /></button>
+            <button className={`composer-cmd${showPalette ? ' is-open' : ''}`} aria-label="命令" aria-expanded={showPalette} aria-controls="composer-commands" onClick={() => { setPalette(!showPalette); setCursor(0); ta.current?.focus(); }} data-tip="命令 · 也可以输入 /"><Slash size={12} /><span>命令</span></button>
+          </div>
+          {live && <select className="composer-delivery" aria-label="消息送达方式" value={mode} onChange={e => setMode(e.target.value as "steer" | "followUp")}><option value="steer">立即补充</option><option value="followUp">完成后跟进</option></select>}
+          <div className="composer-actions">
+            {live && <button className="send send--stop" disabled={stopping || !connected || Boolean(replay)} onClick={() => void stop()} aria-label="停止当前回答" data-tip="停止当前回答，流水线任务保留">{stopping ? <Loader2 size={13} className="spin-i" /> : <Square size={12} />}</button>}
+            {(!live || draft.trim() || sending) && <button className="send" disabled={!draft.trim() || Boolean(replay) || sending || commandBusy || !connected} onClick={() => void send()} aria-label={live ? mode === "steer" ? "发送补充要求" : "安排后续跟进" : "发送消息"} data-tip={live ? mode === "steer" ? "发送补充要求" : "安排后续跟进" : "发送"}>{sending ? <Loader2 size={15} className="spin-i" /> : <ArrowUp size={16} />}</button>}
+          </div>
         </div>
+      </div>
+      <div className="composer-meta" id="composer-shortcuts">
+        <span>{replay ? '只读回放' : !connected ? '连接恢复后可发送' : commandBusy ? '正在执行命令…' : <><kbd>↵</kbd> 发送 <i>·</i> <kbd>Shift ↵</kbd> 换行</>}</span>
+        <span className="composer-history-hint" data-tip="空输入时 ↑ 查看上一条消息；Esc 收起命令，草稿保留">↑ 历史</span>
       </div>
     </div>
   );

@@ -12,6 +12,7 @@ import { openCorrection } from "../board/Correction.tsx";
 import { toggleInspector } from "./Canvas.tsx";
 import { useNow } from "../util/useNow.ts";
 import { bottleneck, trailOf } from "./stats.ts";
+import { nodeCountPresentation } from './node-counts.ts';
 
 export const fmt = (n: number) => (n >= 10000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : n.toLocaleString("en-US"));
 export const secs = (ms: number) => (ms >= 60000 ? `${(ms / 60000).toFixed(1)}m` : ms >= 10000 ? `${Math.round(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`);
@@ -50,6 +51,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const strip = dormant ? [] : (n?.strip ?? []).map((id) => s.fs.evidence[id]).filter(Boolean) as EvidenceRef[];
   const visualEvidence = strip.filter((ev) => ev.kind === "image" || ev.kind === "video");
   const workers = n?.workers.length ?? 0;
+  const counts = nodeCountPresentation(node, n, s.fs);
   const slow = shape !== "store" && shape !== "source" && bottleneck(s.fs, s.factory!, node.line)?.key === node.key;
   const stop = trail ? trailOf(s.fs, trail).indexOf(node.key) : -1;
   const vars = { ["--c" as string]: c.border, ["--c-strong" as string]: c.strong, ["--fill" as string]: c.fill, ["--fill-h" as string]: c.fillHover, ["--ink-c" as string]: c.ink, ["--soft" as string]: c.soft, ["--glow" as string]: c.glow };
@@ -61,7 +63,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         data-tip={`${node.name}：${node.blurb ?? ""}${dormant ? "（休眠）" : ""}`} onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
         <StationIcon role={node.role} size={15} />
         <span className="node-name">{displayName}</span>
-        <span className="node-src-sub">{dormant ? "休眠" : "待命"} {n?.stock ?? 0}</span>
+        <span className="node-src-sub" data-tip={counts.detail}>{dormant ? '休眠 · ' : ''}库存 {fmt(n?.stock ?? 0)}</span>
       </div>
     );
   }
@@ -83,12 +85,12 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         {numPrefix && <span className="node-idx num">{numPrefix}</span>}
       </div>
       {visualEvidence.length ? <Strip items={visualEvidence} /> : <div className="node-metrics num">
-        <div className="node-metric"><span>{shape === "store" ? "库存" : "待处理"}</span><b>{fmt(shape === "store" ? n?.stock ?? 0 : n?.queue.length ?? 0)}<small> 件</small></b></div>
-        <div className="node-metric"><span>{shape === "store" ? "本轮新增" : "进行中"}</span><b>{fmt(shape === "store" ? n?.plus ?? 0 : n?.active.length ?? 0)}<small> 件</small></b></div>
+        <div className="node-metric"><span>{shape === "store" ? "当前库存" : "待处理"}</span><b>{fmt(shape === "store" ? n?.stock ?? 0 : n?.queue.length ?? 0)}<small> 件</small></b></div>
+        <div className="node-metric"><span>{shape === "store" ? "本轮流入" : "进行中"}</span><b>{fmt(shape === "store" ? n?.plus ?? 0 : n?.active.length ?? 0)}<small> 件</small></b></div>
       </div>}
       <div className="node-footer">
-        <span className="node-status" data-tip={n?.summary || waiting || lightTip(light, waiting)}><i className={`light light--${light} ${n?.active.length ? "is-pulse" : ""}`} />{dormant ? "待接入" : n?.active.length ? "处理中" : n?.queue.length ? "排队中" : light === "red" ? "需要检查" : n?.failed ? "有异常" : n?.processed ? "已完成" : "待命"}</span>
-        <span className={`node-staff num ${n?.failed?"has-failures":""}`} data-tip={`${workers} 位工人 · 通过 ${n?.processed??0} · 失败 ${n?.failed??0}`}>{n?.failed?`通过 ${fmt(n.processed)} · 异常 ${fmt(n.failed)}`:`本轮 ${fmt(n?.processed ?? 0)}`}</span>
+        <span className="node-status" data-tip={counts.resource ? counts.detail : n?.summary || waiting || lightTip(light, waiting)}><i className={`light light--${light} ${n?.active.length ? "is-pulse" : ""}`} />{dormant ? "待接入" : counts.resource ? '资源库' : n?.active.length ? "处理中" : n?.queue.length ? "排队中" : light === "red" ? "需要检查" : n?.failed ? "有异常" : n?.processed ? "已完成" : "待命"}</span>
+        <span className={`node-staff num ${!counts.resource && n?.failed ? 'has-failures' : ''}`} data-tip={`${counts.resource ? '' : `${workers} 位工人 · `}${counts.detail}`}>{counts.footer}</span>
       </div>
     </div>
   );

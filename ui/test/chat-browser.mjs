@@ -189,9 +189,77 @@ try {
   await page.getByRole("button", { name: "1 件待系统检查", exact: true }).waitFor();
   assert.equal((await page.title()).startsWith("● "), false, "a journaled resolution updates the human-action indicator immediately");
   assert.equal(await page.locator(".alert-item:not(.is-recovery)").count(), 0);
+
+  // Composer stays compact at every supported sidebar width. Test actual boxes,
+  // not CSS text, while retaining the real send/recovery actions above.
+  await page.waitForFunction(() => document.querySelectorAll('.toast').length === 0);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.evaluate(() => {
+    const { getState, setState } = window.chatFixture;
+    setState({ draft: '', attachments: [], live: { id: null, text: '', tools: [] }, dispatcher: { ...getState().dispatcher, status: 'idle', busy: false, recoverable: false } });
+  });
+  for (const width of [320, 420, 720]) {
+    await page.evaluate(width => {
+      window.chatFixture.setState({ chatWidth: width });
+      document.querySelector('.app').style.setProperty('--chat-w', `${width}px`);
+    }, width);
+    const box = await page.locator('.composer').evaluate(element => {
+      const card = element.querySelector('.composer-box').getBoundingClientRect();
+      const textarea = element.querySelector('textarea');
+      return {
+        width: element.getBoundingClientRect().width,
+        fontSize: parseFloat(getComputedStyle(textarea).fontSize),
+        cardHeight: card.height,
+        fits: element.scrollWidth <= element.clientWidth,
+        controls: [...element.querySelectorAll('.composer-foot button')].map(button => {
+          const rect = button.getBoundingClientRect();
+          return { label: button.getAttribute('aria-label'), width: rect.width, height: rect.height, inside: rect.x >= card.x && rect.right <= card.right, whiteSpace: getComputedStyle(button).whiteSpace };
+        }),
+      };
+    });
+    assert.ok(box.fits && box.fontSize <= 13 && box.cardHeight <= 105, `compact composer at ${width}px: ${JSON.stringify(box)}`);
+    assert.ok(box.controls.every(button => button.inside && button.width >= 27 && button.height <= 32), `controls fit at ${width}px`);
+    assert.equal(box.controls.find(button => button.label === '命令').whiteSpace, 'nowrap');
+    await page.locator('.composer').screenshot({ path: path.join(out, `composer-empty-${width}.png`) });
+  }
+
+  await input.fill('这是一条还没发送的草稿');
+  await page.getByRole('button', { name: '命令', exact: true }).click();
+  await page.locator('.cmd-palette').waitFor();
+  assert.equal(await input.inputValue(), '这是一条还没发送的草稿', 'opening commands never overwrites the draft');
+  await input.press('Escape');
+  await input.press('ArrowUp');
+  assert.equal(await input.inputValue(), '这是一条还没发送的草稿', 'history navigation never replaces a nonempty draft');
+  await input.press('Escape');
+  assert.equal(await input.inputValue(), '这是一条还没发送的草稿', 'Escape preserves the draft');
+  const beforeComposition = posts.length;
+  await input.evaluate(element => element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true })));
+  assert.equal(posts.length, beforeComposition, 'IME confirmation does not send a message');
+
+  await page.evaluate(() => {
+    const { getState, setState } = window.chatFixture;
+    setState({ chatWidth: 320, live: { id: 'composer-busy', text: '', tools: [] }, dispatcher: { ...getState().dispatcher, status: 'running', busy: true }, attachments: [{ type: 'node', id: 'curation/facts', label: '事实核验 · 引用与许可范围' }] });
+    document.querySelector('.app').style.setProperty('--chat-w', '320px');
+  });
+  await page.getByRole('combobox', { name: '消息送达方式' }).selectOption('followUp');
+  await page.locator('.composer').screenshot({ path: path.join(out, 'composer-busy-320.png') });
+  const busyControls = await page.locator('.composer').evaluate(element => {
+    const card = element.querySelector('.composer-box').getBoundingClientRect();
+    return [...element.querySelectorAll('.composer-foot button, .composer-foot select')].map(button => { const rect = button.getBoundingClientRect(); return rect.x >= card.x && rect.right <= card.right && rect.width >= 27; });
+  });
+  assert.ok(busyControls.every(Boolean), 'busy controls and delivery mode remain usable at 320px');
+  await page.getByRole('button', { name: '移除附件：事实核验 · 引用与许可范围', exact: true }).click();
+  assert.equal(await page.locator('.composer .att').count(), 0);
+  await page.getByRole('button', { name: '选择证据附件', exact: true }).click();
+  assert.equal(await page.evaluate(() => window.chatFixture.getState().view), 'board');
+  await page.getByRole('button', { name: '命令', exact: true }).click();
+  await page.locator('.cmd-palette').screenshot({ path: path.join(out, 'composer-commands-320.png') });
+  await page.getByRole('option').filter({ hasText: '/status' }).click();
+  await page.waitForFunction(() => !document.querySelector('.composer-feedback'));
+  assert.equal(await input.inputValue(), '这是一条还没发送的草稿', 'a command can run without consuming the draft or its attachments');
   assert.deepEqual(errors, []);
   await fs.writeFile(path.join(out, "result.json"), JSON.stringify({ ok: true, checks: ["100-site goal accounting", "partial answer retention", "automatic recovery", "steer", "followUp", "SSE reconnect after missed end", "continue checkpoint", "stop answer", "idempotent resend", "network is not login", "recheck instead of blind clear", "activate exact tab", "narrow window", "journaled alert resolution"], requests: posts, errors }, null, 2));
-  console.log("PASS: isolated chat recovery browser checks (14 scenarios), screenshots in var/verification/chat-recovery");
+  console.log("PASS: isolated chat recovery and responsive composer checks, screenshots in var/verification/chat-recovery");
 } finally {
   await browser.close();
   await server.close();
