@@ -14,6 +14,7 @@ export class BatchSupervisor {
   constructor(factory: Factory) {
     this.factory = factory;
     factory.journal.subscribe(event => {
+      if (factory.importing) return;
       const circuit = factory.state.batch?.modelCircuit;
       if (event.kind === 'attempt.finished' && event.ok && circuit?.state === 'trial') {
         const attempt = factory.state.attempts[event.attempt];

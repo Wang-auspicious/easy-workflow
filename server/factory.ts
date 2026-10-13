@@ -46,6 +46,7 @@ export class Factory {
   catalog: CatalogEntry[] = [];
   taken = new Set<string>();
   patches: Patch[] = [];
+  importing = false;
   settings: Settings;
   ephemeral = new Set<(e: Record<string, unknown>) => void>();
   project: ProjectInfo;
@@ -352,17 +353,6 @@ export class Factory {
     // paths once, without rewriting evidence or rerunning paid model work.
     const latest = new Map(Object.values(this.state.tokens).sort((a,b)=>a.createdAt-b.createdAt).map(t=>[t.item,t]));
     for(const token of latest.values()) {
-      if(token.status==="manual"&&token.data.recoveryStation&&token.reason==="没有可走的下一步（分支条件都不成立）"){
-        const last=this.state.attempts[token.attempts.at(-1)??""];
-        const next=last&&(this.runtime.outFlow.get(last.node)??[]).filter(e=>!e.when||pack.conditions[e.when]?.(token.data));
-        const station=next?.length===1&&this.runtime.runnable(this.runtime.nodes.get(next[0].to)!)?next[0].to:last?.node;
-        if(station){
-          const parkedAt=token.finishedAtNode;
-          if(parkedAt&&this.runtime.nodes.get(parkedAt)?.kind==="store")this.runtime.stockDelta(parkedAt,-1,`${token.item}：恢复调度后移回候选`);
-          this.journal.append({kind:"token.finished",token:token.id,node:station,status:"parked",reason:"恢复分支状态不完整，现已修复；保留产物并从后续工位继续"});
-          this.recordRecovery(token,{tag:"tool_error",category:"system",message:"恢复分支状态不完整，现已修复；从后续工位继续",retryable:true,url:token.url});
-        }
-      }
       if(this.state.recoveries[token.item]||!["rejected","manual","parked"].includes(token.status))continue;
       const attempts=token.attempts.map(id=>this.state.attempts[id]).filter(Boolean);
       const failed=[...attempts].reverse().find(a=>a.ok===false||/^打不开[：:]|^HTTP [45]\d\d/.test(a.summary??""));
@@ -508,7 +498,8 @@ export class Factory {
       };
       rt.restoreFlow(t);
       rt.tokens.set(t.id, t);
-      if (ts.status === 'manual' && ts.data.recoveryStation && !ts.data.retriedBy && ts.data.manualReason === '没有可走的下一步（分支条件都不成立）') {
+      const legacyFrontier = ts.status === 'parked' && this.state.recoveries[ts.item]?.failure?.message.startsWith('恢复分支状态不完整');
+      if ((ts.status === 'manual' || legacyFrontier) && ts.data.recoveryStation && !ts.data.retriedBy && ts.data.manualReason === '没有可走的下一步（分支条件都不成立）') {
         const frontier = rt.readyFrontier(t).filter(key=>rt.runnable(rt.nodes.get(key)!));
         if (frontier.length) {
           const failure: Failure = {tag:'tool_error',category:'system',code:'RESTORED_FRONTIER_MISSING',retryable:true,owner:'system',message:`恢复时遗漏的并行分支已找回：${frontier.join('、')}`,nextAction:'从待执行分支继续，保留已经通过的截图、事实和审查；无需人工替系统补结果。'};
@@ -518,7 +509,7 @@ export class Factory {
           this.journal.append({kind:'token.finished',token:t.id,node:frontier[0],status:'parked',reason:failure.message});
           const old=this.state.recoveries[t.item];
           this.journal.append({kind:'candidate.disposition',candidate:{...old,item:t.item,token:t.id,url:t.url,title:t.title??t.item,source:t.source,disposition:'retry',failure,at:Date.now(),attempts:old?.attempts??1}});
-          rt.stockDelta('candidates/pool',1,'系统恢复缺失分支，重新进入可恢复候选');
+          if (old?.disposition !== 'retry') rt.stockDelta('candidates/pool',1,'系统恢复缺失分支，重新进入可恢复候选');
         }
       }
       if(t.finished||!resumable)continue;

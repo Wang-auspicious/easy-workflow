@@ -65,6 +65,11 @@ export const ROLE_AUTHORING = {
 function definitions(f: Factory): Tool[] {
     const nodeName = (k: string) => f.compiled.nodes.find((n) => n.key === k)?.name ?? k;
     return [
+      {name:'adopt_verified_result',label:'接回已验收成果',description:'Import one actually published item from another local project. Verifies journal, record digest and immutable evidence, then runs the current publication gate. Requires an idle paused run and preserves that pause; does not repeat model work.',parameters:object({sourceProject:name(),item:name()}),execute:async(_id,p)=>{
+        const {adoptVerifiedResult}=await import('./verified-import.ts');
+        const result=await adoptVerifiedResult(f,p.sourceProject,p.item);
+        return ok(result,'已核验来源并接回当前项目，发布状态以当前闸门回执为准');
+      }},
       {name:"read_role",label:"查看节点职责",description:"Read one node's ROLE.md: task identity, evidence, situation-specific recovery and handoff. Use dispatcher for the coordinator.",parameters:object({station:name()}),execute:async(_id,p)=>{
         if(p.station!=="dispatcher"&&!f.compiled.nodes.some(n=>n.key===p.station))throw new ControlError(404,"station_not_found","没有这个节点");
         return ok(readRole(p.station),`读取 ${p.station} 职责与异常处理契约`);
@@ -397,6 +402,7 @@ export class FactoryControl {
     if (!def) throw new ControlError(404, "tool_not_found", `未知能力：${tool}`);
     if (!Check(def.parameters, input)) throw new ControlError(400, "invalid_arguments", "参数不符合能力契约", [...Errors(def.parameters, input)]);
     const mutates = this.mutates(tool, input);
+    if (mutates && this.f.importing) throw new ControlError(409,'import_in_progress','正在接回已验证成果，请等待当前闸门回执');
     if (mutates && process.env.FACTORY_READONLY === "1") throw new ControlError(403, "read_only", "当前工作区只读");
     const reply = await def.execute("control", input, actor);
     const result = reply.details.result as any;

@@ -315,8 +315,10 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   const remainingSessions = {...sessions}; delete remainingSessions[ctx.node.key];
   return { ...res, data: {...res.data,...(sessions[ctx.node.key] ? {stationSessions:remainingSessions} : {})}, usage: usageReported ? usage : undefined, metrics: metrics() };
   } catch (err) {
+    const awaitingModel = activity.snapshot().spans.some(span => span.kind === 'model_request' && span.status === 'running');
     activity.close(ctx.signal.aborted || ["AbortError", "TimeoutError"].includes((err as Error)?.name) ? "cancelled" : "failed");
     if (ctx.signal.aborted) throwStationAbort(ctx.signal, { ok: false, summary: "模型调用已取消", usage: usageReported ? usage : undefined, metrics: metrics() });
+    if (sessionSignal.aborted && awaitingModel) return modelFailure(`工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留`, '工位工作预算已用完');
     const failure = sessionSignal.aborted ? sessionSignal.reason : err;
     return { ok: false, summary: sessionSignal.aborted ? "工位工作预算已用完" : "模型调用失败", error: sessionSignal.aborted ? `工位总工作时间超时（预算 ${budget}ms）；已完成工具的记录保留` : failure instanceof Error ? failure.message : String(failure), usage: usageReported ? usage : undefined, metrics: metrics() };
   } finally { activity.close("failed"); narration.flush(); }
