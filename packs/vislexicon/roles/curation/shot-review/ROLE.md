@@ -55,6 +55,7 @@
 
 调用 `submit`：
 
-- perImage：每张图的 role、ok、一句理由；
+- perImage：每张图的 role、ok、一句理由。图片模式必须各写一次 identity、breadth、proof，不漏写或重复；视频模式只写 poster；
 - verdict：pass 或 return；
-- return 时：returnTo、repair、reason。
+- pass 时，每一张都必须是 ok=true；任何一张不合格就不能通过。
+- return 时：returnTo 指向标记为 ok=false 的那张图，另写 repair、reason。视频封面不合格时不填 returnTo，写清理由后交站长处理。

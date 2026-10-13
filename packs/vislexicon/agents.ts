@@ -40,6 +40,26 @@ function corpus(ctx: StationContext) {
 }
 const quoted = (quote: string, hay: string) => { const q = norm(quote); return q.length >= 3 && hay.includes(q); };
 
+/** Keep provenance attached to each excerpt; a matching quote on another page is not a source. */
+function sourcePages(ctx: StationContext) {
+  const d = dossier(ctx), pages: { url: string; text: string }[] = [];
+  const add = (url: unknown, text: string) => { if (isHttp(url) && text) pages.push({ url: String(url), text }); };
+  if (d) {
+    const home = [d.title, d.description, d.text, ...d.headings.map(h => h.text), ...d.links.map(l => `${l.text} → ${l.href}`)].join('\n');
+    add(d.finalUrl, home); add(d.url, home);
+    for (const page of d.pages) add(page.url, `${page.title}\n${page.text}`);
+    if (isHttp(d.finalUrl)) {
+      const origin = new URL(d.finalUrl).origin;
+      add(`${origin}/llms.txt`, d.files.llms ?? '');
+      add(`${origin}/llms-full.txt`, d.files.llmsFull ?? '');
+    }
+    if (d.repo) for (const page of repoSources(d.repo)) add(page.url, page.text);
+  }
+  const home = data(ctx).home;
+  if (home?.text) add(home.finalUrl ?? data(ctx).canonical, String(home.text));
+  return [...pages, ...readEvidence()];
+}
+
 /* ------------------------------------------------------------------ ③ reader */
 
 type Pick = { url: string; reason: string; locate?: string };
@@ -106,10 +126,12 @@ type KindOut = { kind: string; answers: { q: number; yes: boolean; quote: string
 
 function checkKind(out: KindOut, ctx: StationContext) {
   const issues: string[] = [];
+  if (out.answers.some((answer, index) => answer.q !== index + 1)) issues.push('questions must be answered exactly once in order, starting at question 1');
   const firstYes = out.answers.find((a) => a.yes);
   if (!firstYes) issues.push("no question answered YES");
   else {
     if (KINDS[firstYes.q - 1] !== out.kind) issues.push(`kind "${out.kind}" is not the first YES (question ${firstYes.q} = ${KINDS[firstYes.q - 1]})`);
+    if (out.answers.at(-1) !== firstYes) issues.push('stop at the first YES; do not answer more questions after the decision');
     if (!quoted(firstYes.quote, corpus(ctx))) issues.push(`the quote for question ${firstYes.q} is not verbatim in the dossier`);
     const asked = out.answers.filter((a) => a.q < firstYes.q).map((a) => a.q);
     for (let q = 1; q < firstYes.q; q++) if (!asked.includes(q)) issues.push(`question ${q} was skipped (ask in order)`);
@@ -153,8 +175,11 @@ export const arbiter: AgentStationDef<ArbOut> = {
   check: (o, ctx) => {
     if (!o.kind) return [];
     const issues: string[] = [];
-    const hay = corpus(ctx);
-    if (!quoted(o.quote, hay)) issues.push("裁定引用不在卷宗或你读过的页面里；引用原文并给出 sourceUrl，或者提交空 kind 交人");
+    if (!isHttp(o.sourceUrl)) issues.push('sourceUrl 必须是引用所在页面的完整 http(s) 网址');
+    else {
+      const sources = sourcePages(ctx).filter(page => evidenceURL(page.url) === evidenceURL(o.sourceUrl));
+      if (!sources.some(page => quoted(o.quote, norm(page.text)))) issues.push('裁定引用不在 sourceUrl 对应的原文里；不能把其他页面的引用归到此网址。请核对来源，或者提交空 kind 交人');
+    }
     return issues;
   },
   describe: (o) => (o.kind ? `裁定为 ${KIND_ZH[o.kind]}：${o.reason.slice(0, 60)}` : `裁不了，交人：${o.reason.slice(0, 60)}`),
@@ -231,7 +256,18 @@ export const shotReview = (store: EvidenceStore): AgentStationDef<ShotReviewOut>
       images: imgs,
     };
   },
-  check: (o) => (o.verdict === "return" && (!o.returnTo || !o.repair || o.reason.trim().length < 6) ? ["a return must name returnTo, repair (reframe | replace-page | wait-for-render), and a concrete reason"] : []),
+  check: (o, ctx) => {
+    const issues: string[] = [];
+    const roles = data(ctx).mode === 'video' ? ['poster'] : ['identity', 'breadth', 'proof'];
+    if (o.perImage.length !== roles.length || roles.some(role => o.perImage.filter(image => image.role === role).length !== 1))
+      issues.push(`perImage must review each required image exactly once: ${roles.join(', ')}`);
+    if (o.verdict === 'pass' && o.perImage.some(image => !image.ok)) issues.push('pass requires every image to be ok; return the failed image instead');
+    if (o.verdict === 'return' && ((!o.returnTo && data(ctx).mode !== 'video') || !o.repair || o.reason.trim().length < 6))
+      issues.push('a return must name returnTo, repair (reframe | replace-page | wait-for-render), and a concrete reason');
+    if (o.verdict === 'return' && data(ctx).mode !== 'video' && !o.perImage.some(image => image.role === o.returnTo && !image.ok))
+      issues.push('returnTo must identify an image marked ok:false');
+    return issues;
+  },
   describe: (o) => (o.verdict === "pass" ? `通过：${o.perImage.map((p) => `${p.role} ${p.ok ? "✓" : "✗"}`).join(" ")}` : `退回 ${o.returnTo}：${o.reason.slice(0, 70)}`),
   after: (out, ctx) => shotReviewResult(enforceBreadth(out, ctx), ctx),
 });
@@ -342,7 +378,13 @@ async function factSources(ctx: StationContext) {
   const d = data(ctx);
   const dos = dossier(ctx);
   const pages: { url: string; text: string }[] = [];
-  const add = (url: string, text: string) => { if (text && !pages.some((p) => p.url === url)) pages.push({ url, text: text.slice(0, 3500) }); };
+  const add = (url: string, text: string, preserve = false) => {
+    const excerpt = preserve ? text : text.slice(0, 3500);
+    if (isHttp(url) && excerpt && !pages.some(p => evidenceURL(p.url) === evidenceURL(url) && p.text === excerpt)) pages.push({ url, text: excerpt });
+  };
+  // A direct repair must retain the original sources of untouched facts. Those
+  // sources can be longer than the initial preview, or come from later tool reads.
+  for (const page of (d.factPages ?? []) as { url: string; text: string }[]) if (typeof page.text === 'string') add(page.url, page.text, true);
   add(dos?.finalUrl ?? d.canonical, [dos?.title, dos?.description, dos?.text?.slice(0, 1800), dos?.text && dos.text.length > 1800 ? `…页脚：${dos.text.slice(-1500)}` : ""].filter(Boolean).join("\n"));
   for (const p of dos?.pages ?? []) add(p.url, `${p.title}\n${p.text}`);
   const repo = dos?.repo as RepoMeta | null | undefined;
@@ -434,7 +476,13 @@ function fixesOf(problems: Problem[], fallback: string, via?: string[]): Fix[] {
 const reviewer = (station: string, label: string, fallbackOwner: string, system: string, text: (ctx: StationContext) => string, images?: (ctx: StationContext) => { file: string; label: string }[], tools?: string[], via?: string[]): AgentStationDef<ReviewOut> => ({
   system, schema: ReviewSchema, tools,
   input: (ctx) => ({ text: text(ctx), images: images?.(ctx) }),
-  check: (o) => (o.verdict === "fix" && !o.problems.length ? ["要求修改时必须列出 problems（field + problem）"] : []),
+  check: (o) => {
+    const issues: string[] = [];
+    if (o.verdict === 'fix' && !o.problems.length) issues.push('要求修改时必须列出 problems（field + problem）');
+    if (o.verdict === 'pass' && o.problems.length) issues.push('仍有 problems 时不能 pass；请提交 fix 并保留具体问题');
+    if (o.problems.some(problem => !problem.field.trim() || !problem.problem.trim())) issues.push('每个 problem 必须有明确的 field 与具体问题，不能留空');
+    return issues;
+  },
   describe: (o) => (o.verdict === "pass" ? "通过" : `要求修改：${o.problems.map((p) => `${p.field}（${p.problem}）`).join("；").slice(0, 90)}`),
   after: (out, ctx) => {
     const reason = out.verdict === "pass" ? out.reason : out.problems.map((p) => `${p.field}：${p.problem}`).join("；");
@@ -528,7 +576,7 @@ export const audit = (store: EvidenceStore): AgentStationDef<ReviewOut> => {
 - 每条事实的出处真的支持它，覆盖范围写清；事实之间、事实与文案之间不矛盾。
 - 名称、takeaway、手记、简介与事实、截图一致；三条导览和 alt 对得上画面。
 有问题就 verdict=fix，problems 逐项写字段路径（如 facts.license、classification.subcategory、editorial.noteZh、pages[2].shot.alt）和具体问题。拿不准可以用 fetch_text / page_text 打开原页核对。全部没问题就 pass。`,
-    (ctx) => `待发布记录：\n${JSON.stringify(data(ctx).draftV3 ?? {}, null, 1).slice(0, 14000)}`,
+    (ctx) => `待发布记录（完整）：\n${JSON.stringify(data(ctx).draftV3 ?? {}, null, 1)}\n\n已保存的事实原文（与事实审查使用相同资料）：\n${JSON.stringify(data(ctx).factPages ?? [], null, 1)}`,
     imagesFor(store), ["fetch_text", "page_text", "repo_meta"], ["curation/assemble"]);
   return {
     ...base,
