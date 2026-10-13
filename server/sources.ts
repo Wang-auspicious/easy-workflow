@@ -288,6 +288,10 @@ export class SourceSupervisor {
     if (allowed > this.now()) {
       return {reason: '平台访问次数或随机间隔尚未到期', nextAt: allowed};
     }
+    const blocked = source.format !== 'browser' && this.f.broker.blocked('http');
+    if (blocked) {
+      return {reason: `等待共享 HTTP 名额：${blocked}`, nextAt: this.now() + 5000};
+    }
   }
 
   async runDue() {
@@ -312,13 +316,25 @@ export class SourceSupervisor {
     if (existing) return existing.promise;
     const deferred = this.collectionDeferral(source);
     if (deferred) return {deferred: true, ...deferred};
+    const lease = source.format === 'browser' ? undefined : this.f.broker.tryAcquire('http');
+    if (lease === null) {
+      return {deferred: true, reason: '等待共享 HTTP 名额', nextAt: this.now() + 5000};
+    }
     const now = this.now();
     const controller = new AbortController();
     const nextRequestAt = now + Math.ceil(60000 / this.limits(source).minute * (1 + this.random() * 0.2));
-    this.f.journal.append({kind: 'source.requested', source: id, platform: source.platform, requestedAt: now, nextRequestAt});
-    const promise = this.collect(source, controller.signal).finally(() => this.jobs.delete(id));
-    this.jobs.set(id, {promise, controller});
-    return promise;
+    try {
+      this.f.journal.append({kind: 'source.requested', source: id, platform: source.platform, requestedAt: now, nextRequestAt});
+      const promise = this.collect(source, controller.signal).finally(() => {
+        this.jobs.delete(id);
+        lease?.release();
+      });
+      this.jobs.set(id, {promise, controller});
+      return promise;
+    } catch (error) {
+      lease?.release();
+      throw error;
+    }
   }
 
   private async collect(source: SourceSpec, signal: AbortSignal) {

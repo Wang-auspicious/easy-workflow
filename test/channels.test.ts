@@ -561,3 +561,51 @@ test('a downstream rejection resolves its source backlog without counting as pub
     await close(factory);
   }
 });
+
+test('source HTTP collection shares capacity and releases it after cancellation', async () => {
+  const {createServer} = await import('node:http');
+  let hits = 0;
+  let hanging = false;
+  const server = createServer((_request, response) => {
+    hits++;
+    if (!hanging) response.end('[]');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const factory = await boot();
+  await factory.sources.close();
+  const sources = new SourceSupervisor(factory);
+  factory.broker.limits.http = 1;
+  const lease = factory.broker.tryAcquire('http');
+  assert.ok(lease);
+  try {
+    const url = `http://127.0.0.1:${(server.address() as {port: number}).port}/feed`;
+    sources.configure(sourceSpec({format: 'json', url}));
+    const deferred = await sources.run('fixture-source');
+    assert.ok(deferred && typeof deferred === 'object' && 'deferred' in deferred && deferred.deferred);
+    assert.match(sources.list()[0].deferred?.reason ?? '', /HTTP/);
+    assert.equal(hits, 0);
+    assert.equal([...factory.journal.read()].filter(event => event.kind === 'source.requested').length, 0,
+      'capacity waiting cannot spend a platform request');
+    lease.release();
+    const result = await sources.run('fixture-source');
+    assert.ok(result && typeof result === 'object' && 'ok' in result && result.ok);
+    assert.equal(hits, 1);
+    assert.equal(factory.broker.used.http, 0);
+    sources.configure(sourceSpec({id: 'cancel-source', format: 'json', url, platform: 'cancel-fixture'}));
+    hanging = true;
+    const pending = sources.run('cancel-source');
+    for (let i = 0; i < 100 && hits < 2; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(hits, 2);
+    assert.equal(factory.broker.used.http, 1);
+    await sources.close();
+    const cancelled = await pending;
+    assert.ok(cancelled && typeof cancelled === 'object' && 'cancelled' in cancelled && cancelled.cancelled);
+    assert.equal(factory.broker.used.http, 0);
+  } finally {
+    lease.release();
+    await sources.close();
+    await close(factory);
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
