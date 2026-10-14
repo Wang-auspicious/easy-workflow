@@ -412,7 +412,7 @@ export class Factory {
         lastModel: latestModels.get(current.key)?.model,
       });
     }
-    return {bindings, ...(node ? {piModels: piModelCatalog()} : {})};
+    return {bindings, piModels: piModelCatalog()};
   }
 
   setAgentBinding(node: string, input: unknown) {

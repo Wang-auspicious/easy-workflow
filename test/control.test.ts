@@ -19,6 +19,7 @@ async function start(dir: string, readOnly = false) {
   const child = fork(path.join(root, "server/main.ts"), [], {
     cwd: root, execArgv: [], stdio: ["ignore", "pipe", "pipe", "ipc"],
     env: { ...process.env, VISLEXICON_ROOT: path.join(dir, "unconnected"), FACTORY_DISCOVERY: "0", FACTORY_PREFLIGHT: "0", FACTORY_HTTP_CACHE: "0", FACTORY_ROOT: root, FACTORY_PORT: "0", FACTORY_TOKEN: secret,
+      PI_CODING_AGENT_DIR: path.join(dir, 'pi-profile'),
       FACTORY_VAR: dir, FACTORY_LAYOUT: path.join(dir, "layout.json"), FACTORY_START_PAUSED: "1", FACTORY_READONLY: readOnly ? "1" : "0" },
   });
   let output = "";
@@ -186,6 +187,15 @@ test('paused batch admission changes through HTTP without starting work and surv
 
 test("headless service: real HTTP capability discovery, control, validation, activation and restart", { timeout: 60000 }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-control-"));
+  const profile = path.join(dir, 'pi-profile');
+  fs.mkdirSync(profile);
+  fs.writeFileSync(path.join(profile, 'auth.json'), JSON.stringify({
+    'fixture-catalog': {type: 'api_key', key: 'catalog-fixture-private-key'},
+  }));
+  fs.writeFileSync(path.join(profile, 'models.json'), JSON.stringify({providers: {
+    'fixture-catalog': {api: 'openai-completions', baseUrl: 'http://127.0.0.1:1/v1',
+      models: [{id: 'fixture-model', name: 'Catalog fixture', input: ['text', 'image']}]},
+  }}));
   let server: Awaited<ReturnType<typeof start>> | undefined;
   try {
     server = await start(dir);
@@ -314,6 +324,20 @@ test("headless service: real HTTP capability discovery, control, validation, act
         const chunk = new TextDecoder().decode((await reader.read()).value);
         assert.match(chunk, new RegExp(`^id: ${cursor + 1}\\n`));
       } finally { await reader.cancel(); controller.abort(); }
+    });
+    await t.test('global and per-node binding reads expose the same connected model directory', async () => {
+      const before = (await request('/api/state')).body.seq;
+      const all = await tool('agent_bindings');
+      const station = await tool('agent_bindings', {node: 'curation/classify'});
+      assert.equal(all.status, 200);
+      assert.equal(station.status, 200);
+      assert.ok(Array.isArray(all.body.result.piModels), 'the UI requests the catalog without a node filter');
+      assert.deepEqual(all.body.result.piModels, station.body.result.piModels);
+      assert.ok(all.body.result.piModels.some((model: Record<string, unknown>) =>
+        model.provider === 'fixture-catalog' && model.model === 'fixture-model' &&
+        model.name === 'Catalog fixture'));
+      assert.doesNotMatch(JSON.stringify(all.body.result.piModels), /private-key|127\.0\.0\.1|apiKey|authorization/i);
+      assert.equal((await request('/api/state')).body.seq, before, 'reading model options does not change the project');
     });
     await t.test('per-station adapters validate and persist without changing other stations', async () => {
       const node = 'curation/copy';
