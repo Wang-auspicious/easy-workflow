@@ -77,17 +77,19 @@ export function AgentBindingFields({draft, disabled, scope, change, selectAdapte
 }) {
   const inherited = scope === 'node';
   const native = ['opencode', 'codex', 'claude-code'].includes(draft.adapter);
+  const modelLabel = scope === 'node' ? '本节点已接入模型' : scope === 'station' ? '工位默认已接入模型' : '主调度已接入模型';
+  const selectedModel = models?.findIndex(model => model.provider === draft.provider && model.model === draft.model) ?? -1;
   return <>
     {scope !== 'dispatcher' && <label>执行适配器<select aria-label="执行适配器" disabled={disabled} value={draft.adapter} onChange={event => selectAdapter(event.target.value as AgentBindingDraft['adapter'])}>
       {inherited && <option value="inherit">继承默认</option>}
       <option value="pi">Pi</option><option value="opencode">OpenCode</option><option value="codex">Codex</option><option value="claude-code">Claude Code</option><option value="launcher">自定义 launcher</option>
     </select></label>}
-    {inherited && ['pi', 'inherit'].includes(draft.adapter) && Boolean(models?.length) && selectModel &&
-      <label>为本节点选择已接入模型<select aria-label="本节点已接入模型" disabled={disabled} value="" onChange={event => {
+    {['pi', 'inherit'].includes(draft.adapter) && Boolean(models?.length) && selectModel &&
+      <label>{modelLabel}<select aria-label={modelLabel} disabled={disabled} value={selectedModel < 0 ? '' : String(selectedModel)} onChange={event => {
         const model = models?.[Number(event.target.value)];
         if (model) selectModel(model);
       }}>
-        <option value="" disabled>选择模型，将保存为本节点独立配置</option>
+        <option value="" disabled>{inherited ? '选择模型，将保存为本节点独立配置' : '选择已接入模型'}</option>
         {models!.map((model, index) => <option key={`${model.provider}/${model.model}`} value={index}>{model.provider} / {model.name || model.model}</option>)}
       </select></label>}
     {draft.adapter !== 'inherit' && <>

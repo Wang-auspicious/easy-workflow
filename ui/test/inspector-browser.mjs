@@ -50,7 +50,8 @@ try {
     capabilities: {stream: !configured || configured.adapter === 'pi', cancel: true, resume: configured?.adapter !== 'launcher', usage: configured?.adapter === 'launcher' ? 'unknown' : configured?.adapter === 'codex' ? 'tokens-only' : 'reported'},
     lastModel: 'last-actual-fixture-model',
   }], piModels: [{provider: 'fixture-provider', model: 'fixture-model', name: 'Fixture default'},
-    {provider: 'node-provider', model: 'independent-model', name: 'Independent node model'}]});
+    {provider: 'node-provider', model: 'independent-model', name: 'Independent node model'},
+    {provider: 'opencode-go', model: 'muse-spark-1.3-contributor', name: 'Muse Spark 1.3 Contributor'}]});
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(url.pathname);
@@ -115,7 +116,7 @@ try {
     }
     if (url.pathname === '/api/tools/agent_bindings') {
       const args = route.request().postDataJSON();
-      await route.fulfill({json: {ok: true, result: args.node === 'curation/review' ? bindingResult() : {bindings: []}}});
+      await route.fulfill({json: {ok: true, result: !args.node || args.node === 'curation/review' ? bindingResult() : {bindings: []}}});
       return;
     }
     if (url.pathname === '/api/agents/binding') {
@@ -263,26 +264,31 @@ try {
   await page.evaluate(() => window.inspectorFixture.setState({view: 'settings'}));
   const stationDefaults = page.getByRole('form', {name: '工位默认配置'});
   const dispatcherDefaults = page.getByRole('form', {name: '主调度配置'});
-  await stationDefaults.getByLabel('Agent 请求模型').fill('next-station-model');
+  await stationDefaults.getByLabel('工位默认已接入模型').waitFor({timeout: 5000});
+  await stationDefaults.getByLabel('工位默认已接入模型').selectOption({label: 'opencode-go / Muse Spark 1.3 Contributor'});
+  assert.equal(await stationDefaults.getByLabel('Agent provider').inputValue(), 'opencode-go');
+  assert.equal(await stationDefaults.getByLabel('Agent 请求模型').inputValue(), 'muse-spark-1.3-contributor');
   await stationDefaults.getByRole('button', {name: '保存工位默认'}).click();
   await stationDefaults.getByRole('status').waitFor();
-  assert.deepEqual(defaultWrites, [{station: {adapter: 'pi', provider: 'fixture-provider', model: 'next-station-model'}}]);
+  assert.deepEqual(defaultWrites, [{station: {adapter: 'pi', provider: 'opencode-go', model: 'muse-spark-1.3-contributor'}}]);
   assert.equal(await dispatcherDefaults.getByLabel('Agent 请求模型').inputValue(), 'dispatcher-model');
-  await dispatcherDefaults.getByLabel('Agent provider').fill('independent-dispatcher');
+  await dispatcherDefaults.getByLabel('主调度已接入模型').selectOption({label: 'node-provider / Independent node model'});
+  assert.equal(await dispatcherDefaults.getByLabel('Agent provider').inputValue(), 'node-provider');
+  assert.equal(await dispatcherDefaults.getByLabel('Agent 请求模型').inputValue(), 'independent-model');
   await dispatcherDefaults.getByLabel('Agent 请求模型').fill('next-dispatcher-model');
   await dispatcherDefaults.getByRole('button', {name: '保存主调度'}).click();
   await dispatcherDefaults.getByRole('status').waitFor();
   await page.waitForFunction(() => window.inspectorFixture.getState().model === 'next-dispatcher-model');
-  assert.equal(projectDefaults.station.model, 'next-station-model');
+  assert.equal(projectDefaults.station.model, 'muse-spark-1.3-contributor');
   assert.deepEqual(Object.keys(defaultWrites[1]), ['dispatcher'], 'saving the dispatcher cannot overwrite station defaults');
   rejectDefaultSave = true;
   await stationDefaults.getByLabel('Agent 请求模型').fill('rejected-default');
   await stationDefaults.getByRole('button', {name: '保存工位默认'}).click();
   await stationDefaults.getByRole('alert').filter({hasText: 'Fixture rejected project defaults'}).waitFor();
-  assert.equal(projectDefaults.station.model, 'next-station-model');
+  assert.equal(projectDefaults.station.model, 'muse-spark-1.3-contributor');
   rejectDefaultSave = false;
   await stationDefaults.getByRole('button', {name: '重新读取', exact: true}).click();
-  await page.waitForFunction(() => document.querySelector('[aria-label="工位默认配置"] [aria-label="Agent 请求模型"]').value === 'next-station-model');
+  await page.waitForFunction(() => document.querySelector('[aria-label="工位默认配置"] [aria-label="Agent 请求模型"]').value === 'muse-spark-1.3-contributor');
   await page.locator('.set-sec').first().screenshot({path: path.join(out, 'project-model-defaults.png')});
   await page.evaluate(() => {
     const fixture = window.inspectorFixture;

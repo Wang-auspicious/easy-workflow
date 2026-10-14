@@ -1,11 +1,11 @@
 // Settings: model and key status, global resource quotas (Spec §6.3), social rate limits,
 // and layout resets. Quotas apply to every line at once.
-import {useEffect, useState, type FormEvent} from 'react';
+import {useCallback, useEffect, useState, type FormEvent} from 'react';
 import type {ProjectAgentDefaults} from '../../../shared/types.ts';
 import { getState, setState, useStore } from "../store.ts";
 import {actions, refreshSpec, saveLayout} from '../api.ts';
 import { toast } from "../shell/Toasts.tsx";
-import {AgentBindingFields, adapterLabel, agentBindingDraft, parseBindingDraft, selectBindingAdapter, type AgentBindingDraft} from '../canvas/AgentBindingFields.tsx';
+import {AgentBindingFields, adapterLabel, agentBindingDraft, parseBindingDraft, selectBindingAdapter, type AgentBindingDraft, type PiModelChoice} from '../canvas/AgentBindingFields.tsx';
 import {FlowSettings} from './FlowSettings.tsx';
 
 const FIELDS: { k: string; label: string; hint: string; min: number; max: number; step?: number }[] = [
@@ -22,8 +22,40 @@ const FIELDS: { k: string; label: string; hint: string; min: number; max: number
 export function Settings() {
   const settings = useStore((s) => s.settings);
   const key = useStore((s) => s.keyPresent);
+  const connected = useStore(state => state.connected);
+  const replay = useStore(state => Boolean(state.replay));
+  const [models, setModels] = useState<PiModelChoice[]>([]);
+  const [modelError, setModelError] = useState('');
   const [draft, setDraft] = useState<Record<string, number>>(settings);
   const dirty = FIELDS.some((f) => draft[f.k] !== settings[f.k]);
+  const readModels = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const response = await fetch('/api/tools/agent_bindings', {
+        method: 'POST', headers: {'content-type': 'application/json'}, body: '{}',
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+      });
+      const body: {ok?: boolean; error?: string; result?: {piModels?: unknown}} = await response.json();
+      const choices = body.result?.piModels;
+      if (!response.ok || !body.ok || !Array.isArray(choices)) throw new Error(body.error ?? '已接入模型列表读取失败');
+      const valid = choices.filter((choice: unknown): choice is PiModelChoice =>
+        typeof choice === 'object' && choice !== null &&
+        'provider' in choice && typeof choice.provider === 'string' &&
+        'model' in choice && typeof choice.model === 'string' &&
+        'name' in choice && typeof choice.name === 'string');
+      if (!signal?.aborted) {
+        setModels(valid);
+        setModelError('');
+      }
+    } catch (reason) {
+      if (!signal?.aborted) setModelError(reason instanceof Error ? reason.message : '已接入模型列表读取失败');
+    }
+  }, []);
+  useEffect(() => {
+    if (!connected || replay) return;
+    const controller = new AbortController();
+    void readModels(controller.signal);
+    return () => controller.abort();
+  }, [connected, replay, readModels]);
   return (
     <div className="view">
       <div className="view-inner narrow">
@@ -31,8 +63,9 @@ export function Settings() {
         <section className="set-sec">
           <h3>本项目的 Agent 与模型</h3>
           <p className="muted">首次使用时导入 Pi 的选择，之后独立保存。其他 Pi 窗口切换模型不会改动这里。单个节点可在“规格”中覆盖项目默认。</p>
-          <AgentDefaultEditor scope="station" />
-          <AgentDefaultEditor scope="dispatcher" />
+          {modelError && <p className="agent-binding-error" role="alert">{modelError} <button className="btn btn--sm" disabled={!connected || replay} onClick={() => void readModels()}>重新读取模型列表</button></p>}
+          <AgentDefaultEditor scope="station" models={models} readModels={readModels} />
+          <AgentDefaultEditor scope="dispatcher" models={models} readModels={readModels} />
           <div className="set-row"><span>主调度凭据</span><b className={key ? 'ok-c' : 'bad-c'}>{key ? '已找到对应 Provider 的本机凭据' : '未就绪，请检查所选 Provider 的模型与本机凭据'}</b></div>
         </section>
         <FlowSettings />
@@ -61,7 +94,11 @@ export function Settings() {
   );
 }
 
-function AgentDefaultEditor({scope}: {scope: keyof ProjectAgentDefaults}) {
+function AgentDefaultEditor({scope, models, readModels}: {
+  scope: keyof ProjectAgentDefaults;
+  models: readonly PiModelChoice[];
+  readModels: () => Promise<void>;
+}) {
   const configured = useStore(state => state.fs.agentDefaults?.[scope]);
   const connected = useStore(state => state.connected);
   const replay = useStore(state => Boolean(state.replay));
@@ -95,7 +132,7 @@ function AgentDefaultEditor({scope}: {scope: keyof ProjectAgentDefaults}) {
       const body = await response.json();
       if (!response.ok || !body.ok || !body.result?.station || !body.result?.dispatcher) throw new Error(body.error ?? '项目配置读取失败');
       reflect(body.result);
-      await refreshSpec();
+      await Promise.all([refreshSpec(), readModels()]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '项目配置读取失败');
     } finally {
@@ -118,7 +155,9 @@ function AgentDefaultEditor({scope}: {scope: keyof ProjectAgentDefaults}) {
       const body = await response.json();
       if (!response.ok || !body.ok || !body.result?.station || !body.result?.dispatcher) throw new Error(body.error ?? '配置保存结果未确认，请重新读取核对');
       reflect(body.result);
-      setReceipt(scope === 'station' ? '已保存，继承此默认的工位从下次尝试生效。' : '已保存，从主调度的下次对话生效。');
+      setReceipt(scope === 'station'
+        ? '已保存。继承此默认的 Pi 工位从下一次模型请求生效；更换运行底座从下次尝试生效。'
+        : '已保存，主调度从下一次模型请求使用此选择。');
       await refreshSpec();
     } catch (reason) {
       setError(reason instanceof Error && reason.name === 'TimeoutError'
@@ -140,8 +179,12 @@ function AgentDefaultEditor({scope}: {scope: keyof ProjectAgentDefaults}) {
       setDraft(selectBindingAdapter(adapter, configured ?? null));
       setDirty(true);
       setReceipt('');
+    }} models={models} selectModel={model => {
+      setDraft(agentBindingDraft({adapter: 'pi', provider: model.provider, model: model.model}));
+      setDirty(true);
+      setReceipt('');
     }} />
-    <p className="muted">{scope === 'dispatcher' ? '主调度目前使用 Pi，可与工位选择不同的 Provider 和模型。' : '节点中的独立配置优先。此处保存只影响继承默认的工位。'}正在执行的任务保留已选模型。</p>
+    <p className="muted">{scope === 'dispatcher' ? '主调度使用独立 Pi 会话。' : '节点的独立配置优先，此处只影响继承默认的工位。'}运行中也能修改 Pi 模型，下一次模型请求生效；已经发出的请求完成后再切换。</p>
     {error && <p className="agent-binding-error" role="alert">{error}</p>}
     {receipt && <p className="agent-binding-receipt" role="status">{receipt}</p>}
     <div className="agent-binding-actions">
