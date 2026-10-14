@@ -4,6 +4,7 @@ import {batchSummary, flowWindow, latestBatchTokens, modelRecoveryDelay, occupie
 import { ControlError } from './errors.ts';
 import { classifyFailure } from '../shared/failures.ts';
 import {hasRecoveryPolicy} from '../shared/recovery-policy.ts';
+import {recoveryHasNextTurn} from './admission.ts';
 
 const TRANSIENT = new Set(['network_timeout', 'network_connection', 'network_dns', 'http_server', 'http_rate_limit', 'browser_capture', 'http_forbidden']);
 const REPLAN = new Set(['needs_selection', 'page_unavailable', 'quality_rejected']);
@@ -237,7 +238,7 @@ export class BatchSupervisor {
         f.broker.recoveryToken = 'pending-model-trial';
         f.broker.modelHold = null;
         try {
-          const [trial] = f.retryCandidates({ items: [candidate.item], count: 1, automatic: true });
+          const [trial] = f.retryCandidates({tokens: [candidate.id], count: 1, automatic: true});
           if (!trial) { f.broker.recoveryToken = null; f.broker.modelHold = '模型恢复样本尚未就绪'; return; }
           f.broker.recoveryToken = trial.id;
           f.journal.append({ kind: 'batch.configured', batch: { ...goal, modelCircuit: { ...circuit, state: 'trial', trialToken: trial.id, station: candidate.finishedAtNode } } });
@@ -261,7 +262,7 @@ export class BatchSupervisor {
           // A keyed circuit owns its single trial. The legacy batch loop cannot
           // claim another retry just because the global compatibility hold is clear.
           if (typeof dependency?.key === 'string' && dependency.key) continue;
-          if (active < goal.maxInFlight && !f.broker.modelHold) active += f.retryCandidates({ items: [token.item], count: 1, automatic: true }).length;
+          if (active < goal.maxInFlight && !f.broker.modelHold) active += f.retryCandidates({tokens: [token.id], count: 1, automatic: true}).length;
           continue;
         }
         const replan = REPLAN.has(failure.tag);
@@ -280,40 +281,60 @@ export class BatchSupervisor {
             text: `${token.title || token.item}：${replan ? '交阅读员重新查找公开页面' : '已安排从检查点恢复'}（${count}/${goal.maxRecoveries}），其余网站继续` });
         }
         if (recovery.nextAt > now || active >= goal.maxInFlight || f.broker.modelHold) continue;
-        const got = f.retryCandidates({ items: [token.item], count: 1, automatic: true, replan: recovery.replan });
+        const station = recovery.replan ? 'curation/reader' : recovery.station;
+        if (f.runtime.scopePaused(station) || !f.sources?.permitsRecovery(token)) continue;
+        if (!recoveryHasNextTurn(f.state) && this.admitFresh(1)) {
+          active = latestBatchTokens(f.state).filter(value => value.status === 'active').length;
+          if (active >= goal.maxInFlight) continue;
+        }
+        const got = f.retryCandidates({tokens: [token.id], count: 1, automatic: true, replan: recovery.replan});
         active += got.length;
       }
-      const latest = latestBatchTokens(f.state);
-      active = latest.filter(t => t.status === 'active').length;
-      const flowing = goal.admission?.mode === 'flow';
-      const upstream = latest.filter(token => {
-        if (token.status !== 'active') return false;
-        const live = f.runtime.tokens.get(token.id);
-        if (!live) return true;
-        if (!flowing) return !live.done.has('curation/plan');
-        return occupiesIntake(f.compiled, 'candidates/route', live);
-      }).length;
-      const want = Math.max(0, Math.min(goal.target - latest.length, goal.maxInFlight - active, goal.intakeWindow - upstream));
-      if (want && (goal.admission || !f.broker.blocked('browser'))) {
-        let catalogChecked = false;
-        let admittedTotal = 0;
-        for (let slot = 0; slot < want; slot++) {
-          // Both feeders share this admission decision. Merely reversing their
-          // journal subscriptions would starve the catalog instead of sources.
+      this.admitFresh(goal.maxInFlight);
+    } finally { this.pumping = false; }
+  }
+
+  /** One actual feeder claim can be offered to a waiting checkpoint, and vice versa. */
+  admitFresh(limit = 1): number {
+    const f = this.factory;
+    const goal = f.state.batch;
+    if (!goal || goal.runId !== f.state.run.id || goal.mode !== 'running' || goal.modelCircuit ||
+        !f.runtime.running || f.runtime.paused || f.runtime.ending || process.env.FACTORY_READONLY === '1') return 0;
+    const latest = latestBatchTokens(f.state);
+    const active = latest.filter(t => t.status === 'active').length;
+    const flowing = goal.admission?.mode === 'flow';
+    const upstream = latest.filter(token => {
+      if (token.status !== 'active') return false;
+      const live = f.runtime.tokens.get(token.id);
+      if (!live) return true;
+      if (!flowing) return !live.done.has('curation/plan');
+      return occupiesIntake(f.compiled, 'candidates/route', live);
+    }).length;
+    const want = Math.max(0, Math.min(limit, goal.target - latest.length, goal.maxInFlight - active, goal.intakeWindow - upstream));
+    if (want && (goal.admission || !f.broker.blocked('browser'))) {
+      let catalogChecked = false;
+      let admittedTotal = 0;
+      for (let slot = 0; slot < want; slot++) {
+        // Both feeders share this admission decision. Merely reversing their
+        // journal subscriptions would starve the catalog instead of sources.
+        const feed = () => {
           let admitted = this.sourceHasNextTurn() ? f.sources?.admitManaged(1) ?? 0 : 0;
           if (!admitted && !f.runtime.scopePaused('candidates/route') && !f.runtime.intakeHold('candidates/route')) {
             admitted = f.pull(1, {category: goal.category, query: goal.query}).length;
             catalogChecked = true;
           }
-          if (!admitted) admitted = f.sources?.admitManaged(1) ?? 0;
-          if (!admitted) break;
-          admittedTotal += admitted;
-        }
-        const supplyExhausted = admittedTotal < want;
-        if ((catalogChecked || admittedTotal > 0) && supplyExhausted !== Boolean(goal.supplyExhausted)) {
-          f.journal.append({kind: 'batch.configured', batch: {...goal, supplyExhausted}});
-        }
+          return admitted || f.sources?.admitManaged(1) || 0;
+        };
+        const admitted = f.recovery?.beforeFresh(feed) ?? feed();
+        if (!admitted) break;
+        admittedTotal += admitted;
       }
-    } finally { this.pumping = false; }
+      const supplyExhausted = admittedTotal < want;
+      if ((catalogChecked || admittedTotal > 0) && supplyExhausted !== Boolean(goal.supplyExhausted)) {
+        f.journal.append({kind: 'batch.configured', batch: {...goal, supplyExhausted}});
+      }
+      return admittedTotal;
+    }
+    return 0;
   }
 }

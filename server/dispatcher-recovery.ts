@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { DispatcherCheckpoint } from "../shared/conversation.ts";
+import {compactToolMessage} from '../shared/conversation.ts';
 import { redactModelError } from "./pi.ts";
 
 export function dispatcherError(error: unknown): string {
@@ -11,6 +12,56 @@ export function dispatcherError(error: unknown): string {
 export function transientDispatcherError(message: string): boolean {
   if (/\b(?:401|403)\b|invalid.?api.?key|unauthori[sz]ed|insufficient.?quota|billing|余额|凭据|额度|OAuth/i.test(message)) return false;
   return /timeout|timed out|超时|ECONN|ENET|EAI_AGAIN|UND_ERR|fetch failed|network|connection|socket|stream.*(?:closed|ended|reset)|\b(?:408|429|500|502|503|504|529)\b|rate.?limit|overloaded|temporar/i.test(message);
+}
+
+/** Bound the model projection, keeping user input and complete call/result pairs. */
+export function dispatcherContext(messages: AgentMessage[], currentRequest: string, contextWindow: number): AgentMessage[] {
+  const limit = Math.max(4096, Math.min(128 * 1024, Number.isFinite(contextWindow) ? contextWindow : 32000));
+  const encoder = new TextEncoder();
+  const bytes = (message: AgentMessage) => encoder.encode(JSON.stringify({...message, details: undefined,
+    content: Array.isArray(message.content) ? message.content.map(part => part.type === 'image'
+      ? {...part, data: '[image data has its own attachment size limit]'} : part) : message.content})).length;
+  const text = (message: AgentMessage) => typeof message.content === 'string' ? message.content
+    : message.content?.filter(part => part.type === 'text').map(part => part.text).join('') ?? '';
+  let projected = messages.map(message => message.role === 'toolResult' ? compactToolMessage(message) : message);
+  let total = projected.reduce((sum, message) => sum + bytes(message), 0);
+  if (total <= limit) return projected;
+
+  // Drop complete old turns first. Repeated prompts must anchor the latest user
+  // turn, not an earlier occurrence of the same short request such as “继续”.
+  let active = projected.findLastIndex(message => message.role === 'user' && text(message).startsWith(currentRequest));
+  while (total > limit && active > 0) {
+    const first = projected.findIndex(message => message.role === 'user');
+    const next = projected.findIndex((message, index) => index > first && message.role === 'user');
+    if (first < 0 || next < 0 || next > active) break;
+    const removed = projected.splice(first, next - first);
+    total -= removed.reduce((sum, message) => sum + bytes(message), 0);
+    active -= removed.length;
+  }
+  if (total <= limit) return projected;
+
+  const groups: AgentMessage[][] = [];
+  for (let index = 0; index < projected.length; index++) {
+    const group = [projected[index]];
+    if (projected[index].role === 'assistant') {
+      while (projected[index + 1]?.role === 'toolResult') group.push(projected[++index]);
+    }
+    groups.push(group);
+  }
+  let omitted = 0;
+  const note: AgentMessage = {role: 'system', timestamp: messages[0]?.timestamp ?? 0, content:
+    '较早的工具往来已从本次模型上下文压缩，完整原始记录仍保存在日志。用户输入保留；需要旧细节时按任务或 attempt 读取。已完成写操作的回执仍有效，不要因上下文省略而重复执行。'};
+  for (let index = 0; index < groups.length - 1 && total + bytes(note) > limit; index++) {
+    const group = groups[index];
+    if (group.some(message => message.role === 'user' || message.role === 'system')) continue;
+    total -= group.reduce((sum, message) => sum + bytes(message), 0);
+    omitted += group.length;
+    groups[index] = [];
+  }
+  if (total + (omitted ? bytes(note) : 0) > limit) {
+    throw new Error('当前输入与附件超过模型可用上下文；原对话和操作回执已保存，请缩短输入或选择上下文更大的模型后继续。');
+  }
+  return [...(omitted ? [note] : []), ...groups.flat()];
 }
 
 function stable(value: unknown): string {

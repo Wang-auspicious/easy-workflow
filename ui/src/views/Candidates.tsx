@@ -29,11 +29,11 @@ export function Candidates() {
   const rows = records.filter(candidate => candidate.disposition === disposition &&
     (!tag || candidate.failure?.tag === tag)).sort((a, b) => b.at - a.at);
   const tags = [...new Set(records.flatMap(candidate => candidate.failure ? [candidate.failure.tag] : []))];
-  const selectedItems = rows.filter(candidate => selected.includes(candidate.item)).map(candidate => candidate.item);
+  const selectedTokens = rows.filter(candidate => selected.includes(candidate.token)).map(candidate => candidate.token);
   const manual = disposition === 'manual';
   const canRetry = disposition === 'retry' || manual;
   const readOnly = !connected || replay;
-  const count = Math.min(200, manual || selected.length ? selectedItems.length : rows.length);
+  const count = Math.min(200, manual || selected.length ? selectedTokens.length : rows.length);
   const retryLabel = manual
     ? count ? `继续已选 ${count} 件原工位` : '选择人工项后继续'
     : selected.length ? `重试已选 ${count} 件` : `重试当前筛选 ${count} 件`;
@@ -48,10 +48,10 @@ export function Candidates() {
     if (inFlight.current || !state.connected || state.replay || !canRetry) return;
     const current = Object.values(state.fs.recoveries).filter(candidate => candidate.disposition === disposition &&
       (!tag || candidate.failure?.tag === tag));
-    const chosen = current.filter(candidate => selected.includes(candidate.item));
+    const chosen = current.filter(candidate => selected.includes(candidate.token));
     if (manual && !chosen.length) return;
-    const items = (manual || selected.length ? chosen : current).slice(0, 200).map(candidate => candidate.item);
-    if (!items.length) return;
+    const tokens = (manual || selected.length ? chosen : current).slice(0, 200).map(candidate => candidate.token);
+    if (!tokens.length) return;
 
     inFlight.current = true;
     setBusy(true);
@@ -59,8 +59,8 @@ export function Candidates() {
     setFailed(false);
     try {
       const response = await api.post<{result: {count: number}}>('/api/candidates/retry', {
-        count: items.length,
-        items,
+        count: tokens.length,
+        tokens,
         ...(tag ? {tag} : {}),
         ...(manual ? {includeManual: true} : {}),
       });
@@ -125,15 +125,16 @@ export function Candidates() {
       {disposition === 'removed' && <p className="recovery-message">已确认网址格式无效或返回 404 / 410，不再进入候选投料。这里保留处置记录。</p>}
       <div className="recovery-list">
         {rows.map(candidate => {
-          const checked = selectedItems.includes(candidate.item);
+          const checked = selectedTokens.includes(candidate.token);
           const station = candidate.recoveryStation ?? (manual ? undefined : getState().fs.tokens[candidate.token]?.finishedAtNode);
-          return <div key={candidate.item} className="recovery-row">
+          return <div key={candidate.key ?? candidate.token} className="recovery-row">
             <input aria-label={`选择 ${candidate.title}`} type="checkbox" checked={checked}
-              disabled={readOnly || busy || !canRetry || !checked && selectedItems.length >= 200}
+              disabled={readOnly || busy || !canRetry || !checked && selectedTokens.length >= 200}
               onChange={event => setSelected(event.target.checked
-                ? [...selectedItems, candidate.item] : selectedItems.filter(item => item !== candidate.item))} />
+                ? [...selectedTokens, candidate.token] : selectedTokens.filter(item => item !== candidate.token))} />
             <div>
               <b>{candidate.title}</b>
+              {candidate.line && <p>工作流：{candidate.workflowPack ? `${candidate.workflowPack} / ` : ''}{candidate.line}</p>}
               <a href={candidate.url} aria-disabled={readOnly} onClick={event => {
                 event.preventDefault();
                 void openBrowser(candidate.url);

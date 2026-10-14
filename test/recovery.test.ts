@@ -12,6 +12,7 @@ import {installWorkflowPack, type WorkflowManifest} from '../server/workflow-pac
 import type {ModelDependency, StationRecoveryPolicy} from '../shared/types.ts';
 import type {RecoveryPlan} from '../server/recovery.ts';
 import {recoverySnapshot} from '../shared/recovery-policy.ts';
+import {recoveryKey} from '../shared/project.ts';
 
 // Every database, catalogue and report belongs to this test process.
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-recovery-"));
@@ -434,7 +435,7 @@ test('unmanaged network recovery preserves source, channel and manual checkpoint
   }
 });
 
-test('unmanaged recovery rejects broken channel checkpoints and ambiguous item ownership without stopping storage', {timeout: 30000}, async t => {
+test('unmanaged recovery rejects broken channel checkpoints while independently recovering same-named work', {timeout: 30000}, async t => {
   t.mock.timers.enable({apis: ['Date'], now: Date.now()});
   const factory = new Factory();
   const settle = async () => {
@@ -462,22 +463,29 @@ test('unmanaged recovery rejects broken channel checkpoints and ambiguous item o
     factory.recovery.pump();
     await settle();
     assert.equal((factory.state.tokens[failed].data.__runtimeRecovery as {state: string}).state, 'blocked');
+    assert.match((factory.state.tokens[failed].data.__runtimeRecovery as {reason: string}).reason, /检查点.*不能从入口自动重做/);
     assert.equal(factory.state.tokens[failed].data.retriedBy, undefined);
     assert.equal(factory.runtime.running, true);
     assert.equal(factory.runtime.paused, false);
     const left = factory.runtime.create('curation/reader', {item: 'shared-item', url: 'https://left.example/', source: 'manual'});
     const right = factory.runtime.create('components/describe', {item: 'shared-item', url: 'https://right.example/', source: 'manual'});
     await settle();
-    const owner = factory.state.recoveries['shared-item'].token;
-    const other = owner === left.id ? right.id : left.id;
+    const leftKey = recoveryKey(factory.state.tokens[left.id]);
+    const rightKey = recoveryKey(factory.state.tokens[right.id]);
+    assert.notEqual(leftKey, rightKey);
+    assert.equal(factory.state.recoveries[leftKey].token, left.id);
+    assert.equal(factory.state.recoveries[rightKey].token, right.id);
+    assert.equal(factory.state.recoveries[leftKey].attempts, 1);
+    assert.equal(factory.state.recoveries[rightKey].attempts, 1);
+    assert.throws(() => factory.retryCandidates({items: ['shared-item'], count: 1}),
+      (error: unknown) => (error as {code?: string}).code === 'recovery_item_ambiguous');
     t.mock.timers.tick(60000);
     factory.recovery.pump();
     await settle();
-    assert.equal(factory.state.tokens[other].data.retriedBy, undefined, 'an item-key collision must never claim the other workflow');
-    assert.equal((factory.state.tokens[other].data.__runtimeRecovery as {state: string}).state, 'blocked');
     const retried = Object.values(factory.state.tokens).filter(token => token.data.retryOf);
-    assert.equal(retried.length, 1);
-    assert.equal(retried[0].data.retryOf, owner);
+    assert.equal(retried.length, 2);
+    assert.deepEqual(new Set(retried.map(token => token.data.retryOf)), new Set([left.id, right.id]));
+    assert.ok(retried.every(token => token.status === 'published'));
     const independent = factory.runtime.create('curation/reader', {item: 'unrelated', url: 'https://healthy.example/', source: 'manual'});
     await settle();
     assert.equal(factory.state.tokens[independent.id].status, 'published');
@@ -615,7 +623,7 @@ test('a policy deadline expires queued work after restart without executing or l
     assert.equal(current.status, 'manual');
     assert.equal((current.data.__runtimeRecovery as RecoveryPlan).state, 'exhausted');
     assert.equal(current.data.retained, 'paid evidence');
-    assert.equal(factory.state.recoveries.deadline.disposition, 'manual');
+    assert.equal(factory.state.recoveries[recoveryKey(current)].disposition, 'manual');
     assert.equal(factory.state.nodes['candidates/pool'].stock, 0);
     assert.equal(factory.state.nodes['policy-fixture/manual'].stock, 1);
   } finally {
@@ -717,7 +725,8 @@ test('declared recovery cannot authorize authentication, TLS, unknown effects or
     await settlePolicy(factory);
     assert.equal(calls, 6);
     assert.equal(Object.values(factory.state.tokens).find(token => token.item === 'unknown')?.status, 'manual');
-    assert.equal(factory.state.recoveries.unknown, undefined);
+    const unknown = Object.values(factory.state.tokens).find(token => token.item === 'unknown')!;
+    assert.equal(factory.state.recoveries[recoveryKey(unknown)], undefined);
   } finally {
     await closePolicyFixture(factory);
     removePolicyFixture(fixture.directory);
@@ -852,6 +861,73 @@ test('an explicit retry recaptures policy after a default-policy episode rather 
     factory.recovery.pump();
     await settlePolicy(factory);
     assert.equal(calls, 2);
+  } finally {
+    await closePolicyFixture(factory);
+    removePolicyFixture(fixture.directory);
+  }
+});
+
+test('a due checkpoint gets a bounded turn while a slow source pipeline remains continuously occupied', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  const fixture = await policyFixture();
+  const factory = fixture.factory;
+  let failedCalls = 0;
+  let upstreamCalls = 0;
+  const releases: (() => void)[] = [];
+  const sourceCalls: string[] = [];
+  const turn = async () => {
+    for (let i = 0; i < 4; i++) await new Promise<void>(resolve => setImmediate(resolve));
+  };
+  try {
+    await factory.sources.close();
+    factory.sources = new SourceSupervisor(factory);
+    factory.sources.configure({id: 'slow-pipeline', name: 'Slow continuous fixture',
+      url: 'https://never-polled.fixture.test/feed', platform: 'fixture', format: 'json',
+      target: 'policy-fixture/prepare', intervalMs: 86400000, enabled: false, input: {text: 'title'}});
+    factory.runtime.executors = node => async context => {
+      if (node.key === 'policy-fixture/prepare') {
+        if (context.token.item === 'failed-before-flow') upstreamCalls++;
+        return {ok: true, summary: 'Prepared once', data: {prepared: {text: 'kept'}}};
+      }
+      if (context.token.item === 'failed-before-flow') {
+        failedCalls++;
+        return failedCalls === 1 ? {ok: false, summary: 'Transient checkpoint error', failure: classifyFailure('ETIMEDOUT fixture')}
+          : {ok: true, summary: 'Recovered original checkpoint'};
+      }
+      sourceCalls.push(context.token.item);
+      await new Promise<void>(resolve => {
+        releases.push(resolve);
+        context.signal.addEventListener('abort', () => resolve(), {once: true});
+      });
+      return {ok: true, summary: 'Source stage finished'};
+    };
+    factory.runtime.start('Recovery competes with continuous source flow');
+    factory.runtime.create('policy-fixture/prepare', {item: 'failed-before-flow', url: '', source: 'manual'});
+    await settlePolicy(factory);
+    assert.equal(failedCalls, 1);
+    for (let i = 0; i < 20; i++) factory.journal.append({kind: 'source.candidate', candidate: {
+      id: `slow-${i}`, source: 'slow-pipeline', platform: 'fixture', sourceUrl: 'https://never-polled.fixture.test/feed',
+      url: `https://never-fetched.fixture.test/${i}`, title: `Slow ${i}`, discoveredAt: Date.now() + i, status: 'pending',
+    }});
+    factory.sources.setEnabled('slow-pipeline', true);
+    await turn();
+    const window = factory.sources.unmanagedAdmission('policy-fixture/prepare');
+    assert.ok(window.maxInFlight > 1);
+    assert.ok(window.active > 0);
+    t.mock.timers.tick(20000);
+    let peak = window.active;
+    for (let i = 0; i < 8; i++) {
+      factory.recovery.pump();
+      factory.sources.pump();
+      await turn();
+      peak = Math.max(peak, factory.sources.unmanagedAdmission('policy-fixture/prepare').active);
+      releases.shift()?.();
+      await turn();
+    }
+    assert.equal(failedCalls, 2, 'a due retry cannot wait for the entire continuously occupied pipeline to become empty');
+    assert.equal(upstreamCalls, 1);
+    assert.ok(sourceCalls.length >= 4, 'recovery cannot replace starvation of itself with starvation of the source');
+    assert.ok(peak <= window.maxInFlight, 'recovery shares the existing flow window');
   } finally {
     await closePolicyFixture(factory);
     removePolicyFixture(fixture.directory);

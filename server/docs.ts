@@ -6,7 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import type { CompiledFactory, CompiledNode, Stamped } from "../shared/types.ts";
+import type { CompiledFactory, CompiledNode, Stamped, StationAgentBinding } from "../shared/types.ts";
 import type { FactoryState } from "../shared/project.ts";
 import { apply, initialState, median } from "../shared/project.ts";
 import { failureLabels } from "../shared/failures.ts";
@@ -22,7 +22,8 @@ const hash = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
 // Preserve ordinary existing item folders. The reserved ~ prefix prevents unsafe
 // IDs, Windows aliases and case-insensitive names from colliding with ordinary IDs.
 const segment = (s: string) => /^[a-z0-9][a-z0-9._-]{0,99}$/.test(s) && !s.endsWith(".") && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(s) ? s : `~${hash(s)}`;
-type Host = { state: FactoryState; compiled: CompiledFactory; journal: Pick<Journal, 'read' | 'readSequences'>; runtime?: { roleResolver?: (station: string) => ReturnType<typeof readRole> } };
+type Host = { state: FactoryState; compiled: CompiledFactory; journal: Pick<Journal, 'read' | 'readSequences'>; runtime?: { roleResolver?: (station: string) => ReturnType<typeof readRole> };
+  getStationAgentBinding?: (node: string) => StationAgentBinding | null };
 export type CaseScope = { token: string; attempt: string };
 type Of<K extends Stamped["kind"]> = Extract<Stamped, { kind: K }>;
 const of = <K extends Stamped["kind"]>(events: Stamped[], kind: K) => events.filter((e): e is Of<K> => e.kind === kind);
@@ -182,10 +183,22 @@ export class Docs {
     const isAgent = key === 'dispatcher' || n?.kind === 'agent' || n?.kind === 'review';
     const closed = key !== 'dispatcher' && Boolean(process.env.FACTORY_STATION_COMMAND);
     const executionLabel = (label: string) => caseRedactor([])(label) as string;
-    const model = isAgent ? closed
+    let model = isAgent ? closed
       ? `closed-command · ${executionLabel(process.env.FACTORY_STATION_MODEL?.trim() || '未配置请求模型')}（请求配置，实际以回执为准）`
       : `pi · ${piSelection().id}（当前配置）`
       : n?.kind === 'store' ? '资源库（不执行）' : '程序执行';
+    if (isAgent) {
+      try {
+        const binding = key === 'dispatcher' ? s.agentDefaults?.dispatcher
+          : this.f.getStationAgentBinding?.(key) ?? s.agentBindings?.[key] ?? s.agentDefaults?.station;
+        if (binding) {
+          const provider = 'provider' in binding && binding.provider ? `${binding.provider}/` : '';
+          model = `${executionLabel(binding.adapter)} · ${executionLabel(provider + (binding.model ?? '客户端默认模型'))}（本节点请求配置，实际以回执为准）`;
+        }
+      } catch {
+        model = 'Agent 配置无效；请在本节点模型设置中修正';
+      }
+    }
     const notes = [...(s.contextNotes?.[key] ?? [])].reverse();
     const list = (kind: string, max: number) => notes.filter((x) => x.kind === kind).slice(0, max).map((x) => `- ${time(x.at)} · ${x.by}：${x.text}`).join("\n") || "- （无）";
     const attempts = Object.values(s.attempts).filter((a) => a.node === key && a.endedAt).sort((a, b) => b.endedAt! - a.endedAt!).slice(0, 8);

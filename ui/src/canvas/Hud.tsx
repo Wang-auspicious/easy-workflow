@@ -10,7 +10,7 @@ import { fmt, secs } from "./Node.tsx";
 import { toggleInspector } from "./Canvas.tsx";
 import { toast } from "../shell/Toasts.tsx";
 import { AllocationShortcut } from '../views/AllocationProposal.tsx';
-import { recordedUsage, runStatus } from './status.ts';
+import { browserMemoryGuard, recordedUsage, runStatus } from './status.ts';
 
 const CATEGORIES = ["UI 组件与设计系统", "灵感与案例", "视觉素材与字体", "设计创作与原型", "前端开发与动效", "AI 设计工具", "UX 研究与学习", "协作与效率", "品牌与营销"];
 
@@ -33,6 +33,7 @@ export function Hud() {
   const run = s.fs.run;
   const t = replay ? replay.at : now;
   const progress = runStatus(s.fs, t);
+  const memoryGuard = browserMemoryGuard(s.fs.resources);
   const { counts } = progress;
   const usage = recordedUsage(Object.values(s.fs.attempts).filter(attempt => attempt.startedAt >= run.startedAt));
   const status = run.status;
@@ -70,6 +71,7 @@ export function Hud() {
           </button>
           {selected.length > 0 && <button className="inspect-selection" onClick={() => toggleInspector(selected[0])}>查看所选</button>}
           <AllocationShortcut />
+          {memoryGuard && <span className="chip" title={memoryGuard.detail}>{memoryGuard.label}</span>}
         </div>
       </div>
       {pull && <PullCard onClose={() => setPull(false)} />}

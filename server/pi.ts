@@ -31,6 +31,13 @@ const json = (file: string): any => { try { return JSON.parse(fs.readFileSync(fi
 
 export interface PiModelSelection { provider?: string; model?: string }
 
+export interface PiModelOption {
+  readonly provider: string;
+  readonly model: string;
+  readonly name: string;
+  readonly input: readonly string[];
+}
+
 export function piSelection(selection?: PiModelSelection) {
   const settings = json(path.join(piDirectory(), "settings.json"));
   return {
@@ -70,19 +77,18 @@ const credentials: CredentialStore = {
   delete: async () => { throw new Error("Easy Workflow does not write Pi credentials"); },
 };
 
-export function models(requested?: PiModelSelection) {
-  const selection = piSelection(requested);
+function configuredModels(provider: string) {
   const m = createModels({ credentials });
   const builtin = opencodeGoProvider();
   m.setProvider(builtin);
-  const custom = json(path.join(piDirectory(), "models.json")).providers?.[selection.provider];
+  const custom = json(path.join(piDirectory(), "models.json")).providers?.[provider];
   if (custom) {
-    const inherited = m.getModels(selection.provider);
+    const inherited = m.getModels(provider);
     const catalog = new Map(inherited.map((model) => [model.id, model]));
     for (const entry of custom.models ?? []) {
       const previous = catalog.get(entry.id);
       catalog.set(entry.id, {
-        ...previous, ...entry, provider: selection.provider, name: entry.name ?? previous?.name ?? entry.id,
+        ...previous, ...entry, provider, name: entry.name ?? previous?.name ?? entry.id,
         api: entry.api ?? custom.api ?? previous?.api ?? "openai-completions",
         baseUrl: entry.baseUrl ?? custom.baseUrl ?? previous?.baseUrl,
         input: entry.input ?? previous?.input ?? ["text"], reasoning: entry.reasoning ?? previous?.reasoning ?? false,
@@ -94,14 +100,43 @@ export function models(requested?: PiModelSelection) {
     const apis = { "openai-completions": openAICompletionsApi(), "openai-responses": openAIResponsesApi(), "anthropic-messages": anthropicMessagesApi() };
     // Preserve OpenCode Go's required sticky-session header even when Pi adds
     // custom models to its catalog. Generic API adapters alone omit this header.
-    const api = selection.provider === "opencode-go" ? Object.fromEntries(Object.entries(apis).map(([key, value]) => [key, withOpenCodeSessionHeader(value)])) : apis;
+    const api = provider === "opencode-go" ? Object.fromEntries(Object.entries(apis).map(([key, value]) => [key, withOpenCodeSessionHeader(value)])) : apis;
     m.setProvider(createProvider({
-      id: selection.provider, baseUrl: custom.baseUrl, headers: custom.headers,
-      auth: { apiKey: envApiKeyAuth("Pi API key", selection.provider === "opencode-go" ? ["OPENCODE_API_KEY"] : []) },
+      id: provider, baseUrl: custom.baseUrl, headers: custom.headers,
+      auth: { apiKey: envApiKeyAuth("Pi API key", provider === "opencode-go" ? ["OPENCODE_API_KEY"] : []) },
       models: [...catalog.values()],
       api,
     }));
   }
+  return m;
+}
+
+/** Local, authenticated catalog metadata only. Never probes a provider or CLI. */
+export function piModelCatalog(): PiModelOption[] {
+  const providers = new Set(['opencode-go',
+    ...Object.keys(json(path.join(piDirectory(), 'auth.json'))),
+    ...Object.keys(json(path.join(piDirectory(), 'models.json')).providers ?? {}),
+  ]);
+  const options: PiModelOption[] = [];
+  for (const provider of providers) {
+    try {
+      if (!credential(provider)?.key) continue;
+      for (const model of configuredModels(provider).getModels(provider)) {
+        // Validate identities without disclosing endpoint, headers, or credentials.
+        piModelDependency({provider, model: model.id, endpoint: model.baseUrl});
+        options.push({provider, model: model.id, name: model.name,
+          input: [...model.input]});
+      }
+    } catch {
+      // An unconfigured provider cannot become a station's self-selected model.
+    }
+  }
+  return options;
+}
+
+export function models(requested?: PiModelSelection) {
+  const selection = piSelection(requested);
+  const m = configuredModels(selection.provider);
   const model = m.getModel(selection.provider, selection.id);
   if (!model) throw new Error(`Pi 模型未配置：${selection.provider}/${selection.id}；请检查 Pi settings.json / models.json。`);
   const dependency = piModelDependency({provider: model.provider, model: model.id, endpoint: model.baseUrl});

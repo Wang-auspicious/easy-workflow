@@ -402,6 +402,29 @@ test('legacy Pi checkpoints migrate only with verified receipt identity and neve
       assert.equal(unverified.ok, true);
       assert.match(JSON.stringify(requests.at(-1)), /token=legacy-no-identity;/);
       assert.ok(!JSON.stringify(requests.at(-1)).includes('Persisted fixture observation'));
+      let selected = {provider: 'a', model: 'legacy-model'};
+      definition.piControl = {
+        resolve: current => current.model.provider === selected.provider ? current : models(selected),
+        list: () => ['a', 'b'].map(provider => ({provider, model: 'legacy-model', name: provider, input: ['text']})),
+        select: next => {selected = next;},
+      };
+      mode = 'capture';
+      const live = await cancelAfterObservation('live-model-original');
+      assert.equal(reads(), 2);
+      selected = {provider: 'b', model: 'legacy-model'};
+      definition.agent = {adapter: 'pi', ...selected};
+      mode = 'complete';
+      const switched = await runAgentStation(definition,
+        nativeContext('live-model-retry', {stationSessions: {'curation/reader': live}}));
+      assert.equal(switched.ok, true);
+      assert.equal(reads(), 2, 'a controlled Pi model change resumes the completed tool result');
+      assert.equal(switched.metrics?.execution?.provider, 'b');
+      assert.ok(JSON.stringify(requests.at(-1)).includes('Persisted fixture observation'));
+      const other = nativeContext('different-node', {stationSessions: {'curation/facts': live}});
+      other.node = {...other.node, key: 'curation/facts'};
+      assert.equal((await runAgentStation(definition, other)).ok, true);
+      assert.ok(!JSON.stringify(requests.at(-1)).includes('Persisted fixture observation'),
+        'a model-independent signature still rejects another station context');
     } finally {
       await closeModelTransport(); server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));
@@ -1104,7 +1127,7 @@ for await(const line of createInterface({input:process.stdin})){
   }
 });
 
-test('Factory captures installed Agent execution before start observers rebind the next item', {timeout: 30000}, async t => {
+test('Factory captures native execution and applies Pi rebinding at the next provider request', {timeout: 30000}, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-factory-binding-'));
   const keys = ['FACTORY_VAR', 'FACTORY_PREFLIGHT', 'FACTORY_START_PAUSED', 'FACTORY_RESUME_MANAGED',
     'FACTORY_HTTP_CACHE', 'VISLEXICON_ROOT', 'PI_CODING_AGENT_DIR', 'FACTORY_STATION_COMMAND'];
@@ -1212,10 +1235,10 @@ process.stdout.write(JSON.stringify({model: 'reported-' + request.model, modelCa
             source: 'manual', data: {workflowPack: manifest.id, input: {value: name}}});
           await factory.runtime.settle();
           assert.equal(factory.state.tokens[token.id].status, 'published');
-          assert.deepEqual(token.data.result, {value: name});
+          assert.deepEqual(token.data.result, {value: adapter === 'pi' ? 'b' : name});
           const attempt = factory.state.attempts[factory.state.tokens[token.id].attempts[0]];
           assert.deepEqual(attempt.dependency, identities[index]);
-          assert.deepEqual(attempt.metrics?.dependency, identities[index]);
+          assert.deepEqual(attempt.metrics?.dependency, identities[adapter === 'pi' ? 1 : index]);
           assert.equal(attempt.metrics?.execution?.model,
             adapter === 'launcher' ? `reported-requested-${name}` : 'shared-model');
           const durable = [...factory.journal.read()].find(event =>
@@ -1229,8 +1252,26 @@ process.stdout.write(JSON.stringify({model: 'reported-' + request.model, modelCa
     });
     assert.deepEqual(fs.readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line)),
       [{command: 'a', model: 'requested-a'}, {command: 'b', model: 'requested-b'}]);
-    assert.deepEqual(requests, [{path: '/a/v1/chat/completions', model: 'shared-model'},
+    assert.deepEqual(requests, [{path: '/b/v1/chat/completions', model: 'shared-model'},
       {path: '/b/v1/chat/completions', model: 'shared-model'}]);
+    await t.test('an invalid live model selection does not blame the previously healthy provider', async () => {
+      factory.setAgentBinding('captured/work', {adapter: 'pi', provider: 'a', model: 'shared-model'});
+      const dependency = models({provider: 'a', model: 'shared-model'}).dependency;
+      const unsubscribe = factory.journal.subscribe(event => {
+        if (event.kind === 'attempt.started' && event.node === 'captured/work') {
+          factory.setAgentBinding(event.node, {adapter: 'pi', provider: 'a', model: 'missing-model'});
+        }
+      });
+      try {
+        const token = factory.runtime.create('captured/work', {item: 'invalid-live-selection', url: '', source: 'manual',
+          data: {workflowPack: manifest.id, input: {value: 'unchanged'}}});
+        await factory.runtime.settle();
+        assert.equal(factory.state.tokens[token.id].status, 'parked');
+        assert.equal((token.data.failure as {code?: string}).code, 'INVALID_AGENT_BINDING');
+        assert.equal(factory.state.modelCircuits[dependency.key], undefined);
+        assert.equal(requests.length, 2, 'configuration rejection does not send a provider request');
+      } finally {unsubscribe();}
+    });
     await t.test('native defaults resolve once before observers can change PATH', async () => {
       const previousPath = process.env.PATH;
       const first = path.join(dir, 'first-native-bin');
@@ -1330,6 +1371,7 @@ test('project defaults, dispatcher turns and concurrent station contexts remain 
   const requests: {provider: string; body: string}[] = [];
   let active = 0;
   let peak = 0;
+  let selfModelCalls = 0;
   const server = http.createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -1342,10 +1384,22 @@ test('project defaults, dispatcher turns and concurrent station contexts remain 
     await gate;
     const station = body.tools?.some(tool => tool.function.name === 'submit');
     const wroteNote = body.messages.some(message => message.role === 'tool');
-    const delta = station ? {role: 'assistant', tool_calls: [{index: 0, id: `project-${requests.length}-${provider}`,
+    let delta = station ? {role: 'assistant', tool_calls: [{index: 0, id: `project-${requests.length}-${provider}`,
       type: 'function', function: wroteNote ? {name: 'submit', arguments: JSON.stringify({value: provider})}
         : {name: 'env_call', arguments: JSON.stringify({name: 'case_note', arguments: {section: 'fixture', text: `local-${provider}-note`}})}}]}
       : {role: 'assistant', content: `Dispatcher ${provider}`};
+    if (station && text.includes('SELF_MODEL_SELECTION')) {
+      const calls = [
+        {name: 'station_model', arguments: JSON.stringify({action: 'select', provider: 'unconnected', model: 'fixture-model'})},
+        {name: 'station_model', arguments: JSON.stringify({action: 'select', provider: 'b', model: 'fixture-model', node: 'independent/beta'})},
+        {name: 'station_model', arguments: JSON.stringify({action: 'list'})},
+        {name: 'station_model', arguments: JSON.stringify({action: 'select', provider: 'b', model: 'fixture-model'})},
+        {name: 'submit', arguments: JSON.stringify({value: provider})},
+      ];
+      assert.ok(selfModelCalls < calls.length, 'the station model control must not loop');
+      delta = {role: 'assistant', tool_calls: [{index: 0, id: `self-model-${selfModelCalls}`,
+        type: 'function', function: calls[selfModelCalls++]}]};
+    }
     response.writeHead(200, {'content-type': 'text/event-stream'});
     for (const part of [
       {choices: [{index: 0, delta, finish_reason: null}]},
@@ -1432,7 +1486,8 @@ test('project defaults, dispatcher turns and concurrent station contexts remain 
     right.setAgentDefaults({dispatcher: binding('a')});
     release();
     await Promise.all(factories.map(factory => factory.runtime.settle()));
-    assert.deepEqual(tokens.map(token => token.data.result), [{value: 'a'}, {value: 'a'}, {value: 'b'}, {value: 'b'}]);
+    assert.deepEqual(tokens.map(token => token.data.result), [{value: 'b'}, {value: 'b'}, {value: 'b'}, {value: 'b'}],
+      'already sent A requests finish, then the same station conversations select B on their next request');
     const firstRequests = sessions.filter((_value, index) => index < 4);
     assert.equal(new Set(firstRequests.map(value => value.session)).size, 4);
     for (const value of sessions) {
@@ -1444,6 +1499,33 @@ test('project defaults, dispatcher turns and concurrent station contexts remain 
     assert.equal(right.state.cases['left-one'], undefined, 'the host toolbox cannot write into another project');
     assert.ok(right.state.cases['right-one'].some(note => note.text === 'local-b-note'));
     assert.equal(left.state.cases['right-one'], undefined);
+    await t.test('a Pi station lists and selects only its own connected models inside one attempt', async () => {
+      left.setAgentBinding('independent/alpha', binding('a'));
+      left.setAgentBinding('independent/beta', binding('a'));
+      const defaults = left.getAgentDefaults();
+      const startIndex = requests.length;
+      const self = left.runtime.create('independent/alpha', {item: 'self-model', url: '', source: 'manual',
+        data: {input: {value: 'SELF_MODEL_SELECTION'}}});
+      await left.runtime.settle();
+      assert.equal(left.state.tokens[self.id].status, 'published');
+      assert.equal(left.state.tokens[self.id].attempts.length, 1, 'selection continues the same attempt');
+      assert.deepEqual(requests.slice(startIndex).map(request => request.provider), ['a', 'a', 'a', 'a', 'b']);
+      const finalInput = requests.at(-1)!.body;
+      assert.match(finalInput, /unconnected/);
+      assert.ok(finalInput.includes('must not have additional properties'), 'cross-node selection is rejected by the tool schema');
+      assert.doesNotMatch(finalInput, /fixture-project-[ab]|127\.0\.0\.1|apiKey|authorization/i,
+        'the model directory contains no provider credentials or endpoints');
+      assert.deepEqual(left.state.agentBindings?.['independent/alpha'], binding('b'));
+      assert.deepEqual(left.state.agentBindings?.['independent/beta'], binding('a'), 'the tool cannot target another node');
+      assert.deepEqual(left.getAgentDefaults(), defaults, 'the dispatcher and project default stay unchanged');
+      const attempt = left.state.attempts[left.state.tokens[self.id].attempts[0]];
+      assert.equal(attempt.metrics?.execution?.provider, 'b');
+      assert.equal(attempt.metrics?.dependency?.provider, 'b');
+      assert.deepEqual(attempt.metrics?.modelResponses?.map(response => [response.provider, response.modelCalls]), [['a', 4], ['b', 1]]);
+      assert.equal(attempt.metrics?.tokenUsage?.input, 100);
+      assert.equal(attempt.metrics?.tokenUsage?.output, 25);
+      left.setAgentBinding('independent/alpha', null);
+    });
     const next = left.runtime.create('independent/alpha', {item: 'left-next', url: '', source: 'manual', data: {input: {value: 'LEFT_NEXT'}}});
     await left.runtime.settle();
     assert.deepEqual(next.data.result, {value: 'b'}, 'a project change applies to the next attempt');

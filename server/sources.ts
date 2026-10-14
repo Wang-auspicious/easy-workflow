@@ -8,7 +8,7 @@ import { workflowValue } from './workflow-packs.ts';
 import { workflowEntry } from './workflow-entry.ts';
 import {batchSummary, flowWindow, latestBatchTokens, occupiesIntake, type FlowObservation} from '../shared/batch.ts';
 
-type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'toolbox' | 'settings' | 'broker' | 'batch' | 'channels'>;
+type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'toolbox' | 'settings' | 'broker' | 'batch' | 'channels'> & Partial<Pick<Factory, 'recovery'>>;
 type Poll = { nextAt: number; count: number; duplicates: number; invalid?: number; attention?: string; failure?: ReturnType<typeof classifyFailure> };
 type Incoming = { url: string; title?: string; author?: string; publishedAt?: string; excerpt?: string; images?: string[] };
 const MAX_BACKLOG = 500;
@@ -532,6 +532,13 @@ export class SourceSupervisor {
       upstream: occupied.filter(token => occupiesIntake(f.compiled, entry, token)).length};
   }
 
+  permitsRecovery(token: {source: string; data: Record<string, unknown>}): boolean {
+    if (!token.data.sourceCandidate && !token.source.startsWith('source:')) return true;
+    const source = record(token.data.sourceRecord) ? token.data.sourceRecord.source
+      : token.source.startsWith('source:') ? token.source.slice(7) : undefined;
+    return typeof source === 'string' && Boolean(this.definitions.get(source)?.enabled);
+  }
+
   /** The batch owns managed admission so subscriber order cannot take its slot. */
   pump(): number {
     if (this.closed || process.env.FACTORY_READONLY === '1') return 0;
@@ -539,6 +546,10 @@ export class SourceSupervisor {
       this.f.batch.schedule();
       return 0;
     }
+    return this.f.recovery?.beforeFresh(() => this.pumpFresh()) ?? this.pumpFresh();
+  }
+
+  private pumpFresh(): number {
     if (this.channelHasNextTurn()) {
       const admitted = this.f.channels?.pump() ?? 0;
       if (admitted) return admitted;

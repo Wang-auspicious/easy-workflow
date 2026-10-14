@@ -21,7 +21,9 @@ const deferred = () => { let resolve!: () => void; const promise = new Promise<v
 const tool = (id = "write-one") => ({ ...answer(""), stopReason: "toolUse" as const,
   content: [{ type: "toolCall" as const, id, name: "easy_workflow_call", arguments: { name: "feed_urls", arguments: { urls: ["https://fixture.invalid"] } } }] });
 
-function fixture(handler: (count: number, context: TranscriptContext, signal: AbortSignal) => Promise<AssistantMessage> | AssistantMessage, options: DispatcherOptions = {}, execute?: () => Promise<void>) {
+function fixture(handler: (count: number, context: TranscriptContext, signal: AbortSignal,
+  model: {id: string; provider: string}) => Promise<AssistantMessage> | AssistantMessage,
+  options: DispatcherOptions = {}, execute?: () => Promise<void>) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easy-workflow-chat-"));
   const journal = new Journal(path.join(dir, "journal.db"));
   const conversation: ConversationEntry[] = [];
@@ -35,14 +37,14 @@ function fixture(handler: (count: number, context: TranscriptContext, signal: Ab
   const control = { bootstrap: () => ({ instructions: "Call the fixture tool", tools: [] }), mutates: () => true, execute: async () => ({ result: { running: 0 } }),
     agentTools: () => [{ name: "easy_workflow_call", label: "Call", description: "Call", parameters: { type: "object", properties: { name: { type: "string" }, arguments: { type: "object" } }, required: ["name", "arguments"] },
       execute: async () => { writes++; await execute?.(); return { content: [{ type: "text", text: "created t-fixture" }], details: { summary: "created t-fixture", result: { task: "t-fixture" } } }; } }] } as unknown as FactoryControl;
-  const opts: DispatcherOptions = { requestTimeoutMs: 1000, retryDelaysMs: [1, 1], ...options, modelFactory: () => ({
+  const opts: DispatcherOptions = { requestTimeoutMs: 1000, retryDelaysMs: [1, 1], ...options, modelFactory: selection => ({
     dependency: piModelDependency({provider: 'fixture', model: 'fixture', endpoint: 'https://model.fixture.invalid/v1'}),
-    models: {} as never, model: { id: "fixture", provider: "fixture", api: "openai-completions", baseUrl: "https://model.fixture.invalid/v1", name: "fixture", reasoning: false, input: ["text"], contextWindow: 32000, maxTokens: 4000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+    models: {} as never, model: { id: selection?.model ?? 'fixture', provider: selection?.provider ?? 'fixture', api: "openai-completions", baseUrl: "https://model.fixture.invalid/v1", name: "fixture", reasoning: false, input: ["text"], contextWindow: 32000, maxTokens: 4000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
     stream: (_model, context, options) => {
       const stream = createAssistantMessageEventStream(); const count = ++calls;
       queueMicrotask(async () => {
         let message: AssistantMessage;
-        try { message = await handler(count, context, options!.signal!); }
+        try { message = await handler(count, context, options!.signal!, _model); }
         catch (error) { message = { ...failure(String(error)), stopReason: options?.signal?.aborted ? "aborted" : "error" }; }
         stream.push({ type: "start", partial: message });
         if (message.stopReason === "error" || message.stopReason === "aborted") stream.push({ type: "error", reason: message.stopReason, error: message });
@@ -52,10 +54,91 @@ function fixture(handler: (count: number, context: TranscriptContext, signal: Ab
     },
   }) };
   const newDispatcher = () => new Dispatcher(f, control, opts);
-  return { journal, conversation, events, newDispatcher, factory: f, get calls() { return calls; }, get writes() { return writes; }, cleanup: () => {
+  return { journal, conversation, events, newDispatcher, factory: f, control, get calls() { return calls; }, get writes() { return writes; }, cleanup: () => {
     journal.close(); assert.ok(path.resolve(dir).startsWith(path.join(path.resolve(os.tmpdir()), "easy-workflow-chat-"))); fs.rmSync(dir, { recursive: true, force: true });
   } };
 }
+
+test('dispatcher model changes apply at the next request without replacing in-flight work or tool receipts', async () => {
+  const started = deferred();
+  const released = deferred();
+  let selected = {adapter: 'pi' as const, provider: 'provider-a', model: 'model-a'};
+  const used: string[] = [];
+  const f = fixture(async (count, context, _signal, model) => {
+    used.push(`${model.provider}/${model.id}`);
+    if (count === 1) {
+      started.resolve();
+      await released.promise;
+      assert.equal(model.id, 'model-a', 'the already sent request keeps its captured model');
+      return tool('one-write');
+    }
+    assert.ok(context.messages.some(message => message.role === 'toolResult' && message.toolCallId === 'one-write'));
+    return answer('已保留工具结果并使用新模型继续。');
+  });
+  f.factory.getAgentDefaults = () => ({station: {adapter: 'pi', provider: 'station-only', model: 'independent'}, dispatcher: selected});
+  try {
+    const dispatcher = f.newDispatcher();
+    const task = dispatcher.chat('Execute one operation then continue.', []);
+    await started.promise;
+    selected = {adapter: 'pi', provider: 'provider-b', model: 'model-b'};
+    released.resolve();
+    await task;
+    assert.equal(dispatcher.status.status, 'completed');
+    assert.deepEqual(used, ['provider-a/model-a', 'provider-b/model-b']);
+    assert.equal(f.writes, 1);
+    assert.equal(f.factory.getAgentDefaults().station.model, 'independent');
+  } finally { released.resolve(); f.cleanup(); }
+});
+
+test('a saved oversized tool reply can resume without resending the payload or repeating a completed write', async () => {
+  const turn = 'm-oversized-report';
+  const request = '为什么暂停了呢？继续啊。';
+  const f = fixture((_count, context) => {
+    if (Buffer.byteLength(JSON.stringify(context.messages)) > 128 * 1024) {
+      return failure('opencode-go API error (400): invalid_request_error: request contains invalid parameters');
+    }
+    const result = context.messages.find(message => message.role === 'toolResult' && message.toolCallId === 'report-read');
+    assert.ok(result?.role === 'toolResult');
+    assert.ok(JSON.stringify(result).includes('completeResultInJournal') || JSON.stringify(result).includes('原始回执'));
+    return answer('已从检查点继续，原始报告和投料回执保留。');
+  });
+  try {
+    f.journal.append({kind: 'chat.user', id: turn, text: request, attachments: []});
+    const assistant: AssistantMessage = tool('finished-write');
+    const writeCall = assistant.content.find(part => part.type === 'toolCall')!;
+    assistant.content.push({type: 'toolCall', id: 'report-read', name: 'easy_workflow_call',
+      arguments: {name: 'read_report', arguments: {}}});
+    f.journal.append({kind: 'chat.message', id: `${turn}-pi-1`, turn, message: assistant});
+    f.journal.append({kind: 'chat.message', id: `${turn}-tool-finished-write`, turn, message: {
+      role: 'toolResult', toolCallId: 'finished-write', toolName: 'easy_workflow_call',
+      content: [{type: 'text', text: 'Created t-existing exactly once.'}], isError: false, timestamp: Date.now(),
+    }});
+    const huge = JSON.stringify({ok: true, tool: 'read_report', seq: 1234, runId: 'run-fixture',
+      result: {activity: {intervals: [{text: 'observed interval '.repeat(200000)}]}}});
+    f.journal.append({kind: 'chat.message', id: `${turn}-tool-report-read`, turn, message: {
+      role: 'toolResult', toolCallId: 'report-read', toolName: 'easy_workflow_call',
+      content: [{type: 'text', text: huge}], details: {result: huge}, isError: false, timestamp: Date.now(),
+    }});
+    f.journal.append({kind: 'chat.checkpoint', checkpoint: {
+      state: {turn, status: 'failed', busy: false, attempt: 1, maxAttempts: 3, recoverable: true,
+        message: 'Saved after provider rejection.', updatedAt: Date.now()},
+      prompted: true, messageNumber: 1, request: {text: request, attachments: []}, scope: turn, inputs: [],
+      operations: [{key: dispatcherOperationKey('easy_workflow_call', writeCall.arguments),
+        callId: 'finished-write', name: 'feed_urls', scope: turn, phase: 'completed',
+        result: {content: [{type: 'text', text: 'Created t-existing exactly once.'}], details: {token: 't-existing'}}}],
+    }});
+    const dispatcher = f.newDispatcher();
+    await dispatcher.resume();
+    assert.equal(dispatcher.status.status, 'completed');
+    assert.equal(f.calls, 1);
+    assert.equal(f.writes, 0, 'recovery cannot execute the earlier successful write again');
+    const original = f.conversation.find(entry => entry.id === `${turn}-tool-report-read`);
+    assert.ok(original?.message.role === 'toolResult');
+    assert.equal(original.message.content.find(part => part.type === 'text')?.text, huge);
+    assert.ok(Buffer.byteLength(JSON.stringify(original?.message)) > 1024 * 1024,
+      'context projection must not erase the full journal receipt');
+  } finally { f.cleanup(); }
+});
 
 test("per-provider timeout recovers through the real Pi Agent without stopping the conversation", async () => {
   const f = fixture(async (count, _context, signal) => {

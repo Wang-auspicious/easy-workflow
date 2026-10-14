@@ -11,7 +11,8 @@ import { models, MODEL_ID } from "./pi.ts";
 import type { Factory } from "./factory.ts";
 import { FactoryControl } from "./control.ts";
 import { EvidenceStore } from "./evidence.ts";
-import { dispatcherError, dispatcherOperationKey, recoverDispatcherMessages, transientDispatcherError, uncertainToolResult } from "./dispatcher-recovery.ts";
+import {dispatcherContext, dispatcherError, dispatcherOperationKey, recoverDispatcherMessages,
+  transientDispatcherError, uncertainToolResult} from './dispatcher-recovery.ts';
 import {withModelAdmission} from './model-requests.ts';
 
 const SYSTEM = `你是“主调度”，一个多 agent 流水线工厂的总调度，站长（用户）只和你说话。
@@ -104,8 +105,18 @@ export class Dispatcher {
       } catch (error) { operation.phase = "uncertain"; this.save(); throw error; }
     } }));
   }
-  private boundedStream(stream: StreamFn): StreamFn {
-    return async (model, context, options) => {
+  private boundedStream(): StreamFn {
+    return async (_model, context, options) => {
+      const binding = this.f.getAgentDefaults?.().dispatcher ?? this.checkpoint.agent;
+      if (binding && binding.adapter !== 'pi') throw new Error('主调度目前只支持 Pi 执行器');
+      const selected = this.options.modelFactory(binding);
+      if (this.agent) this.agent.state.model = selected.model;
+      if (binding && JSON.stringify(binding) !== JSON.stringify(this.checkpoint.agent)) {
+        this.checkpoint.agent = structuredClone(binding);
+        this.save();
+      }
+      const requestContext = {...context, messages: dispatcherContext(
+        context.messages, this.checkpoint.request.text, selected.model.contextWindow)};
       this.requestTimedOut = false;
       const timeout = new AbortController();
       const timer = setTimeout(() => { this.requestTimedOut = true; timeout.abort(new DOMException("模型响应超时", "TimeoutError")); }, this.options.requestTimeoutMs);
@@ -113,7 +124,7 @@ export class Dispatcher {
       const signal = options?.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
       try {
         const response = await withModelAdmission(dependency => this.f.broker?.modelBlocked(dependency) ?? null,
-          async () => stream(model, context, {...options, signal}),
+          async () => selected.stream(selected.model, requestContext, {...options, signal}),
           this.f.broker ? (_dependency, owner) => this.f.broker.modelRequests.acquire(owner) : undefined);
         void response.result().then(() => clearTimeout(timer), () => clearTimeout(timer));
         return response;
@@ -121,24 +132,19 @@ export class Dispatcher {
     };
   }
   private ensure(includeCurrent = false) {
-    const binding = this.checkpoint.agent ?? this.f.getAgentDefaults?.().dispatcher;
+    const binding = this.f.getAgentDefaults?.().dispatcher ?? this.checkpoint.agent;
     if (binding && binding.adapter !== 'pi') throw new Error('主调度目前只支持 Pi 执行器');
     const signature = JSON.stringify([binding, this.checkpoint.state.turn]);
     if (this.agent && this.agentSignature === signature) return this.agent;
-    const {stream, model} = this.options.modelFactory(binding);
+    const {model} = this.options.modelFactory(binding);
     this.agentSignature = signature;
     const project = crypto.createHash('sha256').update(this.f.project.dir).digest('hex').slice(0, 16);
     this.agent = new Agent({
       initialState: { systemPrompt: (this.f.docs ? this.f.docs.envelope("dispatcher").text : readRole("dispatcher").content) + "\n\n" + SYSTEM + "\n\n" + this.control.bootstrap().instructions,
         model, thinkingLevel: "off", tools: this.guardedTools() as never },
-      streamFn: this.boundedStream(stream), sessionId: `easy-workflow-dispatcher-${project}-${this.checkpoint.state.turn}`, toolExecution: 'sequential',
-      transformContext: async (messages: AgentMessage[]) => {
-        if (messages.length <= 80) return messages;
-        const active = messages.findIndex(m => m.role === "user" && textOf(m).startsWith(this.checkpoint.request.text));
-        const at = messages.findIndex((m, i) => i >= messages.length - 80 && m.role === "user");
-        const start = active >= 0 && at >= 0 ? Math.min(active, at) : at;
-        return start > 0 ? [...messages.slice(0, start).filter(m => m.role === "system"), ...messages.slice(start)] : messages;
-      },
+      streamFn: this.boundedStream(), sessionId: `easy-workflow-dispatcher-${project}-${this.checkpoint.state.turn}`, toolExecution: 'sequential',
+      transformContext: async (messages: AgentMessage[]) => dispatcherContext(
+        messages, this.checkpoint.request.text, this.agent?.state.model.contextWindow ?? model.contextWindow),
     });
     const history = this.orderedHistory().filter(m => includeCurrent || m.turn !== this.checkpoint.state.turn && !this.checkpoint.inputs.some(input => input.id === m.turn));
     const users = history.filter(m => m.message.role === "user");

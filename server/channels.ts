@@ -4,7 +4,7 @@ import type { Factory } from './factory.ts';
 import type { TokenRun } from './runtime.ts';
 import { ControlError } from './errors.ts';
 
-type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'sources'>;
+type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'sources'> & Partial<Pick<Factory, 'recovery'>>;
 const internal = new Set(['runtimeCheckpoint', 'checkpointDone', 'recoveryRoot', 'recoveryStation', 'retryOf', 'retriedBy', 'retryTag', 'batchRecovery', 'capacityWait', 'browserRecoveries', 'published', 'gate', 'digest', 'failure', 'manualReason', 'accessVerified', 'workflowPack', 'channelDelivery', 'sourceCandidate']);
 /** A delivery transfers business data, never its parent's scheduler identity. */
 export function channelPayload(data: Record<string, unknown>) {
@@ -244,6 +244,11 @@ export class ChannelSupervisor {
   pump(): number {
     const f = this.f;
     if (this.closed || process.env.FACTORY_READONLY === '1' || !f.runtime.running || f.runtime.paused || f.runtime.ending) return 0;
+    return f.recovery?.beforeFresh(() => this.pumpFresh()) ?? this.pumpFresh();
+  }
+
+  private pumpFresh(): number {
+    const f = this.f;
     // An unmanaged run shares its next free intake slot with new sources. This
     // direct admission does not call SourceSupervisor.pump, so neither feeder
     // can recursively delegate or yield to a peer that did not create a task.

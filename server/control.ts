@@ -91,7 +91,7 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'set_agent_defaults', label: '设置项目 Agent 默认配置',
-        description: 'User-only project station and dispatcher defaults. Omitted sections stay unchanged. Changes apply to the next station attempt or dispatcher turn; active executions keep their captured selection. The dispatcher currently supports Pi.',
+        description: 'User-only project station and dispatcher defaults. Omitted sections stay unchanged. Inheriting Pi stations and the independently configured Pi dispatcher use a changed model on their next model request; in-flight requests finish unchanged. The dispatcher currently supports Pi.',
         parameters: Type.Object({station: Type.Optional(agentBinding()), dispatcher: Type.Optional(agentBinding())}, {additionalProperties: false, minProperties: 1}),
         execute: async (_id, parameters, actor) => {
           if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '项目模型与主调度模型由用户选择，Agent 不能自行更换');
@@ -106,11 +106,11 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'set_agent_binding', label: '设置工位 Agent',
-        description: 'User-only per-station adapter selection. Changes apply to the next attempt. A null binding restores the workflow or saved project default. Credentials and tool scope remain host-managed.',
+        description: 'User-only per-station adapter selection, including while running. Pi model changes apply to the next model request and preserve the station conversation; in-flight requests finish unchanged. Harness changes apply to the next attempt. A null binding restores the workflow or saved project default. A station may choose its own connected Pi model through its scoped station_model tool. Credentials and tool scope remain host-managed.',
         parameters: object({node: name(), binding: Type.Union([Type.Null(), agentBinding()])}),
         execute: async (_id, parameters, actor) => {
-          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '工位 Agent 配置由用户选择，不能由执行中的 Agent 自行更换');
-          return ok(f.setAgentBinding(parameters.node, parameters.binding), parameters.binding ? '已保存工位 Agent 配置，下次尝试生效' : '已恢复继承默认 Agent，下次尝试生效');
+          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '全局控制接口不能代替其他工位改配置；节点可用 station_model 调整自己的 Pi 模型');
+          return ok(f.setAgentBinding(parameters.node, parameters.binding), parameters.binding ? '已保存工位配置；Pi 模型从下一次请求生效，运行底座从下次尝试生效' : '已恢复继承；Pi 模型从下一次请求生效');
         },
       },
       {
@@ -298,10 +298,11 @@ function definitions(f: Factory): Tool[] {
       {
         name: 'retry_candidates',
         label: '按标签批量重试',
-        description: 'Explicitly retry retained candidates after resolving their cause. Filter by tag and/or item ids; removed invalid URLs cannot be retried. includeManual requires a user request with explicit item ids and preserves the original checkpoint.',
+        description: 'Explicitly retry retained candidates after resolving their cause. Prefer exact token ids; legacy item ids are accepted only when unambiguous across workflows. Removed invalid URLs cannot be retried. includeManual requires a user request with explicit tokens or unambiguous items and preserves the original checkpoint.',
         parameters: object({
           tag: Type.Optional(name()),
           items: Type.Optional(Type.Array(name(), {minItems: 1, maxItems: 200})),
+          tokens: Type.Optional(Type.Array(name(), {minItems: 1, maxItems: 200})),
           count: Type.Integer({minimum: 1, maximum: 200}),
           includeManual: Type.Optional(Type.Boolean()),
         }),
@@ -309,10 +310,11 @@ function definitions(f: Factory): Tool[] {
           if (parameters.includeManual && actor !== 'user') {
             throw new ControlError(403, 'owner_decision_required', '恢复策略已转人工复核，需由用户明确选择条目继续');
           }
-          if (parameters.includeManual && !parameters.items?.length) {
+          if (parameters.includeManual && !parameters.items?.length && !parameters.tokens?.length) {
             throw new ControlError(400, 'manual_retry_requires_items', '请明确选择要恢复的人工复核条目');
           }
-          if (!f.runtime.running) await f.ensureReady();
+          const selected = f.candidatesForRetry(parameters);
+          if (selected.length && !f.runtime.running) await f.ensureReady();
           const tasks = f.retryCandidates(parameters);
           return ok({count: tasks.length, tokens: tasks.map(token => ({id: token.id, item: token.item})), runId: f.state.run.id},
             `已取出 ${tasks.length} 件重试`);
@@ -454,10 +456,11 @@ function definitions(f: Factory): Tool[] {
         },
       },
       {
-        name: "read_report", label: "读取本轮报告", description: "Read a historical or current run report, including observed activity intervals. Optional station returns only that station's attempts, metrics and timeline; missing interval boundaries remain unknown.",
-        parameters: object({ runId: Type.Optional(Type.String({ pattern: "^run-[a-zA-Z0-9-]+$" })), station: Type.Optional(name()) }),
+        name: "read_report", label: "读取本轮报告", description: "Read a historical or current run report. view=summary returns exact totals, measurement coverage and bounded station/attempt previews; view=full includes complete steps and observed intervals. Dispatcher calls default to summary. Optional station scopes all metrics to that station; missing measurements remain unknown.",
+        parameters: object({ runId: Type.Optional(Type.String({ pattern: "^run-[a-zA-Z0-9-]+$" })), station: Type.Optional(name()), view: Type.Optional(choice('summary', 'full')) }),
         execute: async (_id, p) => {
           const { stationReport } = await import("./report.ts");
+          const { compactReport } = await import('../shared/report-summary.ts');
           const { readReportJson } = await import('./report-reader.ts');
           const id = p.runId ?? f.state.run.id;
           if (!id || !f.journal.lastSequence(id)) {
@@ -466,7 +469,10 @@ function definitions(f: Factory): Tool[] {
           const result = await readReportJson(f, id);
           const report: import('./report.ts').RunReport = JSON.parse(result.body.toString('utf8'));
           if (p.station && !f.compiled.nodes.some(n => n.key === p.station) && !report.attempts.some(a => a.node === p.station)) throw new ControlError(404, "station_not_found", "没有这个工位");
-          return ok(p.station ? stationReport(report, p.station) : report, p.station ? `读取 ${p.station} 的工作报告` : "读取工作报告");
+          const selected = p.station ? stationReport(report, p.station) : report;
+          const summary = p.view === 'summary' ? compactReport(selected) : undefined;
+          if (p.view === 'summary' && !summary) throw new ControlError(500, 'report_summary_invalid', '报告结构无法生成摘要');
+          return ok(summary ?? selected, p.station ? `读取 ${p.station} 的工作报告` : "读取工作报告");
         },
       },
       {
@@ -593,7 +599,9 @@ export class FactoryControl {
       { name: CONTROL_CALL, label: "调用 Easy Workflow", description: "Execute a discovered Easy Workflow capability with its exact arguments. Mutations are journaled; never blindly retry a timed-out write.", parameters: object({ name: name(), arguments: Type.Record(Type.String(), Type.Unknown()) }),
         execute: async (_id, p) => {
           if (p.name === "decide_patch") throw new ControlError(403, "owner_decision_required", "主调度不能批准自己起草的补丁；请站长在界面决定。");
-          const receipt = await this.execute(p.name, p.arguments, "dispatcher");
+          const arguments_ = p.name === 'read_report' && p.arguments?.view === undefined
+            ? {...p.arguments, view: 'summary'} : p.arguments;
+          const receipt = await this.execute(p.name, arguments_, "dispatcher");
           return ok(receipt, receipt.summary);
         } },
     ];

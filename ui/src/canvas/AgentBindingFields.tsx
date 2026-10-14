@@ -8,6 +8,12 @@ export interface AgentBindingDraft {
   requestTimeoutMs: string;
 }
 
+export interface PiModelChoice {
+  readonly provider: string;
+  readonly model: string;
+  readonly name: string;
+}
+
 export function agentBindingDraft(binding: StationAgentBinding | null): AgentBindingDraft {
   return {
     adapter: binding?.adapter ?? 'inherit',
@@ -60,12 +66,14 @@ export function selectBindingAdapter(adapter: AgentBindingDraft['adapter'], conf
   return {adapter, provider: '', model: '', command: '', requestTimeoutMs: ''};
 }
 
-export function AgentBindingFields({draft, disabled, scope, change, selectAdapter}: {
+export function AgentBindingFields({draft, disabled, scope, change, selectAdapter, models, selectModel}: {
   draft: AgentBindingDraft;
   disabled: boolean;
   scope: 'node' | 'station' | 'dispatcher';
   change: (field: keyof AgentBindingDraft, value: string) => void;
   selectAdapter: (adapter: AgentBindingDraft['adapter']) => void;
+  models?: readonly PiModelChoice[];
+  selectModel?: (model: PiModelChoice) => void;
 }) {
   const inherited = scope === 'node';
   const native = ['opencode', 'codex', 'claude-code'].includes(draft.adapter);
@@ -74,6 +82,14 @@ export function AgentBindingFields({draft, disabled, scope, change, selectAdapte
       {inherited && <option value="inherit">继承默认</option>}
       <option value="pi">Pi</option><option value="opencode">OpenCode</option><option value="codex">Codex</option><option value="claude-code">Claude Code</option><option value="launcher">自定义 launcher</option>
     </select></label>}
+    {inherited && ['pi', 'inherit'].includes(draft.adapter) && Boolean(models?.length) && selectModel &&
+      <label>为本节点选择已接入模型<select aria-label="本节点已接入模型" disabled={disabled} value="" onChange={event => {
+        const model = models?.[Number(event.target.value)];
+        if (model) selectModel(model);
+      }}>
+        <option value="" disabled>选择模型，将保存为本节点独立配置</option>
+        {models!.map((model, index) => <option key={`${model.provider}/${model.model}`} value={index}>{model.provider} / {model.name || model.model}</option>)}
+      </select></label>}
     {draft.adapter !== 'inherit' && <>
       {draft.adapter === 'pi' && <label>{inherited ? 'Provider（留空继承项目默认）' : 'Provider'}<input aria-label="Agent provider" disabled={disabled} required={!inherited} value={draft.provider} maxLength={200} onChange={event => change('provider', event.target.value)} placeholder={inherited ? '项目默认 provider' : '例如 opencode-go'} /></label>}
       {['opencode', 'codex'].includes(draft.adapter) && <label>Provider（留空使用客户端配置）<input aria-label="Agent provider" disabled={disabled} value={draft.provider} maxLength={200} onChange={event => change('provider', event.target.value)} placeholder="客户端已配置的 Provider" /></label>}

@@ -186,6 +186,61 @@ test('the actual scheduler admits one fast and three slow jobs within four share
   } finally { hold = false; release.forEach(resolve => resolve()); await runtime.close(); journal.close(); }
 });
 
+test('browser memory protection explains a zero allocation and resumes queued work without changing the floor', async () => {
+  const browserPack: Pack = {...pack, lines: [line({...pack.lines[0], stations: [
+    station({...pack.lines[0].stations[0], resource: 'browser',
+      workers: {min: 1, max: 1, initial: 1, policy: 'fixed'}}),
+    pack.lines[0].stations[1],
+  ]})], order: ['fast']};
+  const {runtime, broker, journal, state} = setup(browserPack, {browser: 1});
+  let freeMemMB = 2475;
+  broker.memoryFloorMB = 3072;
+  broker.freeMem = () => freeMemMB;
+  const calls: string[] = [];
+  runtime.executors = () => async context => {
+    calls.push(context.token.id);
+    return {ok: true, summary: 'Browser fixture completed'};
+  };
+  try {
+    const first = runtime.create('fast/work', {item: 'memory-wait', url: '', source: 'fixture'});
+    await runtime.settle();
+    assert.equal(broker.effectiveBrowser(), 0);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(runtime.queues.get('fast/work'), [first.id]);
+    assert.equal(state.tokens[first.id].attempts.length, 0, 'resource waiting is not a failed attempt');
+    assert.match(runtime.waiting['fast/work'], /空闲内存 2475MB < 3072MB/);
+    assert.doesNotMatch(runtime.waiting['fast/work'], /到达率/);
+
+    freeMemMB = 3305;
+    runtime.balance();
+    await runtime.settle();
+    assert.deepEqual(calls, [first.id], 'the regular balance tick observes recovery without a released lease');
+    assert.equal(state.tokens[first.id].status, 'published');
+    assert.equal(broker.used.browser, 0);
+
+    freeMemMB = 2400;
+    const second = runtime.create('fast/work', {item: 'paused-memory-wait', url: '', source: 'fixture'});
+    await runtime.settle();
+    runtime.pause();
+    freeMemMB = 4096;
+    runtime.balance();
+    await runtime.settle();
+    assert.deepEqual(calls, [first.id], 'memory recovery cannot override a user pause');
+    assert.deepEqual(runtime.queues.get('fast/work'), [second.id]);
+    runtime.resume();
+    await runtime.settle();
+    runtime.balance();
+    await runtime.settle();
+    assert.deepEqual(calls, [first.id, second.id], 'each retained input executes exactly once');
+    assert.equal(state.tokens[second.id].status, 'published');
+    assert.equal(broker.memoryFloorMB, 3072);
+    assert.equal(broker.limits.browser, 1);
+  } finally {
+    await runtime.close();
+    journal.close();
+  }
+});
+
 test('station and line pauses preserve queued inputs while unrelated lines continue', async () => {
   const { runtime, journal, state } = setup(); const calls: string[] = [];
   runtime.executors = node => async () => { calls.push(node.key); return { ok: true, summary: 'fixture' }; };

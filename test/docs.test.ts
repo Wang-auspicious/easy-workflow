@@ -41,6 +41,15 @@ test('station context distinguishes configured closed agents, actual model recei
     assert.match(completed, /最近执行回执：closed-command · actual-fixture-model/);
     assert.match(f.docs.renderContext('curation/scout'), /执行：程序执行/);
     assert.match(f.docs.renderContext('dispatcher'), /执行：pi · .*当前配置/);
+    f.journal.append({kind: 'agent.defaults', defaults: {
+      station: {adapter: 'pi', provider: 'project-provider', model: 'project-model'},
+      dispatcher: {adapter: 'pi', provider: 'dispatcher-provider', model: 'dispatcher-model'},
+    }});
+    f.journal.append({kind: 'agent.binding', node: 'curation/facts',
+      binding: {adapter: 'pi', provider: 'node-provider', model: 'node-model'}});
+    assert.match(f.docs.renderContext('curation/facts'), /执行：pi · node-provider\/node-model.*本节点请求配置/);
+    assert.match(f.docs.renderContext('curation/reader'), /执行：pi · project-provider\/project-model/);
+    assert.match(f.docs.renderContext('dispatcher'), /执行：pi · dispatcher-provider\/dispatcher-model/);
   } finally {
     if (previous.command === undefined) delete process.env.FACTORY_STATION_COMMAND; else process.env.FACTORY_STATION_COMMAND = previous.command;
     if (previous.model === undefined) delete process.env.FACTORY_STATION_MODEL; else process.env.FACTORY_STATION_MODEL = previous.model;
@@ -82,7 +91,9 @@ test("a real multi-station run persists actions, facts, review repairs and immut
     assert.deepEqual(first.runs[0].stationOrder.map((x) => x.station), ["curation/scout", "curation/reader", "curation/facts", "curation/fact-review", "curation/facts", "curation/fact-review", "curation/copy", "curation/copy-review"]);
     assert.equal(first.runs[0].attempts[0].actions.filter((a) => a.tool === "page_text").length, 95, "case keeps the full journal rather than the UI's 80-step ring");
     assert.equal(first.runs[0].evidence[0].id, `source-${token.id}`);
-    assert.equal(first.runs[0].tokens[0].dataChanges.filter(change => Object.keys(change.patch).some(key => key !== 'runtimeCheckpoint')).length, 5, 'all five business outputs remain recorded');
+    assert.equal(first.runs[0].tokens[0].dataChanges.filter(change =>
+      ['dossier', 'understanding', 'facts', 'copy'].some(key => Object.hasOwn(change.patch, key))).length,
+    5, 'all five business outputs remain recorded separately from scheduler and recovery policy checkpoints');
     assert.ok(first.runs[0].tokens[0].dataChanges.some(change => 'runtimeCheckpoint' in change.patch), 'scheduler checkpoints remain part of the full case audit trail');
     assert.equal(first.runs[0].consultations.filter((e) => e.kind === "consult.closed" && e.outcome === "resolved").length, 1);
     assert.ok(first.runs[0].unresolved.some((i) => i.field === "facts.pricing" && i.status === "unknown"));

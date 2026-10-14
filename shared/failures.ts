@@ -8,6 +8,10 @@ export interface Failure { tag:FailureTag; category:"invalid"|"network"|"auth"|"
   /** Methods already tried, so nobody repeats them. */
   tried?:string[] }
 export interface CandidateRecovery {
+  /** Stable work identity; absent only in journals written before identity scoping. */
+  key?: string;
+  line?: string;
+  workflowPack?: string;
   item: string;
   token: string;
   url: string;

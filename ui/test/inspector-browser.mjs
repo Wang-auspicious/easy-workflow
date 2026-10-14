@@ -49,7 +49,8 @@ try {
     source: configured ? 'project' : 'default',
     capabilities: {stream: !configured || configured.adapter === 'pi', cancel: true, resume: configured?.adapter !== 'launcher', usage: configured?.adapter === 'launcher' ? 'unknown' : configured?.adapter === 'codex' ? 'tokens-only' : 'reported'},
     lastModel: 'last-actual-fixture-model',
-  }]});
+  }], piModels: [{provider: 'fixture-provider', model: 'fixture-model', name: 'Fixture default'},
+    {provider: 'node-provider', model: 'independent-model', name: 'Independent node model'}]});
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(url.pathname);
@@ -59,7 +60,7 @@ try {
       if (holdCandidateRetry) await new Promise(resolve => { releaseCandidateRetry = resolve; });
       await route.fulfill(rejectCandidateRetry
         ? {status: 409, json: {ok: false, error: 'Fixture checkpoint is temporarily unavailable'}}
-        : {json: {ok: true, result: {count: request.items.length}}});
+        : {json: {ok: true, result: {count: request.tokens.length}}});
       return;
     }
     if (url.pathname === '/api/batch/admission') {
@@ -203,6 +204,12 @@ try {
   assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'inherit');
   assert.match(await settings.locator('.agent-binding-effective').innerText(), /Pi · fixture-model.*本项目默认/s);
   assert.match(await settings.innerText(), /最近回报模型：last-actual-fixture-model/);
+  assert.match(await settings.innerText(), /运行中也能修改.*下一次模型请求/s);
+  await settings.getByLabel('本节点已接入模型').selectOption('1');
+  assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'pi');
+  assert.equal(await settings.getByLabel('Agent provider').inputValue(), 'node-provider');
+  assert.equal(await settings.getByLabel('Agent 请求模型').inputValue(), 'independent-model');
+  assert.equal(savedBindings.length, 0, 'choosing a connected model stays a draft until save');
   await settings.getByLabel('执行适配器').selectOption('claude-code');
   await settings.getByLabel('Agent 请求模型').fill('fixture-claude');
   await settings.getByLabel('Agent 启动命令').fill('not-json');
@@ -401,7 +408,7 @@ try {
   releaseCandidateRetry();
   await page.getByRole('alert').filter({hasText: 'Fixture checkpoint is temporarily unavailable'}).waitFor();
   assert.equal(await page.getByLabel('选择 需核查一', {exact: true}).isChecked(), true, 'a rejected request preserves the explicit choice');
-  assert.deepEqual(candidateRetries[0], {count: 1, items: ['manual-one'], includeManual: true});
+  assert.deepEqual(candidateRetries[0], {count: 1, tokens: ['manual-one'], includeManual: true});
   rejectCandidateRetry = false;
   await page.getByRole('button', {name: '继续已选 1 件原工位', exact: true}).click();
   await page.getByRole('status').filter({hasText: '已从原工位继续 1 件'}).waitFor();
@@ -421,7 +428,7 @@ try {
   await page.getByRole('button', {name: '待重试 1', exact: true}).click();
   await page.getByRole('button', {name: '重试当前筛选 1 件', exact: true}).click();
   await page.getByRole('status').filter({hasText: '已从原工位继续 1 件'}).waitFor();
-  assert.deepEqual(candidateRetries[2], {count: 1, items: ['retry-one'], tag: 'network_timeout'});
+  assert.deepEqual(candidateRetries[2], {count: 1, tokens: ['retry-one'], tag: 'network_timeout'});
   assert.equal(calls.includes('/api/tools/retry_candidates'), false, 'both paths use the authorized user route');
   await page.getByLabel('失败原因标签').selectOption('');
   await page.getByRole('button', {name: '恢复待人工 2', exact: true}).click();

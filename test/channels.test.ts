@@ -341,6 +341,80 @@ test('unmanaged source and channel backlogs share a bounded flow window without 
   }
 });
 
+test('a due channel checkpoint shares live source and channel intake without replaying its paid upstream', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  let paid = 0;
+  let reviewed = 0;
+  const order: string[] = [];
+  const releases: (() => void)[] = [];
+  const factory = await boot(async context => {
+    if (context.token.item === 'failed-child') {
+      if (context.node.key === 'child/paid') paid++;
+      if (context.node.key === 'child/review') {
+        reviewed++;
+        if (reviewed === 1) return {ok: false, summary: 'Transient review transport', failure: {
+          tag: 'network_timeout', category: 'network', owner: 'system', retryable: true, message: 'ETIMEDOUT fixture',
+        }};
+        order.push('recovery');
+      }
+      return success(context);
+    }
+    if (context.node.key === 'child/prepare' || context.node.key === 'components/discover') {
+      order.push(context.token.data.channelDelivery ? 'channel' : 'source');
+      await new Promise<void>(resolve => {
+        releases.push(resolve);
+        context.signal.addEventListener('abort', () => resolve(), {once: true});
+      });
+    }
+    return success(context);
+  });
+  const turn = async () => {
+    for (let index = 0; index < 4; index++) await new Promise<void>(resolve => setImmediate(resolve));
+  };
+  try {
+    const failed = parent(factory, 'failed-child');
+    emit(factory, failed.id);
+    factory.runtime.start('Fair channel checkpoint');
+    await settle(factory);
+    assert.equal(reviewed, 1);
+    const origin = parent(factory, 'new-children');
+    for (let index = 0; index < 8; index++) {
+      factory.journal.append({kind: 'token.data', token: origin.id, patch: {revision: index}});
+      emit(factory, origin.id);
+    }
+    await factory.sources.close();
+    factory.sources = new SourceSupervisor(factory);
+    factory.sources.configure(sourceSpec({enabled: true}));
+    for (let index = 0; index < 12; index++) {
+      factory.journal.append({kind: 'source.candidate', candidate: sourceItem(`live-${index}`)});
+    }
+    await turn();
+    t.mock.timers.tick(20000);
+    let peak = 0;
+    for (let index = 0; index < 24; index++) {
+      factory.recovery.pump();
+      factory.sources.pump();
+      factory.channels!.pump();
+      await turn();
+      const window = factory.sources.unmanagedAdmission('child/inbox', true);
+      peak = Math.max(peak, window.active);
+      assert.ok(window.active <= window.maxInFlight);
+      assert.ok(children(factory).filter(token => token.status === 'active').length <= 1);
+      releases.shift()?.();
+      await turn();
+    }
+    assert.equal(reviewed, 2, 'new channel deliveries cannot repeatedly take the failed child slot');
+    assert.equal(paid, 1, 'the retry resumes the review checkpoint');
+    assert.ok(order.filter(value => value === 'source').length >= 2);
+    assert.ok(order.filter(value => value === 'channel').length >= 2);
+    assert.ok(order.indexOf('recovery') < 6, 'recovery makes bounded progress before the live backlog drains');
+    assert.ok(peak > 1);
+  } finally {
+    factory.recovery.close();
+    await close(factory);
+  }
+});
+
 test('continuous sources rotate admissions while keeping reputation order inside each source', async () => {
   const order: string[] = [];
   const factory = await boot(async ctx => {

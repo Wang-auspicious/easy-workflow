@@ -5,7 +5,9 @@ import { failureLabels } from "../../../shared/failures.ts";
 
 /** Legacy alerts may say “auth” for connection errors; a label is not login evidence. */
 export function alertPresentation(alert: Alert, recoveries: Record<string, CandidateRecovery>, browser: BrowserState) {
-  const recovery = Object.values(recoveries).find(r => r.item === alert.item || Boolean(alert.token && r.token === alert.token));
+  const matches = Object.values(recoveries).filter(recovery => alert.token
+    ? recovery.token === alert.token : recovery.item === alert.item);
+  const recovery = matches.length === 1 ? matches[0] : undefined;
   const tab = browser.tabs.find(t => t.id === alert.tab);
   const failure = recovery?.failure;
   const confirmedLogin = tab?.attentionKind === "auth" || tab?.attentionKind === "challenge";

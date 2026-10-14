@@ -2,7 +2,9 @@
 // 跑法：node --test ui/test/transcript.test.ts（或 npm run test:ui）
 import assert from "node:assert/strict";
 import test from "node:test";
-import { legacyReply, type ConversationEntry } from "../../shared/conversation.ts";
+import {compactToolMessage, legacyReply, TOOL_MESSAGE_BYTES, type ConversationEntry, type PiMessage} from '../../shared/conversation.ts';
+import {initialState} from '../../shared/project.ts';
+import {uiEvent, uiState} from '../../shared/client-view.ts';
 import { emptyLive, idleDispatcher, type LiveChat, type DispatcherStatus } from "../src/chat/live.ts";
 import { buildTranscript, correctionReceipt, dispatcherState, toolLabel } from "../src/chat/transcript.ts";
 import type { CompiledFactory, CompiledNode } from "../../shared/types.ts";
@@ -11,6 +13,26 @@ import { botFor } from "../../shared/palette.ts";
 const dispatcher = (patch: Partial<DispatcherStatus> = {}): DispatcherStatus => ({ ...idleDispatcher(), ...patch });
 const live = (patch: Partial<LiveChat> = {}): LiveChat => ({ ...emptyLive(), ...patch });
 const assistant = (text: string) => legacyReply(text, 1000);
+
+test('large chat tool receipts stay bounded in UI snapshots and SSE without erasing the journal view', () => {
+  for (const payload of ['历史报告'.repeat(50000), '\u0000"\\'.repeat(50000)]) {
+    const message: PiMessage = {role: 'toolResult', toolCallId: 'large-report', toolName: 'easy_workflow_call',
+      content: [{type: 'text', text: payload}], details: {result: payload}, isError: false, timestamp: 1000};
+    const original = JSON.stringify(message);
+    const compacted = compactToolMessage(message);
+    assert.ok(Buffer.byteLength(JSON.stringify(compacted)) <= TOOL_MESSAGE_BYTES);
+    assert.equal(compacted.role, 'toolResult');
+    const state = initialState();
+    state.conversation.push({id: 'report-message', turn: 'turn-report', message});
+    assert.deepEqual(uiState(state).conversation[0].message, compacted);
+    const event = uiEvent({kind: 'chat.message', id: 'report-message', turn: 'turn-report', message,
+      seq: 1, at: 1000, run: 'run-report'});
+    assert.ok(event.kind === 'chat.message');
+    assert.deepEqual(event.message, compacted);
+    assert.equal(JSON.stringify(message), original);
+    assert.deepEqual(compactToolMessage(compacted), compacted, 'replayed UI projections are stable');
+  }
+});
 
 test('撤销只绑定真实纠错回执，不把任意输出中的 correction 当成按钮', () => {
   assert.equal(correctionReceipt('correct', {}, JSON.stringify({ ok: true, correction: 'c-direct' })), 'c-direct');

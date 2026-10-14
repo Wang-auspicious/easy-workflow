@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {CompiledFactory, CompiledNode, ProjectAgentDefaults, Stamped, StationAgentBinding} from '../shared/types.ts';
-import { apply, initialState, latestRunTokens, tokenWorkKey, type FactoryState } from "../shared/project.ts";
+import { apply, initialState, latestRunTokens, tokenWorkKey, recoveryKey, type FactoryState } from "../shared/project.ts";
 import { compile, type Patch } from "./spec/compile.ts";
 import { Journal } from "./journal.ts";
 import { Broker } from "./broker.ts";
@@ -34,7 +34,7 @@ import { flushAtlas } from '../packs/vislexicon/components.ts';
 import { ChannelSupervisor } from './channels.ts';
 import { SourceSupervisor } from './sources.ts';
 import {agentCapabilities, closedModelDependency, parseAgentBinding, resolveNativeCommand} from './agent-bindings.ts';
-import {models, piSelection} from './pi.ts';
+import {models, piModelCatalog, piSelection} from './pi.ts';
 import {UnmanagedRecoverySupervisor} from './recovery.ts';
 import {ModelCircuits} from './model-circuits.ts';
 import {withModelAdmission} from './model-requests.ts';
@@ -135,7 +135,8 @@ export class Factory {
             return {
               dependency: captured.dependency,
               execute: scoped(this.workflowPacks!.executor(n, (definition, context) =>
-                runAgentStation({...definition, services: this.stationServices(), agent: captured.binding, piRuntime: captured.piRuntime}, context))!),
+                runAgentStation({...definition, services: this.stationServices(), agent: captured.binding,
+                  piRuntime: captured.piRuntime, piControl: captured.piControl}, context))!),
             };
           },
         };
@@ -165,7 +166,8 @@ export class Factory {
             const captured = this.captureAgent(n.key, def.agent);
             return {
               dependency: captured.dependency,
-              execute: scoped(context => runAgentStation({...def, services: this.stationServices(), agent: captured.binding, piRuntime: captured.piRuntime}, context)),
+              execute: scoped(context => runAgentStation({...def, services: this.stationServices(), agent: captured.binding,
+                piRuntime: captured.piRuntime, piControl: captured.piControl}, context)),
             };
           } catch (error) {
             // Deterministic rules still run without a configured model. If a
@@ -273,8 +275,9 @@ export class Factory {
   }
 
   private bindAgent(node: string, definition: AgentStationDef): AgentStationDef {
-    const binding = this.state.agentBindings?.[node] ?? definition.agent ?? this.defaultAgentBinding();
-    return {...definition, services: this.stationServices(), agent: this.resolveAgentBinding(binding)};
+    const captured = this.captureAgent(node, definition.agent);
+    return {...definition, services: this.stationServices(), agent: captured.binding,
+      piRuntime: captured.piRuntime, piControl: captured.piControl};
   }
 
   private stationServices() {
@@ -288,11 +291,28 @@ export class Factory {
       return {
         binding: {adapter: 'pi' as const, provider: piRuntime.model.provider, model: piRuntime.model.id},
         piRuntime, dependency: piRuntime.dependency,
+        piControl: {
+          resolve: (current: ReturnType<typeof models>) => {
+            const next = this.resolveAgentBinding(this.state.agentBindings?.[node] ?? declared ?? this.defaultAgentBinding());
+            // A different harness needs its own process and starts on the next attempt.
+            if (next.adapter !== 'pi' || next.provider === current.model.provider && next.model === current.model.id) return current;
+            return models(next);
+          },
+          list: piModelCatalog,
+          select: (selection: {provider: string; model: string}) => {
+            const current = this.resolveAgentBinding(this.state.agentBindings?.[node] ?? declared ?? this.defaultAgentBinding());
+            if (current.adapter !== 'pi') throw new ControlError(409, 'agent_binding_changed', '用户已为本节点选择其他运行底座；不能覆盖该配置');
+            if (!piModelCatalog().some(option => option.provider === selection.provider && option.model === selection.model)) {
+              throw new ControlError(422, 'model_not_connected', '只能选择本机已接入 Pi 供应商目录中的模型');
+            }
+            this.setAgentBinding(node, {adapter: 'pi', ...selection});
+          },
+        },
       };
     }
     const captured = binding.command ? {...binding, command: [...binding.command]}
       : {...binding, command: resolveNativeCommand(binding.adapter as 'claude-code' | 'opencode' | 'codex')};
-    return {binding: captured, piRuntime: undefined, dependency: closedModelDependency(captured)};
+    return {binding: captured, piRuntime: undefined, piControl: undefined, dependency: closedModelDependency(captured)};
   }
 
   private agentDefault(node: string): {binding?: StationAgentBinding} | undefined {
@@ -305,6 +325,12 @@ export class Factory {
 
   private defaultAgentBinding(): StationAgentBinding {
     return this.getAgentDefaults().station;
+  }
+
+  getStationAgentBinding(node: string): StationAgentBinding | null {
+    const declared = this.agentDefault(node);
+    if (!declared) return null;
+    return this.resolveAgentBinding(this.state.agentBindings?.[node] ?? declared.binding ?? this.defaultAgentBinding());
   }
 
   private resolveAgentBinding(input: StationAgentBinding): StationAgentBinding {
@@ -340,6 +366,10 @@ export class Factory {
     if (JSON.stringify(defaults) !== JSON.stringify(this.state.agentDefaults)) {
       this.journal.append({kind: 'agent.defaults', defaults});
       this.lastPreflight = 0;
+      if (update.station) {
+        for (const node of this.compiled.nodes) if (this.agentDefault(node.key)) this.recovery?.bindingChanged(node.key);
+        this.runtime.tick();
+      }
     }
     return this.getAgentDefaults();
   }
@@ -382,7 +412,7 @@ export class Factory {
         lastModel: latestModels.get(current.key)?.model,
       });
     }
-    return {bindings};
+    return {bindings, ...(node ? {piModels: piModelCatalog()} : {})};
   }
 
   setAgentBinding(node: string, input: unknown) {
@@ -393,6 +423,8 @@ export class Factory {
     if (JSON.stringify(binding) !== JSON.stringify(this.state.agentBindings?.[node] ?? null)) {
       this.journal.append({kind: 'agent.binding', node, binding});
       this.lastPreflight = 0;
+      this.recovery?.bindingChanged(node);
+      this.runtime.tick();
     }
     return this.agentBindings(node);
   }
@@ -532,11 +564,22 @@ export class Factory {
       }
     }
     for (const alert of Object.values(this.state.alerts)) {
-      const candidate = alert.item ? this.state.recoveries[alert.item] : undefined;
+      const candidate = this.recoveryForAlert(alert);
       if (alert.kind === 'auth' && candidate && (candidate.disposition !== 'retry' || candidate.failure?.tag !== 'auth_required')) {
         this.clearAlert(alert.id, '按实际失败原因重新核对：这不是需要用户登录的任务');
       }
     }
+  }
+
+  private recoveryForAlert(alert: Alert): CandidateRecovery | undefined {
+    if (alert.token) {
+      const token = this.state.tokens[alert.token];
+      const candidate = token && this.state.recoveries[recoveryKey(token)];
+      return candidate?.token === alert.token ? candidate : undefined;
+    }
+    if (!alert.item) return;
+    const matches = this.candidateFailures().filter(candidate => candidate.item === alert.item);
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   async recheckAlert(id: string) {
@@ -550,14 +593,15 @@ export class Factory {
       for (const tab of matches) browser = await browserCommand({ action: 'attention.check', id: tab.id }) as BrowserState;
       const checked = browser.tabs.filter(tab => sameSite(tab.url) && matches.some(original => original.id === tab.id));
       if (!checked.length || checked.some(tab => tab.loading || tab.attention || !/^https?:/.test(tab.url))) return { cleared: false, resumed: false, message: '页面仍有访问限制或仍在加载，已保留现场与检查点' };
-      const candidate = alert.item ? this.state.recoveries[alert.item] : undefined;
+      const candidate = this.recoveryForAlert(alert);
       if (candidate?.disposition === 'retry') this.journal.append({ kind: 'token.data', token: candidate.token, patch: { accessVerified: { at: Date.now(), tab: checked[0].id, url: checked[0].url } } });
       this.clearAlert(id, '共享浏览器重新检查确认页面可访问，已保存恢复标记');
       if (this.runtime.paused) return { cleared: true, resumed: false, message: '页面可访问；已保存恢复标记，继续本轮后将从检查点恢复' };
       if (this.state.batch?.runId === this.state.run.id && this.state.batch.mode !== 'running') return { cleared: true, resumed: false, message: '页面可访问；托管已停止，恢复任务后再继续此条目' };
       if (!this.runtime.running) await this.ensureReady();
       const tasks = this.resumeVerifiedCandidates();
-      return { cleared: true, resumed: tasks.some(token => token.item === alert.item), message: tasks.some(token => token.item === alert.item) ? '访问已恢复，已从失败工位继续' : candidate?.disposition === 'retry' ? '访问已恢复，已排入恢复队列；在途任务腾出空位后自动继续' : '访问已恢复，该任务已不在待重试队列' };
+      const resumed = tasks.some(token => token.data.retryOf === candidate?.token);
+      return { cleared: true, resumed, message: resumed ? '访问已恢复，已从失败工位继续' : candidate?.disposition === 'retry' ? '访问已恢复，已排入恢复队列；在途任务腾出空位后自动继续' : '访问已恢复，该任务已不在待重试队列' };
     }
     if (alert.kind === 'model' || alert.kind === 'preflight') {
       let checked = false;
@@ -582,10 +626,10 @@ export class Factory {
   resumeVerifiedCandidates() {
     if (!this.runtime.running || this.runtime.paused || this.runtime.ending) return [];
     if (this.state.batch?.runId === this.state.run.id && this.state.batch.mode !== 'running') return [];
-    const items = this.candidateFailures({ disposition: 'retry' }).filter(candidate => candidate.failure?.tag === 'auth_required' && this.state.tokens[candidate.token]?.data.accessVerified).map(candidate => candidate.item);
+    const tokens = this.candidateFailures({ disposition: 'retry' }).filter(candidate => candidate.failure?.tag === 'auth_required' && this.state.tokens[candidate.token]?.data.accessVerified).map(candidate => candidate.token);
     const goal = this.state.batch?.runId === this.state.run.id ? this.state.batch : undefined;
     const slots = goal ? Math.max(0, goal.maxInFlight - [...this.runtime.tokens.values()].filter(token => !token.finished).length) : 12;
-    return items.length && slots ? this.retryCandidates({ items, count: Math.min(items.length, slots) }) : [];
+    return tokens.length && slots ? this.retryCandidates({ tokens, count: Math.min(tokens.length, slots) }) : [];
   }
   async resumeVerified(browser: BrowserState) {
     const alerts = Object.values(this.state.alerts ?? {}).filter((a) => a.kind === "auth" && a.item && (a.url || a.tab));
@@ -601,11 +645,11 @@ export class Factory {
       this.resuming = true;
       try {
         if (!this.runtime.running) await this.ensureReady();
-        const candidate = this.state.recoveries[a.item!];
+        const candidate = this.recoveryForAlert(a);
         if (candidate?.disposition === 'retry') {
           this.journal.append({ kind: 'token.data', token: candidate.token, patch: { accessVerified: { at: Date.now(), tab: tabs[0].id, url: tabs[0].url } } });
           this.clearAlert(a.id, '内置浏览器里的验证已通过，已排入恢复队列');
-          if (this.resumeVerifiedCandidates().some(token => token.item === a.item)) this.journal.append({ kind: "dispatch.note", node: a.node, tone: "info", text: `${a.item}：内置浏览器里的验证已通过，自动从失败工位继续` });
+          if (this.resumeVerifiedCandidates().some(token => token.data.retryOf === candidate.token)) this.journal.append({ kind: "dispatch.note", node: a.node, tone: "info", text: `${a.item}：内置浏览器里的验证已通过，自动从失败工位继续` });
         }
       } catch { /* Paused, preflight failed or no longer waiting: the red light and manual retry remain. */ }
       finally { this.resuming = false; }
@@ -670,7 +714,8 @@ export class Factory {
     this.runtime.onAlert = (token, node, failure, dependency) => {
       const kind: Alert["kind"] | undefined = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" || failure.tag === "model_transport" ? "model" : failure.tag === "auth_required" ? "auth" : undefined;
       if (!kind) return;
-      const id = failure.tag === 'model_transport' ? 'model-transport' : kind === 'model' ? 'model' : `${kind}:${token.item}`;
+      const current = this.state.tokens[token.id];
+      const id = failure.tag === 'model_transport' ? 'model-transport' : kind === 'model' ? 'model' : `${kind}:${current ? recoveryKey(current) : token.item}`;
       this.raiseAlert({ id: kind === 'model' && dependency ? `${id}:${dependency.key}` : id,
         dependency: kind === 'model' ? dependency : undefined,
         level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: kind === 'model' ? undefined : failure.url ?? token.url });
@@ -690,10 +735,12 @@ export class Factory {
       if(!this.state.tokens[token.id]?.data.failure)this.journal.append({kind:'token.data',token:token.id,patch:{failure}});
       return;
     }
-    const previous=this.state.recoveries[token.item],disposition=failure.retryable?"retry":"removed";
+    const current = this.state.tokens[token.id];
+    const key = current ? recoveryKey(current) : token.item;
+    const previous = this.state.recoveries[key], disposition = failure.retryable ? 'retry' : 'removed';
     if(previous?.token===token.id&&previous.disposition===disposition)return;
     if(!this.state.tokens[token.id]?.data.failure)this.journal.append({kind:"token.data",token:token.id,patch:{failure}});
-    this.journal.append({kind:"candidate.disposition",candidate:{item:token.item,token:token.id,url:token.url,title:token.title||token.item,source:token.source,category:this.state.tokens[token.id]?.category,disposition,failure}});
+    this.journal.append({kind:"candidate.disposition",candidate:{key,item:token.item,token:token.id,url:token.url,title:token.title||token.item,source:token.source,category:current?.category,disposition,failure}});
     const delta=Number(disposition==="retry")-Number(previous?.disposition==="retry");
     if(delta && this.runtime.nodes.has('candidates/pool'))this.runtime.stockDelta("candidates/pool",delta,`${token.item}：${disposition==="retry"?"退回待重试":"移除无效网址"}`);
   }
@@ -702,10 +749,12 @@ export class Factory {
     if (!this.runtime.nodes.has('candidates/pool')) return;
     // Repair the old "fetch failed → successful rejection" and exhausted capture
     // paths once, without rewriting evidence or rerunning paid model work.
-    const latest = new Map(Object.values(this.state.tokens).sort((a,b)=>a.createdAt-b.createdAt).map(t=>[t.item,t]));
+    const latest = new Map(Object.values(this.state.tokens).sort((a,b)=>a.createdAt-b.createdAt).map(t=>[recoveryKey(t),t]));
     for(const token of latest.values()) {
       if(token.data.channelDelivery||token.source.startsWith('channel:'))continue;
-      if(this.state.recoveries[token.item]||!["rejected","manual","parked"].includes(token.status))continue;
+      if(this.state.recoveries[recoveryKey(token)]||!["rejected","manual","parked"].includes(token.status))continue;
+      const recorded = token.data.failure as Failure | undefined;
+      if (recorded && (!recorded.retryable || recorded.code === 'EXTERNAL_OPERATION_UNKNOWN')) continue;
       const attempts=token.attempts.map(id=>this.state.attempts[id]).filter(Boolean);
       const failed=[...attempts].reverse().find(a=>a.ok===false||/^打不开[：:]|^HTTP [45]\d\d/.test(a.summary??""));
       if(!failed&&token.status!=="parked")continue;
@@ -730,7 +779,7 @@ export class Factory {
     if (!['parked', 'failed'].includes(current.status) || token.inflight.size) {
       throw new ControlError(409, 'recovery_still_active', '等待原尝试结束并保存回执后再转人工复核');
     }
-    const candidate = this.state.recoveries[token.item];
+    const candidate = this.state.recoveries[recoveryKey(current)];
     this.runtime.atomicTransition(() => {
       if (candidate?.token === tokenId && candidate.disposition === 'retry') {
         this.journal.append({kind: 'candidate.disposition', candidate: {
@@ -748,8 +797,32 @@ export class Factory {
     return Object.values(this.state.recoveries).filter(c=>(!filter.tag||c.failure?.tag===filter.tag)&&(!filter.disposition||c.disposition===filter.disposition)).sort((a,b)=>b.at-a.at);
   }
 
+  /** Exact token selectors cannot drift to a newer attempt or a same-named workflow. */
+  candidatesForRetry(filter: {tag?: string; items?: string[]; tokens?: string[]; count: number; includeManual?: boolean}) {
+    if (filter.tokens?.length && filter.items?.length) {
+      throw new ControlError(400, 'recovery_selector_conflict', '请按任务或条目标识选择，不要同时提供两种选择器');
+    }
+    const records = this.candidateFailures();
+    if (filter.items) {
+      for (const item of filter.items) {
+        const matches = records.filter(candidate => candidate.item === item);
+        if (matches.length > 1) {
+          throw new ControlError(409, 'recovery_item_ambiguous', '同名条目属于多个工作流，请选择具体任务后继续', {
+            item, candidates: matches.map(candidate => ({key: candidate.key, token: candidate.token,
+              line: candidate.line, workflowPack: candidate.workflowPack, disposition: candidate.disposition})),
+          });
+        }
+      }
+    }
+    return records.filter(candidate => candidate.disposition === 'retry' || filter.includeManual && candidate.disposition === 'manual')
+      .filter(candidate => !filter.tag || candidate.failure?.tag === filter.tag)
+      .filter(candidate => !filter.items || filter.items.includes(candidate.item))
+      .filter(candidate => !filter.tokens || filter.tokens.includes(candidate.token))
+      .slice(0, filter.count);
+  }
+
   choosePreview(item:string,role:"breadth"|"proof",url:string) {
-    const c=this.state.recoveries[item];
+    const c = this.candidatesForRetry({items: [item], count: 1})[0];
     if(!c||c.disposition!=="retry")throw new ControlError(409,"candidate_not_waiting","该候选当前不在待处理队列");
     let selected:URL,entry:URL;
     try{selected=new URL(url);entry=new URL(c.url);}catch{throw new ControlError(400,"invalid_url","请输入完整网页地址");}
@@ -757,12 +830,13 @@ export class Factory {
     if(!["http:","https:"].includes(selected.protocol)||selected.username||selected.password||!(selected.hostname.replace(/^www\./,"")===host||selected.hostname.endsWith('.'+host)))throw new ControlError(400,"invalid_preview_page","采集页必须是该站点或其子域的 HTTP(S) 网页");
     if(/\.(txt|md|json|xml|zip|pdf|png|jpe?g|svg|mp4)$/i.test(selected.pathname))throw new ControlError(400,"not_visual_page","请选择可视页面，不能用数据文件或下载文件代替截图");
     if(!this.state.tokens[c.token]?.data.canonical)throw new ControlError(409,"missing_classification","请先完成首页抓取与分类，再指定采集页");
-    return this.retryCandidates({items:[item],count:1,preview:{role,url:selected.href}})[0];
+    return this.retryCandidates({tokens:[c.token],count:1,preview:{role,url:selected.href}})[0];
   }
 
   retryCandidates(filter: {
     tag?: string;
     items?: string[];
+    tokens?: string[];
     count: number;
     preview?: {role: 'breadth' | 'proof'; url: string};
     automatic?: boolean;
@@ -774,13 +848,10 @@ export class Factory {
     if (this.runtime.paused && this.runtime.running) {
       throw new ControlError(409, 'run_paused', '请先继续或结束当前暂停的轮次');
     }
-    if (filter.includeManual && (filter.automatic || !filter.items?.length)) {
+    if (filter.includeManual && (filter.automatic || !filter.items?.length && !filter.tokens?.length)) {
       throw new ControlError(400, 'manual_retry_requires_items', '人工复核项仅能按明确指定的条目主动重试');
     }
-    const selected = this.candidateFailures({tag: filter.tag})
-      .filter(candidate => candidate.disposition === 'retry' ||
-        (filter.includeManual && candidate.disposition === 'manual'))
-      .filter(candidate => !filter.items || filter.items.includes(candidate.item)).slice(0, filter.count);
+    const selected = this.candidatesForRetry(filter);
     if (!selected.length) return [];
     if (filter.checkpointOnly) {
       if (!this.runtime.running || this.runtime.ending) throw new ControlError(409, 'run_inactive', '自动恢复只在当前运行中继续已有检查点');
@@ -811,7 +882,10 @@ export class Factory {
     if (!filter.automatic) {
       for (const candidate of selected) {
         for (const kind of ['tls', 'auth', 'browser']) {
-          this.clearAlert(`${kind}:${candidate.item}`, '站长已处理，按原因重试');
+          const token = this.state.tokens[candidate.token];
+          const id = `${kind}:${candidate.key ?? (token ? recoveryKey(token) : candidate.item)}`;
+          const alert = this.state.alerts[id];
+          if (alert && (!alert.token || alert.token === candidate.token)) this.clearAlert(id, '站长已处理，按原因重试');
         }
       }
     }
@@ -1050,7 +1124,7 @@ export class Factory {
       t.notes = notes.get(ts.id) ?? t.notes;
       rt.restoreFlow(t);
       rt.tokens.set(t.id, t);
-      const legacyFrontier = ts.status === 'parked' && this.state.recoveries[ts.item]?.failure?.message.startsWith('恢复分支状态不完整');
+      const legacyFrontier = ts.status === 'parked' && this.state.recoveries[recoveryKey(ts)]?.failure?.message.startsWith('恢复分支状态不完整');
       if ((ts.status === 'manual' || legacyFrontier) && ts.data.recoveryStation && !ts.data.retriedBy && ts.data.manualReason === '没有可走的下一步（分支条件都不成立）') {
         const frontier = rt.readyFrontier(t).filter(key=>rt.runnable(rt.nodes.get(key)!));
         if (frontier.length) {
@@ -1059,7 +1133,7 @@ export class Factory {
           t.finishedStore=undefined; t.data.failure=failure;
           this.journal.append({kind:'token.data',token:t.id,patch:{failure,manualReason:null}});
           this.journal.append({kind:'token.finished',token:t.id,node:frontier[0],status:'parked',reason:failure.message});
-          const old=this.state.recoveries[t.item];
+          const old = this.state.recoveries[recoveryKey(ts)];
           this.journal.append({kind:'candidate.disposition',candidate:{...old,item:t.item,token:t.id,url:t.url,title:t.title??t.item,source:t.source,disposition:'retry',failure,at:Date.now(),attempts:old?.attempts??1}});
           if (old?.disposition !== 'retry') rt.stockDelta('candidates/pool',1,'系统恢复缺失分支，重新进入可恢复候选');
         }

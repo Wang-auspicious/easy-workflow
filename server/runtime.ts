@@ -357,13 +357,23 @@ export class Runtime {
     } catch (error) { return {prepared: null, failed: true, error}; }
   }
 
-  private modelWait(t: TokenRun, key: string) {
-    return (t.data.modelWait as Record<string, {dependency?: ModelDependency; reason: string}> | undefined)?.[key];
+  selectedModelDependency(key: string): ModelDependency | undefined {
+    const node = this.nodes.get(key);
+    return node ? this.prepareExecutor(node).prepared?.dependency : undefined;
+  }
+
+  private modelWait(t: TokenRun, key: string, selected?: ModelDependency) {
+    const waiting = (t.data.modelWait as Record<string, {
+      dependency?: ModelDependency; stationDependency?: ModelDependency; reason: string;
+    }> | undefined)?.[key];
+    if (selected && waiting?.stationDependency && waiting.stationDependency.key === waiting.dependency?.key &&
+        selected.key !== waiting.dependency?.key) return undefined;
+    return waiting;
   }
 
   private dispatchHold(t: TokenRun, n: CompiledNode, preparation: ExecutorPreparation): string | null {
     if (preparation.failed) return null;
-    const waiting = this.modelWait(t, n.key);
+    const waiting = this.modelWait(t, n.key, preparation.prepared?.dependency);
     if (waiting) {
       const reason = this.broker.modelBlocked(waiting.dependency, t.id);
       if (reason) return reason;
@@ -409,7 +419,7 @@ export class Runtime {
       const prepared = this.prepareExecutor(node);
       if (!this.scopePaused(key) && !this.dispatchHold(token, node, prepared)) return true;
       if (targetClosure.has(key)) return true;
-      const dependency = this.modelWait(token, key)?.dependency ?? prepared.prepared?.dependency;
+      const dependency = this.modelWait(token, key, prepared.prepared?.dependency)?.dependency ?? prepared.prepared?.dependency;
       // Unknown fault domains retain their global compatibility barrier.
       return dependency ? targetDependencies.has(dependency.key) : node.resource === 'model';
     });
@@ -581,11 +591,15 @@ export class Runtime {
           continue;
         }
         const resource = preparation.failed ? 'none' : n.resource;
-        if (resource !== 'none' && this.workers.get(key)!.filter(worker => worker.busy).length >= (allocation.get(key) ?? 0)) { waiting[key] = `按到达率 × 服务时间分配 ${allocation.get(key) ?? 0} 个 ${n.resource} 名额`; continue; }
         const queuedToken = this.tokens.get(q[index]);
+        const options = {review: n.kind === 'review', dependency: preparation.prepared?.dependency, token: queuedToken!.id};
+        if (resource !== 'none' && this.workers.get(key)!.filter(worker => worker.busy).length >= (allocation.get(key) ?? 0)) {
+          waiting[key] = this.broker.blocked(resource, options) ??
+            `按到达率 × 服务时间分配 ${allocation.get(key) ?? 0} 个 ${n.resource} 名额`;
+          continue;
+        }
         const capacityWait = queuedToken?.data.capacityWait as Record<string, number> | undefined;
         if ((capacityWait?.[key] ?? 0) > Date.now()) { waiting[key] = '等待共享浏览器释放容量；网站未记为失败'; continue; }
-        const options = {review: n.kind === 'review', dependency: preparation.prepared?.dependency, token: queuedToken!.id};
         const why = this.broker.blocked(resource, options);
         if (why) { waiting[key] = why; break; }
         const lease = this.broker.tryAcquire(resource, options)!;
@@ -822,6 +836,7 @@ export class Runtime {
         this.running && !this.ending && (t.nodeEpochs?.get(n.key) ?? 0) === epoch) {
       const modelWait = {...(t.data.modelWait as object ?? {}), [n.key]: {
         dependency: res.failure.dependency ?? res.metrics?.dependency, reason: res.failure.message,
+        stationDependency: res.metrics?.dependency,
       }};
       const patch: Record<string, unknown> = {modelWait};
       // Waiting is not a business result. Keep only host-owned conversations;

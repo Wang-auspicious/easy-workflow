@@ -2,10 +2,11 @@ import type {Factory} from './factory.ts';
 import type {TokenRun} from './runtime.ts';
 import type {TokenState} from '../shared/project.ts';
 import type {ModelDependency, Stamped, StationRecoveryPolicy} from '../shared/types.ts';
-import {latestRunTokens} from '../shared/project.ts';
+import {latestRunTokens, recoveryKey} from '../shared/project.ts';
 import {classifyFailure, type Failure} from '../shared/failures.ts';
-import {isBatchToken, modelRecoveryDelay} from '../shared/batch.ts';
+import {isBatchToken, latestBatchTokens, modelRecoveryDelay, occupiesIntake} from '../shared/batch.ts';
 import {ControlError} from './errors.ts';
+import {pausedFrontierBlocksRecovery, recoveryHasNextTurn} from './admission.ts';
 import {allowsRecovery, hasRecoveryPolicy, parseRecoveryPolicy,
   recoveryDelay, recoverySnapshot} from '../shared/recovery-policy.ts';
 
@@ -51,6 +52,7 @@ export class UnmanagedRecoverySupervisor {
   private closed = false;
   private scheduled = false;
   private pumping = false;
+  private offering = false;
 
   constructor(factory: Factory) {
     this.factory = factory;
@@ -148,17 +150,65 @@ export class UnmanagedRecoverySupervisor {
     const station = token.finishedAtNode;
     const node = station && f.runtime.nodes.get(station);
     if (!record(saved) || saved.version !== 1 || typeof saved.entry !== 'string' ||
-        !Array.isArray(saved.done) || !Array.isArray(saved.notes) || !record(saved.rounds) ||
+        !Array.isArray(saved.done) || !saved.done.every(key => typeof key === 'string') ||
+        !Array.isArray(saved.notes) || !record(saved.rounds) ||
         !node || !f.runtime.runnable(node) ||
         !f.runtime.nodes.has(saved.entry) || !f.runtime.closureOf(saved.entry).has(node.key)) return;
     return node.key;
   }
 
   private sourceEnabled(token: TokenState) {
-    if (!token.data.sourceCandidate) return true;
-    const source = record(token.data.sourceRecord) ? token.data.sourceRecord.source
-      : token.source.startsWith('source:') ? token.source.slice(7) : undefined;
-    return typeof source === 'string' && Boolean(this.factory.sources?.list().find(value => value.id === source)?.enabled);
+    return this.factory.sources?.permitsRecovery(token) ?? !token.data.sourceCandidate;
+  }
+
+  /** A feeder yields only when another supervisor actually claims a task. */
+  beforeFresh(admit: () => number): number {
+    if (this.offering || this.pumping || !this.running() || !recoveryHasNextTurn(this.factory.state)) return admit();
+    this.offering = true;
+    try {
+      return this.pump(Date.now(), true) || admit();
+    } finally {
+      this.offering = false;
+    }
+  }
+
+  private offerFresh(): number {
+    if (this.offering) return 0;
+    this.offering = true;
+    try {
+      const f = this.factory;
+      const admitted = f.state.batch?.runId === f.state.run.id
+        ? f.batch.admitFresh(1) : f.sources?.pump() ?? 0;
+      return admitted || f.channels?.pump() || 0;
+    } finally {
+      this.offering = false;
+    }
+  }
+
+  private networkAdmission(token: TokenState, entry: string): boolean {
+    const f = this.factory;
+    const saved = token.data.runtimeCheckpoint;
+    if (!record(saved) || !Array.isArray(saved.done) || !saved.done.every(key => typeof key === 'string')) return false;
+    if (pausedFrontierBlocksRecovery(f.runtime, entry, Boolean(token.data.channelDelivery))) return false;
+    const checkpoint = {entry, done: new Set<string>(saved.done), dead: new Set<string>()};
+    if (this.managed(token)) {
+      const goal = f.state.batch!;
+      const occupied = latestBatchTokens(f.state).flatMap(value => {
+        if (value.status !== 'active') return [];
+        const live = f.runtime.tokens.get(value.id);
+        return live && f.runtime.occupiesAdmission(live, entry) ? [live] : [];
+      });
+      const upstream = occupied.filter(value => goal.admission
+        ? occupiesIntake(f.compiled, 'candidates/route', value) : !value.done.has('curation/plan')).length;
+      const needsIntake = goal.admission ? occupiesIntake(f.compiled, 'candidates/route', checkpoint)
+        : !checkpoint.done.has('curation/plan');
+      return goal.mode === 'running' && !goal.modelCircuit && occupied.length < goal.maxInFlight &&
+        (!needsIntake || upstream < goal.intakeWindow);
+    }
+    const admission = f.sources?.unmanagedAdmission(entry, Boolean(token.data.channelDelivery));
+    if (!admission) return ![...f.runtime.tokens.values()].some(value => f.runtime.occupiesAdmission(value, entry));
+    return admission.active < admission.maxInFlight &&
+      (!occupiesIntake(f.compiled, entry, checkpoint) || admission.upstream < admission.intakeWindow);
   }
 
   private exhaustion(plan: RecoveryPlan, now: number): string | undefined {
@@ -309,6 +359,31 @@ export class UnmanagedRecoverySupervisor {
     this.schedule();
   }
 
+  /** A new station selection does not repair the provider it stopped using. */
+  bindingChanged(node: string) {
+    if (!this.writable()) return;
+    const f = this.factory;
+    const selected = f.runtime.selectedModelDependency(node);
+    if (!selected) return;
+    const now = Date.now();
+    for (const token of this.tokens()) {
+      const plan = this.plan(token);
+      if (!plan || plan.kind !== 'model' || plan.state !== 'waiting' ||
+          (plan.modelStation ?? plan.station) !== node || !plan.dependency ||
+          plan.dependency.key === selected.key || f.runtime.tokens.get(token.id)?.inflight.size) continue;
+      const failed = f.state.attempts[plan.failureAttempt];
+      const primary = failed?.metrics?.dependency ?? failed?.dependency;
+      if (primary?.key !== plan.dependency.key) continue;
+      const circuit = f.modelCircuits.get(selected);
+      this.save(token.id, {...plan, dependency: selected,
+        modelFailures: circuit?.failures ?? 0,
+        nextAt: Math.max(plan.policy ? plan.nextAt : now, circuit?.nextAt ?? now),
+        reason: '本节点已选择另一模型服务，保留检查点并按新依赖排队；原服务故障记录保留'},
+      '本节点的新模型配置已接入恢复队列，其他节点的服务暂停不变');
+    }
+    this.schedule();
+  }
+
   /** A new user request owns this already-created token, not another clone. */
   requestedRetry(previous: TokenState | undefined, token: TokenRun) {
     const f = this.factory;
@@ -327,6 +402,12 @@ export class UnmanagedRecoverySupervisor {
     }
     if (!old) return;
     const station = typeof token.data.recoveryStation === 'string' ? token.data.recoveryStation : old.station;
+    const selected = f.runtime.selectedModelDependency(old.modelStation ?? station);
+    const failed = f.state.attempts[old.failureAttempt];
+    const primary = failed?.metrics?.dependency ?? failed?.dependency;
+    if (old.kind === 'model' && old.dependency && primary?.key === old.dependency.key && selected && selected.key !== old.dependency.key) {
+      old = {...old, dependency: selected, modelFailures: f.modelCircuits.get(selected)?.failures ?? 0};
+    }
     const configured = f.runtime.nodes.get(station)?.recovery;
     const policy = configured === undefined ? null : parseRecoveryPolicy(configured);
     if (!policy && this.delegated(previous, old.kind, old.dependency)) return;
@@ -447,7 +528,7 @@ export class UnmanagedRecoverySupervisor {
   private resume(token: TokenState, plan: RecoveryPlan, now: number): TokenRun | null {
     const f = this.factory;
     const channel = token.data.channelDelivery;
-    const candidate = f.state.recoveries[token.item];
+    const candidate = f.state.recoveries[recoveryKey(token)];
     if (typeof channel !== 'string' && (candidate?.token !== token.id || candidate.disposition !== 'retry')) {
       this.save(token.id, {...plan, state: 'blocked', nextAt: 0,
         reason: '当前恢复记录关联另一件任务；保留本件检查点，不能认领不同工作流'},
@@ -463,7 +544,7 @@ export class UnmanagedRecoverySupervisor {
     };
     try {
       return typeof channel === 'string' ? f.channels?.resumeFailed(channel, onClaim) ?? null
-        : f.retryCandidates({items: [token.item], count: 1, automatic: true, checkpointOnly: true, onClaim})[0] ?? null;
+        : f.retryCandidates({tokens: [token.id], count: 1, automatic: true, checkpointOnly: true, onClaim})[0] ?? null;
     } catch (error) {
       // Expected plan validation happens before either claim transaction. A
       // rolled-back runtime is stopped and must never be written to again here.
@@ -474,8 +555,8 @@ export class UnmanagedRecoverySupervisor {
     }
   }
 
-  pump(now = Date.now()) {
-    if (!this.running() || this.pumping) return;
+  pump(now = Date.now(), networkOnly = false): number {
+    if (!this.running() || this.pumping) return 0;
     this.pumping = true;
     const f = this.factory;
     try {
@@ -488,15 +569,17 @@ export class UnmanagedRecoverySupervisor {
           ? '已达到声明的自动恢复总期限；保留检查点与成果，等待明确处理' : undefined;
         if (reason) this.exhaust(token, plan, reason, now);
       }
-      if (tokens.some(token => this.plan(token)?.state === 'trial' && !this.plan(token)?.dependency && token.status === 'active')) return;
+      if (tokens.some(token => this.plan(token)?.kind === 'model' && this.plan(token)?.state === 'trial' &&
+          !this.plan(token)?.dependency && token.status === 'active')) return 0;
       const modelHold = Boolean(f.state.alerts['model-transport'] || f.broker.modelHold);
-      if (Object.values(f.state.alerts).some(alert => alert.kind === 'model' && !alert.dependency && alert.id !== 'model-transport')) return;
+      if (Object.values(f.state.alerts).some(alert => alert.kind === 'model' && !alert.dependency && alert.id !== 'model-transport')) return 0;
       const waiting = tokens.filter(token => {
         const plan = this.plan(token);
         const circuit = plan?.dependency && f.modelCircuits.get(plan.dependency);
         const legacy = plan?.policy && plan.kind === 'model' && !plan.dependency &&
           f.state.batch?.runId === f.state.run.id ? f.state.batch.modelCircuit : undefined;
         return plan?.state === 'waiting' && !this.delegated(token, plan.kind, plan.dependency) &&
+          (!networkOnly || plan.kind === 'network') &&
           (!this.managed(token) || f.state.batch?.mode === 'running') &&
           (!plan.policy || plan.nextAt <= now) &&
           (circuit ? circuit.state === 'open' && circuit.nextAt <= now && (!circuit.trialToken || circuit.trialToken === token.id) : plan.nextAt <= now) &&
@@ -509,9 +592,15 @@ export class UnmanagedRecoverySupervisor {
         if (plan.kind === 'model' && !plan.dependency && f.broker.used.model > 0) continue;
         const saved = token.data.runtimeCheckpoint;
         const entry = this.checkpoint(token) && record(saved) && typeof saved.entry === 'string' ? saved.entry : undefined;
-        if (plan.kind === 'network' && !token.data.channelDelivery &&
-            [...f.runtime.tokens.values()].some(value => entry
-              ? f.runtime.occupiesAdmission(value, entry) : !value.finished)) continue;
+        if (plan.kind === 'network') {
+          if (!entry) {
+            const reason = '缺少有效的原工位持久检查点；保留成果，不能从入口自动重做';
+            this.save(token.id, {...plan, state: 'blocked', nextAt: 0, reason}, reason);
+            continue;
+          }
+          if (!this.networkAdmission(token, entry)) continue;
+          if (!recoveryHasNextTurn(f.state) && this.offerFresh()) return 0;
+        }
         const hold = f.broker.modelHold;
         if (plan.kind === 'model' && !plan.dependency) {
           f.broker.recoveryToken = 'pending-unmanaged-trial';
@@ -532,7 +621,7 @@ export class UnmanagedRecoverySupervisor {
             }}});
           }
           f.runtime.schedule();
-          return;
+          return 1;
         } finally {
           if (f.broker.recoveryToken === 'pending-unmanaged-trial') {
             f.broker.recoveryToken = null;
@@ -540,6 +629,7 @@ export class UnmanagedRecoverySupervisor {
           }
         }
       }
+      return 0;
     } finally {
       this.pumping = false;
     }

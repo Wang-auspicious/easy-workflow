@@ -6,7 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
 import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, CircleMinus, Check, AlertTriangle, Loader2, ExternalLink, Play, Pause } from "lucide-react";
 import type { CompiledNode, EvidenceRef, StationAgentBinding } from "../../../shared/types.ts";
-import {AgentBindingFields, adapterLabel, agentBindingDraft, parseBindingDraft, selectBindingAdapter, type AgentBindingDraft} from './AgentBindingFields.tsx';
+import {AgentBindingFields, adapterLabel, agentBindingDraft, parseBindingDraft, selectBindingAdapter, type AgentBindingDraft, type PiModelChoice} from './AgentBindingFields.tsx';
 import { median, quantile, type AttemptState, type TokenState } from "../../../shared/project.ts";
 import { roleColors } from "../../../shared/palette.ts";
 import { attach, getState, setState, useStore, type Inspector, type NodeAgentBinding } from "../store.ts";
@@ -272,6 +272,7 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
   const configuredRevision = useStore(state => JSON.stringify(state.fs.agentBindings?.[node.key] ?? null));
   const defaultsRevision = useStore(state => JSON.stringify(state.fs.agentDefaults ?? null));
   const [entry, setEntry] = useState<NodeAgentBinding | null>(null);
+  const [models, setModels] = useState<PiModelChoice[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -301,6 +302,7 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
         const binding = (body.result.bindings as NodeAgentBinding[]).find(binding => binding.node === node.key) ?? null;
         if (active) {
           setEntry(binding);
+          setModels(Array.isArray(body.result.piModels) ? body.result.piModels : []);
           setState(state => {
             const metadata = {...state.agentBindings};
             if (binding) metadata[node.key] = binding;
@@ -344,7 +346,7 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
       }
       setDraft(agentBindingDraft(saved?.configured ?? binding));
       setDirty(false);
-      setReceipt(binding ? '已保存，下一次尝试使用此配置；当前执行保持原配置。' : '已恢复继承，下一次尝试使用工作流包或本项目默认配置。');
+      setReceipt(binding ? '已保存。Pi 模型从下一次模型请求生效；更换运行底座从下次尝试生效。' : '已恢复继承。Pi 的下一次模型请求使用工作流包或本项目默认配置。');
       setRevision(value => value + 1);
     } catch (reason) {
       setError(reason instanceof Error && reason.name === 'TimeoutError'
@@ -383,8 +385,13 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
       {entry.error && <p className="agent-binding-error" role="alert">{entry.error}</p>}
       <p className="agent-binding-capabilities">流式 {entry.capabilities.stream ? '支持' : '不支持'} · 取消 {entry.capabilities.cancel ? '支持' : '不支持'} · 续接 {entry.capabilities.resume ? '支持' : '不支持'} · 用量 {entry.capabilities.usage === 'reported' ? '客户端回报' : entry.capabilities.usage === 'tokens-only' ? '仅 Token 回报，费用未知' : '未提供'}</p>
       <form onSubmit={submit}>
-        <AgentBindingFields draft={draft} disabled={disabled} scope="node" change={change} selectAdapter={selectAdapter} />
-        <p className="muted">只影响下次尝试。角色、工具权限、输出契约和程序审查保持有效。</p>
+        <AgentBindingFields draft={draft} disabled={disabled} scope="node" change={change} selectAdapter={selectAdapter}
+          models={models} selectModel={model => {
+            setDraft(agentBindingDraft({adapter: 'pi', provider: model.provider, model: model.model}));
+            setDirty(true);
+            setReceipt('');
+          }} />
+        <p className="muted">运行中也能修改。Pi 在下一次模型请求时切换，保留对话和已完成的工具；已经发出的请求正常完成。节点也可用 station_model 调整自己的 Pi 模型，其他节点和主调度不变。</p>
         <div className="agent-binding-actions"><button type="button" className="btn btn--sm" disabled={disabled || !entry.configured} onClick={() => void save(null)}>恢复继承</button><button className="btn btn--sm btn--primary" disabled={disabled || !dirty}>{busy ? '正在保存…' : '保存配置'}</button></div>
       </form>
     </>}

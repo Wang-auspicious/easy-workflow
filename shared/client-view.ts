@@ -1,5 +1,6 @@
 import {apply, type AttemptState, type FactoryState} from './project.ts';
 import type {AttemptMetrics, EvidenceRef, Stamped} from './types.ts';
+import {compactToolMessage} from './conversation.ts';
 
 /** UI-only cursors retain journal ordering without transporting recovery payloads. */
 export type UiEvent = Stamped | {kind: 'ui.cursor'; seq: number; at: number; run: string};
@@ -19,7 +20,7 @@ function pick(value: unknown, keys: readonly string[]): Record<string, unknown> 
 /** Keep identity and status inputs as well as the board's visible business labels. */
 function tokenData(data: Record<string, unknown>) {
   const summary = pick(data, [
-    'retriedBy', 'channelDelivery', 'workflowPack', 'batchRecovery', 'failure',
+    'retriedBy', 'channelDelivery', 'workflowPack', 'recoveryRoot', 'batchRecovery', 'failure',
     'title', 'kind', 'kindAgreed', 'mode', 'shotReview', 'factReview', 'copyReview',
   ]);
   if (Object.hasOwn(data, '__runtimeRecovery')) {
@@ -93,6 +94,7 @@ function projectUiState(state: FactoryState): FactoryState & {view: 'ui-v1'} {
       [id, evidenceSummary(evidence)])),
     cases: {},
     contextNotes: {},
+    conversation: state.conversation.map(entry => ({...entry, message: compactToolMessage(entry.message)})),
   };
 }
 
@@ -113,6 +115,8 @@ export function isUiState(state: unknown): state is FactoryState & {view: 'ui-v1
 /** This transform depends only on its event, so catch-up cannot observe future state. */
 export function uiEvent(event: Stamped): UiEvent {
   switch (event.kind) {
+    case 'chat.message':
+      return {...event, message: compactToolMessage(event.message)};
     case 'attempt.activity':
     case 'case.noted':
     case 'context.noted':

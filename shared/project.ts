@@ -381,7 +381,10 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       const t = s.tokens[e.token];
       if (!t) break;
       t.status = e.status; t.finishedAt = e.at; t.finishedAtNode = e.node; t.reason = e.reason;
-      if(s.recoveries[t.item]?.token===t.id && s.recoveries[t.item].disposition==="claimed" && e.status!=="parked")s.recoveries[t.item].disposition="resolved";
+      const recovery = s.recoveries[recoveryKey(t)];
+      if (recovery?.token === t.id && recovery.disposition === 'claimed' && e.status !== 'parked') {
+        recovery.disposition = 'resolved';
+      }
       for (const k of t.at) remove(node(k).queue, t.id);
       t.at = [];
       const n = node(e.node);
@@ -394,9 +397,21 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       break;
     }
     case "candidate.disposition": {
-      const prior=s.recoveries[e.candidate.item];
-      s.recoveries[e.candidate.item]={...e.candidate,at:e.at,attempts:(prior?.attempts??0)+((e.candidate.disposition==="retry"||e.candidate.disposition==="removed")&&!(prior?.token===e.candidate.token&&prior.disposition===e.candidate.disposition)?1:0)};
       const t=s.tokens[e.candidate.token];
+      const identified = t && typeof t.line === 'string' && t.line.length > 0;
+      const key = identified ? recoveryKey(t) : e.candidate.key ?? e.candidate.item;
+      const prior = s.recoveries[key];
+      const previous = prior && s.tokens[prior.token];
+      if (identified && previous?.line && recoveryWorkKey(previous) !== recoveryWorkKey(t)) {
+        throw new Error('恢复身份命名空间冲突；原记录已保留，不能覆盖另一件任务');
+      }
+      s.recoveries[key] = {
+        ...e.candidate, key,
+        ...(identified ? {line: t.line, workflowPack: typeof t.data.workflowPack === 'string' ? t.data.workflowPack : undefined} : {}),
+        at: e.at,
+        attempts: (prior?.attempts ?? 0) + ((e.candidate.disposition === 'retry' || e.candidate.disposition === 'removed') &&
+          !(prior?.token === e.candidate.token && prior.disposition === e.candidate.disposition) ? 1 : 0),
+      };
       if(t && t.status!=="active" && (e.candidate.disposition==="retry"||e.candidate.disposition==="removed")) {
         // Old versions rejected network failures as successes. Keep the immutable
         // log, but project the explicit recovery disposition for history and UI.
@@ -536,8 +551,24 @@ export function nodeLight(n: NodeState | undefined, dormant: boolean, now: numbe
 }
 
 /** A cross-line delivery is independent work; its retries retain that identity. */
-export function tokenWorkKey(t: TokenState) {
+export function tokenWorkKey(t: Pick<TokenState, 'data' | 'line' | 'item'>) {
   return JSON.stringify([t.data.channelDelivery ?? '', t.data.workflowPack ?? '', ['candidates', 'curation'].includes(t.line) ? 'curation' : t.line, t.item]);
+}
+
+function recoveryWorkKey(token: Pick<TokenState, 'data' | 'line' | 'item'>) {
+  const root = token.data.recoveryRoot;
+  const line = typeof root === 'string' && root.includes('/') ? root.slice(0, root.indexOf('/')) : token.line;
+  return tokenWorkKey({...token, line});
+}
+
+/** Preserve website keys while scoping independent work and cross-line retries. */
+export function recoveryKey(token: Pick<TokenState, 'data' | 'line' | 'item'>): string {
+  const root = token.data.recoveryRoot;
+  const line = typeof root === 'string' && root.includes('/') ? root.slice(0, root.indexOf('/')) : token.line;
+  if (!token.data.workflowPack && !token.data.channelDelivery && ['candidates', 'curation'].includes(line)) {
+    return token.item;
+  }
+  return `work:${recoveryWorkKey(token)}`;
 }
 
 /** A retry is another attempt at the same work, not another unresolved item. */

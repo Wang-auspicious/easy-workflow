@@ -29,3 +29,21 @@ test("a current browser login/challenge observation identifies an actual user ac
   assert.equal(view.label, "登录");
   assert.equal(view.tab, "exact-tab");
 });
+
+test('same-named workflow alerts use the exact token and never guess an anonymous item match', () => {
+  const first: CandidateRecovery = {key: 'first', item: 'same', token: 'first-token', title: 'First workflow',
+    source: 'fixture', url: 'https://first.test/', disposition: 'retry', at: 1, attempts: 1,
+    failure: {tag: 'network_timeout', category: 'network', retryable: true, message: 'First timed out'}};
+  const second: CandidateRecovery = {...first, key: 'second', token: 'second-token', title: 'Second workflow',
+    url: 'https://second.test/', failure: {tag: 'network_dns', category: 'network', retryable: true, message: 'Second DNS failed'}};
+  const records = {first, second};
+  const alert: Alert = {id: 'second-alert', kind: 'auth', level: 'red', item: 'same', token: 'second-token', message: 'Exact second alert'};
+  const exact = alertPresentation(alert, records, emptyBrowser());
+  assert.equal(exact.title, second.title);
+  assert.equal(exact.url, second.url);
+  assert.equal(exact.message, second.failure!.message);
+  const unknown = alertPresentation({...alert, token: undefined}, records, emptyBrowser());
+  assert.equal(unknown.title, 'same');
+  assert.equal(unknown.url, undefined);
+  assert.equal(unknown.message, alert.message);
+});

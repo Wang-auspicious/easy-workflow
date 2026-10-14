@@ -755,7 +755,11 @@ test('network recovery shares an empty slot only outside the paused task and ful
       await settleRecovery(factory);
       assert.equal(factory.state.tokens[paused.id].status, 'active');
       if (entry === 'candidates/route') {
+        for (let index = 0; index < 3; index++) factory.recovery.pump();
+        await settleRecovery(factory);
         assert.equal(calls, 1, 'the original intake closure includes Skills, even when the failed station does not');
+        assert.equal(recoveryPlan(factory).plan.state, 'waiting');
+        assert.equal(recoveryPlan(factory).plan.nextAt, due, 'a paused frontier does not consume or reset the recovery deadline');
         factory.runtime.setScopePaused({scope: 'line', key: 'skills', paused: false, reason: 'Resume the shared bottleneck'});
         await settleRecovery(factory);
         factory.recovery.pump();
@@ -1154,7 +1158,7 @@ test('an occupied network retry does not prevent a later independent keyed model
       if (context.token.item === 'older-network') return {ok: false, summary: 'Network unavailable', failure: {
         tag: 'network_timeout', category: 'network', owner: 'system', retryable: true, message: 'Fixture network timeout',
       }};
-      if (context.token.item === 'active-local') {
+      if (context.token.item.startsWith('active-local-')) {
         localEntered = true;
         await held;
         return {ok: true, summary: 'Local work complete', finish: {status: 'published', reason: 'fixture'}};
@@ -1169,14 +1173,19 @@ test('an occupied network retry does not prevent a later independent keyed model
     await settleRecovery(factory);
     factory.runtime.create('curation/reader', {item: 'later-model', url: '', source: 'manual'});
     await settleRecovery(factory);
-    const local = factory.runtime.create('candidates/tidy', {item: 'active-local', url: '', source: 'manual'});
+    const limit = factory.sources.unmanagedAdmission('skills/fetch-file').maxInFlight;
+    const local = Array.from({length: limit}, (_, index) => factory.runtime.create('candidates/tidy', {
+      item: `active-local-${index}`, url: '', source: 'manual',
+    }));
     for (let i = 0; i < 200 && !localEntered; i++) await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(localEntered, true);
+    const admission = factory.sources.unmanagedAdmission('skills/fetch-file');
+    assert.equal(admission.active, admission.maxInFlight, 'fill the actual flow window before asserting it blocks another network retry');
     t.mock.timers.tick(factory.state.modelCircuits[dependency.key].nextAt - Date.now());
     for (let i = 0; i < 3; i++) factory.recovery.pump();
     for (let i = 0; i < 200 && modelCalls < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(modelCalls, 2, 'the occupied older network plan must not stop scanning independent model plans');
-    assert.equal(local.finished, false);
+    assert.ok(local.every(token => !token.finished));
     assert.equal(factory.state.modelCircuits[dependency.key], undefined);
     assert.equal(factory.state.tokens[network.id].data.retriedBy, undefined, 'network admission remains bounded');
   } finally {
@@ -1311,6 +1320,57 @@ test('a due keyed recovery joins the request FIFO ahead of later healthy traffic
   } finally {
     active?.();
     next?.();
+    await close(factory);
+    cleanup();
+  }
+});
+
+test('rebinding one Pi station wakes its original checkpoint without claiming the old provider circuit', {timeout: 15000}, async () => {
+  const factory = await ready();
+  const a = {key: 'rebound-a', adapter: 'pi' as const, provider: 'rebound', model: 'a'};
+  const b = {...a, key: 'rebound-b', model: 'b'};
+  const calls: {node: string; dependency: string}[] = [];
+  factory.runtime.executors = node => ({prepare: () => {
+    const binding = factory.state.agentBindings?.[node.key];
+    const dependency = binding?.model === 'b' ? b : a;
+    return {dependency, execute: async context => {
+      calls.push({node: node.key, dependency: dependency.key});
+      if (dependency === a) return transport();
+      const release = await acquireModelRequest(dependency, context.signal);
+      try {
+        reportModelResponse({dependency, model: dependency.model, provider: dependency.provider,
+          modelCalls: 1, usageReported: true, tokenUsage: {input: 3, output: 1}, costReported: false});
+        return reportedReply();
+      } finally {release();}
+    }};
+  }});
+  try {
+    factory.runtime.start('Rebind only this station');
+    const original = factory.runtime.create('curation/reader', {item: 'old-a', url: '', source: 'manual',
+      data: {retainedEvidence: 'already-paid'}});
+    await settleRecovery(factory);
+    const circuit = structuredClone(factory.state.modelCircuits[a.key]);
+    assert.equal(circuit.state, 'open');
+    const waiting = factory.runtime.create('curation/reader', {item: 'queued-a', url: '', source: 'manual'});
+    const other = factory.runtime.create('skills/provenance', {item: 'other-a', url: '', source: 'manual'});
+    await settleRecovery(factory);
+    assert.equal(factory.state.tokens[waiting.id].attempts.length, 0);
+    assert.equal(factory.state.tokens[other.id].attempts.length, 0);
+    factory.setAgentBinding('curation/reader', {adapter: 'pi', provider: 'rebound', model: 'b'});
+    await settleRecovery(factory);
+    const resumed = Object.values(factory.state.tokens).find(token => token.data.retryOf === original.id);
+    assert.ok(resumed);
+    assert.equal(resumed.status, 'published');
+    assert.equal(resumed.data.retainedEvidence, 'already-paid');
+    assert.equal(factory.state.tokens[waiting.id].status, 'published');
+    assert.equal(factory.state.tokens[other.id].attempts.length, 0, 'another node still obeys A cooldown');
+    assert.deepEqual(factory.state.modelCircuits[a.key], circuit, 'B success cannot clear or claim A');
+    assert.equal(factory.state.modelCircuits[b.key], undefined, 'healthy B needs no artificial circuit');
+    assert.deepEqual(calls.map(call => call.dependency), [a.key, b.key, b.key]);
+    const attempt = factory.state.attempts[resumed.attempts[0]];
+    assert.equal(attempt.metrics?.modelResponses?.[0].dependency.key, b.key);
+    assert.equal((resumed.data.__runtimeRecovery as {state: string}).state, 'completed');
+  } finally {
     await close(factory);
     cleanup();
   }

@@ -1,5 +1,5 @@
 import {batchSummary, isBatchToken, type BatchRecovery} from '../../../shared/batch.ts';
-import { latestRunTokens, type AttemptState, type FactoryState, type Light, type TokenState } from '../../../shared/project.ts';
+import { latestRunTokens, recoveryKey, type AttemptState, type FactoryState, type Light, type TokenState } from '../../../shared/project.ts';
 import type { CompiledNode, ModelDependency, StationAgentBinding, StationRecoveryPolicy } from '../../../shared/types.ts';
 import {parseRecoveryPolicy} from '../../../shared/recovery-policy.ts';
 
@@ -201,6 +201,18 @@ function modelRecovery(state: FactoryState, now: number): StatusPresentation | u
   return { label: seconds ? '模型冷却' : '等待恢复验证', detail: `${reason}${seconds ? `；最早 ${seconds} 秒后尝试` : ''}`, light: 'yellow' };
 }
 
+export function browserMemoryGuard(resources: FactoryState['resources']) {
+  const configured = resources.limits.browser;
+  const effective = resources.limits.browserEffective;
+  if (!(configured > 0) || !Number.isFinite(effective) || effective < 0 || effective >= configured) return;
+  const reason = Object.values(resources.waiting).find(value => value.includes('内存')) ??
+    `当前空闲内存 ${resources.freeMemMB}MB`;
+  return {
+    label: `内存保护 · 浏览器 ${effective}/${configured}`,
+    detail: `${reason}。浏览器名额暂时收缩；排队输入已保留，内存回升后自动重新调度，用户暂停仍保持。`,
+  };
+}
+
 export function stationStatus(node: NodeIdentity, state: FactoryState, now: number, dormant = false, recoveryTokens: readonly string[] = []): StatusPresentation {
   const current = state.nodes[node.key], active = current?.active.length ?? 0, queued = current?.queue.length ?? 0;
   if (dormant) return { label: '待接入', detail: '当前不领取任务。', light: 'gray' };
@@ -214,6 +226,9 @@ export function stationStatus(node: NodeIdentity, state: FactoryState, now: numb
   if (recovery && (!queued || recovery.light !== 'red')) return {...recovery, detail: `${recovery.detail} 当前排队 ${queued} 件。`};
   if (queued) {
     const waiting = state.resources.waiting?.[node.key];
+    if (node.resource === 'browser' && waiting?.includes('内存')) {
+      return {label: '等待内存', detail: `${waiting}；当前排队 ${queued} 件，输入已保留，内存回升后自动重新调度。${recovery?.detail ?? ''}`, light: 'yellow'};
+    }
     const model = modelRecovery(state, now);
     if (model && (node.resource === 'model' || waiting?.includes('模型'))) return { ...model, detail: `${model.detail}；当前排队 ${queued} 件。` };
     return { label: waiting ? '等待资源' : '排队中', detail: `${waiting ? `等待：${waiting}；当前排队 ${queued} 件。` : `当前排队 ${queued} 件，尚未开始执行。`}${recovery?.detail ?? ''}`, light: 'yellow' };
@@ -277,7 +292,7 @@ export function tokenStatus(token: TokenState, state: FactoryState, now: number)
   if (token.status === 'parked') {
     if (automatic) return automatic;
     const recovery = modelRecovery(state, now);
-    const disposition = state.recoveries[token.item];
+    const disposition = state.recoveries[recoveryKey(token)];
     const failure = token.data.failure as { tag?: string } | undefined ?? (disposition?.token === token.id ? disposition.failure : undefined);
     const currentRun = (token.touchedAt ?? token.createdAt) >= state.run.startedAt;
     if (currentRun && recovery && failure?.tag === 'model_transport') return recovery;

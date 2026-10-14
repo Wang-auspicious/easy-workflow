@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { apply, initialState } from '../../shared/project.ts';
 import type { Stamped } from '../../shared/types.ts';
 import { nodeCountPresentation } from '../src/canvas/node-counts.ts';
-import { executionIndex, nodeExecutionPresentation, recordNodeExecution, recordedUsage, runStatus, runtimeRecoveryIndex, stationStatus, tokenStatus } from '../src/canvas/status.ts';
+import { browserMemoryGuard, executionIndex, nodeExecutionPresentation, recordNodeExecution, recordedUsage, runStatus, runtimeRecoveryIndex, stationStatus, tokenStatus } from '../src/canvas/status.ts';
 import {applyUiEvent, uiEvent, uiState} from '../../shared/client-view.ts';
 
 test('resource counters report journaled arrivals even though stores never execute attempts', () => {
@@ -97,6 +97,33 @@ test('a successful station result is not publication; waiting and scoped pause o
   emit({ kind: 'attempt.started', token: 'one', node: review.key, attempt: 'a2', worker: 'w2', input: 'already admitted' });
   assert.equal(stationStatus(review, state, 200).label, '在途收尾');
   assert.equal(runStatus(state, 200).counts.published, 0);
+});
+
+test('queued browser work names memory protection and preserves the pause and active states', () => {
+  const {state, emit, create} = statusFixture();
+  const browser = {key: 'curation/proof', line: 'curation', kind: 'agent' as const, resource: 'browser' as const};
+  create('memory-wait');
+  emit({kind: 'token.queued', token: 'memory-wait', node: browser.key});
+  emit({kind: 'resource.sample', used: {browser: 0}, limits: {browser: 1, browserEffective: 0},
+    freeMemMB: 2475, waiting: {[browser.key]: '空闲内存 2475MB < 3072MB'}});
+  assert.equal(browserMemoryGuard(state.resources)?.label, '内存保护 · 浏览器 0/1');
+  assert.match(browserMemoryGuard(state.resources)!.detail, /2475MB < 3072MB.*输入已保留.*用户暂停仍保持/);
+  assert.equal(stationStatus(browser, state, 200).label, '等待内存');
+  assert.match(stationStatus(browser, state, 200).detail, /2475MB < 3072MB.*排队 1 件.*自动/);
+  assert.equal(state.run.status, 'running', 'resource protection does not report that the run has stopped');
+  emit({kind: 'run.paused', runId: state.run.id});
+  assert.equal(stationStatus(browser, state, 200).label, '已暂停');
+  emit({kind: 'run.resumed', runId: state.run.id});
+  state.resources.waiting[browser.key] = 'browser 0/0（内存不足，上限暂降自 1）';
+  assert.equal(stationStatus(browser, state, 200).label, '等待内存');
+  emit({kind: 'attempt.started', token: 'memory-wait', node: browser.key, attempt: 'memory-1', worker: 'fixture', input: ''});
+  assert.equal(stationStatus(browser, state, 200).label, '处理中', 'a stale resource sample cannot hide a running attempt');
+  emit({kind: 'resource.sample', used: {browser: 1}, limits: {browser: 1, browserEffective: 1},
+    freeMemMB: 3305, waiting: {}});
+  assert.equal(browserMemoryGuard(state.resources), undefined, 'the guard clears when the effective cap recovers');
+  emit({kind: 'resource.sample', used: {browser: 0}, limits: {browser: 0, browserEffective: 0},
+    freeMemMB: 3305, waiting: {}});
+  assert.equal(browserMemoryGuard(state.resources), undefined, 'an explicitly disabled browser quota is not a memory guard');
 });
 
 test('unreported and estimated model usage stays unknown; an explicitly reported zero is zero', () => {

@@ -479,6 +479,83 @@ test('single-slot managed admission alternates durable sources and catalog acros
   }
 });
 
+test('single-slot recovery alternates with source and catalog admissions across restart', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: Date.now()});
+  for (const declared of [false, true]) await t.test(declared ? 'declared website policy' : 'default batch policy', async () => {
+    let factory = new Factory();
+    const order: string[] = [];
+    let peak = 0;
+    const setup = () => {
+      factory.runtime.nodes.get('curation/reader')!.recovery = declared ? {
+        tags: ['network_timeout'], maxRetries: 1,
+        backoff: {initialMs: 1000, factor: 1, maxMs: 1000}, exhausted: 'parked',
+      } : undefined;
+      factory.runtime.executors = () => async context => {
+        const retry = typeof context.token.data.retryOf === 'string';
+        if (context.token.item.startsWith('waiting-') && !retry) {
+          return {ok: false, summary: 'Controlled recoverable fixture failure', failure: {
+            tag: 'network_timeout', category: 'network', owner: 'system', retryable: true, message: 'ETIMEDOUT fixture',
+          }};
+        }
+        order.push(retry ? 'recovery' : context.token.source.startsWith('source:') ? 'source' : 'catalog');
+        peak = Math.max(peak, [...factory.runtime.tokens.values()].filter(token => !token.finished).length);
+        return {ok: true, summary: 'One logical fixture publication', finish: {status: 'published', reason: 'fixture'}};
+      };
+    };
+    try {
+      await factory.boot();
+      factory.catalog = [];
+      setup();
+      factory.runtime.start('Fair checkpoint and fresh admission');
+      for (let index = 0; index < 3; index++) {
+        factory.runtime.create('curation/reader', {item: `waiting-${index}`, url: `https://waiting-${index}.fixture.test/`,
+          source: 'candidates/pool', data: {canonical: `https://waiting-${index}.fixture.test/`}});
+        await factory.runtime.settle();
+      }
+      await factory.sources.close();
+      factory.sources = new SourceSupervisor(factory);
+      factory.sources.configure({id: 'fresh-recovery', name: 'Fresh alongside recovery',
+        url: 'https://never-polled.fixture.test/items', platform: 'fixture', format: 'json',
+        target: 'candidates/tidy', intervalMs: 86400000, enabled: false});
+      factory.journal.append({kind: 'source.polled', source: 'fresh-recovery', nextAt: Date.now() + 86400000, count: 0, duplicates: 0});
+      for (let index = 0; index < 4; index++) factory.journal.append({kind: 'source.candidate', candidate: {
+        id: `fresh-recovery-${index}`, source: 'fresh-recovery', platform: 'fixture',
+        sourceUrl: 'https://never-polled.fixture.test/items', url: `https://fresh-recovery-${index}.fixture.test/`,
+        title: `Fresh ${index}`, discoveredAt: Date.now() + index, status: 'pending',
+      }});
+      factory.batch.configure({target: 9, maxInFlight: 1, intakeWindow: 1});
+      const unsubscribe = factory.journal.subscribe(event => {
+        if (event.kind === 'token.finished' && order.length === 1) factory.runtime.pause();
+      });
+      factory.catalog = catalog(12);
+      factory.sources.setEnabled('fresh-recovery', true);
+      t.mock.timers.tick(20000);
+      factory.batch.pump();
+      factory.recovery.pump();
+      await factory.runtime.settle();
+      assert.deepEqual(order, ['recovery']);
+      unsubscribe();
+      await close(factory);
+      factory = new Factory();
+      await factory.boot();
+      factory.catalog = catalog(12);
+      setup();
+      assert.equal(factory.runtime.paused, true);
+      factory.runtime.resume();
+      await factory.runtime.settle();
+      assert.deepEqual(order, ['recovery', 'source', 'recovery', 'catalog', 'recovery', 'source', 'catalog', 'source', 'catalog']);
+      assert.equal(peak, 1, 'declared recovery must obey the website goal, not the larger default source window');
+      assert.equal(batchSummary(factory.state)?.admitted, 9);
+      assert.equal(batchSummary(factory.state)?.completed, 9);
+      assert.equal(factory.sources.list()[0].counts.pending, 1);
+    } finally {
+      await close(factory);
+      assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+      fs.rmSync(dir, {recursive: true, force: true});
+    }
+  });
+});
+
 test('managed feeder rotation preserves filters, disabled sources, intake limits and empty-side fallback', async () => {
   for (const scenario of ['category', 'query', 'disabled', 'source-only', 'local-pause'] as const) {
     const factory = new Factory();
