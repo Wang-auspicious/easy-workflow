@@ -199,7 +199,9 @@ export class Lessons {
 
   /** Called after report.ready (cleanup is complete); idempotent across restarts. */
   draftRun(runId: string) {
-    const events = this.history();
+    // A finished run's observations cannot depend on later conversations. Avoid
+    // repeatedly parsing all newer payloads when repairing historical drafts.
+    const events = this.history(this.host.journal.lastSequence(runId));
     if (!events.some((e) => e.kind === "run.ended" && e.runId === runId)) throw new ControlError(409, "run_not_ended", "本轮尚未结束，不能提前复盘");
     const existing = this.list().filter((l) => l.runId === runId);
     const groups = groupLessonObservations(events, runId, this.host.compiled);

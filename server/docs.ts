@@ -148,6 +148,9 @@ export class Docs {
   dir: string;
   name: string;
   private timers = new Map<string, NodeJS.Timeout>();
+  private readonly caseBackfill = new Set<string>();
+  private caseBackfillTimer?: NodeJS.Timeout;
+  private caseBackfillGeneration = 0;
   private f: Host;
   private readOnly: boolean;
   private indexedSeq = 0;
@@ -377,6 +380,7 @@ export class Docs {
 
   schedule(kind: "context" | "case", id: string) {
     if (this.readOnly) return;
+    if (kind === 'case') this.caseBackfill.delete(id);
     const k = `${kind}:${id}`;
     if (this.timers.has(k)) return;
     this.timers.set(k, setTimeout(() => { this.timers.delete(k); try { this.write(kind, id); } catch (e) { console.warn("docs", (e as Error).message); } }, 800));
@@ -385,6 +389,7 @@ export class Docs {
   write(kind: "context" | "case", id: string) {
     if (this.readOnly) return;
     if (kind === "context") { this.atomicWrite(this.contextFile(id), this.renderContext(id)); return; }
+    this.caseBackfill.delete(id);
     const doc = this.caseData(id);
     // Each replacement is atomic. The shared digest identifies a pair interrupted
     // between the two renames; journal replay on boot repairs it. JSON is the last
@@ -422,7 +427,44 @@ export class Docs {
     } finally { if (owned) fs.unlinkSync(temp); }
   }
 
-  flush() { for (const [k, t] of this.timers) { clearTimeout(t); const [kind, ...id] = k.split(":"); try { this.write(kind as "context" | "case", id.join(":")); } catch { /* best effort */ } } this.timers.clear(); }
+  flush() {
+    // Historical files are derived from the journal. Shutdown must not wait for
+    // a full-library rebuild; a later boot repairs the remaining files.
+    this.caseBackfillGeneration++;
+    clearTimeout(this.caseBackfillTimer);
+    this.caseBackfillTimer = undefined;
+    this.caseBackfill.clear();
+    for (const [key, timer] of this.timers) {
+      clearTimeout(timer);
+      const [kind, ...id] = key.split(':');
+      try { this.write(kind as 'context' | 'case', id.join(':')); } catch { /* Best effort; the journal remains authoritative. */ }
+    }
+    this.timers.clear();
+  }
+
+  /** Refresh historical files incrementally; live reads always use the journal. */
+  scheduleAllCases() {
+    if (this.readOnly) return;
+    for (const id of this.caseIds()) {
+      if (!this.timers.has(`case:${id}`)) this.caseBackfill.add(id);
+    }
+    this.scheduleCaseBackfill();
+  }
+
+  private scheduleCaseBackfill() {
+    if (this.caseBackfillTimer || !this.caseBackfill.size) return;
+    const generation = this.caseBackfillGeneration;
+    this.caseBackfillTimer = setTimeout(() => {
+      this.caseBackfillTimer = undefined;
+      if (generation !== this.caseBackfillGeneration) return;
+      const id = this.caseBackfill.values().next().value;
+      if (id === undefined) return;
+      this.caseBackfill.delete(id);
+      try { this.write('case', id); } catch (error) { console.warn('case document', (error as Error).message); }
+      if (generation === this.caseBackfillGeneration) this.scheduleCaseBackfill();
+    }, 10);
+    this.caseBackfillTimer.unref();
+  }
 
   writeAllContexts() {
     if (this.readOnly) return;

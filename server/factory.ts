@@ -488,14 +488,14 @@ export class Factory {
         if (e.kind === 'run.resumed') queueMicrotask(() => this.resumeVerifiedCandidates());
         // Delay journal reads and disk work until the batch timer/flush, including
         // records that have notes but no token.created event (legacy tool calls).
-        for (const item of new Set([...Object.values(this.state.tokens).map((t) => t.item), ...Object.keys(this.state.cases)])) this.docs.schedule("case", item);
+        this.docs.scheduleAllCases();
       }
       else if (e.kind === "candidate.disposition") this.docs.schedule("case", e.candidate.item);
       else if (e.kind === "evidence.added") { const t = this.state.tokens[e.evidence.token]; if (t) this.docs.schedule("case", t.item); }
       else if (e.kind === "token.created" || e.kind === "token.queued" || e.kind === "token.data" || e.kind === "token.returned" || e.kind === "token.finished" || e.kind === "review.verdict" || e.kind === "correction.created" || e.kind === "consult.opened" || e.kind === "consult.replied" || e.kind === "consult.closed") { const t = this.state.tokens[e.token]; if (t) this.docs.schedule("case", t.item); }
     });
     try { this.docs.writeAllContexts(); } catch (err) { console.warn("contexts", (err as Error).message); }
-    this.docs.writeAllCases();
+    this.docs.scheduleAllCases();
   }
 
   /** Bind the whole rerun before Runtime's queued microtask may start a worker. */

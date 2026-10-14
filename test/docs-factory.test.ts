@@ -5,12 +5,22 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { Journal } from "../server/journal.ts";
+import {Docs} from '../server/docs.ts';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easy-workflow-case-boot-"));
 Object.assign(process.env, { FACTORY_VAR: dir, FACTORY_PREFLIGHT: "0", FACTORY_HTTP_CACHE: "0", FACTORY_DISCOVERY: "0", FACTORY_START_PAUSED: "1", VISLEXICON_ROOT: path.join(dir, "unconnected") });
 const { Factory } = await import("../server/factory.ts");
 const { closeNetwork } = await import("../server/network.ts");
 const close = async (f: InstanceType<typeof Factory>) => { await f.runtime.close(); f.lessons.close(); f.docs.flush(); f.journal.close(); };
+const waitForCase = async (f: InstanceType<typeof Factory>, item: string) => {
+  const file = f.docs.caseJsonFile(item);
+  const digest = f.docs.caseData(item).digest;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try { if (JSON.parse(fs.readFileSync(file, 'utf8')).digest === digest) return; } catch { /* Backfill may still be pending. */ }
+    await delay(25);
+  }
+  assert.fail('Background case repair did not complete');
+};
 
 test("Factory rebuilds legacy cases on boot, batches live progress and flushes late data/evidence before close", async (t) => {
   const seed = new Journal(path.join(dir, "journal.db"));
@@ -20,7 +30,16 @@ test("Factory rebuilds legacy cases on boot, batches live progress and flushes l
   seed.append({ kind: "run.ended", runId: "legacy", manual: true }); seed.close();
   let f: InstanceType<typeof Factory> | undefined;
   try {
-    f = new Factory(); await f.boot(); f.docs.flush();
+    let bootWrites = 0;
+    const originalWrite = Docs.prototype.write;
+    const bootMock = t.mock.method(Docs.prototype, 'write', function(this: Docs, kind: 'context' | 'case', id: string) {
+      if (kind === 'case') bootWrites++;
+      return originalWrite.call(this, kind, id);
+    });
+    f = new Factory(); await f.boot();
+    assert.equal(bootWrites, 0, 'startup must not synchronously rebuild historical case files');
+    await waitForCase(f, 'case-site');
+    bootMock.mock.restore();
     const file = f.docs.caseJsonFile("case-site"), markdown = f.docs.caseFile("case-site");
     assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).runs[0].id, "legacy");
     let caseWrites = 0;
@@ -51,10 +70,21 @@ test("Factory rebuilds legacy cases on boot, batches live progress and flushes l
     assert.equal(persisted.runs[1].corrections[0].correction, "late-fix");
     assert.ok(persisted.runs[1].decisions.some((e: { kind: string }) => e.kind === "review.verdict"));
     fs.writeFileSync(file, "broken derived JSON"); fs.writeFileSync(markdown, "stale derived markdown");
-    f = new Factory(); await f.boot(); f.docs.flush();
+    f = new Factory(); await f.boot(); await waitForCase(f, 'case-site');
     const rebuilt = JSON.parse(fs.readFileSync(file, "utf8"));
     assert.deepEqual(rebuilt, f.docs.caseData("case-site"));
     assert.equal(fs.readFileSync(markdown, "utf8"), f.docs.renderCase("case-site"));
+    let writesAfterClose = 0;
+    const closeMock = t.mock.method(f.docs, 'write', (kind: 'context' | 'case', id: string) => {
+      writesAfterClose++;
+      return originalWrite.call(f!.docs, kind, id);
+    });
+    f.docs.scheduleAllCases();
+    f.docs.flush();
+    assert.equal(writesAfterClose, 0, 'shutdown cancels historical backfill instead of rebuilding the library');
+    await delay(40);
+    assert.equal(writesAfterClose, 0, 'cancelled backfill must not write after shutdown');
+    closeMock.mock.restore();
     await close(f); f = undefined;
 
     const bytes = fs.readFileSync(file), mdBytes = fs.readFileSync(markdown);
