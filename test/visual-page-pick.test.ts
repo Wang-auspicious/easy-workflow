@@ -100,6 +100,7 @@ test("the catalogue page is chosen by comparing screenshots, including pages the
     const context = {
       token: { id, item: "fixture", url: site, data: { kind: "component-source", host: "127.0.0.1", title: "Fixture UI", canonical: site, home: { finalUrl: site + "/", navLinks: links }, homeLinks: links, shots: {} } },
       node, attempt: `a-${id}`, worker: { id: `w-${id}` }, signal: new AbortController().signal,
+      modelAssist: {binding: {adapter: 'pi', provider: 'look-fixture', model: 'look-fixture'}, projectDirectory: root},
       progress: (text: string) => progress.push(text), activity: () => {}, addEvidence: (ev: Record<string, unknown>) => ev,
     } as unknown as StationContext;
     return { result: await TOOLS["curation.breadth"](context, svc), progress };

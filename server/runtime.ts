@@ -4,7 +4,7 @@
 // Everything that changes state is journaled first.
 import crypto from "node:crypto";
 import { withModelAdmission } from './model-requests.ts';
-import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, ModelDependency, ModelResponse, ModelTokenUsage, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
+import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, ModelDependency, ModelResponse, ModelTokenUsage, StationAgentBinding, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
 import { median, type FactoryState } from "../shared/project.ts";
 import { allocateResource } from './allocation.ts';
 import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
@@ -78,6 +78,13 @@ export interface StationContext {
   signal: AbortSignal;
   /** Explicit project selection for Pi calls made inside program helpers. */
   piRuntime?: ReturnType<typeof import('./pi.ts').models>;
+  /** A program's bounded model helper; it is not a general Agent executor. */
+  modelAssist?: {
+    binding: StationAgentBinding;
+    projectDirectory: string;
+    piRuntime?: ReturnType<typeof import('./pi.ts').models>;
+    piControl?: Pick<import('./agent-station.ts').StationPiControl, 'resolve'>;
+  };
   /** Set when this attempt re-runs a returned or corrected token. */
   redo?: { reason: string; note?: string; byHuman: boolean };
   progress(text: string, step?: StepDetail): void;
