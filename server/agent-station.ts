@@ -276,7 +276,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
       : '客户端未报告用量；保持未知'});
   }) : new Agent({
     initialState: { systemPrompt: `${env.text}\n\n${contract}`, model: selection!.model, thinkingLevel: "off", tools },
-    streamFn: boundRequest(activity.wrapStream(async (_model, context, options) => {
+    streamFn: boundRequest(async (_model, context, options) => {
       const previous = selection!;
       selectionFailure = undefined;
       try {
@@ -295,8 +295,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
           tool: 'model', text: '本节点的新请求使用新模型；保留已完成的工具结果',
         });
       }
-      return selection.stream(selection.model, context, options);
-    })),
+      const observedStream = activity.wrapStream(selection.stream);
+      return observedStream(selection.model, context, options);
+    }),
     sessionId: `${ctx.worker.id}-${ctx.attempt}`,
   });
   if (agent instanceof Agent) agent.subscribe((e) => {

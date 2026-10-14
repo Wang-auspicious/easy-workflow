@@ -1393,7 +1393,7 @@ test('project defaults, dispatcher turns and concurrent station contexts remain 
         {name: 'station_model', arguments: JSON.stringify({action: 'select', provider: 'unconnected', model: 'fixture-model'})},
         {name: 'station_model', arguments: JSON.stringify({action: 'select', provider: 'b', model: 'fixture-model', node: 'independent/beta'})},
         {name: 'station_model', arguments: JSON.stringify({action: 'list'})},
-        {name: 'station_model', arguments: JSON.stringify({action: 'select', provider: 'b', model: 'fixture-model'})},
+        {name: 'station_model', arguments: JSON.stringify({action: 'select', provider: 'b', model: 'fixture-next-model'})},
         {name: 'submit', arguments: JSON.stringify({value: provider})},
       ];
       assert.ok(selfModelCalls < calls.length, 'the station model control must not loop');
@@ -1415,7 +1415,7 @@ test('project defaults, dispatcher turns and concurrent station contexts remain 
     .map(provider => [provider, {type: 'api_key', key: `fixture-project-${provider}`}]))));
   fs.writeFileSync(path.join(profile, 'models.json'), JSON.stringify({providers: Object.fromEntries(['a', 'b']
     .map(provider => [provider, {api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/${provider}/v1`,
-      models: [{id: 'fixture-model', input: ['text']}]}]))}));
+      models: [{id: 'fixture-model', input: ['text']}, {id: 'fixture-next-model', input: ['text']}]}]))}));
   const selectExternal = (provider: string) => fs.writeFileSync(path.join(profile, 'settings.json'),
     JSON.stringify({defaultProvider: provider, defaultModel: 'fixture-model'}));
   const schema = {type: 'object', properties: {value: {type: 'string'}}, required: ['value'], additionalProperties: false};
@@ -1515,12 +1515,17 @@ test('project defaults, dispatcher turns and concurrent station contexts remain 
       assert.ok(finalInput.includes('must not have additional properties'), 'cross-node selection is rejected by the tool schema');
       assert.doesNotMatch(finalInput, /fixture-project-[ab]|127\.0\.0\.1|apiKey|authorization/i,
         'the model directory contains no provider credentials or endpoints');
-      assert.deepEqual(left.state.agentBindings?.['independent/alpha'], binding('b'));
+      assert.deepEqual(left.state.agentBindings?.['independent/alpha'], {...binding('b'), model: 'fixture-next-model'});
       assert.deepEqual(left.state.agentBindings?.['independent/beta'], binding('a'), 'the tool cannot target another node');
       assert.deepEqual(left.getAgentDefaults(), defaults, 'the dispatcher and project default stay unchanged');
       const attempt = left.state.attempts[left.state.tokens[self.id].attempts[0]];
       assert.equal(attempt.metrics?.execution?.provider, 'b');
+      assert.equal(attempt.metrics?.execution?.model, 'fixture-next-model');
       assert.equal(attempt.metrics?.dependency?.provider, 'b');
+      const requestedModels = requests.slice(startIndex).map(request =>
+        (JSON.parse(request.body) as {model: string}).model);
+      assert.deepEqual(attempt.metrics?.activity?.spans.filter(span => span.kind === 'model_request')
+        .map(span => span.model), requestedModels, 'the activity timeline names the model actually sent for each request');
       assert.deepEqual(attempt.metrics?.modelResponses?.map(response => [response.provider, response.modelCalls]), [['a', 4], ['b', 1]]);
       assert.equal(attempt.metrics?.tokenUsage?.input, 100);
       assert.equal(attempt.metrics?.tokenUsage?.output, 25);
