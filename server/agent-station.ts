@@ -654,9 +654,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   };
   let preparingImages = true;
   try {
-  // A recovered Pi transcript already contains its images. All other attempts
-  // prepare the current input within the owner signal and the checkpoint catch.
-  if (!(saved && agent instanceof Agent) || ctx.redo) {
+  // A recovered task transcript already contains its images. A dialogue has a
+  // newly scoped view, so its current images must accompany this new turn.
+  if (dialogue || !(saved && agent instanceof Agent) || ctx.redo) {
     for (const image of input.images ?? []) {
       const bytes = await EvidenceStore.jpegAsync(image.file, 720, { signal: sessionSignal, timeoutMs: 15000 });
       sessionSignal.throwIfAborted();

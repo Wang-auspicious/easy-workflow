@@ -200,7 +200,7 @@ async function contractFixture(reply: (index: number, request: Record<string, un
     fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify({contract: {type: 'api_key', key: 'local-contract-fixture'}}));
     fs.writeFileSync(path.join(dir, 'models.json'), JSON.stringify({providers: {contract: {
       api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/v1`,
-      models: [{id: 'contract-model', input: ['text']}],
+      models: [{id: 'contract-model', input: ['text', 'image']}],
     }}}));
     const definition: ContractFixture['definition'] = {
       agent: {adapter: 'pi', provider: 'contract', model: 'contract-model'},
@@ -265,9 +265,11 @@ test('D dialogue uses the original Pi history with scoped input and dedicated an
     assert.deepEqual(reply.agentContract?.budget, {maxTokens: 8000, maxMs: 180000});
     assert.match(JSON.stringify(fixture.requests[1]), /original-submit-history-marker/);
     assert.ok(!JSON.stringify(fixture.requests.slice(1)).includes('DO-NOT-LEAK-FULL-ITEM'));
+    const image = path.join(fixture.dir, 'dialogue-home.ppm');
+    fs.writeFileSync(image, Buffer.concat([Buffer.from('P6\n4 6\n255\n'), Buffer.alloc(4 * 6 * 3, 128)]));
     const room = await runStationDialogue(definition, {...context, attempt: 'room-turn', session: reply.sessionCheckpoint!.pi}, {
       kind: 'room', prompt: '讨论室 proof，第 1/3 轮，请发一条 claim 后 submit_turn。',
-      input: {text: JSON.stringify({proof: 'visible-proof'})}, read: () => posts,
+      input: {text: JSON.stringify({proof: 'visible-proof'}), images: [{file: image, label: '本轮新增首页截图'}]}, read: () => posts,
       post: value => {(posts as unknown[]).push(value); return {id: 'claim-fixture'};}});
     assert.equal(room.ok, true, room.error ?? 'Room must finish with submit_turn');
     assert.equal(room.sessionCheckpoint?.pi?.signature, first.sessionCheckpoint.pi.signature);
@@ -280,6 +282,10 @@ test('D dialogue uses the original Pi history with scoped input and dedicated an
     assert.match(roomRequest, /original-only-input-marker/);
     assert.match(roomRequest, /The observed proof is valid/);
     assert.ok(!roomRequest.includes('DO-NOT-LEAK-FULL-ITEM'));
+    const latestUser = (fixture.requests[3].messages as {role: string; content: unknown}[]).findLast(message => message.role === 'user');
+    assert.ok(Array.isArray(latestUser?.content), 'a restored dialogue must append its new image to this turn');
+    const imagePart = (latestUser.content as {type: string; image_url?: {url: string}}[]).find(part => part.type === 'image_url');
+    assert.match(imagePart?.image_url?.url ?? '', /^data:image\/jpeg;base64,/);
     const tools = fixture.requests[3].tools as {function: {name: string}}[];
     assert.deepEqual(tools.map(tool => tool.function.name).sort(), ['board_post', 'board_read', 'handoff', 'submit_turn']);
     const saved = JSON.parse(fs.readFileSync(path.join(fixture.dir, room.sessionCheckpoint!.pi!.file), 'utf8'));
