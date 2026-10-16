@@ -58,7 +58,10 @@ test("Pi profile, structured station submission, repair and cancellation", { tim
       assert.equal(requestCount, 2);
       assert.ok(JSON.stringify(bodies[0]).includes("Easy Workflow station contract v2"));
       assert.ok(JSON.stringify(bodies[0]).includes("七个问题"),"each model receives its own ROLE.md");
-      assert.equal(bodies[0].tools.length, 1, "station agents get only their own submit tool");
+      assert.deepEqual(bodies[0].tools.map((tool: {function: {name: string}}) => tool.function.name).sort(), ['handoff', 'submit'],
+        'C stations expose exactly their submission and bounded handoff tools');
+      assert.deepEqual(bodies[0].tools.find((tool: {function: {name: string}}) => tool.function.name === 'submit').function.parameters,
+        JSON.parse(JSON.stringify(definition.schema)), 'handoff does not weaken the original submission schema');
       assert.ok(JSON.stringify(bodies[1]).includes("value must be positive"));
       assert.equal(fs.readFileSync(path.join(dir, "auth.json"), "utf8"), authBefore);
     });
