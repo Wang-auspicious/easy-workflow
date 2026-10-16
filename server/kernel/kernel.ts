@@ -76,11 +76,13 @@ export class Kernel extends Runtime {
   /** Called only after room creation and item holds are committed. */
   private driveRoom(room: Room): void {
     if (!this.collaboration || !this.running || this.paused || this.disposedV2 || this.roomControllers.has(room.id)) return;
+    const item = this.store.get(room.item);
+    if (!item || terminal(item) || !item.roomHolds?.[room.id] || this.collaboration.board.getRoom(room.id)?.status !== 'open') return;
     const controller = new AbortController();
     this.roomControllers.set(room.id, controller);
     const task = Promise.resolve().then(async () => {await this.collaboration!.runRoom(room, controller.signal);})
       .catch(error => {
-        if (!controller.signal.aborted) this.parkCollaboration(room.item, room.participants[0],
+        if (!controller.signal.aborted && this.store.get(room.item)?.roomHolds?.[room.id]) this.parkCollaboration(room.item, room.participants[0],
           error instanceof Error ? error.message : String(error));
       }).finally(() => {
         this.roomControllers.delete(room.id);
@@ -128,7 +130,11 @@ export class Kernel extends Runtime {
   applyRoomResolution(itemId: string, field: string, value: unknown, owner: string, roomId: string): void {
     const before = this.store.get(itemId);
     const hold = before?.roomHolds?.[roomId];
-    if (!before || !hold) return;
+    const room = this.collaboration?.board.getRoom(roomId);
+    if (!before || before.status !== 'active' || !hold || hold.field !== field || !room ||
+        room.item !== itemId || room.field !== field || !['resolved', 'judged'].includes(room.status)) {
+      throw new ControlError(409, 'stale_room', '该讨论室已失效，不能覆盖当前货物结果');
+    }
     this.atomicTransition(() => {
       const next = structuredClone(before);
       const parts = field.split('.');
@@ -168,11 +174,11 @@ export class Kernel extends Runtime {
     this.atomicTransition(() => this.parkItem(item, node, reason, code));
   }
 
-  saveDialogueSession(itemId: string, key: string, result: Pick<StationResult, 'sessionCheckpoint'>): void {
+  saveDialogueSession(itemId: string, key: string, result: Pick<StationResult, 'sessionCheckpoint'>, allowShutdown = false): void {
     const before = this.store.get(itemId);
     const checkpoint = result.sessionCheckpoint;
     if (!before?.nodes[key] || !checkpoint) return;
-    this.atomicTransition(() => {
+    const save = () => {
       const next = structuredClone(before);
       const patch: Record<string, unknown> = {};
       if (checkpoint.pi) {
@@ -183,6 +189,26 @@ export class Kernel extends Runtime {
       next.data = {...next.data, ...patch};
       this.journal.append({kind: 'token.data', token: itemId, patch});
       this.persist(before, next);
+    };
+    // Shutdown stops admissions first, but a still-valid room keeps its partial
+    // transcript just as an interrupted ordinary attempt does in finishV2.
+    if (allowShutdown && this.disposedV2) this.journal.atomic(save);
+    else this.atomicTransition(save);
+  }
+
+  /** The question and the exact suspended tool call commit with its transcript. */
+  savePendingQuestion(itemId: string, key: string, attempt: string, question: NonNullable<StationContext['pendingQuestion']>,
+    checkpoint: NonNullable<StationResult['sessionCheckpoint']>): void {
+    const before = this.store.get(itemId);
+    if (before?.status !== 'active' || before.nodes[key]?.status !== 'running' || before.nodes[key].lastAttempt !== attempt) {
+      throw new ControlError(409, 'stale_attempt', '当前工位已经变化，不能发起答疑');
+    }
+    this.atomicTransition(() => {
+      this.saveDialogueSession(itemId, key, {sessionCheckpoint: checkpoint});
+      const current = this.store.get(itemId)!;
+      const next = structuredClone(current);
+      next.nodes[key].pendingQuestion = structuredClone(question);
+      this.persist(current, next);
     });
   }
 
@@ -225,6 +251,7 @@ export class Kernel extends Runtime {
     from?: string; returned?: boolean; status?: TokenStatus; reason?: string; admittedAt?: number;
   } = {}) {
     next.updatedAt = Date.now();
+    this.retireRooms(previous, next, options.reason ?? next.parked?.reason ?? '货物状态已变化');
     if (terminal(next)) for (const node of Object.values(next.nodes)) {
       if (node.status === 'running') node.status = 'pending';
     }
@@ -265,6 +292,21 @@ export class Kernel extends Runtime {
       });
     }
     this.journal.afterCommit(() => this.syncView(next));
+  }
+
+  /** A room id is the generation of its hold. Removed holds never become valid
+   * again, and their audit receipt commits with the item transition. */
+  private retireRooms(previous: ItemState | undefined, next: ItemState, reason: string): void {
+    const held = new Set([...Object.keys(previous?.roomHolds ?? {}), ...Object.keys(next.roomHolds ?? {})]);
+    if (terminal(next)) delete next.roomHolds;
+    const retired = [...held].filter(id => !next.roomHolds?.[id]);
+    for (const id of retired) {
+      const room = this.collaboration?.board.getRoom(id);
+      if (room?.status === 'open') this.collaboration!.board.closeRoom(id, {status: 'parked', reason: `讨论已失效：${reason}`});
+    }
+    if (retired.length) this.journal.afterCommit(() => {
+      for (const id of retired) this.roomControllers.get(id)?.abort(new Error('discussion hold invalidated'));
+    });
   }
 
   /** Recovery changes no business output and never starts an executor. */
@@ -462,7 +504,9 @@ export class Kernel extends Runtime {
   }
 
   async waitForStationIdle(itemId: string, key: string, signal: AbortSignal): Promise<void> {
-    while (this.store.get(itemId)?.nodes[key]?.status === 'running') {
+    while (true) {
+      const state = this.store.get(itemId)?.nodes[key];
+      if (state?.status !== 'running' && !(state?.status === 'waiting' && state.waitingFor === 'room' && state.pendingQuestion)) break;
       signal.throwIfAborted();
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(done, 20);
@@ -577,13 +621,32 @@ export class Kernel extends Runtime {
       redo: initial.nodes[node.key].redo,
       agentBudget: initial.nodes[node.key].agentBudget,
       session: initial.nodes[node.key].session,
+      pendingQuestion: initial.nodes[node.key].pendingQuestion,
+      resumeQuestion: async signal => {
+        const pending = this.store.get(work.item)?.nodes[node.key]?.pendingQuestion;
+        const question = pending && this.collaboration?.board.getPost(pending.id);
+        if (!pending || !question || question.item !== work.item || question.author !== node.key || question.type !== 'question') {
+          throw new ControlError(409, 'question_checkpoint_invalid', '找不到待恢复的原答疑问题');
+        }
+        const answer = await this.waitForRoom(work.item, node.key, work.attempt,
+          () => this.collaboration!.answer(question, signal ? AbortSignal.any([work.controller.signal, signal]) : work.controller.signal));
+        return {ok: true, id: question.id, answer};
+      },
       waitForRoom: action => this.waitForRoom(work.item, node.key, work.attempt, action),
       checkpointSession: checkpoint => {
         if (!current() || work.controller.signal.aborted) throw new ControlError(409, 'stale_attempt', '当前工位已经变化，不能保存会话');
         this.saveDialogueSession(work.item, node.key, {sessionCheckpoint: checkpoint});
       },
-      progress: (text, step) => { if (!work.controller.signal.aborted && current()) this.journal.atomic(() => this.journal.append({kind: 'attempt.progress', attempt: work.attempt, text, step})); },
-      activity: activity => { this.journal.atomic(() => this.journal.append({kind: 'attempt.activity', attempt: work.attempt, activity})); },
+      progress: (text, step) => {
+        if (!work.controller.signal.aborted && current()) this.journal.atomic(() => {
+          const event = this.journal.append({kind: 'attempt.progress', attempt: work.attempt, text, step});
+          this.store.touch(work.item, event.at);
+        });
+      },
+      activity: activity => { this.journal.atomic(() => {
+        const event = this.journal.append({kind: 'attempt.activity', attempt: work.attempt, activity});
+        if (!work.controller.signal.aborted && current()) this.store.touch(work.item, event.at);
+      }); },
       addEvidence: evidence => {
         work.controller.signal.throwIfAborted();
         if (!current()) throw new Error('stale attempt');
@@ -742,7 +805,7 @@ export class Kernel extends Runtime {
       if (modelProbeSucceeded(circuit, item.id, node.key)) this.clearCircuit(work.dependency);
     }
     const wasReturned = Boolean(state.redo);
-    delete state.redo; delete state.lastFailure; delete state.handoff; delete state.waitingSince;
+    delete state.redo; delete state.lastFailure; delete state.handoff; delete state.waitingSince; delete state.pendingQuestion;
     if (this.collaboration) {
       const board = this.collaboration.board;
       board.autoClaim(item, node.key, result.summary, data, work.evidence);
@@ -860,7 +923,7 @@ export class Kernel extends Runtime {
         const previousStore = asTokenRun(before).finishedStore;
         if (previousStore) this.stockDelta(previousStore, -1, '纠错撤回原结果');
       }
-      this.persist(before, next, {from, returned: true});
+      this.persist(before, next, {from, returned: true, reason});
       this.journal.afterCommit(() => {
         for (const work of this.liveV2.values()) if (work.item === token.id && reset.includes(work.node)) work.controller.abort(new Error('returned'));
       });
@@ -940,6 +1003,9 @@ export class Kernel extends Runtime {
     if (event?.kind !== 'correction.created' || !event.snapshot?.itemState) throw new ControlError(409, 'correction_not_reversible', '该纠错没有可撤销快照');
     if (events.some(row => row.seq > event.seq && (row.kind === 'attempt.started' && row.token === event.token || row.kind === 'correction.created' && row.token === event.token || row.kind === 'correction.reverted' && row.correction === id)) || [...this.liveV2.values()].some(work => work.item === event.token)) throw new ControlError(409, 'correction_already_executed', '纠错后已有工位执行，不能撤销');
     const item = event.snapshot.itemState as ItemState;
+    if (Object.keys(item.roomHolds ?? {}).some(room => this.collaboration?.board.getRoom(room)?.status !== 'open')) {
+      throw new ControlError(409, 'correction_not_reversible', '纠错前的讨论室已经关闭，不能恢复已失效的讨论');
+    }
     this.atomicTransition(() => {
       const before = this.store.get(item.id);
       const restoredStore = asTokenRun(item).finishedStore;

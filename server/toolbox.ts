@@ -15,8 +15,14 @@ import { visit } from "../packs/vislexicon/capture.ts";
 import { parseHtml } from "../packs/vislexicon/tools.ts";
 import {decideInCurrentAttempt, type DecisionRequest} from './decision-model.ts';
 import type {BoardPostInput} from '../shared/board.ts';
+import type {StationResult} from './runtime.ts';
 
-export interface EnvContext { node: string; token?: string; caseId?: string; signal: AbortSignal; progress?: (text: string, step?: { tool: string; text: string; ok?: boolean }) => void; waitForRoom?<T>(action: () => Promise<T>): Promise<T> }
+export interface EnvContext {
+  node: string; token?: string; caseId?: string; signal: AbortSignal;
+  attempt?: string; toolCallId?: string; questionCheckpoint?: StationResult['sessionCheckpoint'];
+  progress?: (text: string, step?: { tool: string; text: string; ok?: boolean }) => void;
+  waitForRoom?<T>(action: () => Promise<T>): Promise<T>;
+}
 interface ToolboxDependencies {
   journal: Journal; broker: Broker; docs: () => Docs;
   board?: {

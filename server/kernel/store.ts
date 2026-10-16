@@ -82,6 +82,15 @@ export class KernelStore {
     ).run(item.id, item.run, item.line, item.status, admission, item.updatedAt, serializeSnapshot(item));
   }
 
+  /** A real progress receipt updates only the fixed item envelope. Nested
+   * snapshot encodings remain untouched, and both timestamp copies agree. */
+  touch(id: string, at: number): void {
+    this.assertTransaction();
+    if (!Number.isSafeInteger(at) || at < 0) throw new TypeError('Invalid item progress timestamp');
+    this.journal.database.prepare(`UPDATE items SET updated_at = MAX(updated_at, ?),
+      body = json_set(body, '$.updatedAt', MAX(updated_at, ?)) WHERE id = ?`).run(at, at, id);
+  }
+
   saveAttempt(attempt: AttemptRecord): void {
     this.assertTransaction();
     if (![attempt.id, attempt.item, attempt.node].every(value => typeof value === 'string' && value.length > 0) ||

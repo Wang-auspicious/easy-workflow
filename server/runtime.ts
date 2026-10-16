@@ -92,6 +92,9 @@ export interface StationContext {
   /** Keep this attempt's conversation while an answer releases its worker lease. */
   waitForRoom?<T>(action: () => Promise<T>): Promise<T>;
   checkpointSession?(checkpoint: NonNullable<StationResult['sessionCheckpoint']>): void;
+  /** A persisted question whose original tool result must be restored first. */
+  pendingQuestion?: {id: string; toolCallId: string; askedBy: string; addressee: string};
+  resumeQuestion?(signal?: AbortSignal): Promise<unknown>;
   progress(text: string, step?: StepDetail): void;
   /** Observations remain journaled even when cancellation invalidates the output. */
   activity?(activity: ActivitySpan): void;

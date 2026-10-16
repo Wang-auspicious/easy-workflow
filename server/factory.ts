@@ -182,11 +182,12 @@ export class Factory {
     this.collaboration = collaboration;
   }
 
-  private collaborationContext(kernel: Kernel, id: string, key: string, attempt: string, signal: AbortSignal): StationContext {
+  private collaborationContext(kernel: Kernel, id: string, key: string, attempt: string, signal: AbortSignal,
+    validSession: () => boolean = () => true): StationContext {
     const item = kernel.store.get(id), node = kernel.nodes.get(key);
     if (!item || !node) throw new ControlError(404, 'collaboration_node_missing', '答疑节点或货不存在');
     return {token: asTokenRun(item), node, attempt, signal, session: item.nodes[key]?.session,
-      checkpointSession: checkpoint => kernel.saveDialogueSession(id, key, {sessionCheckpoint: checkpoint}),
+      checkpointSession: checkpoint => { if (validSession()) kernel.saveDialogueSession(id, key, {sessionCheckpoint: checkpoint}, true); },
       worker: {id: `dialogue-${attempt}`, node: key, label: node.name, busy: id, idleSince: 0},
       progress: (text, step) => { this.journal.append({kind: 'attempt.progress', attempt, text, ...(step ? {step} : {})}); },
       activity: activity => { this.journal.append({kind: 'attempt.activity', attempt, activity}); },
@@ -203,7 +204,14 @@ export class Factory {
     const node = kernel.nodes.get(turn.node);
     if (!node || !['agent', 'review'].includes(node.kind)) throw new ControlError(422, 'dialogue_not_agent', '只有 Agent 节点可以参加答疑');
     const attempt = `dialogue-${randomUUID()}`, startedAt = Date.now();
-    const context = this.collaborationContext(kernel, turn.itemId, turn.node, attempt, signal);
+    const generation = kernel.store.get(turn.itemId)?.nodes[turn.node];
+    const validSession = () => {
+      const current = kernel.store.get(turn.itemId);
+      const owner = current?.nodes[turn.node];
+      return current?.status === 'active' && Boolean(generation && owner) && owner?.lastAttempt === generation?.lastAttempt &&
+        owner?.rounds === generation?.rounds && (!turn.room || current.roomHolds?.[turn.room.id]?.field === turn.room.field);
+    };
+    const context = this.collaborationContext(kernel, turn.itemId, turn.node, attempt, signal, validSession);
     let view = turn.view;
     if (view.viewKind === 'dossier+home' && (!Array.isArray(view.images) || !view.images.length)) {
       let screenshot = Object.values(this.state.evidence).filter(evidence => evidence.token === turn.itemId && evidence.label === '讨论首页截图').at(-1);
@@ -228,7 +236,10 @@ export class Factory {
     const lease = await this.broker.acquire(node.resource, {signal});
     if (!lease) throw new ControlError(503, 'dialogue_resource', '答疑资源暂不可用');
     const request = {kind: turn.mode, prompt: turn.prompt, input: {text: JSON.stringify(view), images: collaborationImages(view, this.store)},
-      post: turn.post, posted: Boolean(turn.existingPost), read: () => turn.posts, model: turn.model, repairReason: turn.repairReason};
+      post: turn.post ? (value: Parameters<NonNullable<CollaborationTurn['post']>>[0]) => {
+        if (!validSession()) throw new ControlError(409, 'stale_dialogue', '原工位已退回或结束，本次协作发言已经失效');
+        return turn.post!(value);
+      } : undefined, posted: Boolean(turn.existingPost), read: () => turn.posts, model: turn.model, repairReason: turn.repairReason};
     try {
       request.input.text = JSON.stringify(await collaborationPixels(view, this.store, signal));
       this.journal.atomic(() => {
@@ -240,21 +251,23 @@ export class Factory {
       const definition = this.stationAgents[turn.node];
       const result = installed ? await installed(context) : definition ? await run(definition, context) : undefined;
       if (!result) throw new ControlError(422, 'dialogue_definition_missing', '答疑节点没有执行契约');
+      const current = validSession();
       this.journal.atomic(() => {
-        kernel.saveDialogueSession(turn.itemId, turn.node, result);
+        if (current) kernel.saveDialogueSession(turn.itemId, turn.node, result, true);
         kernel.store.saveAttempt({id: attempt, item: turn.itemId, node: turn.node, startedAt, endedAt: Date.now(),
-          status: result.handoff ? 'handoff' : result.ok ? 'ok' : 'failed', body: {dialogue: turn.mode, ...result}});
-        this.journal.append({kind: 'attempt.finished', attempt, ok: result.ok, summary: result.summary,
+          status: !current ? 'cancelled' : result.handoff ? 'handoff' : result.ok ? 'ok' : 'failed', body: {dialogue: turn.mode, ...result}});
+        this.journal.append({kind: 'attempt.finished', attempt, ok: current && result.ok, cancelled: !current, summary: result.summary,
           ms: Date.now() - startedAt, queuedMs: 0, usage: result.usage, metrics: result.metrics, error: result.error});
       });
       return result;
     } catch (error) {
       const partial = error as Partial<StationResult>;
+      const current = validSession();
       this.journal.atomic(() => {
-        if (partial.sessionCheckpoint) kernel.saveDialogueSession(turn.itemId, turn.node, {sessionCheckpoint: partial.sessionCheckpoint});
+        if (current && partial.sessionCheckpoint) kernel.saveDialogueSession(turn.itemId, turn.node, {sessionCheckpoint: partial.sessionCheckpoint}, true);
         kernel.store.saveAttempt({id: attempt, item: turn.itemId, node: turn.node, startedAt, endedAt: Date.now(),
-          status: signal.aborted ? 'cancelled' : 'failed', body: {dialogue: turn.mode, error: '协作回合未完成'}});
-        this.journal.append({kind: 'attempt.finished', attempt, ok: false, summary: '协作回合未完成', ms: Date.now() - startedAt, queuedMs: 0});
+          status: signal.aborted || !current ? 'cancelled' : 'failed', body: {dialogue: turn.mode, error: '协作回合未完成'}});
+        this.journal.append({kind: 'attempt.finished', attempt, ok: false, cancelled: signal.aborted || !current, summary: '协作回合未完成', ms: Date.now() - startedAt, queuedMs: 0});
       });
       throw error;
     } finally { lease.release(); }
@@ -264,7 +277,23 @@ export class Factory {
     if (!(this.runtime instanceof Kernel) || !this.board || !this.collaboration || !context.token) throw new ControlError(410, 'kernel_v2_required', '黑板需要 v2 内核');
     const item = this.runtime.store.get(context.token);
     if (!item) throw new ControlError(404, 'item_not_found', '没有这件货');
-    const post = this.board.addPost({...input, item, author: context.node});
+    if (input.type === 'question') {
+      const target = input.addressee && item.nodes[input.addressee];
+      if (input.addressee === context.node || target && target.status === 'waiting' && target.waitingFor === 'room' && target.pendingQuestion) {
+        throw new ControlError(409, 'question_cycle', '不能向自己或正在等待答疑的节点提问，请依据现有证据判断');
+      }
+      if (!context.attempt || !context.toolCallId || !context.questionCheckpoint) {
+        throw new ControlError(409, 'question_checkpoint_required', '提问需要当前会话与工具回执检查点');
+      }
+    }
+    const kernel = this.runtime;
+    let post!: ReturnType<BoardStore['addPost']>;
+    this.journal.atomic(() => {
+      post = this.board!.addPost({...input, item, author: context.node});
+      if (post.type === 'question') kernel.savePendingQuestion(item.id, context.node, context.attempt!, {
+        id: post.id, toolCallId: context.toolCallId!, askedBy: context.node, addressee: post.addressee!,
+      }, context.questionCheckpoint!);
+    });
     if (post.type !== 'question') return {id: post.id};
     const answer = () => this.collaboration!.answer(post, context.signal);
     const reply = context.waitForRoom ? await context.waitForRoom(answer) : await answer();

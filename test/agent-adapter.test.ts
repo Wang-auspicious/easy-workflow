@@ -7,7 +7,7 @@ import http from 'node:http';
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { configureAgentStations, runAgentStation, runStationDialogue, stationBudget, type AgentStationDef } from "../server/agent-station.ts";
-import { Toolbox } from "../server/toolbox.ts";
+import { Toolbox, type EnvContext } from "../server/toolbox.ts";
 import { Broker } from "../server/broker.ts";
 import { Docs } from "../server/docs.ts";
 import { Journal } from "../server/journal.ts";
@@ -30,6 +30,11 @@ import {OpenCodeProtocol, validOpenCodeSession, type OpenCodeSessionReference} f
 import {CodexProtocol, validCodexSession, type CodexSessionReference} from '../server/codex.ts';
 import {setTimeout as delay} from 'node:timers/promises';
 import {KernelStore} from '../server/kernel/store.ts';
+import {Kernel} from '../server/kernel/kernel.ts';
+import {BoardStore} from '../server/board.ts';
+import type {Factory} from '../server/factory.ts';
+import type {BoardPost, BoardPostInput} from '../shared/board.ts';
+import type {CollaborationTurn} from '../server/collaboration.ts';
 
 test("closed launcher receives envelope first, calls scoped MCP, repairs and reports real usage", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-closed-agent-test-"));
@@ -2139,5 +2144,198 @@ test('Pi tools retain a worker but release the real request slot for an independ
     else process.env.PI_CODING_AGENT_DIR = previous;
     assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
     fs.rmSync(directory, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+  }
+});
+
+for (const answeredBeforeRestart of [false, true]) test(`D pending question restores its original SSE tool receipt after ${answeredBeforeRestart ? 'answer' : 'question'} persistence`, {timeout: 20000}, async () => {
+  await contractFixture(index => index === 1 ? {tool: {name: 'env_call', arguments: {name: 'board_post', arguments: {
+    type: 'question', field: 'proof', addressee: 'curation/owner', body: 'What did the original evidence show?',
+  }}}} : submitContract(), async fixture => {
+    const {Factory} = await import('../server/factory.ts');
+    const compiled = compile([{id: 'pending-fixture', name: 'Pending question', version: '1', blurb: 'Local recovery',
+      resources: {model: 4, cpu: 1, browser: 0, http: 0}, channels: [], links: [], conditions: {}, order: ['curation'], collapsed: [], hints: {},
+      lines: [line({id: 'curation', name: 'Question recovery', layer: 3, priority: 'mid', wired: true, blurb: 'Keep receipts', stations: [
+        station({id: 'owner', name: 'Owner', kind: 'agent', role: 'process', resource: 'model', accept: ['Keep evidence']}),
+        station({id: 'reader', name: 'Reader', kind: 'agent', role: 'process', resource: 'model', accept: ['Score equals 2']}),
+        station({id: 'published', name: 'Published', kind: 'store', role: 'store'}),
+      ], edges: [['owner', 'reader'], ['reader', 'published']]})]}]);
+    assert.deepEqual(compiled.issues, []);
+    const journal = new Journal(path.join(fixture.dir, 'questions.db'));
+    const broker = new Broker({model: 4, modelWorkers: 4}, 0);
+    const board = new BoardStore(journal, compiled, {'curation/owner': {outputKey: 'proof'}, 'curation/reader': {outputKey: 'score'}});
+    const docs = {dir: fixture.dir, envelope: () => ({text: 'Original task.', sizes: {role: 0, project: 0, context: 0, caseFile: 0}})} as unknown as Docs;
+    let interrupted!: () => void;
+    const interruption = new Promise<void>(resolve => {interrupted = resolve;});
+    let recovering = false, answers = 0;
+    const answer = async (question: BoardPost, signal: AbortSignal): Promise<BoardPost> => {
+      const existing = board.answerTo(question.id);
+      if (existing) return existing;
+      let reply: BoardPost | undefined;
+      if (recovering || answeredBeforeRestart) {
+        reply = board.addPost({item: question.item, author: question.addressee!, type: 'answer', field: question.field,
+          target: question.id, body: 'Original durable answer: fixture evidence supports score 2.'});
+        answers++;
+      }
+      if (recovering) return reply!;
+      interrupted();
+      await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), {once: true}));
+      throw new Error('The interrupted request must not continue');
+    };
+    let kernel!: Kernel;
+    const postBoard = (Factory.prototype as unknown as {postBoard(context: EnvContext, input: BoardPostInput): Promise<unknown>}).postBoard;
+    const facade = {get runtime() {return kernel;}, journal, board, collaboration: {answer}} as unknown as Factory;
+    const toolbox = new Toolbox({journal, broker, docs: () => docs, board: {
+      read: (context, options) => board.read(context.token!, options), post: (context, input) => postBoard.call(facade, context, input),
+    }});
+    const definition = {...fixture.definition, services: {docs: () => docs, toolbox: () => toolbox}};
+    const create = () => {
+      const value = new Kernel(compiled, journal, broker, {}, () => async context => context.node.id === 'owner'
+        ? {ok: true, summary: 'Owned proof', data: {proof: 'known'}} : runAgentStation(definition, context));
+      value.configureCollaboration({board, answer, openRoom: () => {throw new Error('No room in question fixture');}, runRoom: async () => {}});
+      return value;
+    };
+    kernel = create();
+    let token: ReturnType<Kernel['create']>;
+    let atomicReceipt = false;
+    journal.subscribe(event => {
+      if (event.kind === 'board.posted' && event.post.type === 'question') {
+        const pending = kernel.store.get(event.post.item)?.nodes[event.post.author]?.pendingQuestion;
+        assert.equal(pending?.id, event.post.id, 'question and suspended call must be visible in one commit');
+        const ref = kernel.store.get(event.post.item)?.nodes[event.post.author]?.session;
+        assert.ok(ref && JSON.parse(fs.readFileSync(path.join(fixture.dir, ref.file), 'utf8')).messages
+          .some((message: {content?: {type?: string; id?: string}[]}) => Array.isArray(message.content) && message.content.some(part => part.type === 'toolCall' && part.id === pending?.toolCallId)));
+        atomicReceipt = true;
+      }
+    });
+    try {
+      kernel.start('pending fixture');
+      token = kernel.create('curation/owner', {item: 'fixture', url: 'https://fixture.invalid', source: 'fixture'});
+      await interruption;
+      assert.equal(atomicReceipt, true);
+      const pending = kernel.store.get(token.id)!.nodes['curation/reader'].pendingQuestion!;
+      assert.equal(board.askQuota(token.id, 'curation/owner'), 1);
+      await kernel.close();
+      recovering = true;
+      kernel = create(); kernel.recover(); kernel.resume();
+      await kernel.settle();
+      assert.equal(kernel.store.get(token.id)?.status, 'published');
+      assert.equal(kernel.store.get(token.id)?.nodes['curation/reader'].pendingQuestion, undefined);
+      assert.equal(board.askQuota(token.id, 'curation/owner'), 1, 'recovery cannot consume another question');
+      assert.equal(answers, 1, 'a persisted answer is reused');
+      assert.equal(fixture.requests.length, 2, 'recovery continues the original task without another question request');
+      const messages = fixture.requests[1].messages as {role: string; tool_call_id?: string; content: unknown}[];
+      const receipt = messages.find(message => message.role === 'tool' && message.tool_call_id === pending.toolCallId);
+      assert.ok(receipt, 'the answer belongs to the original tool call');
+      assert.match(JSON.stringify(receipt.content), /Original durable answer/);
+      assert.ok(!JSON.stringify(messages).includes('No result provided'));
+    } finally {await kernel.close(); journal.close();}
+  });
+});
+
+test('D SSE rejects self and cyclic questions before posting or spending quota', {timeout: 20000}, async () => {
+  await contractFixture(index => index <= 2 ? {tool: {name: 'env_call', arguments: {name: 'board_post', arguments: {
+    type: 'question', field: index === 1 ? 'score' : 'proof', addressee: index === 1 ? 'curation/reader' : 'curation/owner', body: 'This would reenter a live session.',
+  }}}} : submitContract(), async fixture => {
+    const {Factory} = await import('../server/factory.ts');
+    const compiled = compile([{id: 'cycle-fixture', name: 'No cyclic question', version: '1', blurb: 'Local policy',
+      resources: {model: 4, cpu: 1, browser: 0, http: 0}, channels: [], links: [], conditions: {}, order: ['curation'], collapsed: [], hints: {},
+      lines: [line({id: 'curation', name: 'Question recovery', layer: 3, priority: 'mid', wired: true, blurb: 'Single live session', stations: [
+        station({id: 'owner', name: 'Owner', kind: 'agent', role: 'process', resource: 'model', accept: ['Keep evidence']}),
+        station({id: 'reader', name: 'Reader', kind: 'agent', role: 'process', resource: 'model', accept: ['Score equals 2']}),
+      ], edges: [['owner', 'reader']]})]}]);
+    assert.deepEqual(compiled.issues, []);
+    const journal = new Journal(path.join(fixture.dir, 'cycles.db'));
+    const broker = new Broker({model: 4, modelWorkers: 4}, 0);
+    const kernel = new Kernel(compiled, journal, broker, {}, () => async () => {throw new Error('Do not schedule the fixture');});
+    const board = new BoardStore(journal, compiled, {'curation/owner': {outputKey: 'proof'}, 'curation/reader': {outputKey: 'score'}});
+    const docs = {dir: fixture.dir, envelope: () => ({text: 'Original task.', sizes: {role: 0, project: 0, context: 0, caseFile: 0}})} as unknown as Docs;
+    const postBoard = (Factory.prototype as unknown as {postBoard(context: EnvContext, input: BoardPostInput): Promise<unknown>}).postBoard;
+    const facade = {runtime: kernel, journal, board, collaboration: {answer: () => {throw new Error('A rejected cycle must never start a second session');}}} as unknown as Factory;
+    const toolbox = new Toolbox({journal, broker, docs: () => docs, board: {
+      read: (context, options) => board.read(context.token!, options), post: (context, input) => postBoard.call(facade, context, input),
+    }});
+    const token = kernel.create('curation/owner', {item: 'fixture', url: 'https://fixture.invalid', source: 'fixture'});
+    const item = kernel.store.get(token.id)!;
+    item.status = 'active'; item.nodes['curation/reader'].status = 'running'; item.nodes['curation/reader'].lastAttempt = 'reader-live';
+    journal.atomic(() => {
+      const question = board.addPost({item, author: 'curation/owner', type: 'question', field: 'score', addressee: 'curation/reader', body: 'Explain your score.'});
+      item.nodes['curation/owner'].status = 'waiting'; item.nodes['curation/owner'].waitingFor = 'room';
+      item.nodes['curation/owner'].pendingQuestion = {id: question.id, toolCallId: 'original-owner-call', askedBy: 'curation/owner', addressee: 'curation/reader'};
+      kernel.store.save(item);
+    });
+    const controller = new AbortController();
+    try {
+      const result = await runAgentStation({...fixture.definition, services: {docs: () => docs, toolbox: () => toolbox}}, {
+        ...fixture.context, token: {...fixture.context.token, id: token.id}, attempt: 'reader-live', node: compiled.nodes.find(node => node.key === 'curation/reader')!,
+      });
+      assert.equal(result.ok, true, result.error ?? 'The original attempt should continue after tool errors');
+      assert.deepEqual([board.askQuota(token.id, 'curation/reader'), board.askQuota(token.id, 'curation/owner')], [1, 0]);
+      assert.equal(board.read(token.id).length, 1, 'cycle errors must leave no new post');
+      const errors = (fixture.requests[2].messages as {role: string; content: unknown}[]).filter(message => message.role === 'tool');
+      assert.equal(errors.length, 2);
+      assert.ok(errors.every(message => JSON.stringify(message.content).includes('不能向自己或正在等待答疑的节点提问')));
+      let idle = false;
+      const wait = kernel.waitForStationIdle(token.id, 'curation/owner', controller.signal).then(() => {idle = true;});
+      await delay(30);
+      assert.equal(idle, false, 'a waiting original session is still live and cannot be resumed concurrently');
+      journal.atomic(() => {const next = kernel.store.get(token.id)!; next.nodes['curation/owner'].status = 'done'; kernel.store.save(next);});
+      await wait;
+    } finally {controller.abort(); await kernel.close(); journal.close();}
+  });
+});
+
+for (const disposition of ['return', 'park', 'shutdown'] as const) test(`D Factory ${disposition === 'return' ? 'question' : 'room'} session saves respect ${disposition} before a deferred result`, async () => {
+  const {Factory} = await import('../server/factory.ts');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-room-session-'));
+  const compiled = compile([{id: 'room-session', name: 'Room session', version: '1', blurb: 'Deferred Factory result',
+    resources: {model: 4, cpu: 1, browser: 0, http: 0}, channels: [], links: [], conditions: {}, order: ['room'], collapsed: [], hints: {},
+    lines: [line({id: 'room', name: 'Room', layer: 3, priority: 'mid', wired: true, blurb: 'Session generation', stations: [
+      station({id: 'owner', name: 'Owner', kind: 'agent', role: 'process', resource: 'model', accept: ['Keep proof']}),
+      station({id: 'review', name: 'Review', kind: 'review', role: 'review', resource: 'model', accept: ['Check proof']}),
+    ], edges: [['owner', 'review']]})]}]);
+  const journal = new Journal(path.join(dir, 'journal.db'));
+  const broker = new Broker({model: 4, modelWorkers: 4}, 0);
+  const kernel = new Kernel(compiled, journal, broker, {}, () => async () => {throw new Error('No ordinary work in fixture');});
+  const board = new BoardStore(journal, compiled, {'room/owner': {outputKey: 'proof'}});
+  kernel.configureCollaboration({board, openRoom: () => {throw new Error('Use fixture room');}, runRoom: async () => {}, answer: async () => {throw new Error('No question');}});
+  const token = kernel.create('room/owner', {item: 'room', url: 'https://fixture.invalid', source: 'fixture'});
+  const before = kernel.store.get(token.id)!;
+  const room = board.createRoom({item: before, field: 'proof', topic: 'Keep session', participants: ['room/owner', 'room/review'], judge: 'room/review'});
+  before.status = 'active'; before.nodes['room/owner'].status = 'done';
+  before.nodes['room/owner'].lastAttempt = 'original-owner-attempt';
+  before.roomHolds = {[room.id]: {field: 'proof', owner: 'room/owner', nodes: ['room/review']}};
+  journal.atomic(() => kernel.store.save(before));
+  const initial = {pi: {file: 'work/agent-sessions/current.json', signature: 'same-contract'}};
+  const late = {pi: {file: 'work/agent-sessions/late.json', signature: 'same-contract'}};
+  const final = {pi: {file: 'work/agent-sessions/final.json', signature: 'same-contract'}};
+  let entered!: () => void, release!: () => void;
+  const ready = new Promise<void>(resolve => {entered = resolve;}), barrier = new Promise<void>(resolve => {release = resolve;});
+  const controller = new AbortController();
+  const facade = Object.assign(Object.create(Factory.prototype), {journal, broker, store: new EvidenceStore(path.join(dir, 'evidence')), stationAgents: {},
+    workflowPacks: {executor: () => async (context: StationContext) => {
+      context.checkpointSession!(initial); entered(); await barrier;
+      context.checkpointSession!(late);
+      if (disposition !== 'return') throw Object.assign(new Error('Deferred interruption'), {sessionCheckpoint: final});
+      return {ok: true, summary: 'Late room result', sessionCheckpoint: final};
+    }}}) as Factory;
+  const run = (Factory.prototype as unknown as {runCollaborationTurn(kernel: Kernel, turn: CollaborationTurn): Promise<StationResult>}).runCollaborationTurn;
+  const mode = disposition === 'return' ? 'answer' : 'room';
+  const pending = run.call(facade, kernel, {itemId: token.id, node: 'room/owner', ...(mode === 'room' ? {room} : {}), mode, prompt: 'Fixture',
+    view: {}, posts: [], budget: {maxTokens: 12000, maxMs: 240000}, signal: controller.signal});
+  try {
+    await ready;
+    assert.deepEqual(kernel.store.get(token.id)?.nodes['room/owner'].session, initial.pi);
+    if (disposition === 'return') kernel.returnToken(token, 'human', 'room/owner', 'New correction', true);
+    else if (disposition === 'park') kernel.toManual(token, compiled.nodes.find(node => node.key === 'room/owner')!, 'Manual review');
+    else {controller.abort(new Error('Shutdown')); kernel.dispose();}
+    release();
+    if (disposition === 'return') await pending;
+    else await assert.rejects(pending, /Deferred interruption/);
+    assert.deepEqual(kernel.store.get(token.id)?.nodes['room/owner'].session, disposition === 'shutdown' ? final.pi : initial.pi);
+    assert.deepEqual((kernel.store.get(token.id)?.data.stationSessions as Record<string, SessionRef>)['room/owner'], disposition === 'shutdown' ? final.pi : initial.pi);
+    assert.equal(kernel.store.attempts(token.id).find(attempt => attempt.body.dialogue === mode)?.status, 'cancelled');
+  } finally {
+    release(); controller.abort(); await kernel.close(); journal.close();
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir())); fs.rmSync(dir, {recursive: true, force: true});
   }
 });

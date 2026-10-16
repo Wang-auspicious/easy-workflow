@@ -357,9 +357,11 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     },
     {
       name: "env_call", label: "调用能力箱", description: "Run one environment tool: {name, arguments}. Results are JSON; on ok:false follow failure.nextAction and failure.owner.", parameters: Type.Object({ name: Type.String(), arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown())) }),
-      execute: async (_id: string, p: { name: string; arguments?: Record<string, unknown> }, signal?: AbortSignal) => {
+      execute: async (id: string, p: { name: string; arguments?: Record<string, unknown> }, signal?: AbortSignal) => {
         envCalls++;
+        const question = p.name === 'board_post' && p.arguments?.type === 'question';
         const r = await toolbox.call(allowed, p.name, p.arguments ?? {}, {node: ctx.node.key, token: ctx.token.id, caseId,
+          attempt: ctx.attempt, toolCallId: id, ...(question ? {questionCheckpoint: sessionCheckpoint()} : {}),
           signal: signal ? AbortSignal.any([ctx.signal, signal]) : ctx.signal, progress: ctx.progress,
           waitForRoom: ctx.waitForRoom ? async action => {
             const checkpoint = sessionCheckpoint();
@@ -372,6 +374,10 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
         // object corrupts JSON and can silently remove the evidence being cited.
         const text = JSON.stringify(r);
         toolResultChars += text.length;
+        if (question && ok) {
+          const checkpoint = sessionCheckpoint({id, text});
+          if (checkpoint) ctx.checkpointSession?.(checkpoint);
+        }
         return { content: [{ type: "text", text }], details: { ok } };
       },
     },
@@ -538,10 +544,13 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     }
     return undefined;
   };
-  const sessionCheckpoint = (): StationResult['sessionCheckpoint'] => {
+  const sessionCheckpoint = (receipt?: {id: string; text: string}): StationResult['sessionCheckpoint'] => {
     const closed = agent instanceof ClosedStationAgent ? agent.sessionReference() : undefined;
     if (!sessionRoot) return closed ? {closed} : undefined;
     const messages: unknown[] = agent instanceof ClosedStationAgent ? agent.messagesSnapshot() : [...agent.state.messages];
+    if (receipt) messages.push(agent instanceof ClosedStationAgent
+      ? {role: 'user', content: [{type: 'text', text: `已完成答疑工具回执 ${receipt.id}：${receipt.text}`} ]}
+      : {role: 'toolResult', toolCallId: receipt.id, toolName: 'env_call', content: [{type: 'text', text: receipt.text}], isError: false, timestamp: Date.now()});
     const last = messages.at(-1) as {role?: string; stopReason?: string} | undefined;
     if (last?.role === 'assistant' && ['error', 'aborted'].includes(last.stopReason ?? '')) messages.pop();
     return {pi: saveStationSession(sessionRoot, signature, {messages, evidence: readEvidence(), calls: envCalls,
@@ -652,8 +661,31 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
     agent.state.messages = messages.slice(0, -1);
     await invoke(() => agent.continue());
   };
-  let preparingImages = true;
+  let preparingImages = false;
+  let recoveredQuestionText = '';
   try {
+  if (!dialogue && ctx.pendingQuestion) {
+    if (!ctx.resumeQuestion) throw new Error('待恢复答疑缺少原问题恢复入口');
+    const result = await ctx.resumeQuestion(sessionSignal);
+    sessionSignal.throwIfAborted();
+    const receipt = JSON.stringify(result);
+    recoveredQuestionText = `原答疑工具 ${ctx.pendingQuestion.toolCallId} 已完成，不要重复发问或重发该工具。以下是原工具的实际结果：\n${receipt}\n继续原任务并按原契约提交。`;
+    if (agent instanceof Agent) {
+      const messages = [...agent.state.messages];
+      const call = messages.findIndex(message => message.role === 'assistant' && message.content.some(part =>
+        part.type === 'toolCall' && part.id === ctx.pendingQuestion!.toolCallId && part.name === 'env_call'));
+      const previous = messages.findIndex(message => message.role === 'toolResult' && message.toolCallId === ctx.pendingQuestion!.toolCallId);
+      const answer = {role: 'toolResult' as const, toolCallId: ctx.pendingQuestion.toolCallId, toolName: 'env_call',
+        content: [{type: 'text' as const, text: receipt}], isError: false, timestamp: Date.now()};
+      if (previous !== -1) messages[previous] = answer;
+      else if (call !== -1) messages.splice(call + 1, 0, answer);
+      else messages.push({role: 'user', content: recoveredQuestionText, timestamp: Date.now()});
+      agent.state.messages = messages;
+    } else agent.restoreMessages([...agent.messagesSnapshot(), {role: 'user', content: [{type: 'text', text: recoveredQuestionText}]}]);
+    const checkpoint = sessionCheckpoint();
+    if (checkpoint) ctx.checkpointSession?.(checkpoint);
+  }
+  preparingImages = true;
   // A recovered task transcript already contains its images. A dialogue has a
   // newly scoped view, so its current images must accompany this new turn.
   if (dialogue || !(saved && agent instanceof Agent) || ctx.redo) {
@@ -667,9 +699,9 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   preparingImages = false;
   ctx.progress(`读取身份、案卷与输入${input.images?.length ? `：${input.images.length} 张图 + 文字` : ""}；调用 ${external ? "闭源 Agent / " : ""}${modelId}`, { tool: "model", text: input.text.slice(0, 160) });
   const lastSaved = saved?.messages.at(-1) as {role?: string} | undefined;
-  if (!dialogue && saved && agent instanceof Agent && !ctx.redo && !saved.submitSummary && ['user', 'toolResult'].includes(lastSaved?.role ?? '')) {
+  if (!dialogue && agent instanceof Agent && (Boolean(recoveredQuestionText) || saved && !ctx.redo && !saved.submitSummary && ['user', 'toolResult'].includes(lastSaved?.role ?? ''))) {
     await invoke(() => agent.continue());
-  } else await ask((redo ? `${redo}\n\n当前输入：\n` : '') + input.text + previousSubmit, images.length ? images : undefined);
+  } else await ask((recoveredQuestionText ? `${recoveredQuestionText}\n\n` : '') + (redo ? `${redo}\n\n当前输入：\n` : '') + input.text + previousSubmit, images.length ? images : undefined);
   let handoffPrompts = 0;
   while (submitted === null && !handedOff) {
     const error = modelError();

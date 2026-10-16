@@ -375,6 +375,73 @@ for (const postedButUnfinished of [false, true]) test(`D restarting a room prese
   } finally {await recovered?.close(); await value.close();}
 });
 
+for (const action of ['return', 'park'] as const) test(`D a late room result cannot overwrite an item after a human ${action}`, async () => {
+  let entered!: () => void;
+  const waiting = new Promise<void>(resolve => {entered = resolve;});
+  let release!: () => void;
+  const late = new Promise<void>(resolve => {release = resolve;});
+  let roomSignal: AbortSignal | undefined;
+  let ownerCalls = 0;
+  const value = fixture(`late-room-${action}`, async ctx => {
+    if (ctx.node.id === 'owner') return {ok: true, summary: 'Current owner result',
+      data: {proof: ownerCalls++ === 0 ? 'original' : 'new-human-result'}};
+    return normal(ctx);
+  }, {turn: async turn => {
+    assert.equal(turn.mode, 'room');
+    roomSignal = turn.signal;
+    turn.post!({type: 'claim', field: 'proof', body: JSON.stringify({value: 'obsolete-room-value', reason: 'Old generation'}),
+      evidence: ['fixture-evidence']});
+    entered();
+    // Deliberately ignore cancellation, as a remote model response can arrive late.
+    await late;
+    return {ok: true, summary: 'Late room response', data: {dialogue: {}}};
+  }});
+  try {
+    const token = value.start();
+    await value.kernel.settle();
+    value.kernel.returnToken(token, 'human', 'board/check', 'Discuss before continuing', true);
+    const room = value.kernel.openDiscussion(token.id, 'proof', 'Old result is disputed');
+    await waiting;
+    const closed: string[] = [];
+    value.journal.subscribe(event => {
+      if (event.kind !== 'room.closed' || event.room.id !== room.id) return;
+      assert.equal(value.kernel.store.get(token.id)?.roomHolds?.[room.id], undefined,
+        'the closed room receipt must observe its invalidated hold in the same commit');
+      closed.push(event.room.status);
+    });
+    if (action === 'return') {
+      value.kernel.pause();
+      const correction = value.kernel.correct({token: token.id, node: 'board/owner'}, 'Use the new human correction');
+      assert.equal(correction.ok, true);
+      assert.ok(correction.correction);
+      assert.throws(() => value.kernel.undoCorrection(correction.correction!), {code: 'correction_not_reversible'},
+        'undoing a correction must not resurrect a hold for its closed room');
+      value.kernel.resume();
+      for (let index = 0; index < 30 && value.kernel.store.get(token.id)?.status !== 'published'; index++) await tick();
+      assert.equal(value.kernel.store.get(token.id)?.data.proof, 'new-human-result');
+      assert.equal(value.kernel.store.get(token.id)?.status, 'published');
+    } else {
+      value.kernel.parkCollaboration(token.id, 'board/owner', 'A human must review this item', 'manual_store');
+      assert.equal(value.kernel.store.get(token.id)?.status, 'parked');
+    }
+    assert.equal(roomSignal?.aborted, true);
+    assert.deepEqual(closed, ['parked']);
+    assert.equal(value.board.getRoom(room.id)?.status, 'parked');
+    assert.match(value.board.getRoom(room.id)?.outcome?.reason ?? '', /失效/);
+    const current = value.kernel.store.get(token.id)!;
+    assert.equal(current.roomHolds, undefined);
+    const seq = value.journal.seq;
+    assert.throws(() => value.kernel.applyRoomResolution(token.id, 'proof', 'obsolete-room-value', 'board/owner', room.id),
+      {code: 'stale_room'});
+    assert.equal(value.journal.seq, seq, 'rejected late resolutions must not append a transition');
+    release();
+    await value.kernel.settle();
+    assert.deepEqual(value.kernel.store.get(token.id), current);
+    assert.equal(value.board.getRoom(room.id)?.status, 'parked');
+    assert.equal(ownerCalls, action === 'return' ? 2 : 1);
+  } finally {release(); await value.close();}
+});
+
 test('D kind disagreement enters a discussion and adopts its result before routing past the arbiter', async () => {
   const pack: Pack = {...fixturePack(), lines: [line({id: 'board', name: 'Kind room', layer: 3, priority: 'mid', wired: true,
     blurb: 'A disagreement must enter the field discussion', stations: [

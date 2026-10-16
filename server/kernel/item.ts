@@ -20,6 +20,7 @@ export interface NodeState {
   agentBudget?: AgentBudget;
   handoff?: AgentHandoff;
   waitingSince?: number;
+  pendingQuestion?: {id: string; toolCallId: string; askedBy: string; addressee: string};
   redo?: {reason: string; note?: string; byHuman: boolean};
 }
 
@@ -183,13 +184,19 @@ export function returnItem(item: ItemState, compiled: CompiledFactory, target: s
   const rounds = next.nodes[target].rounds + Number(!options.byHuman);
   next.nodes[target].rounds = rounds;
   next.updatedAt = now;
+  const reset = closureOf(compiled, target);
+  for (const [id, hold] of Object.entries(next.roomHolds ?? {})) {
+    if (reset.has(hold.owner) || hold.nodes.some(key => reset.has(key))) delete next.roomHolds![id];
+  }
+  if (next.roomHolds && !Object.keys(next.roomHolds).length) delete next.roomHolds;
   if (!options.byHuman && rounds > options.maxRounds) {
     next.status = 'parked';
     next.nodes[target].status = 'failed';
     next.parked = {node: target, reason: options.reason, code: 'max_rounds', at: now};
+    delete next.roomHolds;
     return next;
   }
-  for (const key of closureOf(compiled, target)) {
+  for (const key of reset) {
     if (!Object.hasOwn(next.nodes, key)) continue;
     const previous = next.nodes[key];
     next.nodes[key] = {status: key === target ? 'ready' : 'pending', attempts: 0, rounds: previous.rounds,
@@ -258,6 +265,11 @@ export function validateItem(value: unknown): ItemState {
         !['done', 'evidence', 'remaining'].every(key => Array.isArray(handoff[key]) &&
           (handoff[key] as unknown[]).every(value => typeof value === 'string')))) {
       throw new TypeError('Invalid kernel handoff');
+    }
+    const pending = node.pendingQuestion;
+    if (pending !== undefined && (!record(pending) || !['id', 'toolCallId', 'askedBy', 'addressee'].every(key =>
+      typeof pending[key] === 'string' && Boolean((pending[key] as string).trim())))) {
+      throw new TypeError('Invalid pending board question');
     }
   }
   if (value.roomHolds !== undefined && (!record(value.roomHolds) || Object.values(value.roomHolds).some(hold =>
