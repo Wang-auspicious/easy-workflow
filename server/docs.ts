@@ -8,7 +8,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import type { CompiledFactory, CompiledNode, Stamped, StationAgentBinding } from "../shared/types.ts";
 import type { FactoryState } from "../shared/project.ts";
-import { apply, initialState, median } from "../shared/project.ts";
+import {apply, initialState, median, serializeSnapshot, deserializeSnapshot} from '../shared/project.ts';
+import type {Snapshottable} from './snapshots.ts';
 import { failureLabels } from "../shared/failures.ts";
 import { readRole } from "./roles.ts";
 import { digest, projectPaths } from "./workspace.ts";
@@ -22,7 +23,7 @@ const hash = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
 // Preserve ordinary existing item folders. The reserved ~ prefix prevents unsafe
 // IDs, Windows aliases and case-insensitive names from colliding with ordinary IDs.
 const segment = (s: string) => /^[a-z0-9][a-z0-9._-]{0,99}$/.test(s) && !s.endsWith(".") && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(s) ? s : `~${hash(s)}`;
-type Host = { state: FactoryState; compiled: CompiledFactory; journal: Pick<Journal, 'read' | 'readSequences'>; runtime?: { roleResolver?: (station: string) => ReturnType<typeof readRole> };
+type Host = { state: FactoryState; compiled: CompiledFactory; journal: Pick<Journal, 'read' | 'readSequences' | 'seq' | 'subscribeProjection'>; runtime?: { roleResolver?: (station: string) => ReturnType<typeof readRole> };
   getStationAgentBinding?: (node: string) => StationAgentBinding | null };
 export type CaseScope = { token: string; attempt: string };
 type Of<K extends Stamped["kind"]> = Extract<Stamped, { kind: K }>;
@@ -144,7 +145,8 @@ function caseRun(s: FactoryState, events: Stamped[], prior: Stamped[], run: { id
 export const CONTEXT_HEADER = "> 这份 CONTEXT.md 由 Easy Workflow 程序维护，每完成一次处理自动重写，段名和顺序固定。你不能直接改写它；要留笔记或报告问题，调用 env_call(\"context_note\", {kind, text})。版本信息只看这里，ROLE.md 不记版本。最新的条目在每段最上面。";
 export const CASE_HEADER = "> 这份案卷随这件货走，所有工位共用。开始工作前读完它，完成后调用 env_call(\"case_note\", {section, text}) 给后面的人留一段交接笔记：你确认了什么、拿不准什么、提醒谁注意什么。案卷由程序按时间渲染，不要直接改写，也不要复述别人已经写过的内容。";
 
-export class Docs {
+export class Docs implements Snapshottable {
+  readonly snapshotName = 'docs';
   dir: string;
   name: string;
   private timers = new Map<string, NodeJS.Timeout>();
@@ -160,9 +162,52 @@ export class Docs {
   private runs = new Map<string, { id: string; title: string | null; startedAt: number | null; endedAt: number | null; status: string }>();
   private currentRun = "";
   private runSeq = 0;
+  private unsubscribe?: () => void;
   private lessons?: { pendingContext(station: string): string; validationContext(station: string, item: string, scope: CaseScope): string };
-  constructor(f: Host, dir: string, name: string, options: { readOnly?: boolean } = {}) {
+  constructor(f: Host, dir: string, name: string, options: {readOnly?: boolean; deferReplay?: boolean} = {}) {
     this.f = f; this.dir = dir; this.name = name; this.readOnly = options.readOnly ?? process.env.FACTORY_READONLY === "1";
+    if (!options.deferReplay) this.start();
+  }
+
+  start(): void {
+    if (this.unsubscribe) return;
+    this.refresh();
+    this.unsubscribe = this.f.journal.subscribeProjection(event => this.observe(event));
+  }
+
+  serialize(): string {
+    return serializeSnapshot({indexedSeq: this.indexedSeq, caseSequences: this.caseSequences,
+      tokenCases: this.tokenCases, attemptTokens: this.attemptTokens, runs: this.runs,
+      currentRun: this.currentRun, runSeq: this.runSeq});
+  }
+
+  restore(body: string): void {
+    const value = deserializeSnapshot(body);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid docs snapshot');
+    const saved = value as Record<string, unknown>;
+    const sequence = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
+    const stringMap = (value: unknown): value is Map<string, string> => value instanceof Map &&
+      [...value].every(([key, entry]) => typeof key === 'string' && typeof entry === 'string');
+    if (!sequence(saved.indexedSeq) || !sequence(saved.runSeq) || saved.runSeq > saved.indexedSeq ||
+        typeof saved.currentRun !== 'string' || !stringMap(saved.tokenCases) || !stringMap(saved.attemptTokens) ||
+        !(saved.caseSequences instanceof Map) || ![...saved.caseSequences].every(([key, sequences]) =>
+          typeof key === 'string' && Array.isArray(sequences) && sequences.every((seq, index) =>
+            sequence(seq) && seq > 0 && seq <= Number(saved.indexedSeq) && (index === 0 || seq > sequences[index - 1]))) ||
+        !(saved.runs instanceof Map) || ![...saved.runs].every(([key, run]) => typeof key === 'string' &&
+          run && typeof run === 'object' && run.id === key && typeof run.status === 'string' &&
+          (run.title === null || typeof run.title === 'string') &&
+          (run.startedAt === null || typeof run.startedAt === 'number') &&
+          (run.endedAt === null || typeof run.endedAt === 'number'))) {
+      throw new Error('Invalid docs snapshot');
+    }
+    this.indexedSeq = saved.indexedSeq;
+    this.caseSequences.clear();
+    for (const [key, sequences] of saved.caseSequences) this.caseSequences.set(key, sequences);
+    this.tokenCases = saved.tokenCases;
+    this.attemptTokens = saved.attemptTokens;
+    this.runs = saved.runs;
+    this.currentRun = saved.currentRun;
+    this.runSeq = saved.runSeq;
   }
 
   setLessons(source: { pendingContext(station: string): string; validationContext(station: string, item: string, scope: CaseScope): string }) { this.lessons = source; }
@@ -241,11 +286,16 @@ export class Docs {
   /** Index only new journal rows. Progress never reads or writes a file synchronously
    * in the event listener; batched writes and envelopes consume this small tail. */
   private refresh() {
+    if (this.indexedSeq === this.f.journal.seq) return;
     for (const e of this.f.journal.read(this.indexedSeq)) this.observeReplay(e);
   }
 
   /** Share Factory's ordered startup replay; retain only IDs and sequence numbers. */
   observeReplay(e: Stamped) {
+    this.observe(e);
+  }
+
+  observe(e: Stamped): void {
     if (e.seq <= this.indexedSeq) return;
     this.indexedSeq = e.seq;
     if (e.kind.startsWith('run.')) {

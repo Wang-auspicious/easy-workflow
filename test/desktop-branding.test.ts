@@ -36,7 +36,7 @@ function desktopStartupFixture(ownsLock = true, pauseMigration = false) {
   const logs: {file: string; text: string}[] = [];
   const child = Object.assign(new EventEmitter(), {
     pid: 123, connected: true, exitCode: null,
-    stdout: {pipe() {}}, stderr: {pipe() {}},
+    stdout: Object.assign(new EventEmitter(), {pipe() {}}), stderr: {pipe() {}},
     send() {}, kill() {kills++; child.emit('exit', null); return true;},
   });
   const webContents = Object.assign(new EventEmitter(), {
@@ -137,14 +137,52 @@ test('quitting while browser migration is pending cannot fork an orphan backend 
   assert.deepEqual(fixture.errors, []);
 });
 
+test('desktop shutdown lets a large final snapshot finish and still bounds a hung backend', async () => {
+  const completing = desktopStartupFixture();
+  await completing.flush();
+  completing.ready();
+  await completing.flush();
+  completing.close();
+  await completing.advance(40000);
+  assert.equal(completing.state().kills, 0, 'a final snapshot may take longer than the old 3.5-second allowance');
+  assert.equal(completing.state().quits, 0, 'the desktop waits for the backend to finish its durable cleanup');
+  completing.child.emit('exit', 0);
+  await completing.flush();
+  assert.equal(completing.state().kills, 0);
+  assert.equal(completing.state().timers, 0);
+  assert.ok(completing.state().quits > 0);
+
+  const hung = desktopStartupFixture();
+  await hung.flush();
+  hung.ready();
+  await hung.flush();
+  hung.close();
+  await hung.advance(179999);
+  assert.equal(hung.state().kills, 0);
+  await hung.advance(1);
+  assert.equal(hung.state().kills, 1);
+  assert.equal(hung.state().timers, 0);
+  assert.ok(hung.state().quits > 0, 'shutdown cannot wait forever for an unresponsive backend');
+});
+
 test('desktop startup accepts normal and slower cold recovery while keeping its window visible', async () => {
   for (const delay of [31000, 0, 59000, 75000]) {
     const fixture = desktopStartupFixture(); await fixture.flush();
-    await fixture.advance(delay);
+    let elapsed = 0;
+    while (elapsed + 25000 < delay) {
+      await fixture.advance(25000);
+      fixture.child.stdout.emit('data', 'BOOT_STAGE replay 25000\n');
+      elapsed += 25000;
+    }
+    await fixture.advance(delay - elapsed);
     assert.equal(fixture.state().kills, 0, `A backend still booting at ${delay}ms must remain alive`);
     fixture.ready(); await fixture.flush();
     assert.deepEqual(fixture.state(), {windows: 1, kills: 0, quits: 0, timers: 0});
-    assert.deepEqual(fixture.startup().map(row => row.phase), ['start', 'fork', 'ready']);
+    const stages = Array.from({length: elapsed / 25000}, (_, index) => ({stage: 'replay',
+      durationMs: 25000, elapsedMs: (index + 1) * 25000}));
+    assert.deepEqual(fixture.startup().map(row => row.phase), ['start', 'fork', ...stages.map(() => 'stage'), 'ready']);
+    assert.deepEqual(fixture.startup().filter(row => row.phase === 'stage')
+      .map(({stage, durationMs, elapsedMs}) => ({stage, durationMs, elapsedMs})), stages);
     assert.equal(fixture.startup().at(-1).elapsedMs, delay);
     assert.doesNotMatch(fixture.logText(), /PRIVATE_|127\.0\.0\.1|isolated\/project/);
   }
@@ -152,7 +190,11 @@ test('desktop startup accepts normal and slower cold recovery while keeping its 
 
 test('desktop startup retains a bounded recovery deadline and ignores late ready IPC', async () => {
   const fixture = desktopStartupFixture(); await fixture.flush();
-  await fixture.advance(179999);
+  for (let i = 0; i < 7; i++) {
+    await fixture.advance(25000);
+    fixture.child.stdout.emit('data', 'BOOT_STAGE replay 25000\n');
+  }
+  await fixture.advance(4999);
   assert.deepEqual(fixture.state(), {windows: 1, kills: 0, quits: 0, timers: 1});
   await fixture.advance(1);
   assert.deepEqual(fixture.state(), {windows: 1, kills: 1, quits: 1, timers: 0});
@@ -161,7 +203,45 @@ test('desktop startup retains a bounded recovery deadline and ignores late ready
   const failure = fixture.startup().at(-1);
   assert.equal(failure.phase, 'failure'); assert.equal(failure.reason, 'ready_timeout');
   assert.equal(failure.elapsedMs, 180000); assert.equal(failure.deadlineMs, 180000);
-  assert.equal(fixture.startup().length, 3);
+  assert.equal(fixture.startup().length, 10);
+  assert.deepEqual(fixture.startup().filter(row => row.phase === 'stage').map(row => row.elapsedMs),
+    [25000, 50000, 75000, 100000, 125000, 150000, 175000]);
+});
+
+test('desktop requires complete BOOT_STAGE records and times out a silent backend in 30 seconds', async () => {
+  const fixture = desktopStartupFixture(); await fixture.flush();
+  await fixture.advance(20000);
+  fixture.child.stdout.emit('data', 'PRIVATE_AUTH_TOKEN unrelated output\nBOOT_STAGE invalid PRIVATE_CDP_VALUE\nBOOT_STAGE partial ');
+  await fixture.advance(9999);
+  assert.equal(fixture.state().kills, 0);
+  await fixture.advance(1);
+  assert.equal(fixture.state().kills, 1);
+  assert.equal(fixture.startup().at(-1).elapsedMs, 30000);
+  assert.equal(fixture.child.stdout.listenerCount('data'), 0);
+  assert.equal(fixture.startup().filter(row => row.phase === 'stage').length, 0);
+  assert.doesNotMatch(fixture.logText(), /PRIVATE_|127\.0\.0\.1|isolated\/project/);
+});
+
+test('desktop assembles split stage lines and removes the progress listener after ready', async () => {
+  const fixture = desktopStartupFixture(); await fixture.flush();
+  await fixture.advance(20000);
+  fixture.child.stdout.emit('data', 'BOOT_STAGE re');
+  assert.equal(fixture.startup().filter(row => row.phase === 'stage').length, 0);
+  await fixture.advance(500);
+  fixture.child.stdout.emit('data', 'play 1000\r\n');
+  assert.deepEqual(fixture.startup().filter(row => row.phase === 'stage').map(({stage, durationMs, elapsedMs}) =>
+    ({stage, durationMs, elapsedMs})), [{stage: 'replay', durationMs: 1000, elapsedMs: 20500}],
+  'elapsedMs records receipt of the complete line, independently of the backend duration');
+  await fixture.advance(29000);
+  assert.equal(fixture.state().kills, 0);
+  fixture.ready(); await fixture.flush();
+  assert.equal(fixture.child.stdout.listenerCount('data'), 0);
+  const entries = fixture.startup().length;
+  fixture.child.stdout.emit('data', 'BOOT_STAGE late 999\nPRIVATE_AUTH_TOKEN\n');
+  await fixture.advance(180000);
+  assert.equal(fixture.state().kills, 0);
+  assert.equal(fixture.startup().length, entries);
+  assert.doesNotMatch(fixture.logText(), /PRIVATE_|127\.0\.0\.1|isolated\/project/);
 });
 
 test('desktop startup error and exit paths clear the deadline and retain the child error guard', async () => {

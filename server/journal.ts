@@ -16,6 +16,7 @@ export class Journal {
   private transaction: { events: Stamped[]; afterCommit: (() => void)[] } | null = null;
   private notifications: Stamped[] = [];
   private notifying = false;
+  private readonly hasSnapshots: boolean;
   seq = 0;
   run = "";
 
@@ -28,7 +29,13 @@ export class Journal {
         seq INTEGER PRIMARY KEY, at INTEGER NOT NULL, run TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL)`);
       this.db.exec("CREATE INDEX IF NOT EXISTS events_run ON events(run, seq)");
       this.db.exec('CREATE INDEX IF NOT EXISTS events_kind ON events(kind, seq)');
+      this.db.exec(`CREATE TABLE IF NOT EXISTS snapshots (
+        name TEXT NOT NULL, seq INTEGER NOT NULL, version TEXT NOT NULL,
+        at INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (name, seq))`);
     }
+    this.hasSnapshots = Boolean(this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'snapshots'"
+    ).get());
     this.insert = this.db.prepare("INSERT INTO events (seq, at, run, kind, body) VALUES (?, ?, ?, ?, ?)");
     const last = this.db.prepare("SELECT seq, run FROM events ORDER BY seq DESC LIMIT 1").get() as { seq: number; run: string } | undefined;
     if (last) { this.seq = last.seq; this.run = last.run; }
@@ -69,6 +76,45 @@ export class Journal {
   afterCommit(action: () => void) {
     if (this.transaction) this.transaction.afterCommit.push(action);
     else action();
+  }
+
+  get inTransaction(): boolean { return this.transaction !== null; }
+
+  /** Snapshots are replaceable caches, and must never capture an open transition. */
+  writeSnapshot(name: string, seq: number, version: string, body: string): void {
+    if (this.inTransaction) throw new Error('Cannot write a snapshot during Journal.atomic');
+    if (!name || !version || !Number.isSafeInteger(seq) || seq < 0 || seq > this.seq) {
+      throw new RangeError('Invalid snapshot name, version or sequence');
+    }
+    this.atomic(() => {
+      this.db.prepare(`INSERT INTO snapshots (name, seq, version, at, body) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(name, seq) DO UPDATE SET version = excluded.version, at = excluded.at, body = excluded.body`
+      ).run(name, seq, version, Date.now(), body);
+      this.db.prepare(`DELETE FROM snapshots WHERE name = ? AND seq NOT IN
+        (SELECT seq FROM snapshots WHERE name = ? ORDER BY seq DESC LIMIT 3)`
+      ).run(name, name);
+    });
+  }
+
+  latestSnapshot(name: string, version: string): {seq: number; body: string} | null {
+    if (!this.hasSnapshots) return null;
+    const row = this.db.prepare(
+      'SELECT seq, body FROM snapshots WHERE name = ? AND version = ? ORDER BY seq DESC LIMIT 1'
+    ).get(name, version) as {seq: number; body: string} | undefined;
+    return row ? {seq: row.seq, body: row.body} : null;
+  }
+
+  completedRuns(): Set<string> {
+    const rows = this.db.prepare("SELECT DISTINCT run FROM events WHERE kind = 'run.ended'")
+      .all() as {run: string}[];
+    return new Set(rows.map(row => row.run));
+  }
+
+  latestEvent<K extends Stamped['kind']>(kind: K): Extract<Stamped, {kind: K}> | null {
+    const row = this.db.prepare(
+      'SELECT seq, at, run, body FROM events WHERE kind = ? ORDER BY seq DESC LIMIT 1'
+    ).get(kind) as {seq: number; at: number; run: string; body: string} | undefined;
+    return row ? {...JSON.parse(row.body), seq: row.seq, at: row.at, run: row.run} : null;
   }
 
   private publish(events: Stamped[]) {

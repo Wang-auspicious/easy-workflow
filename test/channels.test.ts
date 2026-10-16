@@ -74,6 +74,98 @@ function emit(factory: InstanceType<typeof Factory>, token: string, inventory: '
 }
 const children = (factory: InstanceType<typeof Factory>) => Object.values(factory.state.tokens).filter(token => token.data.channelDelivery);
 
+test('channel snapshots preserve an unconsumed emission independently of a newer factory projection', async () => {
+  const factory = await boot();
+  factory.channels!.close();
+  const projections: InstanceType<typeof ChannelSupervisor>[] = [];
+  try {
+    const source = parent(factory);
+    const originalBlob = 'Full synthetic business evidence. '.repeat(20000);
+    factory.journal.append({kind: 'token.data', token: source.id,
+      patch: {dossier: originalBlob, arbitraryBusiness: {mustRetain: ['all', 'fields']}}});
+    const prefix = factory.journal.seq;
+    const emission = emit(factory, source.id);
+    factory.journal.append({kind: 'token.data', token: source.id,
+      patch: {business: 'future payload', dossier: 'future dossier'}});
+    const through = factory.journal.seq;
+    const full = new ChannelSupervisor(factory, {deferReplay: true});
+    projections.push(full);
+    for (const event of factory.journal.read()) full.observe(event);
+    assert.ok(Buffer.byteLength(full.serialize()) < Buffer.byteLength(originalBlob) / 10,
+      'unconsumed payloads retain their exact durable versions without duplicating business blobs');
+    const expected = JSON.parse(full.serialize());
+    for (const cut of [prefix, emission.seq, through]) {
+      const early = new ChannelSupervisor(factory, {deferReplay: true});
+      const restored = new ChannelSupervisor(factory, {deferReplay: true});
+      projections.push(early, restored);
+      for (const event of factory.journal.read(0, undefined, cut)) early.observe(event);
+      restored.restore(early.serialize());
+      for (const event of factory.journal.read(cut)) {
+        restored.observe(event);
+        restored.observe(event);
+      }
+      assert.deepEqual(JSON.parse(restored.serialize()), expected);
+    }
+    assert.equal(factory.journal.seq, through, 'pure replay and restore produce no receipts or stock changes');
+    assert.equal(factory.state.tokens[source.id].data.business, 'future payload');
+    factory.channels = projections.at(-1)!;
+    factory.channels.start();
+    factory.channels.start();
+    assert.equal(factory.channels.status().length, 1);
+    assert.equal(factory.channels.status()[0].data.business, 'original payload');
+    assert.equal(factory.channels.status()[0].data.dossier, originalBlob);
+    assert.deepEqual(factory.channels.status()[0].data.arbitraryBusiness, {mustRetain: ['all', 'fields']});
+    assert.equal(factory.state.nodes['child/inbox'].stock, 1);
+    emit(factory, source.id);
+    assert.equal(factory.channels.status().length, 2);
+    assert.equal(factory.channels.status()[1].data.dossier, 'future dossier');
+    assert.deepEqual(factory.channels.status()[1].data.arbitraryBusiness, {mustRetain: ['all', 'fields']});
+    const liveOnly = {optional: undefined, nested: [NaN, -0, new Set(['retained'])]};
+    factory.journal.append({kind: 'token.data', token: source.id, patch: {liveOnly}});
+    emit(factory, source.id);
+    assert.deepEqual(factory.channels.status()[2].data.liveOnly, liveOnly,
+      'live non-JSON values retain the original payload semantics');
+  } finally {
+    for (const projection of projections) projection.close();
+    await close(factory);
+  }
+});
+
+test('source snapshots restore request limits and candidates without completing a delivery during replay', async () => {
+  const factory = await boot();
+  await factory.sources.close();
+  const full = new SourceSupervisor(factory, {deferReplay: true});
+  const early = new SourceSupervisor(factory, {deferReplay: true});
+  const restored = new SourceSupervisor(factory, {deferReplay: true});
+  try {
+    factory.journal.append({kind: 'source.configured', source: sourceSpec()});
+    factory.journal.append({kind: 'source.candidate', candidate: sourceItem('snapshot-candidate')});
+    const cut = factory.journal.seq;
+    factory.journal.append({kind: 'source.requested', source: 'fixture-source',
+      platform: 'fixture', requestedAt: Date.now(), nextRequestAt: Date.now() + 10000});
+    factory.journal.append({kind: 'source.polled', source: 'fixture-source',
+      count: 1, duplicates: 0, nextAt: Date.now() + 60000});
+    const through = factory.journal.seq;
+    for (const event of factory.journal.read()) {
+      full.observe(event);
+      if (event.seq <= cut) early.observe(event);
+    }
+    restored.restore(early.serialize());
+    for (const event of factory.journal.read(cut)) {
+      restored.observe(event);
+      restored.observe(event);
+    }
+    assert.deepEqual(JSON.parse(restored.serialize()), JSON.parse(full.serialize()));
+    assert.equal(factory.journal.seq, through, 'source replay cannot claim, complete or poll candidates');
+    assert.equal(restored.list()[0].candidates[0].status, 'pending');
+  } finally {
+    await full.close();
+    await early.close();
+    await restored.close();
+    await close(factory);
+  }
+});
+
 test('one committed batch deduplicates repeated emissions using the payload at each emission', async () => {
   const factory = await boot();
   try {

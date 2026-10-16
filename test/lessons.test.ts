@@ -146,16 +146,17 @@ test('ordinary context reads retain only lesson records and do not rebuild the v
     f.create('ordinary', 'ordinary');
     f.emit({kind: 'attempt.started', attempt: 'ordinary-active', token: 'ordinary', node: station,
       worker: 'ordinary-worker', input: 'Ordinary production work'});
-    const read = f.journal.readKinds.bind(f.journal);
-    const reads: number[] = [];
-    const observer = t.mock.method(f.journal, 'readKinds', function* (kinds: Parameters<Journal['readKinds']>[0], since = 0, through?: number) {
-      reads.push(since);
-      yield* read(kinds, since, through);
+    const observer = t.mock.method(f.journal, 'readKinds', () => {
+      assert.fail('The live lesson index must not reread journal kinds');
+    });
+    const historyObserver = t.mock.method(f.journal, 'read', () => {
+      assert.fail('An ordinary context read must not reread journal history');
     });
     assert.equal(f.lessons.validationContext(station, 'ordinary', {token: 'ordinary', attempt: 'ordinary-active'}), '');
-    assert.ok(reads.length > 0 && reads.every(since => since > 0),
-      'checking an ordinary station for trial exposure must use the incremental lesson index, not full history');
+    assert.equal(observer.mock.callCount(), 0);
+    assert.equal(historyObserver.mock.callCount(), 0);
     observer.mock.restore();
+    historyObserver.mock.restore();
 
     const revised = f.lessons.revise(draft.id, {digest: draft.digest, suggestion: '保留直接出处，修复后重跑原工位。'}, 'user');
     assert.notEqual(revised.digest, draft.digest);
@@ -185,6 +186,72 @@ test("restored and orphan consultation replies remain in the new round with unkn
     assert.equal(observations.length, 3);
     assert.ok(observations.every((o) => o.station === station));
     assert.ok(observations.every((o) => o.framework.join() === "unknown"));
+  } finally { f.close(); }
+});
+
+test('lesson snapshots preserve old run observations and recover undrafted work without history rereads', t => {
+  const f = fixture();
+  try {
+    f.start('snapshot-old');
+    f.create('snapshot-site', 'snapshot-token');
+    f.attempt('snapshot-token', false);
+    f.emit({kind: 'consult.opened', consult: 'snapshot-consult', token: 'snapshot-token',
+      reviewer: 'curation/fact-review', owner: station, fields: ['facts.license'], problem: '出处需核对', round: 1});
+    const middle = f.journal.seq;
+    f.emit({kind: 'token.data', token: 'snapshot-token', patch: {dossier: {framework: ['Astro']}}});
+    f.emit({kind: 'consult.replied', consult: 'snapshot-consult', token: 'snapshot-token', owner: station,
+      reply: '同轮回复保留最初框架', ok: true});
+    f.end('snapshot-old');
+    const ended = f.journal.seq;
+    f.start('snapshot-new');
+    f.emit({kind: 'token.data', token: 'snapshot-token', patch: {dossier: {framework: ['Next.js']},
+      unrelatedLargePayload: 'do-not-retain-business-data'.repeat(400)}});
+    f.emit({kind: 'consult.closed', consult: 'snapshot-consult', token: 'snapshot-token',
+      outcome: 'resolved', reason: '跨轮回复按当时上下文'});
+    f.emit({kind: 'consult.replied', consult: 'snapshot-orphan', token: 'snapshot-token', owner: station,
+      reply: '缺失开场的历史回复', ok: false});
+    f.emit({kind: 'token.finished', token: 'snapshot-token', node: 'curation/manual', status: 'manual', reason: '待复核'});
+    f.emit({kind: 'token.returned', token: 'snapshot-token', from: 'curation/manual', to: station,
+      reason: '重做核验', round: 1});
+    f.emit({kind: 'candidate.disposition', candidate: {token: 'snapshot-token', item: 'snapshot-site',
+      url: 'https://snapshot-site.test/', title: 'snapshot', source: 'manual', disposition: 'retry',
+      failure: {tag: 'http_server', category: 'network', retryable: true, message: 'HTTP 503'}}});
+    f.end('snapshot-new');
+    f.lessons.close();
+    const events = [...f.journal.read()];
+    const runs = ['snapshot-old', 'snapshot-new'];
+    const expected = new Map(runs.map(run => [run, groupLessonObservations(events, run, f.f.compiled)]));
+    const bySequence = (groups: ReturnType<typeof groupLessonObservations>) =>
+      groups.flat().sort((left, right) => left.seq - right.seq);
+    assert.deepEqual(expected.get('snapshot-old')?.flat().map(entry => entry.framework), [['storybook'], ['storybook']]);
+    assert.ok(expected.get('snapshot-new')?.flat().every(entry => entry.framework.join() === 'next.js'));
+    for (const cut of [middle, ended, events.at(-1)!.seq]) {
+      const prefix = new Lessons(f.f, f.dir, {rolesRoot: path.join(f.dir, 'roles'), deferReplay: true});
+      for (const event of events) if (event.seq <= cut) prefix.observe(event);
+      const body = prefix.serialize();
+      assert.ok(!body.includes('do-not-retain-business-data'));
+      const restored = new Lessons(f.f, f.dir, {rolesRoot: path.join(f.dir, 'roles'), deferReplay: true});
+      restored.restore(body);
+      for (const event of events) if (event.seq > cut) restored.observe(event);
+      for (const event of f.journal.read(events.at(-1)!.seq)) restored.observe(event);
+      restored.start();
+      const history = t.mock.method(f.journal, 'read', () => {
+        assert.fail('Restored lesson drafts must use saved observations, without rereading history');
+      });
+      try {
+        for (const run of runs) {
+          const drafts = restored.draftRun(run);
+          assert.deepEqual(bySequence(drafts.map(draft => draft.observations)), bySequence(expected.get(run)!));
+        }
+        assert.equal(history.mock.callCount(), 0);
+        assert.equal(fs.readFileSync(f.roleFile, 'utf8'), f.role);
+        assert.throws(() => restored.restore('{broken'), SyntaxError);
+        assert.throws(() => restored.restore('{}'), /Invalid lessons snapshot/);
+      } finally {
+        history.mock.restore();
+        restored.close();
+      }
+    }
   } finally { f.close(); }
 });
 

@@ -6,6 +6,9 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { Journal } from "../server/journal.ts";
 import {Docs} from '../server/docs.ts';
+import {apply, initialState} from '../shared/project.ts';
+import {compile} from '../server/spec/compile.ts';
+import {pack} from '../packs/vislexicon/pack.ts';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easy-workflow-case-boot-"));
 Object.assign(process.env, { FACTORY_VAR: dir, FACTORY_PREFLIGHT: "0", FACTORY_HTTP_CACHE: "0", FACTORY_DISCOVERY: "0", FACTORY_START_PAUSED: "1", VISLEXICON_ROOT: path.join(dir, "unconnected") });
@@ -34,7 +37,7 @@ test("Factory rebuilds legacy cases on boot, batches live progress and flushes l
     let fullReads = 0;
     const originalRead = Journal.prototype.read;
     const bootRead = t.mock.method(Journal.prototype, 'read', function* (this: Journal, since = 0, run?: string, through?: number) {
-      if (since === 0 && run === undefined && through === undefined) fullReads++;
+      if (since === 0 && run === undefined) fullReads++;
       yield* originalRead.call(this, since, run, through);
     });
     const originalWrite = Docs.prototype.write;
@@ -43,7 +46,7 @@ test("Factory rebuilds legacy cases on boot, batches live progress and flushes l
       return originalWrite.call(this, kind, id);
     });
     f = new Factory(); await f.boot();
-    assert.equal(fullReads, 1, 'startup replays the whole journal once; derived modules read only their event kinds');
+    assert.equal(fullReads, 1, 'startup shares exactly one full replay, including bounded journal reads');
     bootRead.mock.restore();
     assert.equal(bootWrites, 0, 'startup must not synchronously rebuild historical case files');
     await waitForCase(f, 'case-site');
@@ -105,5 +108,69 @@ test("Factory rebuilds legacy cases on boot, batches live progress and flushes l
     if (f) await close(f);
     await closeNetwork(); delete process.env.FACTORY_READONLY;
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('document snapshots retain cross-run indexes independently of a newer factory projection', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-doc-snapshot-'));
+  const journal = new Journal(path.join(directory, 'journal.db'));
+  const compiled = compile([pack]);
+  const state = initialState(compiled);
+  journal.subscribeProjection(event => apply(state, event));
+  const host = {journal, compiled, state};
+  const reference = new Docs(host, directory, 'snapshot fixture');
+  try {
+    journal.append({kind: 'run.started', runId: 'old-doc-run', title: 'Old case'});
+    journal.append({kind: 'token.created', token: 'old-doc-token', item: 'shared-case', line: 'curation',
+      source: 'manual', url: 'https://example.test/'});
+    journal.append({kind: 'attempt.started', attempt: 'old-doc-attempt', token: 'old-doc-token',
+      node: 'curation/facts', worker: 'fixture', input: 'Old source'});
+    const middle = journal.seq;
+    journal.append({kind: 'attempt.progress', attempt: 'old-doc-attempt', text: 'Keep old observation'});
+    journal.append({kind: 'token.data', token: 'old-doc-token', patch: {facts: {license: 'old'}}});
+    journal.append({kind: 'attempt.finished', attempt: 'old-doc-attempt', ok: true,
+      summary: 'Old result', ms: 1, queuedMs: 0});
+    journal.append({kind: 'run.ended', runId: 'old-doc-run', manual: true});
+    const ended = journal.seq;
+    journal.append({kind: 'run.started', runId: 'new-doc-run', title: 'New case'});
+    journal.append({kind: 'token.data', token: 'old-doc-token', patch: {facts: {license: 'new'}}});
+    journal.append({kind: 'case.noted', caseId: 'legacy-without-token', token: 'missing',
+      note: {station: 'curation/facts', section: 'handoff', text: 'Legacy note', by: 'fixture'}});
+    const events = [...journal.read()];
+    for (const cut of [middle, ended, journal.seq]) {
+      const prefix = new Docs(host, directory, 'snapshot fixture', {deferReplay: true});
+      for (const event of events) if (event.seq <= cut) prefix.observeReplay(event);
+      const restored = new Docs(host, directory, 'snapshot fixture', {deferReplay: true});
+      restored.restore(prefix.serialize());
+      for (const event of events) if (event.seq > cut) restored.observe(event);
+      const read = t.mock.method(journal, 'read', () => {
+        assert.fail('Restored document indexes must not reread journal history');
+      });
+      try {
+        assert.deepEqual(restored.caseIds(), reference.caseIds());
+        for (const id of reference.caseIds()) {
+          assert.deepEqual(restored.caseData(id), reference.caseData(id));
+        }
+        assert.equal(restored.caseData('shared-case').runs[0].tokens[0].data.facts &&
+          (restored.caseData('shared-case').runs[0].tokens[0].data.facts as {license: string}).license, 'old');
+        const before = restored.serialize();
+        assert.throws(() => restored.restore('{broken'), SyntaxError);
+        assert.throws(() => restored.restore('{}'), /Invalid docs snapshot/);
+        assert.equal(restored.serialize(), before, 'failed restore leaves the valid document index intact');
+        assert.equal(read.mock.callCount(), 0);
+      } finally {
+        read.mock.restore();
+      }
+    }
+    const live = new Docs(host, directory, 'snapshot fixture', {deferReplay: true});
+    live.restore(reference.serialize());
+    live.start();
+    journal.append({kind: 'attempt.progress', attempt: 'old-doc-attempt', text: 'Late indexed event'});
+    assert.deepEqual(live.caseData('shared-case'), reference.caseData('shared-case'));
+    live.flush();
+  } finally {
+    reference.flush();
+    journal.close();
+    fs.rmSync(directory, {recursive: true, force: true});
   }
 });

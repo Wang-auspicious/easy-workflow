@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {CompiledFactory, CompiledNode, ProjectAgentDefaults, Stamped, StationAgentBinding} from '../shared/types.ts';
-import { apply, initialState, latestRunTokens, tokenWorkKey, recoveryKey, type FactoryState } from "../shared/project.ts";
+import { apply, initialState, latestRunTokens, tokenWorkKey, recoveryKey, validateState, serializeSnapshot, deserializeSnapshot, type FactoryState } from "../shared/project.ts";
 import { compile, type Patch } from "./spec/compile.ts";
 import { Journal } from "./journal.ts";
 import { Broker } from "./broker.ts";
@@ -42,12 +42,28 @@ import {importExternalIntake, readExternalIntake, type ExternalIntakeManifest} f
 import {continuationPriority, externalResearchFor, reuseExternalStation} from './intake-continuation.ts';
 import {reuseExternalCapture} from './intake-captures.ts';
 import {PublicationOutbox} from './publication-outbox.ts';
+import {restoreSnapshots, saveSnapshots, snapshotVersion, type Snapshottable} from './snapshots.ts';
 import {projectDecisionClient, withDecisionAttempt} from './decision-model.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
 
 export interface Settings { browser: number; model: number; modelWorkers: number; cpu: number; http: number; memoryFloorMB: number; socialPerMinute: number; socialPerDay: number }
+
+interface RecoveryProjection {
+  done: Map<string, Set<string>>;
+  removed: Map<string, Set<string>>;
+  notes: Map<string, TokenRun['notes']>;
+  checkpointed: Set<string>;
+  arrivals: Map<string, number[]>;
+  sampleTokens: Set<string>;
+  run: string;
+}
+
+function initialRecoveryProjection(): RecoveryProjection {
+  return {done: new Map(), removed: new Map(), notes: new Map(), checkpointed: new Set(),
+    arrivals: new Map(), sampleTokens: new Set(), run: ''};
+}
 
 export class Factory {
   compiled!: CompiledFactory;
@@ -77,21 +93,34 @@ export class Factory {
   private services!: Services;
   private stationAgents: Record<string, AgentStationDef> = {};
   decisionModel: ReturnType<typeof projectDecisionClient> = null;
+  private recoveryProjection = initialRecoveryProjection();
+  private snapshotComponents: Snapshottable[] = [];
+  private projectionVersion = '';
+  private snapshotSeq = 0;
+  private snapshotTimer?: ReturnType<typeof setTimeout>;
+  private snapshotUnsubscribe?: () => void;
+  private snapshotTask?: Promise<void>;
+  private snapshotClosing?: Promise<void>;
+  private snapshotsActive = false;
 
-  constructor(projectDirectory = VAR) {
+  constructor(projectDirectory = VAR, options: {projectionOnly?: boolean} = {}) {
     const readOnly = process.env.FACTORY_READONLY === "1";
+    const initializeProject = !readOnly && !options.projectionOnly;
     const directory = path.resolve(projectDirectory);
-    if (!readOnly) fs.mkdirSync(directory, { recursive: true });
-    this.project = readOnly ? { name: path.basename(directory), dir: directory, pack: "vislexicon", createdAt: "" } : ensureProject(directory, process.env.FACTORY_PROJECT_NAME ?? path.basename(directory));
+    if (initializeProject) fs.mkdirSync(directory, { recursive: true });
+    const projectFallback = {name: path.basename(directory), dir: directory, pack: 'vislexicon', createdAt: ''};
+    this.project = initializeProject ? ensureProject(directory, process.env.FACTORY_PROJECT_NAME ?? path.basename(directory))
+      : options.projectionOnly ? {...this.readJson<ProjectInfo>(path.join(directory, 'project.json'), projectFallback), dir: directory}
+      : projectFallback;
     this.journal = new Journal(path.join(this.project.dir, 'journal.db'), readOnly);
-    this.store = new EvidenceStore(path.join(this.project.dir, 'evidence'), readOnly);
+    this.store = new EvidenceStore(path.join(this.project.dir, 'evidence'), !initializeProject);
     const settingsFile = path.join(this.project.dir, 'settings.json');
     const saved = this.readJson<Partial<Settings> & { browserCapV2?: boolean }>(settingsFile, {});
     if (saved.modelWorkers === undefined) {
       // Allow independent stations to run while Pi waits for tools.
       // Persist this independently so later model quota changes keep user intent.
       saved.modelWorkers = Math.max(3, saved.model ?? 8);
-      if (!readOnly) fs.writeFileSync(settingsFile, JSON.stringify(saved, null, 2));
+      if (initializeProject) fs.writeFileSync(settingsFile, JSON.stringify(saved, null, 2));
     }
     // Browser pages were capped at three before Spec §30.6; lift old saved caps once to the new default.
     if (!saved.browserCapV2 && (saved.browser ?? 0) <= 3) delete saved.browser;
@@ -101,22 +130,145 @@ export class Factory {
 
   private readJson<T>(file: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; } catch { return fallback; } }
 
-  async boot() {
-    this.decisionModel = projectDecisionClient(this.project.dir);
-    this.externalIntake = readExternalIntake(this.project.dir);
+  private async prepareProjection() {
+    const started = performance.now();
+    console.log('BOOT_STAGE journal 0');
     this.workflowPacks = await this.loadWorkflowPacks();
     this.compiled = compile(this.workflowPacks.packs, this.patches);
     if (this.compiled.issues.length) throw new ControlError(422, "invalid_spec", "规格校验失败，未启动运行时", this.compiled.issues);
-    if (process.env.FACTORY_READONLY !== '1') this.project = synchronizeProjectPacks(this.project.dir, this.workflowPacks.packs.map(entry => entry.id));
+    console.log(`BOOT_STAGE compile ${Math.round(performance.now() - started)}`);
     this.state = initialState(this.compiled);
-    this.docs = new Docs(this, this.project.dir, this.project.name);
-    const completedRuns = new Set<string>();
-    for (const e of this.journal.read(0)) {
-      apply(this.state, e);
-      this.docs.observeReplay(e);
-      if (e.kind === 'run.ended') completedRuns.add(e.runId);
+    this.recoveryProjection = initialRecoveryProjection();
+    this.docs = new Docs(this, this.project.dir, this.project.name, {deferReplay: true});
+    this.lessons = new Lessons(this, this.project.dir, {deferReplay: true});
+    this.channels = new ChannelSupervisor(this, {deferReplay: true});
+    this.sources = new SourceSupervisor(this, {deferReplay: true});
+    if (this.compiled.nodes.some(node => node.key === 'curation/gate') &&
+        this.compiled.nodes.some(node => node.key === 'curation/published')) {
+      this.publicationOutbox = new PublicationOutbox(this.project.dir, this.journal, {deferReplay: true});
     }
-    this.journal.subscribeProjection((e) => apply(this.state, e));
+    const factoryProjection: Snapshottable = {
+      snapshotName: 'factory-state',
+      serialize: () => serializeSnapshot({state: this.state, recovery: this.recoveryProjection}),
+      restore: body => {
+        const saved = deserializeSnapshot(body);
+        if (!saved || typeof saved !== 'object' || !('state' in saved) ||
+            !('recovery' in saved) || !saved.recovery || typeof saved.recovery !== 'object') {
+          throw new Error('Invalid factory snapshot');
+        }
+        const state = validateState(saved.state);
+        const index = saved.recovery as RecoveryProjection;
+        if (!(index.done instanceof Map) || !(index.removed instanceof Map) || !(index.notes instanceof Map) ||
+            !(index.checkpointed instanceof Set) || !(index.arrivals instanceof Map) ||
+            !(index.sampleTokens instanceof Set) || typeof index.run !== 'string' ||
+            [...index.done.values(), ...index.removed.values()].some(value => !(value instanceof Set)) ||
+            [...index.notes.values()].some(value => !(value instanceof Map)) ||
+            [...index.arrivals.values()].some(value => !Array.isArray(value))) {
+          throw new Error('Invalid recovery snapshot');
+        }
+        this.state = state;
+        this.recoveryProjection = index;
+      },
+      observe: event => {
+        apply(this.state, event);
+        this.observeRecovery(event);
+      },
+    };
+    this.snapshotComponents = [factoryProjection, this.docs, this.lessons, this.channels, this.sources,
+      ...(this.publicationOutbox ? [this.publicationOutbox] : [])];
+    this.projectionVersion = snapshotVersion(this.compiled.digest);
+    const restored = restoreSnapshots(this.journal, this.snapshotComponents, this.projectionVersion);
+    this.journal.subscribeProjection(event => {
+      for (const component of this.snapshotComponents) component.observe(event);
+    });
+    this.snapshotSeq = restored.through;
+    return restored;
+  }
+
+  /** Offline upgrade: projection only, without workers, recovery or publication. */
+  async snapshot() {
+    await this.prepareProjection();
+    await this.writeSnapshots();
+  }
+
+  private writeSnapshots(): Promise<void> {
+    if (process.env.FACTORY_READONLY === '1' || !this.snapshotComponents.length) return Promise.resolve();
+    if (this.snapshotTask) return this.snapshotTask;
+    this.snapshotTask = new Promise<void>((resolve, reject) => {
+      const write = () => {
+        if (this.journal.inTransaction) {
+          setImmediate(write);
+          return;
+        }
+        try {
+          if (this.projectionVersion !== snapshotVersion(this.compiled.digest)) this.rebuildCompiledProjection();
+          saveSnapshots(this.journal, this.snapshotComponents, this.projectionVersion);
+          this.snapshotSeq = this.journal.seq;
+          this.scheduleSnapshotTimer();
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      };
+      setImmediate(write);
+    }).finally(() => { this.snapshotTask = undefined; });
+    return this.snapshotTask;
+  }
+
+  private startSnapshots() {
+    if (process.env.FACTORY_READONLY === '1') return;
+    this.snapshotsActive = true;
+    this.snapshotUnsubscribe = this.journal.subscribe(() => {
+      if (this.journal.seq - this.snapshotSeq >= 5000) this.backgroundSnapshot();
+    });
+    this.scheduleSnapshotTimer();
+  }
+
+  private backgroundSnapshot(): void {
+    void this.writeSnapshots().catch(() => {
+      console.warn('boot.snapshot failed');
+      this.scheduleSnapshotTimer();
+    });
+  }
+
+  private scheduleSnapshotTimer(): void {
+    clearTimeout(this.snapshotTimer);
+    this.snapshotTimer = undefined;
+    if (!this.snapshotsActive) return;
+    this.snapshotTimer = setTimeout(() => this.backgroundSnapshot(), 600_000);
+    this.snapshotTimer.unref();
+  }
+
+  /** Call after runtime and document writers settle, before closing the journal. */
+  closeSnapshots(): Promise<void> {
+    if (this.snapshotClosing) return this.snapshotClosing;
+    this.snapshotsActive = false;
+    this.snapshotUnsubscribe?.();
+    this.snapshotUnsubscribe = undefined;
+    clearTimeout(this.snapshotTimer);
+    this.snapshotTimer = undefined;
+    this.snapshotClosing = (async () => {
+      if (process.env.FACTORY_READONLY === '1' || !this.snapshotComponents.length) return;
+      // An earlier background capture may finish before a final writer's queued
+      // microtask. Drain it, then capture again if the journal has advanced.
+      do {
+        await this.writeSnapshots();
+      } while (this.snapshotSeq !== this.journal.seq);
+    })().finally(() => { this.snapshotClosing = undefined; });
+    return this.snapshotClosing;
+  }
+
+  async boot() {
+    const started = performance.now();
+    this.decisionModel = projectDecisionClient(this.project.dir);
+    this.externalIntake = readExternalIntake(this.project.dir);
+    const restored = await this.prepareProjection();
+    if (restored.fullReplay) await this.writeSnapshots();
+    this.docs.start();
+    this.lessons.start();
+    this.startSnapshots();
+    if (process.env.FACTORY_READONLY !== '1') this.project = synchronizeProjectPacks(this.project.dir, this.workflowPacks!.packs.map(entry => entry.id));
+    const completedRuns = this.journal.completedRuns();
     if (!this.state.agentDefaults) {
       const selection = piSelection();
       const binding: StationAgentBinding = {adapter: 'pi', provider: selection.provider, model: selection.id};
@@ -126,7 +278,6 @@ export class Factory {
     }
     if (process.env.FACTORY_READONLY !== "1" && this.state.digest !== this.compiled.digest) this.journal.append({ kind: "factory.loaded", digest: this.compiled.digest, specVersion: this.compiled.specVersion });
     this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, modelWorkers: this.settings.modelWorkers, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
-    this.lessons = new Lessons(this, this.project.dir);
     this.toolbox = new Toolbox({ journal: this.journal, broker: this.broker, docs: () => this.docs });
     const services: Services = {
       store: this.store, workDir: path.join(this.project.dir, 'work'), publishDir: path.join(this.project.dir, 'published'),
@@ -200,7 +351,7 @@ export class Factory {
         },
       };
     };
-    this.runtime = new Runtime(this.compiled, this.journal, this.broker, this.workflowPacks.conditions, executors);
+    this.runtime = new Runtime(this.compiled, this.journal, this.broker, this.workflowPacks!.conditions, executors);
     this.runtime.roleResolver = key => this.workflowPacks?.role(key) ?? readRole(key);
     this.modelCircuits = new ModelCircuits(this);
     this.batch = new BatchSupervisor(this);
@@ -209,8 +360,9 @@ export class Factory {
     this.wireRecovery();
     if (process.env.FACTORY_READONLY === "1") {
       this.catalog = this.runtime.nodes.has('candidates/pool') ? loadCatalog() : [];
-      this.channels = new ChannelSupervisor(this);
-      this.sources = new SourceSupervisor(this);
+      this.channels!.start();
+      this.sources.start();
+      console.log(`BOOT_STAGE factory ${Math.round(performance.now() - started)}`);
       return;
     }
     this.wireStock();
@@ -232,15 +384,13 @@ export class Factory {
     this.modelCircuits.restore();
     this.reconcileManualStock();
     this.reconcileBusinessStock();
-    this.channels = new ChannelSupervisor(this);
-    this.sources = new SourceSupervisor(this);
-    if (this.runtime.nodes.has('curation/gate') && this.runtime.nodes.has('curation/published')) {
-      this.publicationOutbox = new PublicationOutbox(this.project.dir, this.journal);
-    }
+    this.channels!.start();
+    this.publicationOutbox?.start();
     this.recovery.start();
     this.sources.start();
     this.runtime.tick();
     this.batch.schedule();
+    console.log(`BOOT_STAGE factory ${Math.round(performance.now() - started)}`);
   }
 
   /* -------------------------------------------------------------- stock (候选层 / 已发布) */
@@ -298,6 +448,7 @@ export class Factory {
     for (const pool of previous.workers.values()) for (const worker of pool) this.journal.append({ kind: 'worker.retired', node: worker.node, worker: worker.id, reason: '流水线包更新，按新规格配员' });
     this.workflowPacks = loaded; this.compiled = compiled;
     this.project = synchronizeProjectPacks(this.project.dir, loaded.packs.map(entry => entry.id));
+    this.rebuildCompiledProjection();
     this.runtime = new Runtime(compiled, this.journal, this.broker, loaded.conditions, previous.executors);
     this.runtime.roleResolver = key => loaded.role(key) ?? readRole(key);
     this.runtime.onTick = () => this.maintainRuntime();
@@ -1143,6 +1294,77 @@ export class Factory {
 
   /* -------------------------------------------------------------- restart */
 
+  /** A different graph changes initial nodes and which queued nodes are stores.
+   * Rebuild both graph-dependent views before writing the new snapshot version.
+   * The other components index event data without consulting the compiled graph. */
+  private rebuildCompiledProjection(): void {
+    const state = initialState(this.compiled);
+    const through = this.journal.seq;
+    for (const event of this.journal.read(0, undefined, through)) apply(state, event);
+    const recovery = initialRecoveryProjection();
+    recovery.run = state.run.id;
+    // Legacy restore resolves attempts against the final state, not the state
+    // at each historical receipt. Keep that behavior when replacing the graph.
+    for (const event of this.journal.readKinds(['token.queued', 'token.finished', 'token.data',
+      'token.returned', 'attempt.finished'], 0, through)) this.observeRecovery(event, state, recovery);
+    this.state = state;
+    this.recoveryProjection = recovery;
+    if (this.broker) this.broker.modelCircuits = state.modelCircuits;
+    this.projectionVersion = snapshotVersion(this.compiled.digest);
+  }
+
+  private observeRecovery(event: Stamped, state = this.state, index = this.recoveryProjection) {
+    if (event.kind === 'run.started') {
+      index.run = event.runId;
+      index.arrivals.clear();
+      index.sampleTokens.clear();
+    }
+    if (event.run === index.run && event.kind === 'token.queued') {
+      const arrivals = index.arrivals.get(event.node) ?? [];
+      arrivals.push(event.at);
+      index.arrivals.set(event.node, arrivals);
+    }
+    if (event.run === index.run && event.kind === 'token.finished' &&
+        ['published', 'manual', 'merged', 'rejected'].includes(event.status)) {
+      index.sampleTokens.add(event.token);
+    }
+    if (event.kind === 'token.data' &&
+        (event.patch.runtimeCheckpoint as {version?: number} | undefined)?.version === 1) {
+      const checkpoint = event.patch.runtimeCheckpoint as {done: string[]; notes: [string, {reason: string; note?: string; byHuman: boolean}][]};
+      index.done.set(event.token, new Set(checkpoint.done));
+      index.notes.set(event.token, new Map(checkpoint.notes));
+      index.checkpointed.add(event.token);
+      index.removed.delete(event.token);
+    } else if (event.kind === 'token.returned') {
+      const notes = index.notes.get(event.token) ?? new Map();
+      notes.set(event.to, {reason: event.reason, byHuman: event.byHuman});
+      index.notes.set(event.token, notes);
+    } else if (event.kind === 'attempt.finished' && event.ok && event.error !== 'restart' && event.error !== 'stale') {
+      const attempt = state.attempts[event.attempt];
+      if (attempt) index.notes.get(attempt.token)?.delete(attempt.node);
+    }
+    const markDone = (token: string, node: string) => {
+      const done = index.done.get(token) ?? new Set();
+      done.add(node);
+      index.done.set(token, done);
+      index.removed.get(token)?.delete(node);
+    };
+    if (event.kind === 'attempt.finished' && event.ok && event.error !== 'stale') {
+      const attempt = state.attempts[event.attempt];
+      if (attempt && !index.checkpointed.has(attempt.token)) markDone(attempt.token, attempt.node);
+    } else if (event.kind === 'token.returned') {
+      const removed = index.removed.get(event.token) ?? new Set();
+      for (const node of event.reset ?? []) {
+        index.done.get(event.token)?.delete(node);
+        removed.add(node);
+      }
+      index.removed.set(event.token, removed);
+    } else if (event.kind === 'token.queued' &&
+        this.compiled.nodes.find(node => node.key === event.node)?.kind === 'store') {
+      markDone(event.token, event.node);
+    }
+  }
+
   private restore() {
     const rt = this.runtime;
     rt.locked = new Set(this.state.lockedStations);
@@ -1158,31 +1380,21 @@ export class Factory {
     rt.running = resumable; rt.paused = resumable&&(run.status === "paused" || process.env.FACTORY_START_PAUSED === "1" && !managedResume); rt.runStartedAt = run.startedAt;
     if (rt.paused && this.state.run.status === "running") this.journal.append({ kind: "run.paused", runId: run.id });
     // Which nodes each token has finished, per the journal (returns reset descendants).
-    const done = new Map<string, Set<string>>(Object.values(this.state.tokens).map(t=>[t.id,new Set((t.data.checkpointDone as string[])??[])]));
-    const notes=new Map<string,TokenRun["notes"]>();
-    const checkpointed = new Set<string>();
-    for (const e of this.journal.readKinds(['token.queued', 'token.finished', 'token.data', 'token.returned', 'attempt.finished'])) {
-      if (e.run === run.id && e.kind === 'token.queued') {
-        const arrivals = rt.arrivals.get(e.node) ?? []; arrivals.push(e.at); rt.arrivals.set(e.node, arrivals);
-      }
-      if (e.run === run.id && e.kind === 'token.finished' && ['published', 'manual', 'merged', 'rejected'].includes(e.status)) {
-        const item = this.state.tokens[e.token]?.item; if (item) rt.sampleItems.add(item);
-      }
-      if (e.kind === 'token.data' && (e.patch.runtimeCheckpoint as { version?: number } | undefined)?.version === 1) {
-        const checkpoint = e.patch.runtimeCheckpoint as { done: string[]; notes: [string, { reason: string; note?: string; byHuman: boolean }][] };
-        done.set(e.token, new Set(checkpoint.done));
-        notes.set(e.token, new Map(checkpoint.notes));
-        checkpointed.add(e.token);
-      } else if(e.kind==="token.returned"){
-        const entries=notes.get(e.token)??new Map();entries.set(e.to,{reason:e.reason,byHuman:e.byHuman});notes.set(e.token,entries);
-      }else if(e.kind==="attempt.finished"&&e.ok&&e.error!=="restart"&&e.error!=="stale"){
-        const a=this.state.attempts[e.attempt];if(a)notes.get(a.token)?.delete(a.node);
-      }
-      if (e.kind === "attempt.finished" && e.ok && e.error !== "stale") {
-        const a = this.state.attempts[e.attempt];
-        if (a && !checkpointed.has(a.token)) (done.get(a.token) ?? done.set(a.token, new Set()).get(a.token)!).add(a.node);
-      } else if (e.kind === "token.returned") for (const k of e.reset ?? []) done.get(e.token)?.delete(k);
-      else if (e.kind === "token.queued" && this.compiled.nodes.find((n) => n.key === e.node)?.kind === "store") (done.get(e.token) ?? done.set(e.token, new Set()).get(e.token)!).add(e.node);
+    const index = this.recoveryProjection;
+    const done = new Map<string, Set<string>>();
+    const notes = structuredClone(index.notes);
+    const checkpointed = index.checkpointed;
+    for (const token of Object.values(this.state.tokens)) {
+      const completed = index.checkpointed.has(token.id) ? new Set<string>()
+        : new Set((token.data.checkpointDone as string[]) ?? []);
+      for (const node of index.removed.get(token.id) ?? []) completed.delete(node);
+      for (const node of index.done.get(token.id) ?? []) completed.add(node);
+      done.set(token.id, completed);
+    }
+    for (const [node, arrivals] of index.arrivals) rt.arrivals.set(node, [...arrivals]);
+    for (const token of index.sampleTokens) {
+      const item = this.state.tokens[token]?.item;
+      if (item) rt.sampleItems.add(item);
     }
     let requeued = 0, voided = 0;
     for (const ts of Object.values(this.state.tokens)) {
@@ -1308,6 +1520,7 @@ export class Factory {
       previous.dispose();
       for (const pool of previous.workers.values()) for (const w of pool) this.journal.append({ kind: "worker.retired", node: w.node, worker: w.id, reason: "规格新版本生效，重新配员" });
       this.compiled = trial;
+      this.rebuildCompiledProjection();
       this.runtime = new Runtime(trial, this.journal, this.broker, this.workflowPacks?.conditions ?? pack.conditions, previous.executors);
       this.runtime.roleResolver = previous.roleResolver;
       this.runtime.onTick = () => this.maintainRuntime();

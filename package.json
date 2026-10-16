@@ -10,6 +10,7 @@
     "ui:dev": "vite --config ui/vite.config.ts",
     "ui:build": "vite build --config ui/vite.config.ts",
     "server": "node --env-file-if-exists=.env server/main.ts",
+    "snapshot": "node --env-file-if-exists=.env scripts/snapshot.ts",
     "mcp": "node server/mcp.ts",
     "app": "electron .",
     "build": "node scripts/build.mjs",

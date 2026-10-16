@@ -40,3 +40,46 @@ rg -n 'journal\.(read|readKinds|runs)|\.history\(' server
 真实项目仅作只读定位与 SQL 计数：当前为 **187490 个事件**，大于规格起草时约 13.6 万。已开始完整目录复制到 `%TEMP%/ew-v2-copy-20261015`，后续运行使用副本。正式计时前还会确认副本一致性和事件数。
 
 阶段 A 验收尚未执行；没有以盘点结果代替性能或行为验收。
+
+## 2026-10-15 · A 实现与验证进行中
+
+已实现六组件快照、共享一次有界尾部重放、损坏／版本不匹配回退、5000 事件／成功写入后 10 分钟／正常退出写入、离线 CLI、30 秒阶段续期与 180 秒启动封顶。v1 恢复索引同在 factory-state 中；Dispatcher 改用最新单条检查点查询。业务图变更会重新建立相应投影后更新快照版本。正常退出最多等待 180 秒完成大项目快照。
+
+未修改 `ui/`、`packs/`、`Spec.md` 或 v2 spec；没有新增 npm 依赖。阶段 B 尚未开始。
+
+副本准备曾因原项目绝对路径阻断：`Invalid intake manifest path`。按 §0.4 写明等待站长决定，并获得明确授权“允许，仅修正验收副本的路径并继续”。实际仅副本元数据 53 文件、journal 1629 行被重定位，保留 **187492 个事件**。原始数据库和元数据均已备份到 TEMP。**4666 份导入附件 + 61 份发布记录**的 SHA-256/bytes 核验通过，内容寻址原件保持原字节；所有后续实验仍指向副本。准备脚本与说明见 `v2-acceptance/A-rebase-copy.mjs` 和 `v2-decisions.md`。
+
+已完成的定向验证（测试组有重叠，不相加为总测试数）：
+
+| 命令 | 结果 |
+|---|---|
+| `node --test test/journal-atomic.test.ts` | 11/11，通过 20000 事件三个切点、六组件混合切点、坏快照、版本、旧只读库、事务、恢复索引历史顺序及离线副作用验证 |
+| `node --test --test-concurrency=1 test/lessons.test.ts test/docs.test.ts test/docs-factory.test.ts` | 23/23，通过，33.48 秒 |
+| `node --test test/channels.test.ts` | 25/25，通过，含大业务字段、不同切点与字段历史值 |
+| `node --test --test-name-pattern='publication outbox' test/batch-recovery.test.ts` | 3/3，通过，7.13 秒；含写入失败后 SQLite 快照不能丢未完成发布的故障回归 |
+| `node --test test/desktop-branding.test.ts test/runtime-restart.test.ts` | 21/21，通过，37.19 秒；含静默 30 秒、续期封顶、正常退出、计时器重置、图变更和最后 seq |
+| `npm run typecheck` | 通过 |
+| `npx tsc -p ui/tsconfig.json` | 通过 |
+| `npm run build` | 通过；桌面产物 22.9 MiB / 735 文件 / 2 个原有运行依赖包 |
+| `git diff --check` | 通过 |
+
+首次探索性 `npm test` 在并行实施期间跨越了文件版本，685 tests / 655 pass / 29 fail / 1 skip，用时 1428.7 秒；包含尚未写入 observeRecovery 时的旧失败和 Windows EPERM。该命令**不能作为阶段验收通过依据**。全部实现冻结后已重新启动正式 `npm test`，待最终结果。
+
+性能实测：
+
+- 完整副本 `npm run snapshot -- --project <copy>`：21.815 秒，其中全量重放 14.095 秒；factory-state 快照 137810849 bytes、写入 6.700 秒；channels 快照 721764 bytes，保持全部业务数据但只保存字段事件序号。
+- 无 CLI 快照的真实桌面启动：**13.498 秒 ready**，没有被计时器杀掉，退出后六组件快照均存在，见 `v2-acceptance/A-cold.json`。
+- 首轮桌面连续三次（与全套浏览器测试同时运行，空闲内存约 2.2 GiB）：**21.533 / 7.170 / 7.732 秒**，**未达到 ≤5 秒**。保留原始数据 `v2-acceptance/A-ready-under-test-load.json`，不据此通过 A。
+- 仅用于定位的程序入口分段测量：import 1.178 秒，快照恢复 factory-state 1.607 秒，Factory.boot 3.242 秒；其中文档同步刷新约 1.1 秒，v1 恢复 0.052 秒。该数据不是正式桌面验收。
+
+当前状态：继续阶段 A；等待完整测试和无并行浏览器负载的三次桌面实测。未修改 5 秒阈值，未裁剪真实历史，未进入 B。
+
+### A 最近验证结果与范围确认
+
+- 正式冻结后完整 `npm test`：**695 tests / 692 pass / 2 fail / 1 skip，1016.3 秒**。两项失败均为未修改的 `workflow-packs` 安装 fixture 在目录 rename 阶段遇到 Windows `EPERM`；`node --test test/workflow-packs.test.ts` 随后 **28/28 通过，15.24 秒**。完整 npm test 尚未通过，不能用定向结果替代。
+- `npm run desktop:smoke`：**24 个检查全部通过**，脱敏回执 `v2-acceptance/A-smoke.json`。
+- 无并行浏览器回归的第二组：**15.330 / 4.233 / 4.267 秒**，见 `A-ready-after-tests.json`，仍不满足三次全部通过。
+- 补充父进程阶段接收时间日志后，重建并重新执行 CLI 的第三组：**15.350 / 4.372 / 4.352 秒**。第一轮 import 标记 166 ms，journal 标记 7729 ms；第一轮 factory-state 恢复 1787 ms。后两轮约 1 秒进入 journal。记录见 `A-ready.json`。
+- 父进程阶段日志补充的定向验证：`desktop-branding` **12/12 通过**；类型检查和构建通过。新增日志只含阶段名与时间，没有路径或凭据。
+
+**等待站长决定（§0.4）**：仅快照方案尚未满足 G1，建议追加 Playwright 按需加载及内容不变时跳过派生文档重写。具体文件、边界和验证要求见 `v2-acceptance/A-startup-followup.md`。追加方案尚未实施，阶段 B 未开始。

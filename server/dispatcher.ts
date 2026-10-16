@@ -66,7 +66,8 @@ export class Dispatcher {
     this.f = f; this.control = control;
     this.options = { requestTimeoutMs: options.requestTimeoutMs ?? 120_000, maxAttempts: options.maxAttempts ?? 3, retryDelaysMs: options.retryDelaysMs ?? [1000, 3000], modelFactory: options.modelFactory ?? models };
     this.checkpoint = { state: idle(this.options.maxAttempts), prompted: false, messageNumber: 0, request: { text: "", attachments: [] }, scope: "", inputs: [], operations: [] };
-    for (const event of f.journal.read()) if (event.kind === "chat.checkpoint") this.checkpoint = structuredClone(event.checkpoint);
+    const saved = f.journal.latestEvent('chat.checkpoint');
+    if (saved) this.checkpoint = structuredClone(saved.checkpoint);
     if (this.checkpoint.state.busy || ["running", "recovering", "interrupted"].includes(this.checkpoint.state.status)) {
       this.checkpoint.state = { ...this.checkpoint.state, status: "interrupted", busy: false, recoverable: true, nextRetryAt: undefined, message: "服务曾中断，已保存对话和工具回执，将继续未完成的回答。" };
       this.restored = true;

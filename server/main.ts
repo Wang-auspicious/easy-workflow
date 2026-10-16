@@ -26,6 +26,7 @@ const factory = new Factory();
 await factory.boot();
 const control = new FactoryControl(factory);
 const dispatcher = new Dispatcher(factory, control);
+console.log('BOOT_STAGE dispatcher 0');
 let latestBrowserState: import('../shared/browser.ts').BrowserState | undefined;
 browserEvents.add(state => {
   latestBrowserState = state;
@@ -354,7 +355,19 @@ const shutdown = async () => {
   server.close(); server.closeAllConnections();
   await Promise.all([sourceTask, factory.runtime.close(), chatTask]);
   factory.publicationOutbox?.close();
-  await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]); factory.docs.flush(); factory.lessons.close(); factory.journal.close(); process.exit(0);
+  await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]);
+  factory.docs.flush();
+  factory.lessons.close();
+  let exitCode = 0;
+  try {
+    await factory.closeSnapshots();
+  } catch {
+    console.error('Shutdown snapshot failed; journal events remain durable');
+    exitCode = 1;
+  } finally {
+    factory.journal.close();
+  }
+  process.exit(exitCode);
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

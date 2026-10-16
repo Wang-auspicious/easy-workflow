@@ -3,6 +3,10 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {apply, deserializeSnapshot, initialState, type FactoryState} from '../shared/project.ts';
+import {snapshotVersion} from '../server/snapshots.ts';
+import {line, station, type Pack} from '../server/spec/dsl.ts';
+import type {LoadedWorkflowPacks} from '../server/workflow-packs.ts';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-runtime-restart-'));
 process.env.FACTORY_VAR = dir;
@@ -11,8 +15,146 @@ process.env.VISLEXICON_ROOT = path.join(dir, 'unconnected');
 const { Factory } = await import('../server/factory.ts');
 const { Journal } = await import('../server/journal.ts');
 const close = async (factory: InstanceType<typeof Factory>) => {
-  await factory.runtime.close(); factory.docs.flush(); factory.lessons.close(); factory.journal.close();
+  factory.recovery.close();
+  factory.channels?.close();
+  await Promise.all([factory.sources.close(), factory.runtime.close()]);
+  factory.publicationOutbox?.close();
+  factory.docs.flush();
+  factory.lessons.close();
+  await factory.closeSnapshots();
+  factory.journal.close();
 };
+
+test('offline snapshots leave project documents and legacy settings untouched', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-offline-snapshot-'));
+  const seed = new Journal(path.join(directory, 'journal.db'));
+  seed.append({kind: 'dispatch.note', tone: 'info', text: 'Offline fixture'});
+  seed.close();
+  const settings = '{"model":2,"browser":3}\n';
+  fs.writeFileSync(path.join(directory, 'settings.json'), settings);
+  const factory = new Factory(directory, {projectionOnly: true});
+  try {
+    await factory.snapshot();
+    assert.equal(fs.readFileSync(path.join(directory, 'settings.json'), 'utf8'), settings);
+    assert.deepEqual(fs.readdirSync(directory).filter(name => !name.startsWith('journal.db')), ['settings.json'],
+      'the offline command cannot initialize project metadata, documents, or evidence directories');
+    const snapshot = factory.journal.latestSnapshot('factory-state', snapshotVersion(factory.compiled.digest));
+    assert.equal(snapshot?.seq, 1);
+    const saved = deserializeSnapshot(snapshot!.body) as {state: FactoryState};
+    assert.equal(typeof saved.state, 'object', 'the wrapper stores state once, without nested JSON text');
+    assert.equal(saved.state.activity[0].text, 'Offline fixture');
+  } finally {
+    factory.journal.close();
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('snapshot timing resets after success and shutdown captures a late event after an in-flight write', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-snapshot-timer-'));
+  const seed = new Journal(path.join(directory, 'journal.db'));
+  seed.append({kind: 'dispatch.note', tone: 'info', text: 'Timer fixture'});
+  seed.close();
+  const factory = new Factory(directory, {projectionOnly: true});
+  const lifecycle = factory as unknown as {startSnapshots(): void; writeSnapshots(): Promise<void>};
+  try {
+    await factory.snapshot();
+    t.mock.timers.enable({apis: ['Date', 'setTimeout'], now: Date.now()});
+    let late = false;
+    const original = factory.journal.writeSnapshot.bind(factory.journal);
+    const writes = t.mock.method(factory.journal, 'writeSnapshot', (...args: Parameters<typeof original>) => {
+      const result = original(...args);
+      if (late && args[0] === 'outbox') {
+        late = false;
+        queueMicrotask(() => factory.journal.append({kind: 'dispatch.note', tone: 'info', text: 'Final queued writer'}));
+      }
+      return result;
+    });
+    const flush = () => new Promise<void>(resolve => setImmediate(resolve));
+    lifecycle.startSnapshots();
+    t.mock.timers.tick(540_000);
+    factory.journal.atomic(() => {
+      for (let i = 0; i < 5000; i++) factory.journal.append({kind: 'dispatch.note', tone: 'info', text: `threshold ${i}`});
+    });
+    await flush();
+    assert.equal(writes.mock.callCount(), 6, 'the event threshold writes all six snapshots once');
+    t.mock.timers.tick(599_999);
+    await flush();
+    assert.equal(writes.mock.callCount(), 6, 'the previous boot-based ten-minute deadline must be cancelled');
+    t.mock.timers.tick(1);
+    await flush();
+    assert.equal(writes.mock.callCount(), 12, 'ten minutes after the successful threshold capture writes again');
+    late = true;
+    const background = lifecycle.writeSnapshots();
+    await Promise.all([background, factory.closeSnapshots()]);
+    const snapshot = factory.journal.latestSnapshot('factory-state', snapshotVersion(factory.compiled.digest));
+    assert.equal(snapshot?.seq, factory.journal.seq, 'close drains an older capture and includes the final queued event');
+    const saved = deserializeSnapshot(snapshot!.body) as {state: FactoryState};
+    assert.ok(saved.state.activity.some(entry => entry.text === 'Final queued writer'));
+    assert.equal(writes.mock.callCount(), 24, 'shutdown performs another capture only when the journal advanced');
+    t.mock.timers.tick(600_000);
+    await flush();
+    assert.equal(writes.mock.callCount(), 24, 'shutdown cancels the background timer');
+  } finally {
+    await factory.closeSnapshots();
+    t.mock.timers.reset();
+    factory.journal.close();
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('graph reload rebuilds recovery under the new store kinds before snapshot version changes', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-snapshot-graph-'));
+  let kind: 'program' | 'store' = 'program';
+  const fixturePack = (): Pack => ({id: 'snapshot-fixture', name: 'Snapshot fixture', version: '1', blurb: 'Fixture',
+    lines: [line({id: 'snapshot', name: 'Snapshot', layer: 3, priority: 'mid', wired: true, blurb: 'Fixture',
+      stations: [station({id: 'step', name: 'Step', kind, role: 'process', resource: 'none',
+        accept: ['Preserve fixture input']}), ...(kind === 'store' ? [station({id: 'added', name: 'Added', kind: 'store', role: 'store'})] : [])],
+      edges: []})], channels: [], resources: {browser: 0, model: 0, cpu: 0, http: 0}, links: [], conditions: {},
+    order: ['snapshot'], collapsed: [], hints: {}});
+  const loaded = (): LoadedWorkflowPacks => ({packs: [fixturePack()], conditions: {}, executor: () => null,
+    role: key => ({station: key, path: 'fixture/ROLE.md', revision: 'fixture', content: '# Fixture role'}),
+    manifests: [], index: {version: 1, builtins: [], packages: []}});
+  const seed = new Journal(path.join(directory, 'journal.db'));
+  seed.append({kind: 'run.started', runId: 'graph-fixture', title: 'Graph fixture'});
+  seed.append({kind: 'token.created', token: 'graph-token', item: 'graph-item', line: 'snapshot',
+    url: 'https://fixture.test/', source: 'manual'});
+  seed.append({kind: 'token.data', token: 'graph-token', patch: {recoveryRoot: 'snapshot/step'}});
+  seed.append({kind: 'token.queued', token: 'graph-token', node: 'snapshot/step'});
+  seed.append({kind: 'token.finished', token: 'graph-token', node: 'snapshot/step', status: 'published', reason: 'Fixture'});
+  seed.append({kind: 'run.ended', runId: 'graph-fixture', manual: true});
+  seed.close();
+  const factory = new Factory(directory);
+  const configurable = factory as unknown as {loadWorkflowPacks(): Promise<LoadedWorkflowPacks>};
+  t.mock.method(configurable, 'loadWorkflowPacks', async () => loaded());
+  try {
+    await factory.boot();
+    const oldVersion = snapshotVersion(factory.compiled.digest);
+    assert.ok(factory.journal.latestSnapshot('factory-state', oldVersion));
+    assert.equal(factory.runtime.tokens.get('graph-token')?.done.has('snapshot/step'), false);
+    kind = 'store';
+    await factory.reloadWorkflowPacks();
+    assert.equal(factory.runtime.tokens.get('graph-token')?.done.has('snapshot/step'), true,
+      'the same historical queue event is a completed store arrival in the replacement graph');
+    assert.ok(factory.state.nodes['snapshot/added'], 'the new initial graph must be projected, not relabelled');
+    assert.strictEqual(factory.broker.modelCircuits, factory.state.modelCircuits);
+    const patch = factory.proposePatch({author: 'user', summary: 'Fixture rename',
+      ops: [{op: 'set', station: 'snapshot/step', field: 'name', value: 'Renamed step'}]});
+    factory.decidePatch(patch.patch.id, true);
+    const version = snapshotVersion(factory.compiled.digest);
+    assert.notEqual(version, oldVersion);
+    await factory.closeSnapshots();
+    const snapshot = factory.journal.latestSnapshot('factory-state', version);
+    assert.equal(snapshot?.seq, factory.journal.seq, 'accepted graph changes must continue producing snapshots');
+    const expected = initialState(factory.compiled);
+    for (const event of factory.journal.read()) apply(expected, event);
+    const saved = deserializeSnapshot(snapshot!.body) as {state: FactoryState; recovery: {done: Map<string, Set<string>>}};
+    assert.deepEqual(saved.state, expected);
+    assert.ok(saved.recovery.done.get('graph-token')?.has('snapshot/step'));
+  } finally {
+    await close(factory);
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
 
 test('a paused direct repair survives restart with its owner, reviewer, instructions and independent branch', async () => {
   let factory = new Factory();

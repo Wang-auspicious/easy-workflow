@@ -7,7 +7,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { CompiledFactory, Stamped } from "../shared/types.ts";
 import type { FactoryState, TokenState } from "../shared/project.ts";
-import { apply, initialState } from "../shared/project.ts";
+import {apply, initialState, serializeSnapshot, deserializeSnapshot} from '../shared/project.ts';
+import type {Snapshottable} from './snapshots.ts';
 import { classifyFailure, failureLabels } from "../shared/failures.ts";
 import type { LessonArtifact, LessonDraft, LessonEvent, LessonObservation, LessonSample, LessonTrial, LessonValidation, LessonView } from "../shared/lessons.ts";
 import type { CaseScope, Docs } from "./docs.ts";
@@ -43,9 +44,69 @@ function inferredFailure(message: string) {
 function frameworkOf(token: TokenState | undefined) {
   const d = token?.data ?? {}, dossier = d.dossier as { framework?: unknown } | undefined;
   const values = dossier?.framework ?? d.framework;
+  return frameworkNames(values);
+}
+
+function frameworkNames(values: unknown): string[] {
   const names = unique((Array.isArray(values) ? values : typeof values === "string" ? [values] : [])
     .filter((x): x is string => typeof x === "string" && Boolean(x.trim())).map((x) => x.trim().toLowerCase())).sort();
   return names.length ? names : ["unknown"];
+}
+
+interface ObservationLookup {
+  token(id: string): {item: string; url: string; station?: string; framework: string[]} | undefined;
+  consult(id: string): {owner: string; problem: string} | undefined;
+}
+
+function lessonObservation(e: Stamped, lookup: ObservationLookup,
+    consults: Map<string, LessonObservation>): LessonObservation | undefined {
+  let token: string, station: string, message: string, failureType: string, nextAction: string | undefined;
+  if (e.kind === 'candidate.disposition') {
+    if (!['retry', 'removed'].includes(e.candidate.disposition) || !e.candidate.failure) return;
+    token = e.candidate.token;
+    station = lookup.token(token)?.station ?? 'dispatcher';
+    message = e.candidate.failure.message;
+    failureType = e.candidate.failure.tag;
+    nextAction = e.candidate.failure.nextAction;
+  } else if (e.kind === 'token.returned') {
+    token = e.token;
+    station = e.to;
+    message = e.reason;
+    failureType = inferredFailure(message);
+  } else if (e.kind === 'consult.opened') {
+    token = e.token;
+    station = e.owner;
+    message = e.problem;
+    failureType = inferredFailure(message);
+  } else if (e.kind === 'consult.replied' || e.kind === 'consult.closed') {
+    const origin = consults.get(e.consult);
+    if (origin) return {...origin, seq: e.seq, at: e.at, kind: e.kind,
+      message: e.kind === 'consult.replied' ? e.reply : `${e.outcome}: ${e.reason}`};
+    const prior = lookup.consult(e.consult);
+    token = e.token;
+    station = prior?.owner ?? (e.kind === 'consult.replied' ? e.owner : 'dispatcher');
+    message = e.kind === 'consult.replied' ? e.reply : `${e.outcome}: ${e.reason}`;
+    failureType = inferredFailure(prior?.problem ?? message);
+  } else return;
+  const item = lookup.token(token);
+  const observation: LessonObservation = {seq: e.seq, at: e.at, kind: e.kind, token, station, message,
+    failureType, framework: item?.framework ?? ['unknown'],
+    item: item?.item ?? (e.kind === 'candidate.disposition' ? e.candidate.item : token),
+    url: item?.url ?? (e.kind === 'candidate.disposition' ? e.candidate.url : ''),
+    ...(nextAction ? {nextAction} : {})};
+  if (e.kind === 'consult.opened') consults.set(e.consult, observation);
+  return observation;
+}
+
+function observationGroups(observations: readonly LessonObservation[]): LessonObservation[][] {
+  const groups = new Map<string, LessonObservation[]>();
+  for (const observation of observations) {
+    const key = JSON.stringify([observation.station, observation.failureType, observation.framework]);
+    const group = groups.get(key) ?? [];
+    group.push(observation);
+    groups.set(key, group);
+  }
+  return [...groups.values()];
 }
 
 /** Pure replay: a later retry or framework observation cannot rewrite an old run. */
@@ -53,45 +114,23 @@ export function groupLessonObservations(events: Stamped[], runId: string, compil
   const s = initialState(compiled);
   const observations: LessonObservation[] = [];
   const consults = new Map<string, LessonObservation>();
+  const lookup: ObservationLookup = {
+    token: id => {
+      const token = s.tokens[id];
+      if (!token) return;
+      return {item: token.item, url: token.url, framework: frameworkOf(token),
+        station: token.finishedAtNode ?? (token.attempts.at(-1) ? s.attempts[token.attempts.at(-1)!]?.node : undefined)};
+    },
+    consult: id => s.consults[id],
+  };
   for (const e of events) {
     if (e.kind === "run.started" && e.runId !== runId && observations.length && s.run.id === runId) break;
     apply(s, e);
     if (e.run !== runId) continue;
-    let token: string, station: string, message: string, failureType: string, nextAction: string | undefined;
-    if (e.kind === "candidate.disposition") {
-      if (!["retry", "removed"].includes(e.candidate.disposition) || !e.candidate.failure) continue;
-      token = e.candidate.token;
-      const t = s.tokens[token];
-      station = t?.finishedAtNode ?? (t?.attempts.at(-1) ? s.attempts[t.attempts.at(-1)!]?.node : undefined) ?? "dispatcher";
-      message = e.candidate.failure.message; failureType = e.candidate.failure.tag; nextAction = e.candidate.failure.nextAction;
-    } else if (e.kind === "token.returned") {
-      token = e.token; station = e.to; message = e.reason; failureType = inferredFailure(message);
-    } else if (e.kind === "consult.opened") {
-      token = e.token; station = e.owner; message = e.problem; failureType = inferredFailure(message);
-    } else if (e.kind === "consult.replied" || e.kind === "consult.closed") {
-      const origin = consults.get(e.consult);
-      if (origin) {
-        observations.push({ ...origin, seq: e.seq, at: e.at, kind: e.kind, message: e.kind === "consult.replied" ? e.reply : `${e.outcome}: ${e.reason}` });
-        continue;
-      }
-      // A restored consultation can have opened in an earlier run. Keep its
-      // response even if an incomplete legacy journal has lost the opening.
-      const prior = s.consults[e.consult];
-      token = e.token; station = prior?.owner ?? (e.kind === "consult.replied" ? e.owner : "dispatcher");
-      message = e.kind === "consult.replied" ? e.reply : `${e.outcome}: ${e.reason}`;
-      failureType = inferredFailure(prior?.problem ?? message);
-    } else continue;
-    const t = s.tokens[token];
-    const observation: LessonObservation = { seq: e.seq, at: e.at, kind: e.kind, token, station, message, failureType, framework: frameworkOf(t), item: t?.item ?? (e.kind === "candidate.disposition" ? e.candidate.item : token), url: t?.url ?? (e.kind === "candidate.disposition" ? e.candidate.url : ""), ...(nextAction ? { nextAction } : {}) };
-    observations.push(observation);
-    if (e.kind === "consult.opened") consults.set(e.consult, observation);
+    const observation = lessonObservation(e, lookup, consults);
+    if (observation) observations.push(observation);
   }
-  const groups = new Map<string, LessonObservation[]>();
-  for (const o of observations) {
-    const key = JSON.stringify([o.station, o.failureType, o.framework]);
-    const group = groups.get(key) ?? []; group.push(o); groups.set(key, group);
-  }
-  return [...groups.values()];
+  return observationGroups(observations);
 }
 
 function draftDigest(d: Omit<LessonDraft, "digest"> | LessonDraft) {
@@ -129,39 +168,208 @@ function changedFields(before: unknown, after: unknown, prefix = ""): string[] {
   return [prefix];
 }
 
-export class Lessons {
+interface ObservationToken {
+  item: string;
+  url: string;
+  status: TokenState['status'];
+  framework: string[];
+  dossierFramework: string[] | null;
+  lastAttempt?: string;
+  finishedAtNode?: string;
+}
+
+function projectFramework(token: ObservationToken, patch: Record<string, unknown>): void {
+  if ('framework' in patch) token.framework = frameworkNames(patch.framework);
+  if ('dossier' in patch) {
+    const dossier = patch.dossier;
+    const value = dossier && typeof dossier === 'object' ? (dossier as Record<string, unknown>).framework : undefined;
+    token.dossierFramework = value == null ? null : frameworkNames(value);
+  }
+}
+
+export class Lessons implements Snapshottable {
+  readonly snapshotName = 'lessons';
   private host: Host;
   private dir: string;
   private roles: string;
   private store: EvidenceStore;
-  private unsubscribe: () => void;
+  private unsubscribe?: () => void;
   private indexedSeq = 0;
   private lessonSeq = 0;
   private readonly cachedLessonEvents: LessonStamp[] = [];
   private viewSeq = -1;
   private cachedViews: LessonView[] = [];
+  private observationTokens = new Map<string, ObservationToken>();
+  private attemptNodes = new Map<string, string>();
+  private consultContext = new Map<string, {owner: string; problem: string}>();
+  private observations = new Map<string, LessonObservation[]>();
+  private consultOrigins = new Map<string, Map<string, LessonObservation>>();
+  private endedRuns = new Set<string>();
+  private frozenRuns = new Set<string>();
+  private currentRun = '';
 
-  constructor(host: Host, dir: string, options: { rolesRoot?: string } = {}) {
+  constructor(host: Host, dir: string, options: {rolesRoot?: string; deferReplay?: boolean} = {}) {
     this.host = host; this.dir = dir; this.roles = options.rolesRoot ?? roleRoot;
     this.store = host.store ?? new EvidenceStore(path.join(dir, "evidence"), process.env.FACTORY_READONLY === "1");
     host.docs?.setLessons(this);
-    this.unsubscribe = host.journal.subscribe((e) => { if (isLesson(e)) this.write(); });
+    if (!options.deferReplay) this.start();
   }
 
-  close() { this.unsubscribe(); }
+  start(): void {
+    if (this.unsubscribe) return;
+    this.refresh();
+    const projection = this.host.journal.subscribeProjection(event => this.observe(event));
+    const consumer = this.host.journal.subscribe(event => {
+      if (isLesson(event) && process.env.FACTORY_READONLY !== '1') this.write();
+    });
+    this.unsubscribe = () => {
+      projection();
+      consumer();
+    };
+  }
+
+  close() {
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+  }
+
+  serialize(): string {
+    return serializeSnapshot({indexedSeq: this.indexedSeq, lessonSeq: this.lessonSeq,
+      cachedLessonEvents: this.cachedLessonEvents, observationTokens: this.observationTokens,
+      attemptNodes: this.attemptNodes, consultContext: this.consultContext,
+      observations: this.observations, consultOrigins: this.consultOrigins,
+      endedRuns: this.endedRuns, frozenRuns: this.frozenRuns, currentRun: this.currentRun});
+  }
+
+  restore(body: string): void {
+    const record = (value: unknown): value is Record<string, unknown> =>
+      Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    const strings = (value: unknown): value is string[] =>
+      Array.isArray(value) && value.every(entry => typeof entry === 'string');
+    const stringSet = (value: unknown): value is Set<string> =>
+      value instanceof Set && [...value].every(entry => typeof entry === 'string');
+    const stringMap = (value: unknown, valid: (entry: unknown) => boolean): value is Map<string, unknown> =>
+      value instanceof Map && [...value].every(([key, entry]) => typeof key === 'string' && valid(entry));
+    const observation = (value: unknown): boolean => record(value) &&
+      Number.isSafeInteger(value.seq) && Number(value.seq) > 0 && typeof value.at === 'number' &&
+      ['candidate.disposition', 'token.returned', 'consult.opened', 'consult.replied', 'consult.closed'].includes(String(value.kind)) &&
+      ['token', 'item', 'url', 'station', 'failureType', 'message'].every(key => typeof value[key] === 'string') &&
+      strings(value.framework) && (value.nextAction === undefined || typeof value.nextAction === 'string');
+    const saved = deserializeSnapshot(body);
+    if (!record(saved) || !Number.isSafeInteger(saved.indexedSeq) || Number(saved.indexedSeq) < 0 ||
+        !Number.isSafeInteger(saved.lessonSeq) || Number(saved.lessonSeq) < 0 || Number(saved.lessonSeq) > Number(saved.indexedSeq) ||
+        !Array.isArray(saved.cachedLessonEvents) || !saved.cachedLessonEvents.every(event => record(event) &&
+          typeof event.kind === 'string' && event.kind.startsWith('lesson.') && Number.isSafeInteger(event.seq)) ||
+        !stringMap(saved.observationTokens, token => record(token) && typeof token.item === 'string' &&
+          typeof token.url === 'string' && typeof token.status === 'string' && strings(token.framework) &&
+          (token.dossierFramework === null || strings(token.dossierFramework)) &&
+          (token.lastAttempt === undefined || typeof token.lastAttempt === 'string') &&
+          (token.finishedAtNode === undefined || typeof token.finishedAtNode === 'string')) ||
+        !stringMap(saved.attemptNodes, node => typeof node === 'string') ||
+        !stringMap(saved.consultContext, consult => record(consult) && typeof consult.owner === 'string' && typeof consult.problem === 'string') ||
+        !stringMap(saved.observations, entries => Array.isArray(entries) && entries.every(observation)) ||
+        !stringMap(saved.consultOrigins, origins => stringMap(origins, observation)) ||
+        !stringSet(saved.endedRuns) || !stringSet(saved.frozenRuns) || typeof saved.currentRun !== 'string') {
+      throw new Error('Invalid lessons snapshot');
+    }
+    this.indexedSeq = Number(saved.indexedSeq);
+    this.lessonSeq = Number(saved.lessonSeq);
+    this.cachedLessonEvents.length = 0;
+    for (const event of saved.cachedLessonEvents as LessonStamp[]) this.cachedLessonEvents.push(event);
+    this.observationTokens = saved.observationTokens as Map<string, ObservationToken>;
+    this.attemptNodes = saved.attemptNodes as Map<string, string>;
+    this.consultContext = saved.consultContext as Map<string, {owner: string; problem: string}>;
+    this.observations = saved.observations as Map<string, LessonObservation[]>;
+    this.consultOrigins = saved.consultOrigins as Map<string, Map<string, LessonObservation>>;
+    this.endedRuns = saved.endedRuns;
+    this.frozenRuns = saved.frozenRuns;
+    this.currentRun = saved.currentRun;
+    this.viewSeq = -1;
+    this.cachedViews = [];
+  }
+
+  observe(event: Stamped): void {
+    if (event.seq <= this.indexedSeq) return;
+    this.indexedSeq = event.seq;
+    if (isLesson(event)) {
+      this.cachedLessonEvents.push(event);
+      this.lessonSeq = event.seq;
+    }
+    if (event.kind === 'run.started') {
+      if (event.runId !== this.currentRun && this.observations.get(this.currentRun)?.length) {
+        this.frozenRuns.add(this.currentRun);
+      }
+      this.currentRun = event.runId;
+    } else if (event.kind === 'run.ended') {
+      this.endedRuns.add(event.runId);
+    } else if (event.kind === 'token.created') {
+      this.observationTokens.set(event.token, {item: event.item, url: event.url,
+        status: 'active', framework: ['unknown'], dossierFramework: null});
+    } else if (event.kind === 'token.data') {
+      const token = this.observationTokens.get(event.token);
+      if (token) projectFramework(token, event.patch);
+    } else if (event.kind === 'attempt.started') {
+      this.attemptNodes.set(event.attempt, event.node);
+      const token = this.observationTokens.get(event.token);
+      if (token) token.lastAttempt = event.attempt;
+    } else if (event.kind === 'token.finished') {
+      const token = this.observationTokens.get(event.token);
+      if (token) {
+        token.status = event.status;
+        token.finishedAtNode = event.node;
+      }
+    } else if (event.kind === 'token.returned') {
+      const token = this.observationTokens.get(event.token);
+      if (token && token.status !== 'active') {
+        token.status = 'active';
+        token.finishedAtNode = undefined;
+      }
+    } else if (event.kind === 'candidate.disposition') {
+      const token = this.observationTokens.get(event.candidate.token);
+      if (token && token.status !== 'active' && ['retry', 'removed'].includes(event.candidate.disposition)) {
+        token.status = event.candidate.disposition === 'retry' ? 'parked' : 'rejected';
+      }
+    } else if (event.kind === 'correction.reverted') {
+      const token = this.observationTokens.get(event.token);
+      if (token) {
+        const snapshot = event.snapshot as {data: Record<string, unknown>; status: TokenState['status']; finishedAtNode?: string};
+        token.framework = ['unknown'];
+        token.dossierFramework = null;
+        projectFramework(token, snapshot.data);
+        token.status = snapshot.status;
+        token.finishedAtNode = snapshot.status === 'active' ? undefined : snapshot.finishedAtNode;
+      }
+    } else if (event.kind === 'consult.opened') {
+      this.consultContext.set(event.consult, {owner: event.owner, problem: event.problem});
+    }
+    if (this.frozenRuns.has(event.run) || !['candidate.disposition', 'token.returned',
+      'consult.opened', 'consult.replied', 'consult.closed'].includes(event.kind)) return;
+    const origins = this.consultOrigins.get(event.run) ?? new Map<string, LessonObservation>();
+    const observation = lessonObservation(event, {
+      token: id => {
+        const token = this.observationTokens.get(id);
+        if (!token) return;
+        return {item: token.item, url: token.url, framework: token.dossierFramework ?? token.framework,
+          station: token.finishedAtNode ?? (token.lastAttempt ? this.attemptNodes.get(token.lastAttempt) : undefined)};
+      },
+      consult: id => this.consultContext.get(id),
+    }, origins);
+    this.consultOrigins.set(event.run, origins);
+    if (observation) {
+      const observations = this.observations.get(event.run) ?? [];
+      observations.push(observation);
+      this.observations.set(event.run, observations);
+    }
+  }
+
+  private refresh(): void {
+    if (this.indexedSeq === this.host.journal.seq) return;
+    for (const event of this.host.journal.read(this.indexedSeq)) this.observe(event);
+  }
+
   /** Ordinary context reads retain only lesson records, never business payloads. */
   private lessonEvents() {
-    const through = this.host.journal.seq;
-    if (this.indexedSeq !== through) {
-      for (const event of this.host.journal.readKinds(['lesson.proposed', 'lesson.revised', 'lesson.validated',
-        'lesson.approved', 'lesson.rejected', 'lesson.applied', 'lesson.validation.started',
-        'lesson.validation.bound', 'lesson.validation.exposed'], this.indexedSeq, through)) {
-        if (!isLesson(event)) continue;
-        this.cachedLessonEvents.push(event);
-        this.lessonSeq = event.seq;
-      }
-      this.indexedSeq = through;
-    }
+    this.refresh();
     return this.cachedLessonEvents;
   }
 
@@ -201,12 +409,12 @@ export class Lessons {
 
   /** Called after report.ready (cleanup is complete); idempotent across restarts. */
   draftRun(runId: string) {
-    // A finished run's observations cannot depend on later conversations. Avoid
-    // repeatedly parsing all newer payloads when repairing historical drafts.
-    const events = this.history(this.host.journal.lastSequence(runId));
-    if (!events.some((e) => e.kind === "run.ended" && e.runId === runId)) throw new ControlError(409, "run_not_ended", "本轮尚未结束，不能提前复盘");
+    // The compact replay index captures each observation at its original event.
+    // It also retains runs whose draft write was interrupted before a snapshot.
+    this.refresh();
+    if (!this.endedRuns.has(runId)) throw new ControlError(409, "run_not_ended", "本轮尚未结束，不能提前复盘");
     const existing = this.list().filter((l) => l.runId === runId);
-    const groups = groupLessonObservations(events, runId, this.host.compiled);
+    const groups = observationGroups(this.observations.get(runId) ?? []);
     for (const group of groups) {
       const first = group[0], id = `lesson-${hash(JSON.stringify([runId, first.station, first.failureType, first.framework])).slice(0, 16)}`;
       if (existing.some((l) => l.id === id)) continue;
