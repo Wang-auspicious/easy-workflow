@@ -58,10 +58,12 @@ export class KernelStore {
   list(statuses?: ItemStatus[]): ItemState[] {
     if (!this.hasItems || statuses?.length === 0) return [];
     const rows = (statuses
-      ? this.journal.database.prepare(`SELECT body FROM items WHERE status IN (${statuses.map(() => '?').join(',')})`).all(...statuses)
-      : this.journal.database.prepare('SELECT body FROM items').all()) as unknown as ItemRow[];
+      ? this.journal.database.prepare(`SELECT body FROM items WHERE status IN (${statuses.map(() => '?').join(',')}) ORDER BY rowid`).all(...statuses)
+      : this.journal.database.prepare('SELECT body FROM items ORDER BY rowid').all()) as unknown as ItemRow[];
+    // SQLite preserves rowid on our upserts; stable sorting keeps that original
+    // insertion order when millisecond creation timestamps are equal.
     return rows.map(row => validateItem(deserializeSnapshot(row.body)))
-      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+      .sort((left, right) => left.createdAt - right.createdAt);
   }
 
   admittedAt(id: string): number | undefined {

@@ -7,7 +7,7 @@ export function admittedCandidates(items: readonly ItemState[], maxActiveItems =
   if (!Number.isSafeInteger(maxActiveItems) || maxActiveItems < 1) throw new RangeError('maxActiveItems must be a positive integer');
   const slots = Math.max(0, maxActiveItems - items.filter(item => item.status === 'active').length);
   return items.filter(item => item.status === 'queued')
-    .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
+    .sort((left, right) => left.createdAt - right.createdAt)
     .slice(0, slots);
 }
 
@@ -17,6 +17,7 @@ export interface ReadyNode {item: ItemState; node: CompiledNode}
 export function sortReady(items: readonly ItemState[], compiled: CompiledFactory,
     admittedAt: (id: string) => number | undefined, scopePaused: (key: string) => boolean = () => false): ReadyNode[] {
   const positions = new Map(topologicalOrder(compiled).map((key, index) => [key, index]));
+  const itemPositions = new Map(items.map((item, index) => [item.id, index]));
   const nodes = new Map(compiled.nodes.map(node => [node.key, node]));
   const ready: ReadyNode[] = [];
   for (const item of items) {
@@ -29,7 +30,8 @@ export function sortReady(items: readonly ItemState[], compiled: CompiledFactory
   }
   return ready.sort((left, right) =>
     (admittedAt(left.item.id) ?? left.item.createdAt) - (admittedAt(right.item.id) ?? right.item.createdAt) ||
-    positions.get(left.node.key)! - positions.get(right.node.key)! || left.item.id.localeCompare(right.item.id));
+    itemPositions.get(left.item.id)! - itemPositions.get(right.item.id)! ||
+    positions.get(left.node.key)! - positions.get(right.node.key)!);
 }
 
 export function wakeWaiting(item: ItemState, now = Date.now()): ItemState {

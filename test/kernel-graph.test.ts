@@ -11,6 +11,7 @@ import {BUDGET_ATTENTION_MS, streamOf} from '../shared/streams.ts';
 import {kernelStreams} from '../server/kernel/streams.ts';
 import {KernelStore} from '../server/kernel/store.ts';
 import {createItem, type ItemState} from '../server/kernel/item.ts';
+import {admittedCandidates, sortReady} from '../server/kernel/scheduler.ts';
 import type {Executor, StationContext, StationResult, TokenRun} from '../server/runtime.ts';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-kernel-graph-'));
@@ -253,6 +254,41 @@ test('v2 admission is FIFO and records resource waits while the oldest item fini
     await kernel.close();
     journal.close();
   }
+});
+
+test('v2 same-millisecond FIFO survives upserts and database reopen', t => {
+  t.mock.timers.enable({apis: ['Date'], now: 1_000_000});
+  const compiled = compile([returnPack()]);
+  const file = path.join(root, 'same-millisecond-fifo.db');
+  let journal = new Journal(file);
+  let store = new KernelStore(journal);
+  const ids = ['z-first', 'a-second', 'm-third'];
+  const items = ids.map(id => createItem(compiled, {id, run: 'same-ms', entry: 'review/first', item: id,
+    url: '', source: 'fixture', now: Date.now()}));
+  try {
+    journal.atomic(() => {
+      for (const item of items) store.save(item);
+      items[0].data.note = 'Updating the oldest row must preserve its place';
+      store.save(items[0]);
+    });
+    assert.deepEqual(store.list().map(item => item.id), ids, 'random ids cannot decide creation order at the same millisecond');
+    assert.deepEqual(admittedCandidates(store.list(['queued']), 2).map(item => item.id), ids.slice(0, 2));
+    journal.atomic(() => {
+      items[0].status = 'active';
+      items[0].nodes['review/first'].status = 'done';
+      items[0].nodes['review/second'].status = 'ready';
+      items[1].status = 'active';
+      store.save(items[0], Date.now());
+      store.save(items[1], Date.now());
+    });
+    journal.close();
+    journal = new Journal(file);
+    store = new KernelStore(journal);
+    assert.deepEqual(store.list().map(item => item.id), ids, 'recovery preserves the original tie order');
+    assert.deepEqual(sortReady(store.list(['active']), compiled, id => store.admittedAt(id)).map(value => [value.item.id, value.node.key]),
+      [['z-first', 'review/second'], ['a-second', 'review/first']],
+      'an older item keeps priority even when a newer item has an earlier topology position');
+  } finally {journal.close();}
 });
 
 test('v2 returning an item invalidates an older parallel attempt even when its external call ignores cancellation', async () => {
@@ -531,7 +567,8 @@ test('E SQLite statistics count items once, retain current work across runs and 
   } finally {journal.close();}
 });
 
-test('E resource waits are durable, do not spam receipts, and resume after a real broker lease is released', async () => {
+test('E resource waits are durable, do not spam receipts, and resume after a real broker lease is released', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: 1_000_000});
   const spec = returnPack();
   for (const node of spec.lines[0].stations) if (node.kind !== 'store') node.resource = 'cpu';
   const compiled = compile([spec]);
