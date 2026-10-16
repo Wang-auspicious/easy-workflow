@@ -4,8 +4,8 @@
   "samples": [
     {
       "run": 1,
-      "backendReadyMs": 13498,
-      "launchToReadyMs": 14237,
+      "backendReadyMs": 9831,
+      "launchToReadyMs": 10457,
       "stages": [
         {
           "stage": "import",
@@ -17,7 +17,7 @@
         },
         {
           "stage": "compile",
-          "ms": 13
+          "ms": 10
         },
         {
           "stage": "restore-factory-state",
@@ -45,15 +45,77 @@
         },
         {
           "stage": "replay",
-          "ms": 5347
+          "ms": 5423
         },
         {
           "stage": "factory",
-          "ms": 11687
+          "ms": 9224
         },
         {
           "stage": "dispatcher",
           "ms": 0
+        }
+      ],
+      "receivedStages": [
+        {
+          "stage": "import",
+          "elapsedMs": 96,
+          "durationMs": 0
+        },
+        {
+          "stage": "journal",
+          "elapsedMs": 358,
+          "durationMs": 0
+        },
+        {
+          "stage": "compile",
+          "elapsedMs": 368,
+          "durationMs": 10
+        },
+        {
+          "stage": "restore-factory-state",
+          "elapsedMs": 380,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-docs",
+          "elapsedMs": 381,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-lessons",
+          "elapsedMs": 382,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-channels",
+          "elapsedMs": 383,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-sources",
+          "elapsedMs": 383,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-outbox",
+          "elapsedMs": 383,
+          "durationMs": 0
+        },
+        {
+          "stage": "replay",
+          "elapsedMs": 5804,
+          "durationMs": 5423
+        },
+        {
+          "stage": "factory",
+          "elapsedMs": 9553,
+          "durationMs": 9224
+        },
+        {
+          "stage": "dispatcher",
+          "elapsedMs": 9559,
+          "durationMs": 0
         }
       ]
     }

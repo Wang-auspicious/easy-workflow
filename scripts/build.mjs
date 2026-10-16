@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stripTypeScriptTypes } from 'node:module';
+import {builtinModules, stripTypeScriptTypes} from 'node:module';
 import { build as viteBuild } from 'vite';
 import { build as bundleVendor } from 'rolldown';
 
@@ -58,6 +58,77 @@ function copyRuntimeDependencies(destination) {
   return seen.size;
 }
 
+/** Bundle the already-transpiled server without replacing its original modules.
+ * Literal dynamic imports stay in this graph, sharing their original singletons;
+ * runtime URL imports and Playwright continue loading their preserved files. */
+export async function bundleDesktopServer(destination) {
+  const distribution = path.resolve(destination);
+  const directory = path.join(distribution, 'server', 'bundled');
+  const entry = path.join(directory, 'main.js');
+  const builtins = new Set(builtinModules);
+  await bundleVendor({
+    cwd: distribution,
+    input: path.join(distribution, 'server', 'main.js'),
+    platform: 'node',
+    preserveEntrySignatures: 'strict',
+    external: id => id.startsWith('node:') || builtins.has(id) ||
+      id === 'playwright-core' || id.startsWith('playwright-core/'),
+    plugins: [{
+      name: 'desktop-original-module-urls',
+      transform(code, id) {
+        if (!code.includes('import.meta') || id.startsWith('\0')) return null;
+        const replacements = [];
+        const visit = node => {
+          if (!node || typeof node !== 'object') return;
+          const importedMeta = node.object?.type === 'MetaProperty' &&
+            node.object.meta?.name === 'import' && node.object.property?.name === 'meta';
+          if (node.type === 'MemberExpression' && importedMeta &&
+              (node.computed ? node.property?.value === 'url' : node.property?.name === 'url')) {
+            const relative = path.relative(distribution, id);
+            if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+              throw new Error('Desktop module URL must refer to a copied distribution file');
+            }
+            // Every emitted entry/chunk is directly in server/bundled. This URL
+            // remains correct after moving the entire distribution elsewhere.
+            const original = path.relative(directory, id).split(path.sep).map(encodeURIComponent).join('/');
+            replacements.push({start: node.start, end: node.end,
+              text: `new URL(${JSON.stringify(original)}, import.meta.url).href`});
+            return;
+          }
+          if (node.type === 'MetaProperty' && node.meta?.name === 'import' && node.property?.name === 'meta') {
+            throw new Error('Desktop bundling only supports the existing import.meta.url contract');
+          }
+          for (const value of Object.values(node)) {
+            if (Array.isArray(value)) {
+              for (const child of value) if (child?.type) visit(child);
+            } else if (value?.type) visit(value);
+          }
+        };
+        visit(this.parse(code));
+        if (!replacements.length) return null;
+        let transformed = code;
+        for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
+          transformed = transformed.slice(0, replacement.start) + replacement.text + transformed.slice(replacement.end);
+        }
+        return {code: transformed, map: null};
+      },
+    }],
+    output: {
+      dir: directory,
+      format: 'esm',
+      entryFileNames: 'main.js',
+      chunkFileNames: '[name]-[hash].js',
+      assetFileNames: '[name]-[hash][extname]',
+      codeSplitting: true,
+      strictExecutionOrder: true,
+      keepNames: true,
+      sourcemap: false,
+      minify: false,
+    },
+  });
+  return entry;
+}
+
 export async function buildDesktop() {
   const configuredRoot = process.env.VISLEXICON_ROOT?.trim();
   if (!configuredRoot) throw new Error('Set VISLEXICON_ROOT to the connected VisLexicon repository before building; no personal-directory fallback is used.');
@@ -105,6 +176,14 @@ export async function buildDesktop() {
     const target = path.join(bundle, rel); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.copyFileSync(source, target);
   }
   const packages = copyRuntimeDependencies(output);
+  const serverEntry = await bundleDesktopServer(output);
+  const runnerFile = path.join(output, 'app', 'server-runner.cjs');
+  const runner = fs.readFileSync(runnerFile, 'utf8');
+  const originalEntry = "const built = path.join(root, 'server', 'main.js');";
+  if (!runner.includes(originalEntry)) throw new Error('Desktop server runner entry no longer matches the build contract');
+  const bundledEntry = path.relative(output, serverEntry).split(path.sep);
+  fs.writeFileSync(runnerFile, runner.replace(originalEntry,
+    `const built = path.join(root, ${bundledEntry.map(part => JSON.stringify(part)).join(', ')});`));
   const licenses = path.join(output, 'licenses'); fs.mkdirSync(licenses, { recursive: true });
   fs.copyFileSync(path.join(root, 'ui/src/vendor/pi-web-ui/LICENSE'), path.join(licenses, 'pi-web-ui-LICENSE'));
   fs.copyFileSync(path.join(root, 'ui/src/vendor/pi-web-ui/UPSTREAM.md'), path.join(licenses, 'pi-web-ui-UPSTREAM.md'));

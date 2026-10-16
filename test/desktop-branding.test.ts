@@ -6,6 +6,8 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import vm from "node:vm";
 import {EventEmitter} from "node:events";
+import {spawnSync} from 'node:child_process';
+import {pathToFileURL} from 'node:url';
 const { PRODUCT_NAME, userDataDirectory, projectLocations, activeProjectDirectory, recentProjectDirectories } = createRequire(import.meta.url)("../app/branding.cjs");
 
 test("canonical and legacy workflow tools render the same Chinese labels", async () => {
@@ -313,4 +315,151 @@ test("Easy Workflow uses its new defaults while preserving legacy profiles and p
     assert.equal(isolated.legacyProject, null, "test profiles never silently open the user's project");
     assert.equal(activeProjectDirectory(locations, saved, path.join(root, "explicit-project")), path.join(root, "explicit-project"));
   } finally { assert.ok(path.resolve(root).startsWith(path.join(path.resolve(os.tmpdir()), "easy-workflow-branding-"))); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('backend bundles preserve relocated module resources, lazy imports and shared runtime identity', async () => {
+  const {bundleDesktopServer} = await import(new URL('../scripts/build.mjs', import.meta.url).href) as {
+    bundleDesktopServer(destination: string): Promise<string>;
+  };
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-backend-bundle-'));
+  const staging = path.join(directory, 'staging app');
+  const relocated = path.join(directory, 'relocated app Ω');
+  const loaderPath = 'packs/fixture space Ω/loader.js';
+  const sources: Record<string, string> = {
+    'package.json': JSON.stringify({type: 'module'}),
+    'server/main.js': `
+      import {resourceReport, runWorker, loadBrowser} from '../${loaderPath}';
+      import {state} from '../shared/state.js';
+      import {bootLabel} from 'undici';
+      state.count = 7;
+      export {resourceReport, runWorker, loadBrowser};
+      export const dependency = bootLabel;
+      export const mainUrl = import.meta.url;
+      export function count() { return state.count; }
+      export async function loadReport() { return (await import('./report.js')).report(); }
+      export async function loadInstalledPack(url) { return (await import(url)).execute(); }
+    `,
+    'shared/state.js': 'export const state = {count: 0};',
+    'server/report.js': `
+      import {state} from '../shared/state.js';
+      globalThis.fixtureReportLoads = (globalThis.fixtureReportLoads ?? 0) + 1;
+      export function report() { return {count: state.count++, url: import.meta.url}; }
+    `,
+    [loaderPath]: `
+      import fs from 'node:fs';
+      import {createRequire} from 'node:module';
+      import {Worker} from 'node:worker_threads';
+      const localRequire = createRequire(import.meta.url);
+      export function resourceReport() {
+        return {url: import.meta.url, literal: 'import.meta.url',
+          commonjs: localRequire('./native-helper.cjs'),
+          role: fs.readFileSync(new URL('./roles/ROLE.md', import.meta.url), 'utf8'),
+          rules: JSON.parse(fs.readFileSync(new URL('../../resources/vislexicon/rules.json', import.meta.url), 'utf8'))};
+      }
+      export function runWorker() {
+        return new Promise((resolve, reject) => {
+          const worker = new Worker(new URL('./worker.js', import.meta.url));
+          let received = false;
+          let result;
+          worker.once('message', value => { received = true; result = value; });
+          worker.once('error', reject);
+          worker.once('exit', code => {
+            if (code === 0 && received) resolve(result);
+            else reject(new Error('Fixture worker exited without a result: ' + code));
+          });
+        });
+      }
+      export async function loadBrowser() { return (await import('playwright-core')).identity(); }
+    `,
+    'packs/fixture space Ω/worker.js': `
+      import fs from 'node:fs';
+      import {parentPort} from 'node:worker_threads';
+      parentPort.postMessage({url: import.meta.url,
+        text: fs.readFileSync(new URL('./worker-data.txt', import.meta.url), 'utf8')});
+    `,
+    'packs/fixture space Ω/roles/ROLE.md': 'Initial fixture role',
+    'packs/fixture space Ω/worker-data.txt': 'Worker resource',
+    'packs/fixture space Ω/native-helper.cjs': `
+      const fs = require('node:fs');
+      const path = require('node:path');
+      module.exports = {file: __filename, text: fs.readFileSync(path.join(__dirname, 'native-resource.txt'), 'utf8')};
+    `,
+    'packs/fixture space Ω/native-resource.txt': 'Relative CommonJS resource',
+    'resources/vislexicon/rules.json': JSON.stringify({source: 'initial fixture rule'}),
+    'installed/customer-pack.mjs': `
+      import {label} from './pack-helper.mjs';
+      import fs from 'node:fs';
+      export function execute() { return {label, url: import.meta.url,
+        text: fs.readFileSync(new URL('./pack-resource.txt', import.meta.url), 'utf8')}; }
+    `,
+    'installed/pack-helper.mjs': 'export const label = "Runtime installed pack";',
+    'installed/pack-resource.txt': 'Installed pack resource',
+    'node_modules/undici/package.json': JSON.stringify({name: 'undici', version: '0.0.0-fixture', type: 'commonjs', exports: './index.js'}),
+    'node_modules/undici/index.js': 'const path = require("node:path"); exports.bootLabel = path.basename("Bundled startup dependency");',
+    'node_modules/playwright-core/package.json': JSON.stringify({name: 'playwright-core', version: '0.0.0-fixture', type: 'module', exports: './index.js'}),
+    'node_modules/playwright-core/index.js': `
+      import fs from 'node:fs';
+      globalThis.fixtureBrowserLoaded = true;
+      export function identity() { return {url: import.meta.url,
+        text: fs.readFileSync(new URL('./fixture-resource.txt', import.meta.url), 'utf8')}; }
+    `,
+    'node_modules/playwright-core/fixture-resource.txt': 'Lazy browser package resource',
+  };
+  try {
+    for (const [relative, body] of Object.entries(sources)) {
+      const file = path.join(staging, relative);
+      fs.mkdirSync(path.dirname(file), {recursive: true});
+      fs.writeFileSync(file, body);
+    }
+    const entry = await bundleDesktopServer(staging);
+    const relativeEntry = path.relative(staging, entry);
+    assert.ok(relativeEntry && !path.isAbsolute(relativeEntry) && !relativeEntry.startsWith('..'),
+      'the bundled entry remains inside the distribution');
+    // Copied resources must remain runtime files, rather than baked-in source
+    // paths or build-time values. Exercise the relocated distribution from an
+    // unrelated working directory so process.cwd() cannot mask a broken URL.
+    fs.writeFileSync(path.join(staging, 'packs/fixture space Ω/roles/ROLE.md'), 'Role from relocated distribution');
+    fs.writeFileSync(path.join(staging, 'resources/vislexicon/rules.json'), JSON.stringify({source: 'relocated distribution'}));
+    fs.renameSync(staging, relocated);
+    fs.renameSync(path.join(relocated, 'node_modules', 'undici'), path.join(relocated, 'node_modules', 'undici-unavailable'));
+    assert.equal(fs.readFileSync(path.join(relocated, loaderPath), 'utf8'), sources[loaderPath],
+      'original modules remain available for dynamic consumers');
+    const runner = path.join(directory, 'probe.mjs');
+    fs.writeFileSync(runner, `
+      import {pathToFileURL} from 'node:url';
+      const app = await import(pathToFileURL(process.argv[2]).href);
+      const before = {browser: Boolean(globalThis.fixtureBrowserLoaded), reportLoads: globalThis.fixtureReportLoads ?? 0};
+      const resources = app.resourceReport();
+      const worker = await app.runWorker();
+      const reports = [await app.loadReport(), await app.loadReport()];
+      const installed = await app.loadInstalledPack(pathToFileURL(process.argv[3]).href);
+      const browser = await app.loadBrowser();
+      console.log(JSON.stringify({before, resources, worker, reports, installed, browser,
+        dependency: app.dependency, mainUrl: app.mainUrl, count: app.count(),
+        after: {browser: Boolean(globalThis.fixtureBrowserLoaded), reportLoads: globalThis.fixtureReportLoads}}));
+    `);
+    const execution = spawnSync(process.execPath, [runner, path.join(relocated, relativeEntry),
+      path.join(relocated, 'installed/customer-pack.mjs')], {
+      cwd: directory, encoding: 'utf8', timeout: 30_000, windowsHide: true,
+    });
+    assert.equal(execution.error, undefined);
+    assert.equal(execution.status, 0, execution.stderr);
+    const result = JSON.parse(execution.stdout);
+    const url = (relative: string) => pathToFileURL(path.join(relocated, relative)).href;
+    assert.deepEqual(result.before, {browser: false, reportLoads: 0}, 'dynamic modules do not execute during startup');
+    assert.equal(result.mainUrl, url('server/main.js'));
+    assert.equal(result.dependency, 'Bundled startup dependency', 'startup does not reopen the removed undici package');
+    assert.deepEqual(result.resources, {url: url(loaderPath), literal: 'import.meta.url',
+      commonjs: {file: path.join(relocated, 'packs/fixture space Ω/native-helper.cjs'), text: 'Relative CommonJS resource'},
+      role: 'Role from relocated distribution', rules: {source: 'relocated distribution'}});
+    assert.deepEqual(result.worker, {url: url('packs/fixture space Ω/worker.js'), text: 'Worker resource'});
+    assert.deepEqual(result.reports, [{count: 7, url: url('server/report.js')}, {count: 8, url: url('server/report.js')}]);
+    assert.equal(result.count, 9, 'literal dynamic imports share the statically bundled singleton');
+    assert.deepEqual(result.installed, {label: 'Runtime installed pack', url: url('installed/customer-pack.mjs'), text: 'Installed pack resource'});
+    assert.deepEqual(result.browser, {url: url('node_modules/playwright-core/index.js'), text: 'Lazy browser package resource'});
+    assert.deepEqual(result.after, {browser: true, reportLoads: 1});
+  } finally {
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
 });

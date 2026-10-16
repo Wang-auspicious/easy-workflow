@@ -1,0 +1,89 @@
+{
+  "mode": "cold-without-cli",
+  "events": 187492,
+  "samples": [
+    {
+      "run": 1,
+      "backendReadyMs": 13498,
+      "launchToReadyMs": 14237,
+      "stages": [
+        {
+          "stage": "import",
+          "ms": 0
+        },
+        {
+          "stage": "journal",
+          "ms": 0
+        },
+        {
+          "stage": "compile",
+          "ms": 13
+        },
+        {
+          "stage": "restore-factory-state",
+          "ms": 0
+        },
+        {
+          "stage": "restore-docs",
+          "ms": 0
+        },
+        {
+          "stage": "restore-lessons",
+          "ms": 0
+        },
+        {
+          "stage": "restore-channels",
+          "ms": 0
+        },
+        {
+          "stage": "restore-sources",
+          "ms": 0
+        },
+        {
+          "stage": "restore-outbox",
+          "ms": 0
+        },
+        {
+          "stage": "replay",
+          "ms": 5347
+        },
+        {
+          "stage": "factory",
+          "ms": 11687
+        },
+        {
+          "stage": "dispatcher",
+          "ms": 0
+        }
+      ]
+    }
+  ],
+  "snapshots": [
+    {
+      "name": "channels",
+      "seq": 187492
+    },
+    {
+      "name": "docs",
+      "seq": 187492
+    },
+    {
+      "name": "factory-state",
+      "seq": 187492
+    },
+    {
+      "name": "lessons",
+      "seq": 187492
+    },
+    {
+      "name": "outbox",
+      "seq": 187492
+    },
+    {
+      "name": "sources",
+      "seq": 187492
+    }
+  ],
+  "readyLimitMs": 5000,
+  "passed": true
+}

@@ -4,8 +4,8 @@
   "samples": [
     {
       "run": 1,
-      "backendReadyMs": 9338,
-      "launchToReadyMs": 10705,
+      "backendReadyMs": 5683,
+      "launchToReadyMs": 7839,
       "stages": [
         {
           "stage": "import",
@@ -17,11 +17,11 @@
         },
         {
           "stage": "compile",
-          "ms": 13
+          "ms": 10
         },
         {
           "stage": "restore-factory-state",
-          "ms": 1675
+          "ms": 1449
         },
         {
           "stage": "restore-docs",
@@ -29,19 +29,19 @@
         },
         {
           "stage": "restore-lessons",
-          "ms": 21
+          "ms": 18
         },
         {
           "stage": "restore-channels",
-          "ms": 14
+          "ms": 16
         },
         {
           "stage": "restore-sources",
-          "ms": 0
+          "ms": 1
         },
         {
           "stage": "restore-outbox",
-          "ms": 17
+          "ms": 18
         },
         {
           "stage": "replay",
@@ -49,7 +49,7 @@
         },
         {
           "stage": "factory",
-          "ms": 3629
+          "ms": 3560
         },
         {
           "stage": "dispatcher",
@@ -59,70 +59,70 @@
       "receivedStages": [
         {
           "stage": "import",
-          "elapsedMs": 125,
+          "elapsedMs": 94,
           "durationMs": 0
         },
         {
           "stage": "journal",
-          "elapsedMs": 5392,
+          "elapsedMs": 407,
           "durationMs": 0
         },
         {
           "stage": "compile",
-          "elapsedMs": 5404,
-          "durationMs": 13
+          "elapsedMs": 418,
+          "durationMs": 10
         },
         {
           "stage": "restore-factory-state",
-          "elapsedMs": 7095,
-          "durationMs": 1675
+          "elapsedMs": 1877,
+          "durationMs": 1449
         },
         {
           "stage": "restore-docs",
-          "elapsedMs": 7112,
+          "elapsedMs": 1894,
           "durationMs": 17
         },
         {
           "stage": "restore-lessons",
-          "elapsedMs": 7133,
-          "durationMs": 21
+          "elapsedMs": 1912,
+          "durationMs": 18
         },
         {
           "stage": "restore-channels",
-          "elapsedMs": 7148,
-          "durationMs": 14
+          "elapsedMs": 1928,
+          "durationMs": 16
         },
         {
           "stage": "restore-sources",
-          "elapsedMs": 7149,
-          "durationMs": 0
+          "elapsedMs": 1929,
+          "durationMs": 1
         },
         {
           "stage": "restore-outbox",
-          "elapsedMs": 7165,
-          "durationMs": 17
+          "elapsedMs": 1947,
+          "durationMs": 18
         },
         {
           "stage": "replay",
-          "elapsedMs": 7166,
+          "elapsedMs": 1948,
           "durationMs": 0
         },
         {
           "stage": "factory",
-          "elapsedMs": 8982,
-          "durationMs": 3629
+          "elapsedMs": 3931,
+          "durationMs": 3560
         },
         {
           "stage": "dispatcher",
-          "elapsedMs": 8989,
+          "elapsedMs": 3937,
           "durationMs": 0
         }
       ]
     },
     {
       "run": 2,
-      "backendReadyMs": 3336,
-      "launchToReadyMs": 3961,
+      "backendReadyMs": 2867,
+      "launchToReadyMs": 3457,
       "stages": [
         {
           "stage": "import",
@@ -138,7 +138,124 @@
         },
         {
           "stage": "restore-factory-state",
-          "ms": 1532
+          "ms": 1423
+        },
+        {
+          "stage": "restore-docs",
+          "ms": 16
+        },
+        {
+          "stage": "restore-lessons",
+          "ms": 18
+        },
+        {
+          "stage": "restore-channels",
+          "ms": 16
+        },
+        {
+          "stage": "restore-sources",
+          "ms": 0
+        },
+        {
+          "stage": "restore-outbox",
+          "ms": 17
+        },
+        {
+          "stage": "replay",
+          "ms": 0
+        },
+        {
+          "stage": "factory",
+          "ms": 2250
+        },
+        {
+          "stage": "dispatcher",
+          "ms": 0
+        }
+      ],
+      "receivedStages": [
+        {
+          "stage": "import",
+          "elapsedMs": 111,
+          "durationMs": 0
+        },
+        {
+          "stage": "journal",
+          "elapsedMs": 375,
+          "durationMs": 0
+        },
+        {
+          "stage": "compile",
+          "elapsedMs": 384,
+          "durationMs": 9
+        },
+        {
+          "stage": "restore-factory-state",
+          "elapsedMs": 1818,
+          "durationMs": 1423
+        },
+        {
+          "stage": "restore-docs",
+          "elapsedMs": 1834,
+          "durationMs": 16
+        },
+        {
+          "stage": "restore-lessons",
+          "elapsedMs": 1851,
+          "durationMs": 18
+        },
+        {
+          "stage": "restore-channels",
+          "elapsedMs": 1868,
+          "durationMs": 16
+        },
+        {
+          "stage": "restore-sources",
+          "elapsedMs": 1869,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-outbox",
+          "elapsedMs": 1885,
+          "durationMs": 17
+        },
+        {
+          "stage": "replay",
+          "elapsedMs": 1886,
+          "durationMs": 0
+        },
+        {
+          "stage": "factory",
+          "elapsedMs": 2596,
+          "durationMs": 2250
+        },
+        {
+          "stage": "dispatcher",
+          "elapsedMs": 2602,
+          "durationMs": 0
+        }
+      ]
+    },
+    {
+      "run": 3,
+      "backendReadyMs": 2900,
+      "launchToReadyMs": 3447,
+      "stages": [
+        {
+          "stage": "import",
+          "ms": 0
+        },
+        {
+          "stage": "journal",
+          "ms": 0
+        },
+        {
+          "stage": "compile",
+          "ms": 10
+        },
+        {
+          "stage": "restore-factory-state",
+          "ms": 1433
         },
         {
           "stage": "restore-docs",
@@ -150,15 +267,15 @@
         },
         {
           "stage": "restore-channels",
-          "ms": 17
+          "ms": 16
         },
         {
           "stage": "restore-sources",
-          "ms": 0
+          "ms": 1
         },
         {
           "stage": "restore-outbox",
-          "ms": 19
+          "ms": 17
         },
         {
           "stage": "replay",
@@ -166,7 +283,7 @@
         },
         {
           "stage": "factory",
-          "ms": 2430
+          "ms": 2286
         },
         {
           "stage": "dispatcher",
@@ -181,174 +298,57 @@
         },
         {
           "stage": "journal",
-          "elapsedMs": 633,
+          "elapsedMs": 359,
           "durationMs": 0
         },
         {
           "stage": "compile",
-          "elapsedMs": 642,
-          "durationMs": 9
+          "elapsedMs": 369,
+          "durationMs": 10
         },
         {
           "stage": "restore-factory-state",
-          "elapsedMs": 2184,
-          "durationMs": 1532
+          "elapsedMs": 1812,
+          "durationMs": 1433
         },
         {
           "stage": "restore-docs",
-          "elapsedMs": 2202,
+          "elapsedMs": 1829,
           "durationMs": 17
         },
         {
           "stage": "restore-lessons",
-          "elapsedMs": 2220,
+          "elapsedMs": 1847,
           "durationMs": 18
         },
         {
           "stage": "restore-channels",
-          "elapsedMs": 2237,
-          "durationMs": 17
+          "elapsedMs": 1863,
+          "durationMs": 16
         },
         {
           "stage": "restore-sources",
-          "elapsedMs": 2238,
-          "durationMs": 0
-        },
-        {
-          "stage": "restore-outbox",
-          "elapsedMs": 2256,
-          "durationMs": 19
-        },
-        {
-          "stage": "replay",
-          "elapsedMs": 2257,
-          "durationMs": 0
-        },
-        {
-          "stage": "factory",
-          "elapsedMs": 3035,
-          "durationMs": 2430
-        },
-        {
-          "stage": "dispatcher",
-          "elapsedMs": 3042,
-          "durationMs": 0
-        }
-      ]
-    },
-    {
-      "run": 3,
-      "backendReadyMs": 3481,
-      "launchToReadyMs": 4127,
-      "stages": [
-        {
-          "stage": "import",
-          "ms": 0
-        },
-        {
-          "stage": "journal",
-          "ms": 0
-        },
-        {
-          "stage": "compile",
-          "ms": 9
-        },
-        {
-          "stage": "restore-factory-state",
-          "ms": 1578
-        },
-        {
-          "stage": "restore-docs",
-          "ms": 17
-        },
-        {
-          "stage": "restore-lessons",
-          "ms": 21
-        },
-        {
-          "stage": "restore-channels",
-          "ms": 22
-        },
-        {
-          "stage": "restore-sources",
-          "ms": 1
-        },
-        {
-          "stage": "restore-outbox",
-          "ms": 19
-        },
-        {
-          "stage": "replay",
-          "ms": 0
-        },
-        {
-          "stage": "factory",
-          "ms": 2550
-        },
-        {
-          "stage": "dispatcher",
-          "ms": 0
-        }
-      ],
-      "receivedStages": [
-        {
-          "stage": "import",
-          "elapsedMs": 95,
-          "durationMs": 0
-        },
-        {
-          "stage": "journal",
-          "elapsedMs": 604,
-          "durationMs": 0
-        },
-        {
-          "stage": "compile",
-          "elapsedMs": 613,
-          "durationMs": 9
-        },
-        {
-          "stage": "restore-factory-state",
-          "elapsedMs": 2202,
-          "durationMs": 1578
-        },
-        {
-          "stage": "restore-docs",
-          "elapsedMs": 2219,
-          "durationMs": 17
-        },
-        {
-          "stage": "restore-lessons",
-          "elapsedMs": 2240,
-          "durationMs": 21
-        },
-        {
-          "stage": "restore-channels",
-          "elapsedMs": 2262,
-          "durationMs": 22
-        },
-        {
-          "stage": "restore-sources",
-          "elapsedMs": 2264,
+          "elapsedMs": 1864,
           "durationMs": 1
         },
         {
           "stage": "restore-outbox",
-          "elapsedMs": 2282,
-          "durationMs": 19
+          "elapsedMs": 1881,
+          "durationMs": 17
         },
         {
           "stage": "replay",
-          "elapsedMs": 2284,
+          "elapsedMs": 1882,
           "durationMs": 0
         },
         {
           "stage": "factory",
-          "elapsedMs": 3125,
-          "durationMs": 2550
+          "elapsedMs": 2618,
+          "durationMs": 2286
         },
         {
           "stage": "dispatcher",
-          "elapsedMs": 3133,
+          "elapsedMs": 2626,
           "durationMs": 0
         }
       ]

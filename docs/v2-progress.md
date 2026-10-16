@@ -99,3 +99,17 @@ rg -n 'journal\.(read|readKinds|runs)|\.history\(' server
 只读剖析已完成：三个独立 Electron Node 进程只导入启动模块，不构造 Factory 或启动项目。总耗时 **6699 / 556 / 612 ms**，其中同步文件读取 **5920 / 60 / 65 ms**；195 个源码文件中第一轮 177 个加载超过 10 ms。编译时间接近，主要差异位于文件读取。脱敏证据保存为 `v2-acceptance/A-module-load-profile.json`，没有将诊断结果当作正式验收。
 
 **等待站长决定（§0.4）**：请求仅在现有构建中用已安装的 Rolldown 打包后端启动入口及静态依赖，并保持原模块相对资源路径。完整范围及验证要求见 `v2-acceptance/A-build-followup.md`。尚未实施构建调整；A 仍未通过，B 未开始。
+
+随后站长明确回复 **“允许构建层打包并继续（推荐）”**，解除上述等待。开始实施限定的构建层变更并验证模块资源路径；没有扩大业务范围或进入 B。
+
+构建调整期间独立执行的源码 `npm run desktop:smoke` 未通过：首个 `.node` 等待超时。隔离 profile 的父进程日志为 import=101 ms、ready_timeout=30106 ms，未进入 journal/Factory 阶段。保留 TEMP 日志 `ew-v2-A-source-smoke-final.log`；不修改 30 秒静默计时器，不将失败算为通过，最终仍需该命令成功。
+
+### 已批准构建调整的结果
+
+- `scripts/build.mjs` 使用既有 Rolldown 生成 `server/bundled/main.js`，只修改生成的 runner 入口；原始分发模块和资源保留。内部字面量动态导入使用同一模块图和分块，保持共享实例与延迟执行；Node 内置模块和 Playwright 外置。用 AST 重定位原 `import.meta.url`，资源仍可随分发目录迁移。
+- `node --test test/desktop-branding.test.ts` **13/13 通过，2.70 秒**；补充真实 undici 的 CommonJS 输入类型后，针对新增 bundle 回归 **1/1 通过，0.756 秒**。迁移 fixture 实际执行角色／规则读取、CommonJS 相对引用、worker、动态 pack、共享状态与懒加载。
+- `npm run typecheck`、`npm run build` 和 `git diff --check` 通过。桌面产物 **26.3 MiB / 754 文件 / 2 个原有运行依赖包**。
+- 完整项目副本 snapshot CLI 完成 **5.072 秒**，factory-state 恢复 **1.795 秒**、写回 **2.655 秒**；事件数仍为 **187492**。
+- 构建后首组连续三次 ready 为 **5.683 / 2.867 / 2.900 秒**，**未通过**；完整记录见 `v2-acceptance/A-ready-after-bundle.json`。首轮 import→journal 已降至 **313 ms**；Factory 阶段 **3560 ms**，dispatcher 标记到 ready 仍有 **1746 ms**。继续定位其原因，不用后两次代替连续三次验收。
+- 不跑 snapshot CLI 的分发桌面全量启动 **9.831 秒 ready**，全量重放 **5.423 秒**，正常退出后六类快照齐全；见 `A-cold.json`，旧数据保留为 `A-cold-before-bundle.json`。
+- `npm run desktop:smoke -- --app=dist/desktop --standalone` **25 个检查全部通过**；见脱敏回执 `A-packaged-smoke.json`。该模式不连接原 VisLexicon 资料，实际验证分发资源、后端 Playwright 按需加载和本地浏览器操作。额外日志审查发现 **2 条资源加载警告**，正在定位；smoke 检查通过不能证明所有样式资源完整。
