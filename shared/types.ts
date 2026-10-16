@@ -114,6 +114,17 @@ export interface LineSpec {
 export type ChannelInput = Record<string, string | {path?: string; value?: unknown}>;
 export interface ChannelSpec { id: string; from: { line: string; station: string }; to: { line: string; station: string }; label: string; input?: ChannelInput }
 
+export type RoomView = 'dossier' | 'dossier+home' | 'shots+pixels' | 'shots' |
+  'plan+sitemap' | 'sources' | 'source-quotes' | 'facts+style';
+export interface RoomPolicy {
+  field: string;
+  participants: string[];
+  judge: string;
+  fallbackJudge?: string;
+  views: Record<string, RoomView>;
+  models?: Record<string, StationAgentBinding>;
+}
+
 export interface PackSpec {
   id: string;
   name: string;
@@ -121,6 +132,7 @@ export interface PackSpec {
   blurb: string;
   lines: LineSpec[];
   channels: ChannelSpec[];
+  rooms?: RoomPolicy[];
   resources: Record<Exclude<ResourceClass, "none">, number>;
 }
 
@@ -132,6 +144,7 @@ export interface CompiledFactory {
   nodes: CompiledNode[];
   edges: CompiledEdge[];
   channels: ChannelSpec[];
+  rooms?: RoomPolicy[];
   resources: PackSpec["resources"];
   issues: { at: string; message: string }[];
   /** Hash of the compiled runtime graph; layout never changes it (acceptance A11). */
@@ -324,6 +337,7 @@ export interface ModelCircuit {
 
 export type JournalEvent =
   | import("./lessons.ts").LessonEvent
+  | import('./board.ts').BoardEvent
   | { kind: "factory.loaded"; digest: string; specVersion: string }
   | { kind: 'agent.binding'; node: string; binding: StationAgentBinding | null }
   | { kind: 'agent.defaults'; defaults: ProjectAgentDefaults }

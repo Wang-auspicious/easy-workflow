@@ -84,6 +84,22 @@ test('Factory selects v2 without worker or legacy supervisor events and preserve
     await factory.runtime.settle();
     assert.equal(factory.runtime.store.get(token.id)?.status, 'published');
     assert.equal(factory.state.tokens[token.id].status, 'published');
+    assert.ok(factory.board);
+    const claims = factory.board.read(token.id).filter(post => post.type === 'claim');
+    assert.ok(claims.some(post => post.field === 'gate' && post.author === 'curation/gate'));
+    const boardContext = {node: 'curation/gate', token: token.id, signal: new AbortController().signal};
+    const read = await factory.toolbox.call(['board_read'], 'board_read', {}, boardContext);
+    assert.equal(read.ok, true);
+    assert.ok('posts' in read && Array.isArray(read.posts) && read.posts.length > 0);
+    const denied = await factory.toolbox.call(['board_post'], 'board_post',
+      {type: 'challenge', field: 'gate', body: 'A program cannot impersonate a reviewer'}, boardContext);
+    assert.equal(denied.ok, false);
+    const evidence = [factory.runtime.store.attempts(token.id)[0].id];
+    factory.lessons.writeShared({id: 'shared-factory', node: 'curation/gate', text: '核对已保存的闸门证据', evidence, at: Date.now(), status: 'active'});
+    await assert.rejects(() => control.execute('delete_shared_lesson', {id: 'shared-factory'}, 'agent'), error =>
+      error instanceof Error && 'status' in error && error.status === 403);
+    await control.execute('delete_shared_lesson', {id: 'shared-factory'}, 'user');
+    assert.deepEqual(factory.lessons.activeFor('curation/gate'), []);
     assert.ok([...factory.journal.read()].every(event => !/^(worker\.|measurement\.|consult\.|batch\.configured)/.test(event.kind)));
     await assert.rejects(() => control.execute('allocation_plan', {action: 'status'}), error =>
       error instanceof Error && 'status' in error && error.status === 410);

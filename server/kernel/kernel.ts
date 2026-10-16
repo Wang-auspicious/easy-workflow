@@ -5,6 +5,7 @@ import {Runtime, type TokenRun, type Executor, type ExecutorRegistration, type P
   type StationResult, type Fix, type StationContext} from '../runtime.ts';
 import type {AgentBudget, CompiledFactory, CompiledNode, CompiledEdge, EvidenceRef, ModelDependency,
   ModelCircuit, ModelResponse, JournalEvent, TokenStatus} from '../../shared/types.ts';
+import type {BoardPost, Room} from '../../shared/board.ts';
 import type {FactoryState} from '../../shared/project.ts';
 import type {Broker, Lease} from '../broker.ts';
 import type {Journal} from '../journal.ts';
@@ -17,13 +18,22 @@ import {createItem, advanceItem, completeNode, returnItem, asTokenRun, topologic
 import {KernelStore} from './store.ts';
 import {planFailure, nextModelFailure, claimModelProbe, modelProbeSucceeded, releaseModelProbe} from './retry.ts';
 import {admittedCandidates, sortReady, wakeWaiting} from './scheduler.ts';
+import type {BoardStore} from '../board.ts';
 
 const uid = (prefix: string) => `${prefix}-${crypto.randomBytes(8).toString('hex')}`;
 const terminal = (item: ItemState) => !['queued', 'active'].includes(item.status);
 const removed = (): never => { throw new ControlError(410, 'removed_in_v2', 'v2 不再按工人配比，并发由资源上限决定'); };
 type Input = Parameters<Runtime['create']>[1];
 type LiveAttempt = {item: string; node: string; attempt: string; controller: AbortController;
-  dependency?: ModelDependency; evidence: string[]; startedAt: number; queuedMs: number};
+  dependency?: ModelDependency; evidence: string[]; startedAt: number; queuedMs: number; lease?: Lease};
+
+export interface KernelCollaboration {
+  board: BoardStore;
+  /** Synchronous persistence only; the kernel supplies the transaction. */
+  openRoom(item: ItemState, field: string, topic: string): Room;
+  runRoom(room: Room, signal: AbortSignal): Promise<unknown>;
+  answer(question: BoardPost, signal: AbortSignal): Promise<BoardPost>;
+}
 
 export class Kernel extends Runtime {
   readonly store: KernelStore;
@@ -38,6 +48,8 @@ export class Kernel extends Runtime {
   private readonly liveV2 = new Map<string, LiveAttempt>();
   private readonly circuitsV2 = new Map<string, ModelCircuit>();
   private readonly topo: Map<string, number>;
+  private collaboration?: KernelCollaboration;
+  private readonly roomControllers = new Map<string, AbortController>();
 
   constructor(compiled: CompiledFactory, journal: Journal, broker: Broker,
     conditions: Record<string, (data: Record<string, unknown>) => boolean>,
@@ -55,6 +67,123 @@ export class Kernel extends Runtime {
     if (!Number.isSafeInteger(value) || value < 1) throw new ControlError(400, 'invalid_active_limit', '在途货上限必须为正整数');
     this.activeLimit = value;
     this.schedule();
+  }
+
+  configureCollaboration(services: KernelCollaboration): void {
+    this.collaboration = services;
+  }
+
+  /** Called only after room creation and item holds are committed. */
+  private driveRoom(room: Room): void {
+    if (!this.collaboration || !this.running || this.paused || this.disposedV2 || this.roomControllers.has(room.id)) return;
+    const controller = new AbortController();
+    this.roomControllers.set(room.id, controller);
+    const task = Promise.resolve().then(async () => {await this.collaboration!.runRoom(room, controller.signal);})
+      .catch(error => {
+        if (!controller.signal.aborted) this.parkCollaboration(room.item, room.participants[0],
+          error instanceof Error ? error.message : String(error));
+      }).finally(() => {
+        this.roomControllers.delete(room.id);
+        this.workV2.delete(task);
+        this.schedule();
+      });
+    this.workV2.add(task);
+  }
+
+  private holdRoom(item: ItemState, room: Room, owner: string): void {
+    const affected = [...closureOf(this.f, owner)].filter(key => key !== owner && item.nodes[key]);
+    item.roomHolds = {...item.roomHolds, [room.id]: {field: room.field, owner, nodes: affected}};
+    for (const key of affected) {
+      const state = item.nodes[key];
+      state.status = 'pending';
+      delete state.lastAttempt;
+      delete state.waitingFor;
+      delete state.nextAt;
+    }
+    this.journal.afterCommit(() => {
+      for (const work of this.liveV2.values()) if (work.item === item.id && affected.includes(work.node)) {
+        work.controller.abort(new Error('field discussion opened'));
+      }
+      this.driveRoom(room);
+    });
+  }
+
+  openDiscussion(itemId: string, field: string, topic: string): Room {
+    this.assertWritable();
+    const before = this.store.get(itemId);
+    if (!before || !this.collaboration) throw new ControlError(404, 'collaboration_unavailable', '找不到可讨论的货');
+    const owner = field === 'kind' && before.nodes[`${before.line}/kind-join`] ? `${before.line}/kind-join`
+      : this.collaboration.board.owners(before, field).sort((a, b) => (this.topo.get(a) ?? Infinity) - (this.topo.get(b) ?? Infinity))[0];
+    if (!owner) throw new ControlError(422, 'field_owner_missing', '该字段没有归属工位');
+    let room!: Room;
+    this.atomicTransition(() => {
+      const next = structuredClone(before);
+      room = this.collaboration!.openRoom(next, field, topic);
+      this.holdRoom(next, room, owner);
+      this.persist(before, next);
+    });
+    return room;
+  }
+
+  applyRoomResolution(itemId: string, field: string, value: unknown, owner: string, roomId: string): void {
+    const before = this.store.get(itemId);
+    const hold = before?.roomHolds?.[roomId];
+    if (!before || !hold) return;
+    this.atomicTransition(() => {
+      const next = structuredClone(before);
+      const parts = field.split('.');
+      let target = next.data;
+      for (const part of parts.slice(0, -1)) {
+        const prior = target[part];
+        target[part] = prior && typeof prior === 'object' && !Array.isArray(prior) ? {...prior} : {};
+        target = target[part] as Record<string, unknown>;
+      }
+      target[parts.at(-1)!] = structuredClone(value);
+      const actualOwner = hold.owner || owner;
+      if (field === 'kind' && actualOwner.endsWith('/kind-join')) next.data.kindAgreed = true;
+      delete next.roomHolds![roomId];
+      if (!Object.keys(next.roomHolds!).length) delete next.roomHolds;
+      this.collaboration?.board.resolveChallenges(this.collaboration.board.openChallenges(next)
+        .filter(post => post.field === field).map(post => post.id));
+      for (const key of hold.nodes) {
+        const state = next.nodes[key];
+        state.status = 'pending';
+        state.attempts = 0;
+        delete state.lastAttempt;
+        delete state.waitingFor;
+        delete state.nextAt;
+      }
+      this.journal.append({kind: 'token.data', token: itemId, patch: {[parts[0]]: next.data[parts[0]],
+        ...(field === 'kind' ? {kindAgreed: next.data.kindAgreed} : {})}});
+      const advanced = advanceItem(next, this.f, this.conditions);
+      this.persist(before, advanced, {from: actualOwner, returned: true});
+      this.deliverCompletedStores(before, advanced);
+      this.journal.afterCommit(() => this.schedule());
+    });
+  }
+
+  parkCollaboration(itemId: string, node: string, reason: string, code = 'room_unresolved'): void {
+    const item = this.store.get(itemId);
+    if (!item || terminal(item)) return;
+    this.atomicTransition(() => this.parkItem(item, node, reason, code));
+  }
+
+  saveDialogueSession(itemId: string, key: string, result: Pick<StationResult, 'sessionCheckpoint'>): void {
+    const before = this.store.get(itemId);
+    const checkpoint = result.sessionCheckpoint;
+    if (!before?.nodes[key] || !checkpoint) return;
+    this.atomicTransition(() => {
+      const next = structuredClone(before);
+      const patch: Record<string, unknown> = {};
+      if (checkpoint.pi) {
+        next.nodes[key].session = structuredClone(checkpoint.pi);
+        patch.stationSessions = {...next.data.stationSessions as object, [key]: checkpoint.pi};
+      }
+      if (checkpoint.closed) patch.closedStationSessions = {...next.data.closedStationSessions as object, [key]: checkpoint.closed};
+      next.data = {...next.data, ...patch};
+      this.journal.append({kind: 'token.data', token: itemId, patch});
+      this.persist(before, next);
+    });
   }
 
   private assertWritable() {
@@ -164,7 +293,7 @@ export class Kernel extends Runtime {
       for (const item of this.store.list(['active'])) {
         const before = structuredClone(item);
         let changed = false;
-        for (const [key, node] of Object.entries(item.nodes)) if (node.status === 'running') {
+        for (const [key, node] of Object.entries(item.nodes)) if (node.status === 'running' || node.status === 'waiting' && node.waitingFor === 'room' && node.lastAttempt) {
           changed = true;
           if (node.lastAttempt) {
             const attempt = this.store.attempt(node.lastAttempt);
@@ -208,7 +337,12 @@ export class Kernel extends Runtime {
     this.atomicTransition(() => {
       for (const item of this.store.list(['queued', 'active'])) this.parkItem(item, item.entry, '本轮结束，保留已完成工位', 'run_ended');
       this.journal.append({kind: 'run.ended', runId, manual: true});
-      this.journal.afterCommit(() => { this.running = false; this.paused = false; if (this.loop) clearInterval(this.loop); this.loop = undefined; });
+      this.journal.afterCommit(() => {
+        this.running = false; this.paused = false;
+        if (this.loop) clearInterval(this.loop);
+        this.loop = undefined;
+        for (const controller of this.roomControllers.values()) controller.abort(new Error('run ended'));
+      });
     });
     return runId;
   }
@@ -223,6 +357,7 @@ export class Kernel extends Runtime {
     if (this.loop) clearInterval(this.loop);
     this.loop = undefined;
     for (const work of this.liveV2.values()) work.controller.abort(new Error('kernel shutdown'));
+    for (const controller of this.roomControllers.values()) controller.abort(new Error('kernel shutdown'));
   }
   override async close() { this.dispose(); await this.settle(); }
   override async settle() {
@@ -272,6 +407,72 @@ export class Kernel extends Runtime {
       try { this.pumpV2(); } catch (error) { console.error('kernel scheduler', error); }
     });
   }
+
+  /** A question suspends only the calling attempt, not its conversation. */
+  async waitForRoom<T>(itemId: string, key: string, attempt: string, action: () => Promise<T>): Promise<T> {
+    const work = this.liveV2.get(attempt);
+    const before = this.store.get(itemId);
+    if (!work || work.item !== itemId || work.node !== key || before?.nodes[key]?.lastAttempt !== attempt ||
+        before.nodes[key].status !== 'running') throw new ControlError(409, 'stale_attempt', '当前工位已经变化，不能等待答复');
+    this.atomicTransition(() => {
+      const next = structuredClone(before);
+      next.nodes[key].status = 'waiting';
+      next.nodes[key].waitingFor = 'room';
+      next.nodes[key].waitingSince = Date.now();
+      this.persist(before, next);
+    });
+    work.lease?.release();
+    work.lease = undefined;
+    this.schedule();
+    try {
+      return await action();
+    } finally {
+      work.controller.signal.throwIfAborted();
+      let lease: Lease | null = null;
+      while (!lease) {
+        const current = this.store.get(itemId);
+        if (current?.status !== 'active' || current.nodes[key]?.lastAttempt !== attempt ||
+            current.nodes[key].status !== 'waiting' || current.nodes[key].waitingFor !== 'room') {
+          throw new ControlError(409, 'stale_attempt', '等待答复期间工位已退回或结束');
+        }
+        const node = this.nodes.get(key)!;
+        lease = await this.broker.acquire(node.resource, {review: node.kind === 'review' || node.kind === 'gate',
+          dependency: work.dependency, token: itemId, signal: work.controller.signal});
+      }
+      work.lease = lease;
+      try {
+        const current = this.store.get(itemId)!;
+        if (current.status !== 'active' || current.nodes[key]?.lastAttempt !== attempt ||
+            current.nodes[key].status !== 'waiting' || current.nodes[key].waitingFor !== 'room') {
+          throw new ControlError(409, 'stale_attempt', '答复返回时工位已变化');
+        }
+        this.atomicTransition(() => {
+          const next = structuredClone(current);
+          next.nodes[key].status = 'running';
+          delete next.nodes[key].waitingFor;
+          delete next.nodes[key].waitingSince;
+          this.persist(current, next);
+        });
+      } catch (error) {
+        work.lease.release();
+        work.lease = undefined;
+        throw error;
+      }
+    }
+  }
+
+  async waitForStationIdle(itemId: string, key: string, signal: AbortSignal): Promise<void> {
+    while (this.store.get(itemId)?.nodes[key]?.status === 'running') {
+      signal.throwIfAborted();
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(done, 20);
+        const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason); };
+        function done() { signal.removeEventListener('abort', abort); resolve(); }
+        signal.addEventListener('abort', abort, {once: true});
+      });
+    }
+    signal.throwIfAborted();
+  }
   private prepareV2(node: CompiledNode): PreparedExecutor {
     const registration = this.executors(node);
     if (!registration) throw new Error(`工位 ${node.key} 没有执行器`);
@@ -282,6 +483,10 @@ export class Kernel extends Runtime {
     this.pumpingV2 = true;
     try {
       const now = Date.now();
+      for (const room of this.collaboration?.board.rooms(undefined, 'open') ?? []) {
+        const item = this.store.get(room.item);
+        if (item?.status === 'active' && item.roomHolds?.[room.id]) this.driveRoom(room);
+      }
       for (const item of admittedCandidates(this.store.list(['queued', 'active']), this.maxActiveItems)) {
         this.atomicTransition(() => { const next = {...item, status: 'active' as const}; this.persist(item, next, {admittedAt: now}); });
       }
@@ -304,6 +509,7 @@ export class Kernel extends Runtime {
         id => this.store.admittedAt(id), key => this.scopePaused(key))) {
         const item = this.store.get(snapshot.id)!;
         if (item.status !== 'active' || item.nodes[node.key]?.status !== 'ready') continue;
+        if (Object.values(item.roomHolds ?? {}).some(hold => hold.nodes.includes(node.key))) continue;
         if (node.kind === 'store') { this.atomicTransition(() => this.finishStore(item, node)); continue; }
         if (!this.runnable(node)) { this.atomicTransition(() => this.parkItem(item, node.key, '这条线还没接工具', 'station_unavailable')); continue; }
         let prepared: PreparedExecutor;
@@ -335,7 +541,7 @@ export class Kernel extends Runtime {
   }
 
   private launchV2(item: ItemState, node: CompiledNode, prepared: PreparedExecutor, lease: Lease) {
-    const work: LiveAttempt = {item: item.id, node: node.key, attempt: uid('a'), controller: new AbortController(),
+    const work: LiveAttempt = {item: item.id, node: node.key, attempt: uid('a'), controller: new AbortController(), lease,
       dependency: prepared.dependency, evidence: [], startedAt: Date.now(), queuedMs: Math.max(0, Date.now() - item.updatedAt)};
     try {
       this.atomicTransition(() => {
@@ -352,7 +558,7 @@ export class Kernel extends Runtime {
     this.liveV2.set(work.attempt, work);
     const task = Promise.resolve().then(() => this.executeV2(work, node, prepared))
       .catch(error => { console.error('kernel attempt', error); })
-      .finally(() => { this.liveV2.delete(work.attempt); lease.release(); this.workV2.delete(task); this.schedule(); });
+      .finally(() => { this.liveV2.delete(work.attempt); work.lease?.release(); this.workV2.delete(task); this.schedule(); });
     this.workV2.add(task);
   }
 
@@ -371,6 +577,11 @@ export class Kernel extends Runtime {
       redo: initial.nodes[node.key].redo,
       agentBudget: initial.nodes[node.key].agentBudget,
       session: initial.nodes[node.key].session,
+      waitForRoom: action => this.waitForRoom(work.item, node.key, work.attempt, action),
+      checkpointSession: checkpoint => {
+        if (!current() || work.controller.signal.aborted) throw new ControlError(409, 'stale_attempt', '当前工位已经变化，不能保存会话');
+        this.saveDialogueSession(work.item, node.key, {sessionCheckpoint: checkpoint});
+      },
       progress: (text, step) => { if (!work.controller.signal.aborted && current()) this.journal.atomic(() => this.journal.append({kind: 'attempt.progress', attempt: work.attempt, text, step})); },
       activity: activity => { this.journal.atomic(() => this.journal.append({kind: 'attempt.activity', attempt: work.attempt, activity})); },
       addEvidence: evidence => {
@@ -420,7 +631,7 @@ export class Kernel extends Runtime {
     if (!before) return;
     let item = structuredClone(before);
     const state = item.nodes[node.key];
-    const live = item.status === 'active' && state?.status === 'running' && state.lastAttempt === work.attempt;
+    const live = item.status === 'active' && (state?.status === 'running' || state?.status === 'waiting' && state.waitingFor === 'room') && state.lastAttempt === work.attempt;
     const interrupted = live && this.disposedV2;
     const cancelled = !live || work.controller.signal.aborted && !browserFault;
     const handoff = !result.failure && !browserFault ? result.handoff : undefined;
@@ -530,7 +741,27 @@ export class Kernel extends Runtime {
       const circuit = this.circuitsV2.get(work.dependency.key);
       if (modelProbeSucceeded(circuit, item.id, node.key)) this.clearCircuit(work.dependency);
     }
+    const wasReturned = Boolean(state.redo);
     delete state.redo; delete state.lastFailure; delete state.handoff; delete state.waitingSince;
+    if (this.collaboration) {
+      const board = this.collaboration.board;
+      board.autoClaim(item, node.key, result.summary, data, work.evidence);
+      if (result.verdict?.verdict === 'fix') board.legacyFixes(item, node.key, result.verdict.fixes ?? []);
+      const disputed = board.answeredChallenges(item, node.key);
+      const fields = new Set<string>();
+      for (const challenge of disputed) {
+        if (fields.has(challenge.field)) continue;
+        fields.add(challenge.field);
+        const room = this.collaboration.openRoom(item, challenge.field, challenge.body);
+        this.holdRoom(item, room, node.key);
+      }
+      if (wasReturned) board.resolveChallenges(board.openChallenges(item, node.key)
+        .filter(challenge => !disputed.some(value => value.id === challenge.id)).map(challenge => challenge.id));
+      if (node.id === 'kind-join' && data.kindAgreed === false) {
+        const room = this.collaboration.openRoom(item, 'kind', result.summary);
+        this.holdRoom(item, room, node.key);
+      }
+    }
     if (result.finish) {
       state.status = 'done'; item.status = 'excluded';
       this.disposition(item, node.key, result.finish.status === 'merged' ? 'resolved' : 'removed');
@@ -540,8 +771,12 @@ export class Kernel extends Runtime {
     if (result.verdict && result.verdict.verdict !== 'pass') {
       const verdict = result.verdict;
       const fixes = verdict.fixes ?? [];
-      const target = verdict.verdict === 'fix' ? [...fixes].sort((a, b) => (this.topo.get(a.station) ?? Infinity) - (this.topo.get(b.station) ?? Infinity))[0]?.station : verdict.returnTo;
-      const reason = verdict.verdict === 'fix' ? fixes.map(fix => fix.problem).join('\n') || verdict.reason : verdict.reason;
+      const challenges = this.collaboration?.board.openChallenges(item) ?? [];
+      const owner = challenges.filter(challenge => challenge.addressee)
+        .sort((a, b) => (this.topo.get(a.addressee!) ?? Infinity) - (this.topo.get(b.addressee!) ?? Infinity))[0]?.addressee;
+      const target = owner ?? (verdict.verdict === 'fix' ? [...fixes].sort((a, b) => (this.topo.get(a.station) ?? Infinity) - (this.topo.get(b.station) ?? Infinity))[0]?.station : verdict.returnTo);
+      const reason = owner ? challenges.filter(challenge => challenge.addressee === owner).map(challenge => challenge.body).join('\n')
+        : verdict.verdict === 'fix' ? fixes.map(fix => fix.problem).join('\n') || verdict.reason : verdict.reason;
       this.journal.append({kind: 'review.verdict', token: item.id, node: node.key, verdict: verdict.verdict === 'escalate' ? 'escalate' : 'return', returnTo: target, reason});
       this.persist(before, item);
       if (verdict.verdict === 'escalate' || !target) this.parkItem(item, node.key, reason, 'review_escalated');

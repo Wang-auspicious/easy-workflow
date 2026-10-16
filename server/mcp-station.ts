@@ -118,7 +118,7 @@ function ownedWorkDirectory(scope: ClosedSessionScope, candidate: string, mustEx
 export async function openStationMcp(tools: StationTool[], signal: AbortSignal) {
   signal.throwIfAborted();
   // No control token, Factory, or control registry is present in this server.
-  const scoped = tools.filter(t => ["env_help", "env_call", "submit", "handoff"].includes(t.name));
+  const scoped = tools.filter(t => ["env_help", "env_call", "submit", "handoff", "submit_answer", "submit_turn", "board_read", "board_post"].includes(t.name));
   const definitions: McpTool[] = scoped.map(t => ({ name: t.name, title: t.label, description: t.description, inputSchema: t.parameters }));
   const secret = crypto.randomBytes(32).toString("hex");
   const secrets = [secret, ...factorySecrets()];
@@ -316,7 +316,7 @@ export class ClosedStationAgent {
       execute: async (id: string, args: unknown, signal?: AbortSignal) => {
         try {
           const result = await withModelTool(releaseCapacity, () => tool.execute(id, args, signal), failure => {capacityFailure = failure;});
-          if (tool.name === 'submit' || tool.name === 'handoff') this.messages.push({ role: 'assistant', content: [{ type: 'text', text: `${tool.name}: ${JSON.stringify(args)}` }] });
+          if (['submit', 'handoff', 'submit_answer', 'submit_turn'].includes(tool.name)) this.messages.push({ role: 'assistant', content: [{ type: 'text', text: `${tool.name}: ${JSON.stringify(args)}` }] });
           if (tool.name === 'submit' && result.isError) {
             this.messages.push({role: 'user', content: [{type: 'text',
               text: `程序校验错误（工具结果）：${redactText(JSON.stringify(result.content), factorySecrets())}`} ]});
@@ -339,7 +339,7 @@ export class ClosedStationAgent {
       session = await openStationMcp(scopedTools, this.controller.signal);
       const request = { product: "Easy Workflow", protocol: "h2-closed-agent/1", model: this.config.model, firstMessage: pendingMessages[0], messages: pendingMessages, mcpServers: { h2_station: session.config } };
       const vendor = this.config.adapter === 'claude-code' ? new ClaudeCodeProtocol(this.config.model, this.signature,
-        this.session?.adapter === 'claude-code' ? this.session : undefined, reference => this.saveSession(reference)) : undefined;
+        this.session?.adapter === 'claude-code' ? this.session : undefined, reference => this.saveSession(reference), scopedTools.map(tool => tool.name)) : undefined;
       const scope = this.config.sessionScope;
       if (scope && !ownedWorkDirectory(scope, this.workingDirectory, !!this.session)) {
         throw new Error('The saved closed station working directory is no longer available inside this project.');

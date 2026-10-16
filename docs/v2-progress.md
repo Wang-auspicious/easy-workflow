@@ -169,3 +169,21 @@ Agent 以 token/时间预算取代 10 次工具硬上限；默认最近 50 次�
 | `FACTORY_KERNEL=v1 npm run desktop:smoke` | **24 项全部通过**；回执 `C-desktop-smoke.json` |
 
 完整两文件复测曾为 44 pass / 2 fail（同一个新增 handoff 子例及父用例）：交接后重复 submit 虽被阻止但未带 isError；已修正为明确工具错误，并保留严格断言，随后 station-safety 全部通过。原有 Windows 安装 rename EPERM 也在早期尝试出现过，不隐去失败。真实 30 站的 no-submit/handoff 统计尚待最后实测，未伪造 C.4 验收。
+
+### D 实现与定向验证
+
+同一 journal.db 新增 board_posts/rooms，所有写入及状态变化与事件同事务。自动 claim、旧 fix 转 challenge、原会话改正／反驳、字段下游暂停、两次答疑限额、三轮讨论与原文裁决均已接入实际 Factory/Kernel。问答等待释放模型工位名额，完成后续原 attempt；房间发言与 submit_turn 分开持久确认，重启不重复已提交发言。专用工具已接通 Pi、MCP、Claude/Codex/OpenCode，普通执行仍使用原提交契约。
+
+参与者按 pack.rooms 限定视图；分类复核缺少首页图时仅为讨论取得一次持久图证并复用，缺失声明图片会在模型调用前报错。程序裁判复用原图片检查、风格 schema 与否决规则，不能明确决定时交声明的 Agent。跨货经验复用 lesson 事件存储，最多 5×300 字，用户删除保留审计。
+
+| 验证 | 结果 |
+|---|---|
+| `node --test --test-concurrency=1 test/board.test.ts test/kernel-graph.test.ts test/kernel-retry.test.ts` | **47/47，通过，6.527 秒**；其中 board 11 项，含真实 SSE 原 submit 历史与质疑正文、单模型名额问答、多 owner、事务回滚、房间崩溃恢复和 kind-join 路由 |
+| `node --test --test-concurrency=1 test/station-safety.test.ts test/agent-adapter.test.ts` | **48/48，通过，54.676 秒**；新增真实 SSE 答疑／讨论闭合及视图隔离，验证不会重复原 input/envelope/after |
+| `node --test --test-name-pattern='shared lessons' test/lessons.test.ts` | **1/1，通过，1.531 秒**；排序、5 条上限、非法证据、删除重放与 ROLE 原文不变 |
+| `node --test --test-name-pattern='Factory selects v2' test/journal-atomic.test.ts` | **1/1，通过，4.952 秒**；实际 Factory 黑板、Toolbox 权限和经验删除用户权限 |
+| `npm run typecheck` / `npm run build` | 通过；**26.7 MiB / 764 文件 / 2 个原有运行依赖包** |
+
+只读验收副本生成归属盘点 `v2-acceptance/D-ownership.json`。这份旧 journal 的 attempt.finished 没有 output，内置 pack 也无 outputKey，当前可证实的归属为 0 个字段；不从邻接事件猜测归属。新 v2 成功结果会记录实际输出键并建立、重启恢复归属。若旧投影有明确 output 则直接采用，无额外 journal 扫描。
+
+回归中曾发现并修复：测试工具替身没有 names 方法导致能力检测异常；Claude 普通任务被额外工具白名单破坏。能力检测已兼容原接口，Claude 仅允许本回合实际声明的工具，原测试断言保持。最初 Factory 新断言把 kind=gate 当作 kind=program，已按真实节点类型纠正该新增断言。失败日志保留在 TEMP，最终完整两文件测试 48/48。真实模型 10 站的 3 次改正与 1 次讨论室记录仍待最终运行，**本阶段定向测试不冒充 D.10 真实模型验收**。进入 E。

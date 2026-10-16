@@ -89,6 +89,9 @@ export interface StationContext {
   redo?: { reason: string; note?: string; byHuman: boolean };
   agentBudget?: AgentBudget;
   session?: SessionRef;
+  /** Keep this attempt's conversation while an answer releases its worker lease. */
+  waitForRoom?<T>(action: () => Promise<T>): Promise<T>;
+  checkpointSession?(checkpoint: NonNullable<StationResult['sessionCheckpoint']>): void;
   progress(text: string, step?: StepDetail): void;
   /** Observations remain journaled even when cancellation invalidates the output. */
   activity?(activity: ActivitySpan): void;

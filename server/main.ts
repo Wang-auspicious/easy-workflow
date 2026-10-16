@@ -160,6 +160,13 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, state);
     }
     if (p === "/api/browser" && req.method === "GET") return send(res, 200, await browserCommand({action:"state"}));
+    if (p === '/api/board' && req.method === 'GET') {
+      const item = url.searchParams.get('item');
+      if (!item) throw new ControlError(400, 'missing_item', '需要货 id');
+      if (!factory.board) throw new ControlError(410, 'kernel_v2_required', '黑板需要 v2 内核');
+      return send(res, 200, {posts: factory.board.read(item, {field: url.searchParams.get('field') ?? undefined}), rooms: factory.board.rooms(item)});
+    }
+    if (p === '/api/lessons/shared' && req.method === 'GET') return send(res, 200, {lessons: factory.lessons.sharedLessons(url.searchParams.get('node') ?? undefined)});
     if (p === "/api/events") {
       const since = Number(req.headers["last-event-id"] ?? url.searchParams.get("since") ?? 0);
       if (!Number.isSafeInteger(since) || since < 0) throw new ControlError(400, "invalid_cursor", "since 必须是非负整数");
@@ -271,6 +278,7 @@ const server = http.createServer(async (req, res) => {
         case "/api/business/feed": return send(res, 200, await control.execute("business_feed", b, "user"));
         case "/api/browser": return send(res, 200, (await control.execute("browser", b, "user")).result);
         case '/api/kernel/continue': return send(res, 200, await control.execute('continue_budget', b, 'user'));
+        case '/api/lessons/shared/delete': return send(res, 200, await control.execute('delete_shared_lesson', b, 'user'));
         case "/api/chat/abort": dispatcher.abort(); return send(res, 200, { ok: true });
         case "/api/chat/continue": {
           if (dispatcher.busy) return send(res, 202, { ok: true, accepted: true, turn: dispatcher.status.turn, status: dispatcher.status });

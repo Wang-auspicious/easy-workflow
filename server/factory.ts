@@ -4,18 +4,25 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {randomUUID} from 'node:crypto';
 import type {CompiledFactory, CompiledNode, ProjectAgentDefaults, Stamped, StationAgentBinding} from '../shared/types.ts';
 import { apply, initialState, latestRunTokens, tokenWorkKey, recoveryKey, validateState, serializeSnapshot, deserializeSnapshot, type FactoryState } from "../shared/project.ts";
 import { compile, type Patch } from "./spec/compile.ts";
 import { Journal } from "./journal.ts";
 import { Broker } from "./broker.ts";
 import { EvidenceStore } from "./evidence.ts";
-import { Runtime, type Executor, type ExecutorRegistration, type TokenRun } from "./runtime.ts";
-import { runAgentStation, type AgentStationDef } from "./agent-station.ts";
+import { Runtime, type Executor, type ExecutorRegistration, type TokenRun, type StationContext, type StationResult } from "./runtime.ts";
+import { runAgentStation, runStationDialogue, type AgentStationDef } from "./agent-station.ts";
 import { pack } from "../packs/vislexicon/pack.ts";
 import { TOOLS, canonical, type Services } from "../packs/vislexicon/tools.ts";
 import { agentDefs, warmStyleLib } from "../packs/vislexicon/agents.ts";
 import {Kernel} from './kernel/kernel.ts';
+import {asTokenRun} from './kernel/item.ts';
+import {BoardStore} from './board.ts';
+import {Collaboration, type CollaborationTurn} from './collaboration.ts';
+import {collaborationView, collaborationImages, collaborationPixels, judgeCollaboration} from './collaboration-views.ts';
+import type {EnvContext} from './toolbox.ts';
+import type {BoardPostInput} from '../shared/board.ts';
 import { loadCatalog, loadPublished, type CatalogEntry } from "../packs/vislexicon/env.ts";
 import { ControlError } from "./errors.ts";
 import { classifyFailure, type CandidateRecovery, type Failure } from "../shared/failures.ts";
@@ -29,7 +36,8 @@ import { preflight } from "./preflight.ts";
 import type { Alert } from "../shared/types.ts";
 import type { BrowserState } from "../shared/browser.ts";
 import { BatchSupervisor } from './batch.ts';
-import { browserCommand } from './browser.ts';
+import { browserCommand, openPage } from './browser.ts';
+import {visit, VIEW} from '../packs/vislexicon/capture.ts';
 import { loadWorkflowPacks, type LoadedWorkflowPacks } from './workflow-packs.ts';
 import { flushAtlas } from '../packs/vislexicon/components.ts';
 import { ChannelSupervisor } from './channels.ts';
@@ -93,6 +101,8 @@ export class Factory {
   modelCircuits!: ModelCircuits;
   private services!: Services;
   private stationAgents: Record<string, AgentStationDef> = {};
+  board?: BoardStore;
+  collaboration?: Collaboration;
   decisionModel: ReturnType<typeof projectDecisionClient> = null;
   private recoveryProjection = initialRecoveryProjection();
   private snapshotComponents: Snapshottable[] = [];
@@ -114,9 +124,151 @@ export class Factory {
     if (this.kernel === 'v2') {
       const kernel = new Kernel(compiled, this.journal, this.broker, conditions, executors);
       kernel.maxActiveItems = this.settings.maxActiveItems;
+      this.wireCollaboration(kernel, compiled);
       return kernel;
     }
     return new Runtime(compiled, this.journal, this.broker, conditions, executors);
+  }
+
+  private wireCollaboration(kernel: Kernel, compiled: CompiledFactory) {
+    const contracts = Object.assign({}, ...this.workflowPacks!.packs.map(pack => pack.contracts ?? {}));
+    const historical: Record<string, string[]> = {};
+    for (const attempt of Object.values(this.state.attempts).filter(attempt => attempt.ok && attempt.output && !Object.hasOwn(attempt.output, 'dialogue'))
+      .sort((left, right) => (left.endedAt ?? left.startedAt) - (right.endedAt ?? right.startedAt))) {
+      historical[attempt.node] = Object.keys(attempt.output!);
+    }
+    const board = new BoardStore(this.journal, compiled, contracts, historical);
+    const owner = (id: string, field: string) => {
+      const item = kernel.store.get(id);
+      if (!item) return undefined;
+      if (field === 'kind' && item.nodes[`${item.line}/kind-join`]) return `${item.line}/kind-join`;
+      return board.owners(item, field)[0];
+    };
+    const collaboration = new Collaboration(board, {
+      compiled, getItem: id => kernel.store.get(id), owner,
+      view: (id, node, field) => collaborationView(compiled, kernel.store.get(id)!.data, node, field),
+      runTurn: turn => this.runCollaborationTurn(kernel, turn),
+      programJudge: async (name, input) => {
+        const node = owner(input.itemId, input.field);
+        if (!node) return {decided: false};
+        const context = this.collaborationContext(kernel, input.itemId, node, `rules-${randomUUID()}`, new AbortController().signal);
+        return judgeCollaboration(name, context, input.posts, this.store);
+      },
+      evidenceText: (id, evidenceId) => {
+        const evidence = this.state.evidence[evidenceId];
+        if (!evidence || evidence.token !== id) return undefined;
+        const fragments: string[] = [];
+        const collect = (value: unknown, key = '') => {
+          if (typeof value === 'string' && ['quote', 'text', 'excerpt', 'body', 'verdict'].includes(key)) fragments.push(value);
+          else if (Array.isArray(value)) value.forEach(entry => collect(entry, key));
+          else if (value && typeof value === 'object') Object.entries(value).forEach(([name, entry]) => collect(entry, name));
+        };
+        collect(evidence);
+        const file = evidence.src && this.store.resolve(evidence.src);
+        if (file && /\.(?:txt|md|json|html)$/i.test(file) && fs.statSync(file).size <= 1_048_576) fragments.push(fs.readFileSync(file, 'utf8'));
+        return fragments.length ? fragments.join('\n') : undefined;
+      },
+      applyResolution: (id, field, value, node, room) => kernel.applyRoomResolution(id, field, value, node, room),
+      park: (id, node, reason) => kernel.parkCollaboration(id, node, reason),
+    });
+    kernel.configureCollaboration({board, answer: (question, signal) => collaboration.answer(question, signal),
+      runRoom: (room, signal) => collaboration.runRoom(room, signal),
+      openRoom: (item, field, topic) => {
+        const policy = compiled.rooms?.find(rule => rule.field === field || rule.field.endsWith('.*') && field.startsWith(rule.field.slice(0, -1)));
+        if (!policy) throw new ControlError(422, 'room_policy_missing', '该字段没有讨论室配置');
+        return board.createRoom({item, field, topic, participants: policy.participants, judge: policy.judge});
+      }});
+    this.board = board;
+    this.collaboration = collaboration;
+  }
+
+  private collaborationContext(kernel: Kernel, id: string, key: string, attempt: string, signal: AbortSignal): StationContext {
+    const item = kernel.store.get(id), node = kernel.nodes.get(key);
+    if (!item || !node) throw new ControlError(404, 'collaboration_node_missing', '答疑节点或货不存在');
+    return {token: asTokenRun(item), node, attempt, signal, session: item.nodes[key]?.session,
+      checkpointSession: checkpoint => kernel.saveDialogueSession(id, key, {sessionCheckpoint: checkpoint}),
+      worker: {id: `dialogue-${attempt}`, node: key, label: node.name, busy: id, idleSince: 0},
+      progress: (text, step) => { this.journal.append({kind: 'attempt.progress', attempt, text, ...(step ? {step} : {})}); },
+      activity: activity => { this.journal.append({kind: 'attempt.activity', attempt, activity}); },
+      addEvidence: input => {
+        const evidence = {...input, station: key, token: id, attempt, at: Date.now()};
+        this.journal.append({kind: 'evidence.added', evidence});
+        return evidence;
+      }};
+  }
+
+  private async runCollaborationTurn(kernel: Kernel, turn: CollaborationTurn): Promise<StationResult> {
+    const signal = turn.signal ?? new AbortController().signal;
+    await kernel.waitForStationIdle(turn.itemId, turn.node, signal);
+    const node = kernel.nodes.get(turn.node);
+    if (!node || !['agent', 'review'].includes(node.kind)) throw new ControlError(422, 'dialogue_not_agent', '只有 Agent 节点可以参加答疑');
+    const attempt = `dialogue-${randomUUID()}`, startedAt = Date.now();
+    const context = this.collaborationContext(kernel, turn.itemId, turn.node, attempt, signal);
+    let view = turn.view;
+    if (view.viewKind === 'dossier+home' && (!Array.isArray(view.images) || !view.images.length)) {
+      let screenshot = Object.values(this.state.evidence).filter(evidence => evidence.token === turn.itemId && evidence.label === '讨论首页截图').at(-1);
+      if (!screenshot) {
+        const browserLease = await this.broker.acquire('browser', {signal});
+        if (!browserLease) throw new ControlError(503, 'dialogue_resource', '讨论截图等待浏览器资源');
+        let close: (() => Promise<void>) | undefined;
+        try {
+          const browser = await openPage(VIEW, 'zh-CN', signal);
+          close = browser.close;
+          const url = context.token.url;
+          const result = await visit(browser.page, url, new URL(url).hostname);
+          if (result.issues.length) throw new ControlError(422, 'dialogue_capture_failed', result.issues.join('；'));
+          const bytes = await browser.page.screenshot({type: 'png'});
+          const stored = this.store.put(await EvidenceStore.webpAsync(bytes, 1280, 82, {signal}), 'webp');
+          screenshot = context.addEvidence({id: `room-home-${randomUUID()}`, kind: 'image', label: '讨论首页截图',
+            src: stored.src, tone: 'ok', meta: {href: browser.page.url(), role: 'identity'}});
+        } finally { try { await close?.(); } finally { browserLease.release(); } }
+      }
+      view = {...view, images: [{role: 'identity', src: screenshot.src, evidence: screenshot.id}], homeScreenshotAvailable: true};
+    }
+    const lease = await this.broker.acquire(node.resource, {signal});
+    if (!lease) throw new ControlError(503, 'dialogue_resource', '答疑资源暂不可用');
+    const request = {kind: turn.mode, prompt: turn.prompt, input: {text: JSON.stringify(view), images: collaborationImages(view, this.store)},
+      post: turn.post, posted: Boolean(turn.existingPost), read: () => turn.posts, model: turn.model, repairReason: turn.repairReason};
+    try {
+      request.input.text = JSON.stringify(await collaborationPixels(view, this.store, signal));
+      this.journal.atomic(() => {
+        kernel.store.saveAttempt({id: attempt, item: turn.itemId, node: turn.node, startedAt, status: 'running', body: {dialogue: turn.mode}});
+        this.journal.append({kind: 'attempt.started', attempt, token: turn.itemId, node: turn.node, worker: context.worker.id, input: `${turn.mode} 协作回合`});
+      });
+      const run = (definition: AgentStationDef, ctx: StationContext) => runStationDialogue(this.bindAgent(turn.node, definition), ctx, request);
+      const installed = this.workflowPacks?.executor(node, run);
+      const definition = this.stationAgents[turn.node];
+      const result = installed ? await installed(context) : definition ? await run(definition, context) : undefined;
+      if (!result) throw new ControlError(422, 'dialogue_definition_missing', '答疑节点没有执行契约');
+      this.journal.atomic(() => {
+        kernel.saveDialogueSession(turn.itemId, turn.node, result);
+        kernel.store.saveAttempt({id: attempt, item: turn.itemId, node: turn.node, startedAt, endedAt: Date.now(),
+          status: result.handoff ? 'handoff' : result.ok ? 'ok' : 'failed', body: {dialogue: turn.mode, ...result}});
+        this.journal.append({kind: 'attempt.finished', attempt, ok: result.ok, summary: result.summary,
+          ms: Date.now() - startedAt, queuedMs: 0, usage: result.usage, metrics: result.metrics, error: result.error});
+      });
+      return result;
+    } catch (error) {
+      const partial = error as Partial<StationResult>;
+      this.journal.atomic(() => {
+        if (partial.sessionCheckpoint) kernel.saveDialogueSession(turn.itemId, turn.node, {sessionCheckpoint: partial.sessionCheckpoint});
+        kernel.store.saveAttempt({id: attempt, item: turn.itemId, node: turn.node, startedAt, endedAt: Date.now(),
+          status: signal.aborted ? 'cancelled' : 'failed', body: {dialogue: turn.mode, error: '协作回合未完成'}});
+        this.journal.append({kind: 'attempt.finished', attempt, ok: false, summary: '协作回合未完成', ms: Date.now() - startedAt, queuedMs: 0});
+      });
+      throw error;
+    } finally { lease.release(); }
+  }
+
+  private async postBoard(context: EnvContext, input: BoardPostInput) {
+    if (!(this.runtime instanceof Kernel) || !this.board || !this.collaboration || !context.token) throw new ControlError(410, 'kernel_v2_required', '黑板需要 v2 内核');
+    const item = this.runtime.store.get(context.token);
+    if (!item) throw new ControlError(404, 'item_not_found', '没有这件货');
+    const post = this.board.addPost({...input, item, author: context.node});
+    if (post.type !== 'question') return {id: post.id};
+    const answer = () => this.collaboration!.answer(post, context.signal);
+    const reply = context.waitForRoom ? await context.waitForRoom(answer) : await answer();
+    return {id: post.id, answer: reply};
   }
 
   constructor(projectDirectory = VAR, options: {projectionOnly?: boolean} = {}) {
@@ -303,7 +455,11 @@ export class Factory {
     }
     if (process.env.FACTORY_READONLY !== "1" && this.state.digest !== this.compiled.digest) this.journal.append({ kind: "factory.loaded", digest: this.compiled.digest, specVersion: this.compiled.specVersion });
     this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, modelWorkers: this.settings.modelWorkers, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
-    this.toolbox = new Toolbox({ journal: this.journal, broker: this.broker, docs: () => this.docs });
+    this.toolbox = new Toolbox({journal: this.journal, broker: this.broker, docs: () => this.docs,
+      ...(this.kernel === 'v2' ? {board: {
+        read: (context: EnvContext, options: {field?: string; openOnly?: boolean}) => this.board?.read(context.token ?? '', options) ?? [],
+        post: (context: EnvContext, input: BoardPostInput) => this.postBoard(context, input),
+      }} : {})});
     const services: Services = {
       store: this.store, workDir: path.join(this.project.dir, 'work'), publishDir: path.join(this.project.dir, 'published'),
       tryBrowser:()=>this.broker.tryAcquire("browser"),
@@ -493,7 +649,8 @@ export class Factory {
   }
 
   private stationServices() {
-    return {docs: () => this.docs, toolbox: () => this.toolbox, journal: this.journal};
+    return {docs: () => this.docs, toolbox: () => this.toolbox, journal: this.journal,
+      activeLessons: (node: string) => this.lessons.activeFor(node)};
   }
 
   continueAgentBudget(item: string, node: string) {

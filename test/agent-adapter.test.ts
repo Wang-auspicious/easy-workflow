@@ -6,7 +6,7 @@ import path from "node:path";
 import http from 'node:http';
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
-import { configureAgentStations, runAgentStation, stationBudget, type AgentStationDef } from "../server/agent-station.ts";
+import { configureAgentStations, runAgentStation, runStationDialogue, stationBudget, type AgentStationDef } from "../server/agent-station.ts";
 import { Toolbox } from "../server/toolbox.ts";
 import { Broker } from "../server/broker.ts";
 import { Docs } from "../server/docs.ts";
@@ -20,7 +20,8 @@ import { ClosedStationAgent, closedAgentConfig, openStationMcp } from '../server
 import { ClaudeCodeProtocol, type ClaudeSessionReference } from '../server/claude-code.ts';
 import { EvidenceStore, type ImageProcessOptions } from '../server/evidence.ts';
 import { closeModelTransport, models, piStatus, probeModelConnection, redactModelError } from '../server/pi.ts';
-import type {ModelDependency, StationAgentBinding} from '../shared/types.ts';
+import type {CompiledFactory, ModelDependency, StationAgentBinding} from '../shared/types.ts';
+import {collaborationView, collaborationImages, collaborationPixels} from '../server/collaboration-views.ts';
 import { sessionSignature, type SessionRef } from '../server/station-session.ts';
 import {withModelAdmission} from '../server/model-requests.ts';
 import {closedModelDependency} from '../server/agent-bindings.ts';
@@ -226,6 +227,109 @@ async function contractFixture(reply: (index: number, request: Record<string, un
 
 const contractReminder = '你还没有调用 submit。请先对照下面的自检清单逐条确认，然后调用 submit 提交。若无法完成，调用 handoff 说明已完成的部分和缺失的部分。';
 const submitContract = (score = 2): ContractReply => ({tool: {name: 'submit', arguments: {score}}});
+
+test('D dialogue uses the original Pi history with scoped input and dedicated answer/turn endings', {timeout: 20000}, async () => {
+  const answer = {type: 'answer', field: 'proof', target: 'question-fixture', body: 'The observed proof is valid.', evidence: ['proof-evidence']};
+  const claim = {type: 'claim', field: 'proof', body: JSON.stringify({value: 'confirmed', reason: 'Observed proof'}), evidence: ['proof-evidence']};
+  await contractFixture(index => index === 1 ? {tool: {name: 'submit', arguments: {score: 2, note: 'original-submit-history-marker'}}}
+    : index === 2 ? {tool: {name: 'board_post', arguments: answer}}
+      : index === 3 ? {tool: {name: 'submit_answer', arguments: {}}}
+        : index === 4 ? {tool: {name: 'board_post', arguments: claim}}
+          : {tool: {name: 'submit_turn', arguments: {}}}, async fixture => {
+    let dialogue = false, inputs = 0, envelopes = 0, afters = 0;
+    const docs = {dir: fixture.dir, envelope: () => {
+      assert.equal(dialogue, false, 'a dialogue must not reread the full current PROJECT/CASE envelope');
+      envelopes++;
+      return {text: 'Original authorized envelope.', sizes: {role: 0, project: 0, context: 0, caseFile: 0}};
+    }} as unknown as Docs;
+    const definition: typeof fixture.definition = {...fixture.definition,
+      services: {docs: () => docs, toolbox: () => ({names: () => []}) as unknown as Toolbox},
+      input: () => {assert.equal(dialogue, false, 'dialogue must not rerun the original task input'); inputs++; return {text: 'original-only-input-marker'};},
+      after: output => {assert.equal(dialogue, false, 'answering a colleague must not rerun the business after hook'); afters++; return {ok: true, summary: 'original complete', data: output};},
+    };
+    const first = await runAgentStation(definition, fixture.context);
+    assert.equal(first.ok, true, first.error ?? 'Original task should submit');
+    assert.ok(first.sessionCheckpoint?.pi);
+    dialogue = true;
+    const posts: unknown[] = [], checkpoints: unknown[] = [];
+    const context: StationContext = {...fixture.context, attempt: 'answer-turn', session: first.sessionCheckpoint.pi,
+      token: {...fixture.context.token, data: {...first.data, proof: 'visible-proof', privateUnrelated: 'DO-NOT-LEAK-FULL-ITEM'}},
+      checkpointSession: value => checkpoints.push(value)};
+    const reply = await runStationDialogue(definition, context, {kind: 'answer',
+      prompt: '有同事提问：证据是否支持当前取值？请 board_post answer 后 submit_answer。',
+      input: {text: JSON.stringify({proof: 'visible-proof'})}, read: () => [],
+      post: value => {posts.push(value); return {id: 'answer-fixture'};}});
+    assert.equal(reply.ok, true, reply.error ?? 'Question must finish with submit_answer');
+    assert.deepEqual(posts, [answer]);
+    assert.equal(reply.sessionCheckpoint?.pi?.signature, first.sessionCheckpoint.pi.signature);
+    assert.deepEqual(reply.agentContract?.budget, {maxTokens: 8000, maxMs: 180000});
+    assert.match(JSON.stringify(fixture.requests[1]), /original-submit-history-marker/);
+    assert.ok(!JSON.stringify(fixture.requests.slice(1)).includes('DO-NOT-LEAK-FULL-ITEM'));
+    const room = await runStationDialogue(definition, {...context, attempt: 'room-turn', session: reply.sessionCheckpoint!.pi}, {
+      kind: 'room', prompt: '讨论室 proof，第 1/3 轮，请发一条 claim 后 submit_turn。',
+      input: {text: JSON.stringify({proof: 'visible-proof'})}, read: () => posts,
+      post: value => {(posts as unknown[]).push(value); return {id: 'claim-fixture'};}});
+    assert.equal(room.ok, true, room.error ?? 'Room must finish with submit_turn');
+    assert.equal(room.sessionCheckpoint?.pi?.signature, first.sessionCheckpoint.pi.signature);
+    assert.deepEqual(room.agentContract?.budget, {maxTokens: 12000, maxMs: 240000});
+    assert.deepEqual(posts, [answer, claim]);
+    assert.deepEqual([inputs, envelopes, afters], [1, 1, 1]);
+    assert.equal(fixture.requests.length, 5);
+    assert.ok(checkpoints.length >= 2, 'each persisted board post checkpoints its live original session');
+    const roomRequest = JSON.stringify(fixture.requests[3]);
+    assert.match(roomRequest, /original-only-input-marker/);
+    assert.match(roomRequest, /The observed proof is valid/);
+    assert.ok(!roomRequest.includes('DO-NOT-LEAK-FULL-ITEM'));
+    const tools = fixture.requests[3].tools as {function: {name: string}}[];
+    assert.deepEqual(tools.map(tool => tool.function.name).sort(), ['board_post', 'board_read', 'handoff', 'submit_turn']);
+    const saved = JSON.parse(fs.readFileSync(path.join(fixture.dir, room.sessionCheckpoint!.pi!.file), 'utf8'));
+    assert.match(saved.submitSummary, /original-submit-history-marker/, 'dialogue closers do not replace the original business submit summary');
+
+    const store = new EvidenceStore(path.join(fixture.dir, 'missing-evidence'), true);
+    const missingView = {viewKind: 'shots+pixels', images: [{role: 'proof', src: '/evidence/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.webp'}]};
+    const scoped = await collaborationPixels(missingView, store);
+    const missing = collaborationImages(scoped, store);
+    assert.equal(missing?.length, 1);
+    assert.equal(missing?.[0].file, '', 'a declared missing image must not disappear from model input');
+    const rejected = await runStationDialogue(definition, context, {kind: 'room', prompt: 'Review the declared image.',
+      input: {text: JSON.stringify(scoped), images: missing}});
+    assert.equal(rejected.failure?.tag, 'missing_artifact');
+    assert.equal(fixture.requests.length, 5, 'missing images stop before any model request');
+  });
+});
+
+test('D participant views expose only declared evidence and remain detached from item data', () => {
+  const compiled = {rooms: [
+    {field: 'kind', participants: ['c/classify', 'c/classify-review'], judge: 'c/arbiter', views: {'c/classify': 'dossier', 'c/classify-review': 'dossier+home'}},
+    {field: 'shots.*', participants: ['c/shot-review', 'c/style', 'c/reader'], judge: 'program:shot-rules', views: {'c/shot-review': 'shots+pixels', 'c/style': 'shots', 'c/reader': 'plan+sitemap'}},
+    {field: 'facts.*', participants: ['c/facts', 'c/fact-review'], judge: 'c/fact-review', views: {'c/facts': 'sources', 'c/fact-review': 'source-quotes'}},
+    {field: 'copy', participants: ['c/copy', 'c/copy-review'], judge: 'c/copy-review', views: {'c/copy': 'facts+style', 'c/copy-review': 'facts+style'}},
+  ]} as unknown as CompiledFactory;
+  const data = {dossier: {title: 'Public title', text: 'Dossier evidence', secret: 'nested-private', files: {sitemap: ['/evidence'], llms: 'Public rules'}},
+    images: [{role: 'identity', src: '/evidence/home.webp'}, {role: 'proof', src: '/evidence/proof.webp'}],
+    readerPlan: {proof: {url: 'https://fixture.invalid/evidence'}}, facts: {license: {value: 'MIT', quote: 'Original license line', evidence: 'license-evidence'}},
+    factPages: [{url: 'https://fixture.invalid/license', text: 'Source page text'}], style: {styles: ['plain']}, unrelated: 'private-unrelated'};
+  const classify = collaborationView(compiled, data, 'c/classify', 'kind');
+  assert.ok(!JSON.stringify(classify).includes('/evidence/') && !JSON.stringify(classify).includes('nested-private'));
+  const reviewer = collaborationView(compiled, data, 'c/classify-review', 'kind');
+  assert.equal((reviewer.images as unknown[]).length, 1);
+  assert.ok(JSON.stringify(reviewer).includes('home.webp') && !JSON.stringify(reviewer).includes('proof.webp'));
+  const beforeCapture = {...data, images: [], homeScreenshot: {src: '/evidence/room-home.webp', evidence: 'room-home', secret: 'capture-private'}};
+  const capturedHome = collaborationView(compiled, beforeCapture, 'c/classify-review', 'kind');
+  assert.equal(capturedHome.homeScreenshotAvailable, true);
+  assert.deepEqual(capturedHome.images, [{src: '/evidence/room-home.webp', evidence: 'room-home', role: 'identity'}]);
+  assert.ok(!JSON.stringify(collaborationView(compiled, beforeCapture, 'c/classify', 'kind')).includes('room-home'));
+  assert.deepEqual(Object.keys(collaborationView(compiled, data, 'c/style', 'shots.proof')).sort(), ['images', 'viewKind']);
+  assert.deepEqual(Object.keys(collaborationView(compiled, data, 'c/reader', 'shots.proof')).sort(), ['readerPlan', 'sitemap', 'viewKind']);
+  const copy = collaborationView(compiled, data, 'c/copy', 'copy');
+  assert.deepEqual(Object.keys(copy).sort(), ['facts', 'style', 'viewKind']);
+  (copy.facts as typeof data.facts).license.value = 'changed-in-view';
+  assert.equal(data.facts.license.value, 'MIT', 'view mutations cannot change the actual item');
+  for (const [node, field] of [['c/facts', 'facts.license'], ['c/fact-review', 'facts.license'], ['c/shot-review', 'shots.proof']]) {
+    const view = collaborationView(compiled, data, node, field);
+    assert.ok(!JSON.stringify(view).includes('private-unrelated'));
+  }
+});
 
 test('C contract retains two missing submissions and accepts the third in the same conversation', {timeout: 20000}, async () => {
   await contractFixture(index => index < 3 ? {text: `unfinished-turn-${index}`} : submitContract(), async fixture => {

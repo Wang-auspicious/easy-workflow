@@ -544,6 +544,15 @@ function definitions(f: Factory): Tool[] {
         },
       },
       {
+        name: 'delete_shared_lesson', label: '删除生效经验',
+        description: 'User removes a shared station lesson. Its journal history remains available for audit.',
+        parameters: object({id: name()}),
+        execute: async (_id, p, actor) => {
+          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '经验由用户删除');
+          return ok(f.lessons.deleteShared(p.id), '经验已停止注入');
+        },
+      },
+      {
         name: "read_lessons", label: "读取复盘经验", description: "Read pending, validated and approved lessons derived from completed runs. Draft lessons do not change production ROLE.md.",
         parameters: object({ id: Type.Optional(name()) }),
         execute: async (_id, p) => ok(p.id ? f.lessons.get(p.id) : f.lessons.list(), "读取复盘经验"),

@@ -35,6 +35,7 @@ export interface ItemState {
   source: string;
   data: Record<string, unknown>;
   nodes: Record<string, NodeState>;
+  roomHolds?: Record<string, {field: string; owner: string; nodes: string[]}>;
   status: ItemStatus;
   parked?: {node: string; reason: string; code: string; at: number};
   canary?: string;
@@ -119,6 +120,7 @@ function advanceMutable(item: ItemState, compiled: CompiledFactory, conditions: 
   if (!['queued', 'active'].includes(item.status)) return;
   const nodes = new Map(compiled.nodes.map(node => [node.key, node]));
   const incoming = new Map<string, typeof compiled.edges>();
+  const held = new Set(Object.values(item.roomHolds ?? {}).flatMap(room => room.nodes));
   for (const edge of compiled.edges) if (edge.kind === 'flow' && Object.hasOwn(item.nodes, edge.from) && Object.hasOwn(item.nodes, edge.to)) {
     const edges = incoming.get(edge.to) ?? [];
     edges.push(edge);
@@ -127,6 +129,7 @@ function advanceMutable(item: ItemState, compiled: CompiledFactory, conditions: 
   for (const key of topologicalOrder(compiled)) {
     if (!Object.hasOwn(item.nodes, key)) continue;
     const state = item.nodes[key];
+    if (held.has(key)) continue;
     if (state.status === 'pending') {
       const edges = incoming.get(key) ?? [];
       if (!edges.length || edges.some(edge => !['done', 'skipped'].includes(item.nodes[edge.from].status))) continue;
@@ -256,6 +259,12 @@ export function validateItem(value: unknown): ItemState {
           (handoff[key] as unknown[]).every(value => typeof value === 'string')))) {
       throw new TypeError('Invalid kernel handoff');
     }
+  }
+  if (value.roomHolds !== undefined && (!record(value.roomHolds) || Object.values(value.roomHolds).some(hold =>
+    !record(hold) || typeof hold.field !== 'string' || typeof hold.owner !== 'string' ||
+    !Object.hasOwn(value.nodes as object, hold.owner) || !Array.isArray(hold.nodes) ||
+    hold.nodes.some(key => typeof key !== 'string' || !Object.hasOwn(value.nodes as object, key))))) {
+    throw new TypeError('Invalid item discussion hold');
   }
   if (value.status === 'parked' && (!record(value.parked) || typeof value.parked.node !== 'string' ||
       typeof value.parked.reason !== 'string' || typeof value.parked.code !== 'string' || !count(value.parked.at))) {

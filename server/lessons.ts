@@ -390,6 +390,41 @@ export class Lessons implements Snapshottable {
   list(): LessonView[] {
     return structuredClone(this.views()) as LessonView[];
   }
+
+  sharedLessons(node?: string): import('../shared/lessons.ts').SharedLesson[] {
+    const lessons = new Map<string, import('../shared/lessons.ts').SharedLesson>();
+    for (const event of this.lessonEvents()) {
+      if (event.kind === 'lesson.shared') lessons.set(event.lesson.id, structuredClone(event.lesson));
+      else if (event.kind === 'lesson.deleted') {
+        const lesson = lessons.get(event.id);
+        if (lesson) lesson.status = 'deleted';
+      }
+    }
+    return [...lessons.values()].filter(lesson => (!node || lesson.node === node) && lesson.status !== 'deleted')
+      .sort((left, right) => right.at - left.at || left.id.localeCompare(right.id));
+  }
+
+  activeFor(node: string): string[] {
+    return this.sharedLessons(node).filter(lesson => lesson.status === 'active').slice(0, 5)
+      .map(lesson => lesson.text.slice(0, 300));
+  }
+
+  writeShared(lesson: import('../shared/lessons.ts').SharedLesson): void {
+    if (process.env.FACTORY_READONLY === '1') throw new ControlError(403, 'read_only', '只读项目不能写经验');
+    if (!lesson.id || !this.host.compiled.nodes.some(node => node.key === lesson.node) ||
+        !lesson.text.trim() || lesson.text.length > 300 || !Number.isSafeInteger(lesson.at) || lesson.at < 0 || !['active', 'canary'].includes(lesson.status) ||
+        !lesson.evidence.length || lesson.evidence.some(id => !this.host.state.attempts[id])) {
+      throw new ControlError(422, 'invalid_lesson', '经验必须关联真实工位、尝试证据，正文不超过 300 字');
+    }
+    this.host.journal.atomic(() => this.host.journal.append({kind: 'lesson.shared', lesson: structuredClone(lesson)}));
+  }
+
+  deleteShared(id: string): {id: string; deleted: true} {
+    if (process.env.FACTORY_READONLY === '1') throw new ControlError(403, 'read_only', '只读项目不能删除经验');
+    if (!this.sharedLessons().some(lesson => lesson.id === id)) throw new ControlError(404, 'lesson_not_found', '找不到这条跨货经验');
+    this.host.journal.atomic(() => this.host.journal.append({kind: 'lesson.deleted', id, actor: 'user'}));
+    return {id, deleted: true};
+  }
   get(id: string) {
     const found = this.views().find((l) => l.id === id);
     if (!found) throw new ControlError(404, "lesson_not_found", "找不到这条经验草案");

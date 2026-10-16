@@ -79,6 +79,24 @@ function fixture() {
   };
 }
 
+test('shared lessons inject five newest active entries and deletion survives replay without changing ROLE', () => {
+  const f = fixture();
+  try {
+    f.seed();
+    const evidence = Object.keys(f.f.state.attempts).slice(0, 1);
+    for (let index = 0; index < 7; index++) f.lessons.writeShared({id: `shared-${index}`, node: station,
+      text: `经验 ${index}`, evidence, at: index, status: 'active'});
+    f.lessons.writeShared({id: 'trial', node: station, text: '尚未生效', evidence, at: 100, status: 'canary'});
+    assert.deepEqual(f.lessons.activeFor(station), ['经验 6', '经验 5', '经验 4', '经验 3', '经验 2']);
+    assert.throws(() => f.lessons.writeShared({id: 'long', node: station, text: '长'.repeat(301), evidence, at: 101, status: 'active'}));
+    assert.throws(() => f.lessons.writeShared({id: 'fake', node: station, text: '虚构证据', evidence: ['missing'], at: 101, status: 'active'}));
+    f.lessons.deleteShared('shared-6');
+    assert.deepEqual(f.reload().activeFor(station), ['经验 5', '经验 4', '经验 3', '经验 2', '经验 1']);
+    assert.equal(fs.readFileSync(f.roleFile, 'utf8'), f.role);
+    assert.equal(f.lessons.activeFor('curation/style').length, 0);
+  } finally { f.close(); }
+});
+
 test("round-end review conserves candidate, return and every consultation observation, without leaking later frameworks", () => {
   const f = fixture();
   try {

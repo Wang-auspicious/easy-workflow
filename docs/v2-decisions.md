@@ -33,3 +33,8 @@
 - 2026-10-16 · C · v1 没有 waiting(budget) 节点状态 · v1 保存会话并转人工，handoff 不计失败且不启动自动重试；v2 按规范进入 waiting(budget) · 保留 v1 可运行，新增恢复状态由 v2 持有。
 - 2026-10-16 · C · 既有显式 def.timeoutMs 与程序 salvage 已承担安全和确定性修复职责 · 旧 deadline 保持独立，不降低新预算 3 分钟下限；salvage 结果仍须完全通过原 schema/check · 不放宽任何验收、工具权限或校验器。
 - 2026-10-16 · C · native/stdio 工具列表与提交参数校验可能在进入 Agent 修复计数前截断 · 更新实际 native 工具白名单及宿主提示；station submit 的 schema 错误由相同宿主校验返回工具错误并计数，其他 RPC/工具校验不变 · 确保闭源 Agent 与 Pi 的 submit/handoff 契约一致。
+- 2026-10-16 · D · SQL body 没有独立机器取值列 · 仅讨论室 claim 正文使用 JSON {value,reason}，普通自动 claim 继续使用 ≤300 字摘要 · 不加列、不改节点输出 schema，保持 JSON 深度一致判定可执行。
+- 2026-10-16 · D · 发帖与 submit_turn 之间可崩溃 · 房间 post 的 open/resolved 区分未提交／已提交，恢复未提交帖子只补终结工具；普通自动 claim 仅 supersede 普通 claim · 保护逐轮发言与提交收据，避免重启跳过未完成回合或普通结果改写房间历史。
+- 2026-10-16 · D · kind-join 为确定性合流且常在截图工位前发生 · kind 的恢复归属为 kind-join；复核员首次讨论时取得首页持久图证，后续轮复用；其余参与者依 view 严格选择输入 · 实现规格要求的非对称证据视图，保留原图、闸门、分类验收和输出 schema。
+- 2026-10-16 · D · 老 journal 未保存 attempt.output，无法可靠还原未声明字段归属 · 仅采用 pack outputKey、已有明确 output 或新 v2 成功结果，缺失时保持空并写盘点；不猜测并行 token.data 的归属 · 事实不足不伪造字段来源，新执行自动建立归属。
+- 2026-10-16 · D · 多个节点可以写同一顶层键（例如 shots） · 提问接受 owners 中任一合法 addressee，退回仍按拓扑最早归属；等待工具前保存原会话并释放模型工位名额 · 避免拒绝合法答疑与单名额死锁。
