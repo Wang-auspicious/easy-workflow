@@ -136,7 +136,7 @@ export async function buildDesktop() {
   const ruleSources = [
     [path.join(visRoot, 'Spec.md'), 'Spec.md'],
     ...['vocab.json', 'preview-rules.json'].map((name) => [path.join(visRoot, 'VisLexicon-browser-design-kit', 'frontend', 'public', 'spec', 'v1', name), path.join('public', 'spec', 'v1', name)]),
-    ...['style/site-style.mjs', 'ingest-v5/common.mjs'].map((name) => [path.join(visRoot, 'VisLexicon-browser-design-kit', 'frontend', 'scripts', name), path.join('scripts', name)]),
+    ...['style/site-style.mjs', 'style/style-contract.mjs', 'ingest-v5/common.mjs'].map((name) => [path.join(visRoot, 'VisLexicon-browser-design-kit', 'frontend', 'scripts', name), path.join('scripts', name)]),
     [path.join(visRoot, 'VisLexicon-browser-design-kit', 'frontend', 'src', 'data', 'curation-taxonomy.js'), path.join('src', 'data', 'curation-taxonomy.js')],
   ];
   // Check source availability before rebuilding UI or replacing a previous distribution.

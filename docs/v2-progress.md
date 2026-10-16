@@ -113,3 +113,9 @@ rg -n 'journal\.(read|readKinds|runs)|\.history\(' server
 - 构建后首组连续三次 ready 为 **5.683 / 2.867 / 2.900 秒**，**未通过**；完整记录见 `v2-acceptance/A-ready-after-bundle.json`。首轮 import→journal 已降至 **313 ms**；Factory 阶段 **3560 ms**，dispatcher 标记到 ready 仍有 **1746 ms**。继续定位其原因，不用后两次代替连续三次验收。
 - 不跑 snapshot CLI 的分发桌面全量启动 **9.831 秒 ready**，全量重放 **5.423 秒**，正常退出后六类快照齐全；见 `A-cold.json`，旧数据保留为 `A-cold-before-bundle.json`。
 - `npm run desktop:smoke -- --app=dist/desktop --standalone` **25 个检查全部通过**；见脱敏回执 `A-packaged-smoke.json`。该模式不连接原 VisLexicon 资料，实际验证分发资源、后端 Playwright 按需加载和本地浏览器操作。额外日志审查发现 **2 条资源加载警告**，正在定位；smoke 检查通过不能证明所有样式资源完整。
+
+两条资源警告均为原构建复制清单漏掉 `style-contract.mjs`。已在已批准的构建范围补充原样复制，构建通过（**755 文件 / 26.3 MiB**），源和副本 SHA-256 一致，直接导入分发 site-style.mjs 成功，checkStyle/salvage 导出存在；未修改规则正文或原仓库。
+
+进一步独立诊断发现 `Factory.boot → warmStyleLib → common.mjs → Playwright` 绕过 browser.ts 的按需加载。与正式连接资料配置相同的诊断里，listen=2489.5 ms、style完成=2932.0 ms、ready发送=2946.2 ms；ready 前案卷回填回调为 0。没有复现首轮 1746 ms 差额，不能将其全部归因；但确认该动态链会推迟 listen 回调。生成产物的诊断改动均已按原字节恢复。
+
+**等待站长决定（§0.4）**：请求只取消 Factory.boot 主动预热，样式节点继续首次使用时按原路径 await 加载校验库。具体边界与验证见 `v2-acceptance/A-style-load-followup.md`。本项尚未实施，完整 npm test 和源码 smoke 仍未获得最终通过，A 未通过、B 未开始。
