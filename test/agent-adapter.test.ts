@@ -6,7 +6,7 @@ import path from "node:path";
 import http from 'node:http';
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
-import { configureAgentStations, runAgentStation, type AgentStationDef } from "../server/agent-station.ts";
+import { configureAgentStations, runAgentStation, stationBudget, type AgentStationDef } from "../server/agent-station.ts";
 import { Toolbox } from "../server/toolbox.ts";
 import { Broker } from "../server/broker.ts";
 import { Docs } from "../server/docs.ts";
@@ -28,6 +28,7 @@ import {installWorkflowPack, type WorkflowManifest} from '../server/workflow-pac
 import {OpenCodeProtocol, validOpenCodeSession, type OpenCodeSessionReference} from '../server/opencode.ts';
 import {CodexProtocol, validCodexSession, type CodexSessionReference} from '../server/codex.ts';
 import {setTimeout as delay} from 'node:timers/promises';
+import {KernelStore} from '../server/kernel/store.ts';
 
 test("closed launcher receives envelope first, calls scoped MCP, repairs and reports real usage", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-closed-agent-test-"));
@@ -56,15 +57,20 @@ test("closed launcher receives envelope first, calls scoped MCP, repairs and rep
     assert.equal(result.metrics?.time?.modelCalls, 2);
     assert.equal(result.metrics?.time?.firstTokenMs, 16);
     assert.equal(result.metrics?.time?.outputMs, 24);
-    assert.equal(result.metrics?.time?.toolCalls, 8, "count actual env_call, env_help, submit and duplicate-submit executions in both answers");
+    assert.equal(result.metrics?.time?.toolCalls, 7, "count both env_call/env_help/submit rounds and the duplicate after the accepted submit");
     assert.equal(result.metrics?.activity?.modelTiming, "unavailable", "aggregate launcher durations cannot establish model interval boundaries");
-    assert.equal(result.metrics?.activity?.spans.length, 8);
+    assert.equal(result.metrics?.activity?.spans.length, 7);
     assert.ok(result.metrics?.activity?.spans.every(span => span.kind === "tool" && span.endedAt !== undefined));
     assert.equal(result.metrics?.activity?.spans.filter(span => span.status === "failed").length, 4);
     assert.ok(progress.some(p => p.includes("程序检查全部通过")));
     assert.ok(!progress.join("\n").includes("not-for-station"));
     assert.ok(fs.existsSync(path.join(dir, "work", "fixture-task")));
     const simple = { system: "fixture station contract", schema: Type.Object({ score: Type.Integer() }, { additionalProperties: false }), input: () => ({ text: "fixture input" }), after: () => ({ ok: true, summary: "done" }) };
+    process.env.FACTORY_STATION_MODEL = 'fixture-schema-probe';
+    const schemaProbe = await runAgentStation(simple, ctx);
+    assert.equal(schemaProbe.ok, true, schemaProbe.error ?? 'Schema repair must succeed');
+    assert.equal(schemaProbe.agentContract?.repairs, 1);
+    assert.equal(schemaProbe.agentContract?.rounds, 2);
     process.env.FACTORY_STATION_MODEL = "fixture-no-cache";
     const noCache = await runAgentStation(simple, ctx);
     assert.equal(noCache.ok, true); assert.equal(noCache.usage?.cacheRead, undefined); assert.equal(noCache.usage?.cacheWrite, undefined);
@@ -88,7 +94,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const args = process.argv.slice(1), value = flag => args[args.indexOf(flag) + 1];
 assert.equal(value('--tools'), ''); assert.equal(value('--permission-mode'), 'dontAsk');
+assert.ok(!args.includes('--max-turns'), 'the host budget must not be replaced by a twelve-turn CLI ceiling');
 assert.equal(value('--setting-sources'), ''); assert.ok(args.includes('--strict-mcp-config'));
+assert.deepEqual(value('--allowedTools').split(','), ['mcp__h2_station__env_help', 'mcp__h2_station__env_call', 'mcp__h2_station__submit', 'mcp__h2_station__handoff']);
 assert.ok(args.includes('--disable-slash-commands')); assert.ok(!args.includes('--dangerously-skip-permissions'));
 assert.equal(JSON.parse(value('--settings')).disableAllHooks, true);
 const resumed = args.includes('--resume'), id = value(resumed ? '--resume' : '--session-id');
@@ -102,7 +110,7 @@ process.stdin.on('end', async () => {
   const connection = JSON.parse(fs.readFileSync(mcp.env.EASY_WORKFLOW_STATION_CONNECTION, 'utf8'));
   const emit = event => process.stdout.write(JSON.stringify(event) + '\n');
   emit({ type: 'system', subtype: 'init', session_id: id, model: 'fixture-actual-claude',
-    tools: ['mcp__h2_station__env_help', 'mcp__h2_station__env_call', 'mcp__h2_station__submit'], mcp_servers: [{ name: 'h2_station', status: 'connected' }] });
+    tools: ['mcp__h2_station__env_help', 'mcp__h2_station__env_call', 'mcp__h2_station__submit', 'mcp__h2_station__handoff'], mcp_servers: [{ name: 'h2_station', status: 'connected' }] });
   const call = async (name, parameters) => {
     const response = await fetch(connection.url + '/call', { method: 'POST', headers: { authorization: 'Bearer ' + connection.token, 'content-type': 'application/json' }, body: JSON.stringify({ name, arguments: parameters }) });
     assert.equal(response.status, 200); return response.json();
@@ -147,6 +155,243 @@ const nativeContext = (id: string, data: Record<string, unknown> = {}) => ({
   token: { id, item: 'fixture-item', data }, node: { key: 'curation/reader' }, attempt: `attempt-${id}`,
   worker: { id: 'fixture-worker' }, signal: new AbortController().signal, progress: () => {},
 }) as unknown as StationContext;
+
+interface ContractReply {
+  text?: string;
+  tool?: {name: string; arguments: Record<string, unknown>};
+  tokens?: number;
+}
+
+interface ContractFixture {
+  dir: string;
+  requests: Record<string, unknown>[];
+  reads: () => number;
+  definition: AgentStationDef<{score: number; note?: string}>;
+  context: StationContext;
+}
+
+/** Real Pi transport and tool dispatch, with a deterministic local model only. */
+async function contractFixture(reply: (index: number, request: Record<string, unknown>) => ContractReply,
+  run: (fixture: ContractFixture) => Promise<void>) {
+  await nativeFixture(async (dir, reads) => {
+    const previousDirectory = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = dir;
+    const requests: Record<string, unknown>[] = [];
+    const server = http.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+      requests.push(body);
+      const next = reply(requests.length, body);
+      const delta = next.tool ? {role: 'assistant', tool_calls: [{index: 0, id: `contract-${requests.length}`,
+        type: 'function', function: {name: next.tool.name, arguments: JSON.stringify(next.tool.arguments)}}]}
+        : {role: 'assistant', content: next.text ?? 'I am still checking the fixture.'};
+      response.writeHead(200, {'content-type': 'text/event-stream'});
+      for (const part of [
+        {choices: [{index: 0, delta, finish_reason: null}]},
+        {choices: [{index: 0, delta: {}, finish_reason: next.tool ? 'tool_calls' : 'stop'}],
+          usage: {prompt_tokens: next.tokens ?? 10, completion_tokens: 0, total_tokens: next.tokens ?? 10}},
+      ]) response.write(`data: ${JSON.stringify({id: 'contract-fixture', model: 'contract-model', ...part})}\n\n`);
+      response.end('data: [DONE]\n\n');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as {port: number}).port;
+    fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify({contract: {type: 'api_key', key: 'local-contract-fixture'}}));
+    fs.writeFileSync(path.join(dir, 'models.json'), JSON.stringify({providers: {contract: {
+      api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/v1`,
+      models: [{id: 'contract-model', input: ['text']}],
+    }}}));
+    const definition: ContractFixture['definition'] = {
+      agent: {adapter: 'pi', provider: 'contract', model: 'contract-model'},
+      role: {station: 'curation/reader', path: 'fixture/ROLE.md', revision: 'contract-role-v1', content: 'Fixture reader role.'},
+      system: 'Fixture contract with strict program checks.',
+      schema: Type.Object({score: Type.Integer(), note: Type.Optional(Type.String())}, {additionalProperties: false}),
+      tools: ['fetch_text'], input: () => ({text: 'contract-original-input-marker'}),
+      check: output => output.score === 2 ? [] : ['score must be 2'],
+      after: output => ({ok: true, summary: 'contract accepted', data: output}),
+    };
+    const context = nativeContext('contract-fixture');
+    context.node = {...context.node, accept: ['Score equals 2', 'Evidence remains traceable']};
+    try {
+      await run({dir, requests, reads, definition, context});
+    } finally {
+      await closeModelTransport();
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      if (previousDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousDirectory;
+    }
+  });
+}
+
+const contractReminder = '你还没有调用 submit。请先对照下面的自检清单逐条确认，然后调用 submit 提交。若无法完成，调用 handoff 说明已完成的部分和缺失的部分。';
+const submitContract = (score = 2): ContractReply => ({tool: {name: 'submit', arguments: {score}}});
+
+test('C contract retains two missing submissions and accepts the third in the same conversation', {timeout: 20000}, async () => {
+  await contractFixture(index => index < 3 ? {text: `unfinished-turn-${index}`} : submitContract(), async fixture => {
+    const result = await runAgentStation(fixture.definition, fixture.context);
+    assert.equal(result.ok, true, result.error ?? 'Expected accepted submission');
+    assert.equal(fixture.requests.length, 3);
+    const history = JSON.stringify(fixture.requests.at(-1));
+    assert.ok(history.includes('unfinished-turn-1') && history.includes('unfinished-turn-2'));
+    assert.equal(history.split(contractReminder).length - 1, 2);
+    for (const accept of fixture.context.node.accept!) assert.ok(history.includes(accept));
+    assert.equal(result.agentContract?.reminders, 2);
+    assert.equal(result.agentContract?.ending, 'submit');
+    assert.equal(result.agentContract?.actualTokens, 30);
+    assert.ok(result.sessionCheckpoint?.pi, 'successful work must retain its reusable transcript');
+  });
+});
+
+test('C contract uses exactly three fixed reminders then saves a forced handoff', {timeout: 20000}, async () => {
+  await contractFixture(index => ({text: `never-submits-${index}`}), async fixture => {
+    const result = await runAgentStation(fixture.definition, fixture.context);
+    assert.equal(result.ok, false);
+    assert.equal(fixture.requests.length, 4);
+    assert.equal(JSON.stringify(fixture.requests.at(-1)).split(contractReminder).length - 1, 3);
+    assert.equal(result.agentContract?.reminders, 3);
+    assert.equal(result.agentContract?.ending, 'forced_handoff');
+    assert.equal(result.failure, undefined, 'contract exhaustion is a resumable handoff, not a no-submit failure');
+    assert.deepEqual(result.handoff, {done: [], evidence: [], remaining: fixture.context.node.accept,
+      suggestion: '模型未能在预算内完成'});
+    assert.ok(result.sessionCheckpoint?.pi);
+  });
+});
+
+test('C contract reports schema and program failures as tools before the third valid submit', {timeout: 20000}, async () => {
+  await contractFixture(index => index === 1 ? {tool: {name: 'submit', arguments: {score: 'two'}}}
+    : submitContract(index === 2 ? 0 : 2), async fixture => {
+    let accepted = 0;
+    const result = await runAgentStation({...fixture.definition, after: output => {
+      accepted++;
+      return {ok: true, summary: 'accepted only after both checks', data: output};
+    }}, fixture.context);
+    assert.equal(result.ok, true, result.error ?? 'Expected accepted submission');
+    assert.equal(accepted, 1);
+    assert.equal(fixture.requests.length, 3);
+    const messages = fixture.requests.at(-1)!.messages as {role: string; content: unknown}[];
+    const errors = messages.filter(message => message.role === 'tool').map(message => JSON.stringify(message.content));
+    assert.equal(errors.length, 2);
+    assert.match(errors[0], /score|integer|number/i);
+    assert.match(errors[1], /score must be 2/);
+    assert.ok(JSON.stringify(messages).includes('contract-original-input-marker'));
+    assert.equal(result.agentContract?.repairs, 2);
+    assert.equal(result.agentContract?.rounds, 3);
+    assert.equal(result.agentContract?.ending, 'submit');
+  });
+});
+
+test('C contract keeps all fifteen completed environment tools when budget permits', {timeout: 20000}, async () => {
+  await contractFixture(index => index <= 15 ? {tool: {name: 'env_call', arguments: {
+    name: 'fetch_text', arguments: {url: 'https://fixture.invalid/source'},
+  }}} : submitContract(), async fixture => {
+    const result = await runAgentStation(fixture.definition, {...fixture.context, agentBudget: {maxTokens: 1000, maxMs: 900000}});
+    assert.equal(result.ok, true, result.error ?? 'Expected accepted submission');
+    assert.equal(fixture.reads(), 15);
+    assert.equal(fixture.requests.length, 16);
+    assert.equal(result.metrics?.time?.toolCalls, 16);
+    assert.equal(result.agentContract?.actualTokens, 160);
+    assert.equal(result.agentContract?.ending, 'submit');
+  });
+});
+
+test('C contract requests handoff at ninety percent and records the explicit bounded handoff', {timeout: 20000}, async () => {
+  const handoff = {done: ['read source'], evidence: ['https://fixture.invalid/source'], remaining: ['verify score'], suggestion: 'Continue verification.'};
+  await contractFixture(index => index === 1 ? {text: 'Ninety percent of token budget consumed.', tokens: 90}
+    : {tool: {name: 'handoff', arguments: handoff}, tokens: 1}, async fixture => {
+    const result = await runAgentStation(fixture.definition, {...fixture.context, agentBudget: {maxTokens: 100, maxMs: 900000}});
+    assert.equal(result.ok, false);
+    assert.equal(fixture.requests.length, 2);
+    assert.match(JSON.stringify(fixture.requests[1]), /90%/);
+    assert.deepEqual(result.handoff, handoff);
+    assert.equal(result.agentContract?.ending, 'handoff');
+    assert.equal(result.agentContract?.actualTokens, 91);
+    assert.ok(result.sessionCheckpoint?.pi);
+  });
+});
+
+test('C contract forces a handoff at one hundred percent without spending another model request', {timeout: 20000}, async () => {
+  await contractFixture(() => ({text: 'Token budget exhausted before submitting.', tokens: 100}), async fixture => {
+    const result = await runAgentStation(fixture.definition, {...fixture.context, agentBudget: {maxTokens: 100, maxMs: 900000}});
+    assert.equal(result.ok, false);
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(result.agentContract?.ending, 'forced_handoff');
+    assert.equal(result.agentContract?.actualTokens, 100);
+    assert.deepEqual(result.handoff?.remaining, fixture.context.node.accept);
+    assert.equal(result.failure, undefined);
+    assert.ok(result.sessionCheckpoint?.pi);
+  });
+});
+
+test('C contract rejects an oversized handoff field within the same model conversation', {timeout: 20000}, async () => {
+  await contractFixture(index => index === 1 ? {tool: {name: 'handoff', arguments: {
+    done: ['x'.repeat(501)], evidence: [], remaining: ['verify score'], suggestion: 'Continue.',
+  }}} : submitContract(), async fixture => {
+    const result = await runAgentStation(fixture.definition, fixture.context);
+    assert.equal(result.ok, true, result.error ?? 'Expected accepted submission');
+    assert.equal(fixture.requests.length, 2);
+    const messages = fixture.requests[1].messages as {role: string; content: unknown}[];
+    assert.ok(messages.some(message => message.role === 'tool' && /500|maxLength|length/i.test(JSON.stringify(message.content))));
+    assert.equal(result.handoff, undefined);
+    assert.equal(result.agentContract?.ending, 'submit');
+  });
+});
+
+test('C contract redo preserves history and reason while a changed role starts with a bounded submit summary', {timeout: 20000}, async () => {
+  const previousNote = `prior-submit-summary-start-${'x'.repeat(2400)}-prior-submit-summary-tail`;
+  await contractFixture(() => ({tool: {name: 'submit', arguments: {score: 2, note: previousNote}}}), async fixture => {
+    const first = await runAgentStation(fixture.definition, fixture.context);
+    assert.equal(first.ok, true, first.error ?? 'Expected initial submission');
+    assert.ok(first.sessionCheckpoint?.pi);
+    const firstSaved = JSON.parse(fs.readFileSync(path.join(fixture.dir, first.sessionCheckpoint.pi.file), 'utf8'));
+    assert.equal(firstSaved.submitSummary.length, 2000);
+    const redo = {...fixture.context, attempt: 'attempt-redo', token: {...fixture.context.token, data: first.data!},
+      session: first.sessionCheckpoint.pi, redo: {reason: 'review found a missing citation', note: 'Keep the observed source.', byHuman: false}};
+    const second = await runAgentStation(fixture.definition, redo);
+    assert.equal(second.ok, true, second.error ?? 'Expected corrected submission');
+    assert.equal(second.sessionCheckpoint?.pi?.signature, first.sessionCheckpoint.pi.signature);
+    const resumed = JSON.stringify(fixture.requests[1]);
+    assert.ok(resumed.includes('prior-submit-summary-tail'), 'unchanged role receives the complete earlier conversation');
+    assert.ok(resumed.includes('审查退回：review found a missing citation\\nKeep the observed source.'));
+    assert.ok(resumed.includes('contract-original-input-marker'));
+    const third = await runAgentStation({...fixture.definition, role: {...fixture.definition.role!, revision: 'contract-role-v2'}}, redo);
+    assert.equal(third.ok, true, third.error ?? 'Expected submission under changed role');
+    assert.notEqual(third.sessionCheckpoint?.pi?.signature, first.sessionCheckpoint.pi.signature);
+    const restarted = JSON.stringify(fixture.requests[2]);
+    assert.ok(restarted.includes('prior-submit-summary-start-'));
+    assert.ok(!restarted.includes('prior-submit-summary-tail'), 'changed role may receive only the bounded prior submission summary');
+    const messages = fixture.requests[2].messages as {role: string}[];
+    assert.equal(messages.filter(message => message.role === 'assistant').length, 0, 'old assistant/tool history cannot cross a role signature change');
+  });
+});
+
+test('C contract default and explicit budgets retain the minimum time and measured token policy', async () => {
+  const definition = {system: 'budget fixture', schema: Type.Object({}), input: () => ({text: ''}), after: () => ({ok: true, summary: ''})};
+  const context = nativeContext('budget-policy');
+  assert.deepEqual(stationBudget(definition, context), {maxTokens: 60000, maxMs: 900000});
+  assert.deepEqual(stationBudget(definition, {...context, agentBudget: {maxTokens: 123, maxMs: 1}}), {maxTokens: 123, maxMs: 180000});
+  const journal = new Journal(':memory:');
+  const store = new KernelStore(journal);
+  const measured = {...definition, services: {journal, docs: () => {throw new Error('Budget lookup must not read docs');},
+    toolbox: () => {throw new Error('Budget lookup must not call tools');}}};
+  const save = (index: number, tokens: number, status: 'ok' | 'failed' = 'ok', node = context.node.key) => {
+    journal.atomic(() => store.saveAttempt({id: `budget-${index}`, item: 'budget-fixture', node,
+      startedAt: index, endedAt: index + 1, status,
+      body: {metrics: {tokenUsage: {input: tokens / 2, output: tokens / 4, cacheRead: tokens / 8, cacheWrite: tokens / 8}}}}));
+  };
+  try {
+    for (let index = 1; index <= 9; index++) save(index, 100);
+    assert.equal(stationBudget(measured, context).maxTokens, 60000, 'nine successes cannot establish the median budget');
+    save(10, 1000);
+    assert.equal(stationBudget(measured, context).maxTokens, 500, 'the tenth success enables the complete-usage median, including cache');
+    for (let index = 1; index <= 50; index++) save(index + 10, index);
+    save(61, 999999, 'failed');
+    save(62, 999999, 'ok', 'other/station');
+    assert.equal(stationBudget(measured, context).maxTokens, 128, 'only the latest fifty successes of this station determine the rounded median times five');
+  } finally {
+    journal.close();
+  }
+});
 
 test('explicit station bindings override compatibility defaults without sharing mutable commands', () => {
   const keys = ['FACTORY_STATION_COMMAND', 'FACTORY_STATION_MODEL', 'FACTORY_STATION_ADAPTER', 'FACTORY_STATION_TIMEOUT_MS', 'PATH'];
@@ -291,7 +536,7 @@ test('Pi and Claude bindings run concurrently, cancel independently and isolate 
 });
 
 test('closed station references are isolated by the selected model, command and adapter', { timeout: 15000 }, async () => {
-  await nativeFixture(async (_dir, reads) => {
+  await nativeFixture(async (dir, reads) => {
     const binding = { adapter: 'claude-code', command: [process.execPath, '-e', claudeFixture, '--'], model: 'binding-model', requestTimeoutMs: 10000 } satisfies StationAgentBinding;
     const definition: AgentStationDef<{ score: number }> = { agent: binding, system: 'Configuration signature fixture', schema: Type.Object({ score: Type.Integer() }), tools: ['fetch_text'],
       input: () => ({ text: 'native-restart' }), after: output => ({ ok: true, summary: 'done', data: output }) };
@@ -323,7 +568,11 @@ process.stdin.on('end', async () => {
     const result = await runAgentStation({ ...definition, agent: { adapter: 'launcher', command: [process.execPath, '-e', legacy], model: binding.model } }, nativeContext('binding-legacy', first.data));
     assert.equal(result.ok, true, result.error ?? 'Explicit legacy launcher failed');
     assert.deepEqual(result.metrics?.execution, { adapter: 'closed-command', model: 'actual-legacy-binding' });
-    assert.equal(result.usage?.cost, .002); assert.deepEqual(result.data?.closedStationSessions, {});
+    assert.equal(result.usage?.cost, .002);
+    assert.equal(result.sessionCheckpoint?.closed, undefined, 'a launcher cannot adopt a Claude native session');
+    assert.ok(result.sessionCheckpoint?.pi);
+    assert.notEqual(result.sessionCheckpoint.pi.signature, reference.signature);
+    assert.ok(fs.existsSync(path.join(dir, result.sessionCheckpoint.pi.file)));
   });
 });
 
@@ -391,7 +640,11 @@ test('legacy Pi checkpoints migrate only with verified receipt identity and neve
       assert.equal(migrated.signature, current.signature, 'the next save writes the new execution identity');
       mode = 'complete';
       const finished = await runAgentStation(definition, nativeContext('legacy-complete', { stationSessions: { 'curation/reader': migrated } }));
-      assert.equal(finished.ok, true); assert.equal(reads(), 1); assert.deepEqual(finished.data?.stationSessions, {});
+      assert.equal(finished.ok, true); assert.equal(reads(), 1);
+      assert.ok(finished.sessionCheckpoint?.pi);
+      assert.equal(finished.sessionCheckpoint.pi.signature, migrated.signature);
+      assert.deepEqual((finished.data?.stationSessions as Record<string, SessionRef>)['curation/reader'], finished.sessionCheckpoint.pi);
+      assert.ok(fs.existsSync(path.join(dir, finished.sessionCheckpoint.pi.file)));
       const changed = await runAgentStation({ ...definition, agent: { adapter: 'pi', provider: 'b', model: 'legacy-model' } }, nativeContext('legacy-other-provider', legacyData));
       assert.equal(changed.ok, true);
       assert.match(JSON.stringify(requests.at(-1)), /token=legacy-other-provider;/);
@@ -463,7 +716,12 @@ test('Claude station failures preserve signed sessions, read evidence and tool b
     const second = await runAgentStation(definition, nativeContext('retry', first.data));
     assert.equal(second.ok, true, second.error ?? 'Saved station should resume'); assert.equal(reads(), 1);
     assert.ok(Math.abs(second.usage!.cost - .05) < 1e-12);
-    assert.deepEqual(second.data?.closedStationSessions, {});
+    const retained = (second.data?.closedStationSessions as Record<string, ClaudeSessionReference>)['curation/reader'];
+    assert.equal(retained.id, reference.id);
+    assert.equal(retained.signature, reference.signature);
+    assert.deepEqual(second.sessionCheckpoint?.closed, retained);
+    assert.ok(second.sessionCheckpoint?.pi);
+    assert.ok(fs.existsSync(path.join(dir, second.sessionCheckpoint.pi.file)));
   });
 });
 
@@ -652,7 +910,7 @@ test('resumed Claude sessions accept fresh running history but invalidate change
 });
 
 test('runtime cancellation journals only host session metadata and resumes it in a new token', { timeout: 30000 }, async () => {
-  await nativeFixture(async (_dir, reads) => {
+  await nativeFixture(async (dir, reads) => {
     const pack: Pack = {
       id: 'adapter-runtime', name: 'Adapter runtime', blurb: 'Fixture', version: '1', resources: { model: 1, browser: 0, http: 0, cpu: 0 },
       lines: [line({ id: 'curation', name: 'Fixture', layer: 3, priority: 'mid', wired: true, blurb: 'Fixture',
@@ -680,7 +938,12 @@ test('runtime cancellation journals only host session metadata and resumes it in
       const retry = runtime.create('curation/reader', { item: token.item, url: '', source: 'fixture', data: structuredClone(token.data) });
       await runtime.settle();
       assert.equal(state.tokens[retry.id].status, 'published'); assert.equal(reads(), 1);
-      assert.equal(retry.data.accepted, true); assert.deepEqual(retry.data.closedStationSessions, {});
+      assert.equal(retry.data.accepted, true);
+      const retained = (retry.data.closedStationSessions as Record<string, ClaudeSessionReference>)['curation/reader'];
+      assert.equal(retained.id, reference.id);
+      assert.equal(retained.signature, reference.signature);
+      const transcript = (retry.data.stationSessions as Record<string, SessionRef>)['curation/reader'];
+      assert.ok(transcript && fs.existsSync(path.join(dir, transcript.file)), 'publication retains the completed conversation for a later correction');
 
       for (const changedEpoch of [false, true]) {
         let started!: () => void;

@@ -150,3 +150,22 @@ rg -n 'journal\.(read|readKinds|runs)|\.history\(' server
 | `npm run build` | 通过；**26.5 MiB / 760 文件 / 2 个原有运行依赖包** |
 
 完整 npm test 留待本次 B/C/D/E 功能固定后统一验证；分发 v2 桌面冒烟正在执行。真实模型 30 站与 60 秒状态记录尚未执行，**不把上述 fixture 结果冒充 B.17 通过**。按站长最新顺序要求进入 C 实现，默认切换与真实项目切换均未进行。
+
+B 提交 `7bdb6f3` 的冻结分发产物随后完成 `FACTORY_KERNEL=v2 npm run desktop:smoke -- --app=dist/desktop --standalone`：**25 项检查全部通过**，回执 `v2-acceptance/B-desktop-smoke.json`。
+
+### C 实现与定向验证
+
+Agent 以 token/时间预算取代 10 次工具硬上限；默认最近 50 次成功 attempt 的完整 token 用量中位数 ×5，不足 10 次用 60000，时间默认 15 分钟且至少 3 分钟。90% 请求 handoff，100% 强制交接；三次固定漏交提醒附 accept；原 schema 与程序检查在同会话返回工具错误，最多 3 次修复机会。Pi 和闭源 native/launcher 均支持 handoff，Claude 原 12 轮参数也移除，权限限制保持。
+
+正常提交、交接和取消检查点均保留会话；动态输入与退回理由不再改变签名，角色或稳定权限/模型身份变化才重开，并附之前提交摘要。Kernel 原子记录 handoff attempt/body、waiting(budget) 与会话引用；人工继续预算 ×2。v1 保留执行路径，交接转人工而不计失败重试。MCP 全局与其他工具仍严格验证；只有 station submit 将无效参数送到宿主的同一 schema 校验/修复计数入口。
+
+| 验证 | 结果 |
+|---|---|
+| `test/agent-adapter.test.ts` | **38 项通过**，含 9 个新增真实 SSE 假模型协议场景：漏交、修复、15 工具、90/100%预算、续会话、签名变更与预算统计 |
+| `node --test test/station-safety.test.ts` | 最终 **8/8，通过，27.401 秒**；真实闭源 MCP handoff、不执行 after、缓存用量计入、重复提交严格拒绝 |
+| `node --test --test-concurrency=1 test/kernel-graph.test.ts test/kernel-retry.test.ts` | **36/36，通过，2.70 秒**；增加原子预算等待／加倍续会话、v1 兼容、扩大 checkpoint closure 回归 |
+| `npm run typecheck` | 通过 |
+| `npm run build` | 通过；**26.5 MiB / 760 文件** |
+| `FACTORY_KERNEL=v1 npm run desktop:smoke` | **24 项全部通过**；回执 `C-desktop-smoke.json` |
+
+完整两文件复测曾为 44 pass / 2 fail（同一个新增 handoff 子例及父用例）：交接后重复 submit 虽被阻止但未带 isError；已修正为明确工具错误，并保留严格断言，随后 station-safety 全部通过。原有 Windows 安装 rename EPERM 也在早期尝试出现过，不隐去失败。真实 30 站的 no-submit/handoff 统计尚待最后实测，未伪造 C.4 验收。

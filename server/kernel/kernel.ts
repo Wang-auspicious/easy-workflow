@@ -3,7 +3,7 @@
 import crypto from 'node:crypto';
 import {Runtime, type TokenRun, type Executor, type ExecutorRegistration, type PreparedExecutor,
   type StationResult, type Fix, type StationContext} from '../runtime.ts';
-import type {CompiledFactory, CompiledNode, CompiledEdge, EvidenceRef, ModelDependency,
+import type {AgentBudget, CompiledFactory, CompiledNode, CompiledEdge, EvidenceRef, ModelDependency,
   ModelCircuit, ModelResponse, JournalEvent, TokenStatus} from '../../shared/types.ts';
 import type {FactoryState} from '../../shared/project.ts';
 import type {Broker, Lease} from '../broker.ts';
@@ -12,7 +12,7 @@ import {ControlError} from '../errors.ts';
 import {classifyFailure, candidateFailure, type Failure} from '../../shared/failures.ts';
 import {withModelAdmission} from '../model-requests.ts';
 import {browserAttemptScope, withBrowserAttempt} from '../browser.ts';
-import {createItem, advanceItem, completeNode, returnItem, asTokenRun, topologicalOrder,
+import {createItem, advanceItem, completeNode, returnItem, asTokenRun, topologicalOrder, closureOf,
   type ItemState} from './item.ts';
 import {KernelStore} from './store.ts';
 import {planFailure, nextModelFailure, claimModelProbe, modelProbeSucceeded, releaseModelProbe} from './retry.ts';
@@ -369,6 +369,8 @@ export class Kernel extends Runtime {
     const context: StationContext = {
       token: asTokenRun(initial), node, attempt: work.attempt, worker, signal: work.controller.signal,
       redo: initial.nodes[node.key].redo,
+      agentBudget: initial.nodes[node.key].agentBudget,
+      session: initial.nodes[node.key].session,
       progress: (text, step) => { if (!work.controller.signal.aborted && current()) this.journal.atomic(() => this.journal.append({kind: 'attempt.progress', attempt: work.attempt, text, step})); },
       activity: activity => { this.journal.atomic(() => this.journal.append({kind: 'attempt.activity', attempt: work.attempt, activity})); },
       addEvidence: evidence => {
@@ -396,7 +398,8 @@ export class Kernel extends Runtime {
       const failure = observed?.failure ?? classifyFailure(error, {url: initial.url,
         stage: node.kind === 'agent' || node.kind === 'review' ? 'model' : undefined});
       result = {ok: false, summary: failure.message, error: failure.message, failure,
-        usage: observed?.usage, metrics: observed?.metrics, sessionCheckpoint: observed?.sessionCheckpoint};
+        usage: observed?.usage, metrics: observed?.metrics, sessionCheckpoint: observed?.sessionCheckpoint,
+        agentContract: observed?.agentContract};
     }
     if (actualDependency) {
       result.metrics = {...result.metrics, dependency: actualDependency};
@@ -420,24 +423,41 @@ export class Kernel extends Runtime {
     const live = item.status === 'active' && state?.status === 'running' && state.lastAttempt === work.attempt;
     const interrupted = live && this.disposedV2;
     const cancelled = !live || work.controller.signal.aborted && !browserFault;
+    const handoff = !result.failure && !browserFault ? result.handoff : undefined;
     const ms = Date.now() - work.startedAt;
-    const status = interrupted ? 'interrupted' : cancelled ? 'cancelled' : result.ok ? 'ok' : 'failed';
+    const status = interrupted ? 'interrupted' : cancelled ? 'cancelled' : handoff ? 'handoff' : result.ok ? 'ok' : 'failed';
     this.store.saveAttempt({id: work.attempt, item: item.id, node: node.key, startedAt: work.startedAt,
       endedAt: Date.now(), status, body: {summary: result.summary, error: result.error,
-        usage: result.usage, metrics: result.metrics, evidence: work.evidence, queuedMs: work.queuedMs, output: cancelled ? undefined : result.data}});
-    this.journal.append({kind: 'attempt.finished', attempt: work.attempt, ok: result.ok && !cancelled,
-      cancelled: cancelled || interrupted, summary: interrupted ? '进程关闭，工位保留待恢复' : cancelled ? '已取消过期执行结果' : result.summary,
-      ms, queuedMs: work.queuedMs, error: interrupted ? 'interrupted' : cancelled ? 'stale' : result.error, usage: result.usage, metrics: result.metrics});
+        usage: result.usage, metrics: result.metrics, evidence: work.evidence, queuedMs: work.queuedMs,
+        agentContract: result.agentContract, handoff: result.handoff,
+        output: cancelled || handoff ? undefined : result.data}});
+    this.journal.append({kind: 'attempt.finished', attempt: work.attempt, ok: result.ok && !cancelled && !handoff,
+      cancelled: cancelled || interrupted || Boolean(handoff), summary: interrupted ? '进程关闭，工位保留待恢复' : cancelled ? '已取消过期执行结果' : result.summary,
+      ms, queuedMs: work.queuedMs, error: interrupted ? 'interrupted' : cancelled ? 'stale' : handoff ? 'handoff' : result.error, usage: result.usage, metrics: result.metrics});
     if (interrupted || cancelled) {
       if (work.dependency) {
         const circuit = this.circuitsV2.get(work.dependency.key);
         if (circuit && modelProbeSucceeded(circuit, item.id, node.key)) this.saveCircuit(releaseModelProbe(circuit, item.id, node.key));
       }
-      if (interrupted) { state.status = 'ready'; this.persist(before, item); }
+      if (interrupted) {
+        if (result.sessionCheckpoint?.pi) {
+          state.session = structuredClone(result.sessionCheckpoint.pi);
+          item.data.stationSessions = {...item.data.stationSessions as object, [node.key]: state.session};
+          this.journal.append({kind: 'token.data', token: item.id, patch: {stationSessions: item.data.stationSessions}});
+        }
+        if (result.sessionCheckpoint?.closed) {
+          item.data.closedStationSessions = {...item.data.closedStationSessions as object, [node.key]: result.sessionCheckpoint.closed};
+          this.journal.append({kind: 'token.data', token: item.id, patch: {closedStationSessions: item.data.closedStationSessions}});
+        }
+        state.status = 'ready';
+        this.persist(before, item);
+      }
       return;
     }
 
-    const data = {...result.data};
+    const data = handoff ? Object.fromEntries(['stationSessions', 'closedStationSessions']
+      .flatMap(key => result.data?.[key] ? [[key, result.data[key]]] : [])) : {...result.data};
+    if (result.agentContract) state.agentBudget = structuredClone(result.agentContract.budget);
     for (const key of ['stationSessions', 'closedStationSessions']) if (data[key]) {
       data[key] = {...item.data[key] as object, ...data[key] as object};
     }
@@ -454,6 +474,20 @@ export class Kernel extends Runtime {
     }
     for (const note of result.ok ? result.caseNotes ?? [] : []) this.journal.append({kind: 'case.noted', caseId: item.item,
       token: item.id, note: {station: node.key, section: note.section, text: note.text, by: node.key}});
+
+    if (handoff) {
+      state.status = 'waiting';
+      state.waitingFor = 'budget';
+      state.waitingSince = Date.now();
+      state.handoff = structuredClone(handoff);
+      delete state.nextAt;
+      delete state.lastFailure;
+      if (work.dependency && modelProbeSucceeded(this.circuitsV2.get(work.dependency.key), item.id, node.key)) {
+        this.clearCircuit(work.dependency);
+      }
+      this.persist(before, item);
+      return;
+    }
 
     if (!result.ok) {
       const failure = candidateFailure(result.failure ?? classifyFailure(result.error ?? result.summary,
@@ -496,7 +530,7 @@ export class Kernel extends Runtime {
       const circuit = this.circuitsV2.get(work.dependency.key);
       if (modelProbeSucceeded(circuit, item.id, node.key)) this.clearCircuit(work.dependency);
     }
-    delete state.redo; delete state.lastFailure;
+    delete state.redo; delete state.lastFailure; delete state.handoff; delete state.waitingSince;
     if (result.finish) {
       state.status = 'done'; item.status = 'excluded';
       this.disposition(item, node.key, result.finish.status === 'merged' ? 'resolved' : 'removed');
@@ -603,6 +637,33 @@ export class Kernel extends Runtime {
   override toManual(token: TokenRun, node: CompiledNode, reason: string) {
     this.atomicTransition(() => { const item = this.store.get(token.id); if (item) this.parkItem(item, node.key, reason, 'manual'); });
   }
+
+  continueBudget(itemId: string, key: string): {item: string; node: string; budget: AgentBudget} {
+    this.assertWritable();
+    const before = this.store.get(itemId);
+    const state = before?.nodes[key];
+    if (!before || !state) throw new ControlError(404, 'item_node_not_found', '找不到这件货的工位');
+    if (before.status !== 'active' || state.status !== 'waiting' || state.waitingFor !== 'budget') {
+      throw new ControlError(409, 'not_waiting_budget', '该工位当前没有等待预算继续');
+    }
+    if (!state.agentBudget) throw new ControlError(409, 'agent_budget_missing', '交接缺少原预算，无法安全继续');
+    const budget = {maxTokens: state.agentBudget.maxTokens * 2, maxMs: state.agentBudget.maxMs * 2};
+    if (!Number.isSafeInteger(budget.maxTokens) || !Number.isSafeInteger(budget.maxMs)) {
+      throw new ControlError(409, 'agent_budget_limit', '预算已超过可表示的范围');
+    }
+    this.atomicTransition(() => {
+      const next = structuredClone(before);
+      next.nodes[key].agentBudget = budget;
+      next.nodes[key].status = 'ready';
+      delete next.nodes[key].waitingFor;
+      delete next.nodes[key].waitingSince;
+      delete next.nodes[key].handoff;
+      delete next.nodes[key].nextAt;
+      this.persist(before, next, {from: 'budget-continued'});
+    });
+    this.schedule();
+    return {item: itemId, node: key, budget};
+  }
   override parkRecovery(token: TokenRun, station: string, reason: string) {
     const item = this.store.get(token.id);
     if (!item || !item.nodes[station]) return false;
@@ -661,16 +722,37 @@ export class Kernel extends Runtime {
   // These helpers are retained for explicit import/retry integrations. Mutable
   // TokenRun views never control scheduling until checkpoint is called.
   override checkpoint(token: TokenRun) {
+    const previous = this.store.get(token.id);
+    if (!previous) throw new ControlError(404, 'token_not_found', '没有这件货');
+    if (!this.nodes.has(token.entry)) throw new ControlError(422, 'invalid_checkpoint', '检查点入口不存在');
+    const closure = closureOf(this.f, token.entry);
+    if ([...token.done, ...token.dead, ...Object.keys(token.rounds), ...token.notes.keys()].some(key => !closure.has(key)) ||
+        Object.values(token.rounds).some(rounds => !Number.isSafeInteger(rounds) || rounds < 0)) {
+      throw new ControlError(422, 'invalid_checkpoint', '检查点包含流程外工位或无效轮数');
+    }
+    if (token.entry !== previous.entry && [...this.liveV2.values()].some(work => work.item === token.id)) {
+      throw new ControlError(409, 'checkpoint_active', '工位执行期间不能改变检查点入口');
+    }
     this.atomicTransition(() => {
-      const previous = this.store.get(token.id);
-      if (!previous) throw new ControlError(404, 'token_not_found', '没有这件货');
       const next = structuredClone(previous);
       next.data = structuredClone(token.data);
+      const fresh = createItem(this.f, {...previous, entry: token.entry, data: next.data, now: previous.createdAt});
+      next.entry = fresh.entry;
+      next.line = fresh.line;
+      next.nodes = Object.fromEntries(Object.entries(fresh.nodes).map(([key, node]) =>
+        [key, previous.nodes[key] ? structuredClone(previous.nodes[key]) : node]));
       for (const [key, node] of Object.entries(next.nodes)) {
         node.rounds = token.rounds[key] ?? node.rounds;
         node.redo = token.notes.get(key);
         if (token.done.has(key)) node.status = 'done';
         else if (token.dead.has(key)) node.status = 'skipped';
+        else if (next.entry !== previous.entry || node.status === 'done' || node.status === 'skipped') {
+          node.status = key === next.entry ? 'ready' : 'pending';
+          delete node.waitingFor;
+          delete node.nextAt;
+          delete node.waitingSince;
+          delete node.handoff;
+        }
       }
       next.data.runtimeCheckpoint = {version: 1, entry: next.entry,
         done: Object.keys(next.nodes).filter(key => next.nodes[key].status === 'done'), rounds: token.rounds, notes: [...token.notes]};
@@ -679,12 +761,23 @@ export class Kernel extends Runtime {
     });
   }
   override restoreCheckpoint(token: TokenRun) {
-    const checkpoint = token.data.runtimeCheckpoint as {version?: number; entry?: string; done?: string[]; rounds?: Record<string, number>; notes?: [string, NonNullable<ItemState['nodes'][string]['redo']>][]} | undefined;
-    if (checkpoint?.version !== 1 || !Array.isArray(checkpoint.done) || !checkpoint.entry || !this.nodes.has(checkpoint.entry)) return false;
-    token.entry = checkpoint.entry; token.closure = this.closureOf(token.entry);
-    token.done = new Set(checkpoint.done.filter(key => token.closure.has(key))); token.dead.clear();
-    token.rounds = {...checkpoint.rounds}; token.notes = new Map(checkpoint.notes ?? []);
-    this.checkpoint(token);
+    const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+    const checkpoint = token.data.runtimeCheckpoint;
+    if (!record(checkpoint) || checkpoint.version !== 1 || typeof checkpoint.entry !== 'string' ||
+        !this.nodes.has(checkpoint.entry) || !Array.isArray(checkpoint.done) || !record(checkpoint.rounds)) return false;
+    const closure = this.closureOf(checkpoint.entry);
+    if (checkpoint.done.some(key => typeof key !== 'string' || !closure.has(key)) ||
+        Object.entries(checkpoint.rounds).some(([key, rounds]) => !closure.has(key) || !Number.isSafeInteger(rounds) || Number(rounds) < 0)) return false;
+    const notes = checkpoint.notes ?? [];
+    if (!Array.isArray(notes) || notes.some(entry => !Array.isArray(entry) || entry.length !== 2 ||
+        typeof entry[0] !== 'string' || !closure.has(entry[0]) || !record(entry[1]) ||
+        typeof entry[1].reason !== 'string' || typeof entry[1].byHuman !== 'boolean' ||
+        entry[1].note !== undefined && typeof entry[1].note !== 'string')) return false;
+    const restored: TokenRun = {...token, entry: checkpoint.entry, closure,
+      done: new Set(checkpoint.done), dead: new Set(), rounds: {...checkpoint.rounds} as Record<string, number>,
+      notes: new Map(notes as [string, NonNullable<ItemState['nodes'][string]['redo']>][]) };
+    this.checkpoint(restored);
+    Object.assign(token, this.tokens.get(token.id));
     return true;
   }
   override restoreFlow(token: TokenRun) {

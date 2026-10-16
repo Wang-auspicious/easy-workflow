@@ -337,3 +337,68 @@ test('v2 channels create one deterministic child when the parent output is compl
       event.token === childId && event.status === 'published').length, 1);
   } finally {await kernel.close(); journal.close();}
 });
+
+test('v2 explicit checkpoints expand an earlier entry closure without dropping evidence or sessions', async () => {
+  const executed: string[] = [];
+  const fixture = reviewFixture('checkpoint-entry-expansion', async ctx => {
+    executed.push(ctx.node.key);
+    return {ok: true, summary: 'Checkpoint fixture completed'};
+  });
+  try {
+    fixture.kernel.pause();
+    const firstSession = {file: 'work/agent-sessions/earlier.json', signature: 'earlier'};
+    const secondSession = {file: 'work/agent-sessions/later.json', signature: 'later'};
+    const token = fixture.kernel.create('review/second', {item: 'checkpoint', url: '', source: 'fixture',
+      data: {evidence: ['preserved-evidence'], stationSessions: {'review/first': firstSession, 'review/second': secondSession}}});
+    assert.equal(fixture.kernel.store.get(token.id)?.nodes['review/first'], undefined);
+    token.data.runtimeCheckpoint = {version: 1, entry: 'review/first', done: [], rounds: {'review/first': 1},
+      notes: [['review/first', {reason: 'Resume original entry', byHuman: false}]]};
+    assert.equal(fixture.kernel.restoreCheckpoint(token), true);
+    const restored = fixture.kernel.store.get(token.id)!;
+    assert.equal(restored.entry, 'review/first');
+    assert.equal(restored.nodes['review/first'].status, 'ready');
+    assert.equal(restored.nodes['review/second'].status, 'pending', 'the old frontier must now wait for its newly restored predecessor');
+    assert.equal(restored.nodes['review/first'].rounds, 1);
+    assert.deepEqual(restored.nodes['review/first'].session, firstSession);
+    assert.deepEqual(restored.nodes['review/second'].session, secondSession);
+    assert.deepEqual(restored.data.evidence, ['preserved-evidence']);
+    const seq = fixture.journal.seq;
+    token.data.runtimeCheckpoint = {version: 1, entry: 'review/first', done: ['other/workflow'], rounds: {}};
+    assert.equal(fixture.kernel.restoreCheckpoint(token), false);
+    assert.equal(fixture.journal.seq, seq, 'invalid checkpoints do not append or mutate durable state');
+    assert.deepEqual(fixture.kernel.store.get(token.id), restored);
+    fixture.kernel.resume();
+    await fixture.kernel.settle();
+    assert.deepEqual(executed, ['review/first', 'review/second', 'review/check']);
+    assert.equal(fixture.kernel.store.get(token.id)?.status, 'published');
+  } finally {await fixture.close();}
+});
+
+test('v1 retains an agent handoff and its session without treating it as a retryable failure', async () => {
+  const compiled = compile([returnPack()]);
+  const journal = new Journal(path.join(root, 'v1-handoff.db'));
+  const state = initialState(compiled);
+  journal.subscribeProjection(event => apply(state, event));
+  const session = {file: 'work/agent-sessions/v1.json', signature: 'v1-fixture'};
+  const handoff = {done: ['Read source'], evidence: [], remaining: ['Verify output'], suggestion: 'Continue later'};
+  let calls = 0;
+  const runtime = new Runtime(compiled, journal, broker(), {}, () => async () => {
+    calls++;
+    return {ok: false, summary: 'Agent handed off', handoff, sessionCheckpoint: {pi: session},
+      agentContract: {budget: {maxTokens: 60_000, maxMs: 900_000}, actualTokens: 54_000, actualMs: 1000,
+        rounds: 4, reminders: 3, repairs: 0, ending: 'forced_handoff'}};
+  });
+  runtime.roleResolver = key => ({station: key, path: 'fixture/ROLE.md', revision: 'fixture', content: 'Return the explicit fixture handoff.'});
+  try {
+    runtime.ensureWorkers([]);
+    runtime.start('v1 handoff compatibility');
+    const token = runtime.create('review/first', {item: 'handoff', url: '', source: 'fixture'});
+    await runtime.settle();
+    assert.equal(calls, 1);
+    assert.equal(state.tokens[token.id].status, 'manual');
+    assert.deepEqual((token.data.stationSessions as Record<string, unknown>)['review/first'], session);
+    assert.deepEqual((token.data.agentHandoffs as Record<string, {handoff: unknown}>)['review/first'].handoff, handoff);
+    assert.equal(state.nodes['review/first'].failed, 0);
+    assert.equal(Object.keys(state.recoveries).length, 0);
+  } finally {await runtime.close(); journal.close();}
+});

@@ -493,7 +493,12 @@ export class Factory {
   }
 
   private stationServices() {
-    return {docs: () => this.docs, toolbox: () => this.toolbox};
+    return {docs: () => this.docs, toolbox: () => this.toolbox, journal: this.journal};
+  }
+
+  continueAgentBudget(item: string, node: string) {
+    if (!(this.runtime instanceof Kernel)) throw new ControlError(410, 'kernel_v2_required', '预算交接由 v2 内核处理');
+    return this.runtime.continueBudget(item, node);
   }
 
   private captureAgent(node: string, declared?: StationAgentBinding) {

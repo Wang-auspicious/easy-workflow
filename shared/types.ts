@@ -35,6 +35,28 @@ export interface StationRecoveryPolicy {
   exhausted: 'parked' | 'manual';
 }
 
+export interface AgentBudget {
+  maxTokens: number;
+  maxMs: number;
+}
+
+export interface AgentHandoff {
+  done: string[];
+  evidence: string[];
+  remaining: string[];
+  suggestion: string;
+}
+
+export interface AgentContractReport {
+  budget: AgentBudget;
+  actualTokens: number;
+  actualMs: number;
+  rounds: number;
+  reminders: number;
+  repairs: number;
+  ending: 'submit' | 'handoff' | 'forced_handoff';
+}
+
 export interface StationSpec {
   id: string;
   name: string;
@@ -42,6 +64,7 @@ export interface StationSpec {
   num?: string;
   role: Role;
   kind: StationKind;
+  budget?: Partial<AgentBudget>;
   /** Contract names; the compiler checks both ends of every flow edge agree. */
   input: string;
   output: string;

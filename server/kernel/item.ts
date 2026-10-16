@@ -1,6 +1,6 @@
 import type {Failure} from '../../shared/failures.ts';
 import type {TokenState} from '../../shared/project.ts';
-import type {CompiledFactory} from '../../shared/types.ts';
+import type {AgentBudget, AgentHandoff, CompiledFactory} from '../../shared/types.ts';
 import type {TokenRun} from '../runtime.ts';
 import type {SessionRef} from '../station-session.ts';
 
@@ -17,6 +17,9 @@ export interface NodeState {
   lastFailure?: Failure;
   lastAttempt?: string;
   session?: SessionRef;
+  agentBudget?: AgentBudget;
+  handoff?: AgentHandoff;
+  waitingSince?: number;
   redo?: {reason: string; note?: string; byHuman: boolean};
 }
 
@@ -187,7 +190,8 @@ export function returnItem(item: ItemState, compiled: CompiledFactory, target: s
     if (!Object.hasOwn(next.nodes, key)) continue;
     const previous = next.nodes[key];
     next.nodes[key] = {status: key === target ? 'ready' : 'pending', attempts: 0, rounds: previous.rounds,
-      ...(previous.session ? {session: previous.session} : {})};
+      ...(previous.session ? {session: previous.session} : {}),
+      ...(previous.agentBudget ? {agentBudget: previous.agentBudget} : {})};
   }
   next.nodes[target].redo = {reason: options.reason, byHuman: Boolean(options.byHuman),
     ...(options.note === undefined ? {} : {note: options.note})};
@@ -239,8 +243,18 @@ export function validateItem(value: unknown): ItemState {
   for (const node of Object.values(value.nodes)) {
     if (!record(node) || !['pending', 'ready', 'running', 'waiting', 'done', 'skipped', 'failed'].includes(String(node.status)) ||
         !count(node.attempts) || !count(node.rounds) || node.nextAt !== undefined && !count(node.nextAt) ||
-        node.session !== undefined && (!record(node.session) || typeof node.session.file !== 'string' || typeof node.session.signature !== 'string')) {
+        node.session !== undefined && (!record(node.session) || typeof node.session.file !== 'string' || typeof node.session.signature !== 'string') ||
+        node.agentBudget !== undefined && (!record(node.agentBudget) || typeof node.agentBudget.maxTokens !== 'number' ||
+          !Number.isFinite(node.agentBudget.maxTokens) || node.agentBudget.maxTokens <= 0 ||
+          typeof node.agentBudget.maxMs !== 'number' || !Number.isFinite(node.agentBudget.maxMs) || node.agentBudget.maxMs < 180_000) ||
+        node.waitingSince !== undefined && !count(node.waitingSince)) {
       throw new TypeError('Invalid kernel node');
+    }
+    const handoff = node.handoff;
+    if (handoff !== undefined && (!record(handoff) || typeof handoff.suggestion !== 'string' ||
+        !['done', 'evidence', 'remaining'].every(key => Array.isArray(handoff[key]) &&
+          (handoff[key] as unknown[]).every(value => typeof value === 'string')))) {
+      throw new TypeError('Invalid kernel handoff');
     }
   }
   if (value.status === 'parked' && (!record(value.parked) || typeof value.parked.node !== 'string' ||

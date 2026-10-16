@@ -29,3 +29,7 @@
 - 2026-10-16 · B · B.6 只说明 published/manual，现有 channel 的目标还有带 flow 下游的 inbox/pool 中转 store · v2 对这些中转节点记 done 并继续 B.6；无下游非 published store 停为 manual_store · B.13 的新货能够接替原 ChannelSupervisor 的库存消费，避免重复消费者或跨线永远停住。
 - 2026-10-16 · B · TokenState 未保存独立 entry/run 字段 · 迁移优先合法 runtimeCheckpoint.entry，其次 recoveryRoot/首个 attempt.node；run 从 token.created 所在 journal run 取值，已有 retriedBy 的旧记录不重复迁移 · 保留原任务身份及历史轮次，dry-run 不写表、快照或业务文件。
 - 2026-10-16 · B · 旧 run_batch API 使用 v1 入场目标，v2 不再写 batch.configured · v2 将目标全部持久排队，由 maxActiveItems 和资源限额分批执行，pause/resume 映射内核；configure 的 maxInFlight 兼容为 maxActiveItems · 保持入口可用，移除第二套入场与恢复调度。
+- 2026-10-16 · C · 默认预算缺少历史 attempts 表或有效成功样本 · 直接按不足 10 个样本使用 60000；不为估算预算新增启动全历史扫描 · token 用量计 input/output/cacheRead/cacheWrite，reasoning 已包含在 output 不重算。
+- 2026-10-16 · C · v1 没有 waiting(budget) 节点状态 · v1 保存会话并转人工，handoff 不计失败且不启动自动重试；v2 按规范进入 waiting(budget) · 保留 v1 可运行，新增恢复状态由 v2 持有。
+- 2026-10-16 · C · 既有显式 def.timeoutMs 与程序 salvage 已承担安全和确定性修复职责 · 旧 deadline 保持独立，不降低新预算 3 分钟下限；salvage 结果仍须完全通过原 schema/check · 不放宽任何验收、工具权限或校验器。
+- 2026-10-16 · C · native/stdio 工具列表与提交参数校验可能在进入 Agent 修复计数前截断 · 更新实际 native 工具白名单及宿主提示；station submit 的 schema 错误由相同宿主校验返回工具错误并计数，其他 RPC/工具校验不变 · 确保闭源 Agent 与 Pi 的 submit/handoff 契约一致。

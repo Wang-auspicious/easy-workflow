@@ -326,6 +326,15 @@ function definitions(f: Factory): Tool[] {
         if(!p.id)throw new ControlError(400,'missing_measurement','需要建议 id');
         return ok(f.runtime.decideMeasurement(p.id,p.action==='accept'),'已记录配员决定');
       }},
+      {
+        name: 'continue_budget', label: '继续交接会话',
+        description: 'The owner doubles this waiting station budget and resumes its saved conversation.',
+        parameters: object({item: name(), node: name()}),
+        execute: async (_id, p, actor) => {
+          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '预算交接由用户点击继续');
+          return ok(f.continueAgentBudget(p.item, p.node), '预算已加倍，从原会话继续');
+        },
+      },
       { name:'undo_correction',label:'撤销尚未执行的纠错',description:'Restore the durable snapshot of a correction before any new attempt has run. Executed corrections are rejected; all audit events are retained.',parameters:object({correction:name()}),execute:async(_id,p)=>ok(f.runtime.undoCorrection(p.correction),'已撤销未执行的纠错') },
       {
         name: 'candidate_failures',

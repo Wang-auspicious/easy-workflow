@@ -8,7 +8,7 @@ import {line, station, type Pack} from '../server/spec/dsl.ts';
 import {classifyFailure, type Failure, type FailureTag} from '../shared/failures.ts';
 import {apply, initialState} from '../shared/project.ts';
 import type {Executor, ExecutorRegistration, StationContext} from '../server/runtime.ts';
-import type {ModelDependency, StationRecoveryPolicy} from '../shared/types.ts';
+import type {AgentContractReport, AgentHandoff, ModelDependency, StationRecoveryPolicy} from '../shared/types.ts';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-kernel-retry-'));
 process.env.FACTORY_VAR = root;
@@ -18,6 +18,7 @@ const {Kernel} = await import('../server/kernel/kernel.ts');
 const {planFailure} = await import('../server/kernel/retry.ts');
 const {Journal} = await import('../server/journal.ts');
 const {Broker} = await import('../server/broker.ts');
+const {KernelStore} = await import('../server/kernel/store.ts');
 
 after(() => {
   assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
@@ -90,6 +91,74 @@ for (const tag of ['network_timeout', 'network_connection', 'network_dns', 'http
       await f.advance(600_000);
       assert.equal(calls, 4, 'an exhausted item cannot silently start another attempt');
     } finally {await f.close();}
+  });
+}
+
+for (const ending of ['handoff', 'forced_handoff'] as const) {
+  test(`v2 ${ending} commits budget waiting, preserves its session and continues only with doubled budget`, async t => {
+    const name = `contract-${ending.replaceAll('_', '-')}`;
+    const budget = {maxTokens: 60_000, maxMs: 900_000};
+    const session = {file: 'work/agent-sessions/fixture-first.json', signature: 'fixture-signature'};
+    const nextSession = {file: 'work/agent-sessions/fixture-next.json', signature: 'fixture-signature'};
+    const handoff: AgentHandoff = {done: ['Read the source'], evidence: ['fixture-evidence'],
+      remaining: ['Verify the output'], suggestion: 'Continue the same conversation'};
+    const report: AgentContractReport = {budget, actualTokens: 54_000, actualMs: 1000,
+      rounds: 4, reminders: 3, repairs: 0, ending};
+    const calls: {budget: StationContext['agentBudget']; session: StationContext['session']; redo: StationContext['redo']}[] = [];
+    const f = fixture(t, name, () => async ctx => {
+      calls.push({budget: ctx.agentBudget, session: ctx.session, redo: ctx.redo});
+      if (calls.length === 1) return {ok: false, summary: 'Budget handoff', handoff, agentContract: report,
+        sessionCheckpoint: {pi: session}, data: {incomplete: 'must not become business output'}};
+      return {ok: true, summary: 'Submitted', data: {complete: true}, sessionCheckpoint: {pi: nextSession},
+        agentContract: {...report, budget: ctx.agentBudget!, actualTokens: 400, reminders: 0, ending: 'submit'}};
+    });
+    const reader = new Journal(path.join(root, `${name}.db`), true);
+    const readStore = new KernelStore(reader);
+    const committed: {attempt: string; status: string | undefined; waiting: string | undefined}[] = [];
+    try {
+      const token = f.kernel.create('retry/work', {item: name, url: '', source: 'fixture'});
+      f.journal.subscribe(event => {
+        if (event.kind !== 'attempt.finished' || event.error !== 'handoff') return;
+        committed.push({attempt: event.attempt, status: readStore.attempt(event.attempt)?.status,
+          waiting: readStore.get(token.id)?.nodes['retry/work'].waitingFor});
+      });
+      await f.kernel.settle();
+      const item = f.kernel.store.get(token.id)!;
+      const node = item.nodes['retry/work'];
+      assert.equal(item.status, 'active');
+      assert.equal(item.parked, undefined);
+      assert.equal(node.status, 'waiting');
+      assert.equal(node.waitingFor, 'budget');
+      assert.equal(node.waitingSince, Date.now());
+      assert.equal(node.attempts, 0);
+      assert.deepEqual(node.session, session);
+      assert.deepEqual(node.agentBudget, budget);
+      assert.deepEqual(node.handoff, handoff);
+      assert.equal(item.data.incomplete, undefined);
+      const attempt = f.kernel.store.attempts(token.id)[0];
+      assert.equal(attempt.status, 'handoff');
+      assert.deepEqual(attempt.body.agentContract, report);
+      assert.deepEqual(attempt.body.handoff, handoff);
+      assert.deepEqual(committed, [{attempt: attempt.id, status: 'handoff', waiting: 'budget'}],
+        'another connection observes the attempt and waiting node together with their committed receipt');
+      assert.equal(f.state.nodes['retry/work'].failed, 0);
+      await f.advance(600_000);
+      assert.equal(calls.length, 1, 'budget waits do not auto-retry');
+      assert.deepEqual(f.kernel.continueBudget(token.id, 'retry/work').budget,
+        {maxTokens: 120_000, maxMs: 1_800_000});
+      await f.kernel.settle();
+      assert.equal(f.kernel.store.get(token.id)?.status, 'published');
+      assert.deepEqual(calls[1].session, session);
+      assert.deepEqual(calls[1].budget, {maxTokens: 120_000, maxMs: 1_800_000});
+      assert.deepEqual(f.kernel.store.get(token.id)?.nodes['retry/work'].session, nextSession);
+      assert.equal(f.kernel.store.attempts(token.id).filter(value => value.status === 'ok').length, 1);
+      assert.throws(() => f.kernel.continueBudget(token.id, 'retry/work'), {code: 'not_waiting_budget'});
+      assert.equal(f.kernel.returnToken(token, 'human', 'retry/work', 'Review correction', true), true);
+      await f.kernel.settle();
+      assert.deepEqual(calls[2].session, nextSession, 'a later review return retains the submitted conversation');
+      assert.deepEqual(calls[2].budget, {maxTokens: 120_000, maxMs: 1_800_000});
+      assert.equal(calls[2].redo?.reason, 'Review correction');
+    } finally {reader.close(); await f.close();}
   });
 }
 

@@ -4,7 +4,7 @@
 // Everything that changes state is journaled first.
 import crypto from "node:crypto";
 import { withModelAdmission } from './model-requests.ts';
-import type { ActivitySpan, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, ModelDependency, ModelResponse, ModelTokenUsage, StationAgentBinding, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
+import type { ActivitySpan, AgentBudget, AgentContractReport, AgentHandoff, AttemptMetrics, CompiledEdge, CompiledFactory, CompiledNode, EvidenceRef, ModelDependency, ModelResponse, ModelTokenUsage, StationAgentBinding, StepDetail, TokenStatus, Usage } from "../shared/types.ts";
 import { median, type FactoryState } from "../shared/project.ts";
 import { allocateResource } from './allocation.ts';
 import { classifyFailure, candidateFailure, failureLabels, type Failure } from "../shared/failures.ts";
@@ -87,6 +87,8 @@ export interface StationContext {
   };
   /** Set when this attempt re-runs a returned or corrected token. */
   redo?: { reason: string; note?: string; byHuman: boolean };
+  agentBudget?: AgentBudget;
+  session?: SessionRef;
   progress(text: string, step?: StepDetail): void;
   /** Observations remain journaled even when cancellation invalidates the output. */
   activity?(activity: ActivitySpan): void;
@@ -101,6 +103,8 @@ export interface StationResult {
   metrics?: AttemptMetrics;
   /** Host session metadata survives cancellation; business data never does. */
   sessionCheckpoint?: { pi?: SessionRef; closed?: ClosedSessionReference };
+  handoff?: AgentHandoff;
+  agentContract?: AgentContractReport;
   /** Structured notes for the item's case file (Spec §33). */
   caseNotes?: { section: string; text: string }[];
   error?: string;
@@ -925,6 +929,25 @@ export class Runtime {
       }
       this.journal.append({ kind: "attempt.finished", attempt, ok: false, cancelled:true, summary: "已取消：任务已退回或本轮已结束", ms, queuedMs, usage: res.usage, metrics: res.metrics, error: "stale" });
       if((t.nodeEpochs?.get(n.key)??0)===epoch)t.inflight.delete(n.key);
+      this.schedule();
+      return;
+    }
+    if (res.handoff && !res.failure) {
+      // v1 has no waiting(budget) state. Preserve the conversation and explicit
+      // handoff for manual continuation, without classifying a model failure.
+      const patch = {...retainedRecoverySessions(t, n.key, res),
+        agentHandoffs: {...t.data.agentHandoffs as object, [n.key]: {
+          handoff: res.handoff, agentContract: res.agentContract,
+        }}};
+      Object.assign(t.data, patch);
+      this.journal.append({kind: 'token.data', token: t.id, patch});
+      this.journal.append({kind: 'attempt.finished', attempt, ok: false, cancelled: true,
+        summary: res.summary, ms, queuedMs, error: 'handoff', usage: res.usage, metrics: res.metrics});
+      t.inflight.delete(n.key);
+      t.finished = true;
+      this.cancelTokenWork(t);
+      this.journal.append({kind: 'token.finished', token: t.id, node: n.key, status: 'manual',
+        reason: `Agent 预算交接，保留会话等待继续：${res.handoff.suggestion}`});
       this.schedule();
       return;
     }

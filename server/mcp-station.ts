@@ -21,7 +21,9 @@ import {closedModelDependency, resolveNativeCommand} from './agent-bindings.ts';
 
 export interface StationTool {
   name: string; label: string; description: string; parameters: TSchema;
-  execute: (id: string, args: any, signal?: AbortSignal) => Promise<{ content: { type: "text"; text: string }[] }>;
+  /** The station submit handler validates and counts same-session repairs. */
+  validateInTool?: boolean;
+  execute: (id: string, args: any, signal?: AbortSignal) => Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }>;
 }
 export interface ClosedSessionScope { projectDirectory: string; workDirectory: string }
 export interface ClosedAgentConfig {
@@ -116,7 +118,7 @@ function ownedWorkDirectory(scope: ClosedSessionScope, candidate: string, mustEx
 export async function openStationMcp(tools: StationTool[], signal: AbortSignal) {
   signal.throwIfAborted();
   // No control token, Factory, or control registry is present in this server.
-  const scoped = tools.filter(t => ["env_help", "env_call", "submit"].includes(t.name));
+  const scoped = tools.filter(t => ["env_help", "env_call", "submit", "handoff"].includes(t.name));
   const definitions: McpTool[] = scoped.map(t => ({ name: t.name, title: t.label, description: t.description, inputSchema: t.parameters }));
   const secret = crypto.randomBytes(32).toString("hex");
   const secrets = [secret, ...factorySecrets()];
@@ -139,12 +141,12 @@ export async function openStationMcp(tools: StationTool[], signal: AbortSignal) 
       if (!call || typeof call !== "object" || Array.isArray(call) || Object.keys(call).some(k => !["name", "arguments"].includes(k))) return send(400, { error: "Invalid tool request" });
       const tool = scoped.find(t => t.name === call.name);
       if (!tool) return send(403, { error: "Tool is not available to this station" });
-      if (!Check(tool.parameters, call.arguments ?? {})) return send(400, { error: "Tool arguments violate the station contract" });
       if (JSON.stringify(call.arguments ?? {}) !== JSON.stringify(redactValue(call.arguments ?? {}, secrets))) return send(400, { error: "Credentials cannot be submitted as tool arguments" });
+      if (!Check(tool.parameters, call.arguments ?? {}) && !(tool.name === 'submit' && tool.validateInTool)) return send(400, { error: "Tool arguments violate the station contract" });
       scopeSignal.throwIfAborted();
       const result = await tool.execute("station-mcp", call.arguments ?? {}, scopeSignal);
       // Only MCP content leaves the tool boundary; internal details are private.
-      send(200, { content: result.content });
+      send(200, {content: result.content, ...(result.isError ? {isError: true} : {})});
     } catch (err) {
       const text = redactText(err instanceof Error ? err.message : "Station tool failed", secrets);
       send(200, mcpText({ ok: false, error: text }, true));
@@ -210,6 +212,26 @@ export class ClosedStationAgent {
     this.workingDirectory = config.cwd;
   }
   abort() { this.controller?.abort(); }
+  messagesSnapshot(): unknown[] {
+    return structuredClone(this.messages);
+  }
+
+  restoreMessages(messages: unknown[]): void {
+    const valid = (value: unknown): value is Message => {
+      if (!value || typeof value !== 'object') return false;
+      const message = value as Record<string, unknown>;
+      if (!['user', 'assistant'].includes(String(message.role)) || !Array.isArray(message.content)) return false;
+      return message.content.every((part: unknown) => {
+        if (!part || typeof part !== 'object') return false;
+        const content = part as Record<string, unknown>;
+        return content.type === 'text' && typeof content.text === 'string' ||
+          content.type === 'image' && typeof content.data === 'string' && typeof content.mimeType === 'string';
+      });
+    };
+    if (!messages.every(valid)) throw new TypeError('Invalid saved station messages');
+    this.messages = structuredClone(messages);
+  }
+
   configureSession(station: string, signature: string, saved?: unknown, readContext?: () => NonNullable<ClaudeSessionReference['context']>) {
     if (!['claude-code', 'opencode', 'codex'].includes(this.config.adapter ?? 'launcher')) return;
     this.signature = signature;
@@ -294,7 +316,11 @@ export class ClosedStationAgent {
       execute: async (id: string, args: unknown, signal?: AbortSignal) => {
         try {
           const result = await withModelTool(releaseCapacity, () => tool.execute(id, args, signal), failure => {capacityFailure = failure;});
-          if (tool.name === 'submit') this.messages.push({ role: 'assistant', content: [{ type: 'text', text: `submit: ${JSON.stringify(args)}` }] });
+          if (tool.name === 'submit' || tool.name === 'handoff') this.messages.push({ role: 'assistant', content: [{ type: 'text', text: `${tool.name}: ${JSON.stringify(args)}` }] });
+          if (tool.name === 'submit' && result.isError) {
+            this.messages.push({role: 'user', content: [{type: 'text',
+              text: `程序校验错误（工具结果）：${redactText(JSON.stringify(result.content), factorySecrets())}`} ]});
+          }
           return result;
         } finally {
           if (this.session) this.saveSession(this.session);

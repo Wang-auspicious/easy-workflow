@@ -270,6 +270,7 @@ const server = http.createServer(async (req, res) => {
         case "/api/correct/undo": return send(res, 200, await control.execute("undo_correction", b, "user"));
         case "/api/business/feed": return send(res, 200, await control.execute("business_feed", b, "user"));
         case "/api/browser": return send(res, 200, (await control.execute("browser", b, "user")).result);
+        case '/api/kernel/continue': return send(res, 200, await control.execute('continue_budget', b, 'user'));
         case "/api/chat/abort": dispatcher.abort(); return send(res, 200, { ok: true });
         case "/api/chat/continue": {
           if (dispatcher.busy) return send(res, 202, { ok: true, accepted: true, turn: dispatcher.status.turn, status: dispatcher.status });

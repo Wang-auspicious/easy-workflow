@@ -44,7 +44,8 @@ export function controlMcp(file?: string): McpBackend {
 }
 
 export function stationMcp(file: string): McpBackend {
-  return { name: "easy-workflow-station", instructions: "Follow the Easy Workflow station envelope in your first message. Only env_help, env_call and submit are available for this attempt.",
+  return { name: "easy-workflow-station", instructions: "Follow the Easy Workflow station envelope in your first message. Only env_help, env_call, submit and handoff are available for this attempt. End through submit or handoff.",
+    validateInBackend: name => name === 'submit',
     tools: async signal => (await mcpRequest(file, "h2-station/1", "/tools", undefined, signal)).tools,
     call: async (name, args, signal) => mcpRequest(file, "h2-station/1", "/call", { name, arguments: args }, signal) };
 }

@@ -48,7 +48,7 @@ export class Toolbox {
     return {
       ok: true,
       tools: allowed.map((n) => ({ name: n, description: this.defs.get(n)?.description.split("。")[0] })),
-      environment: "网络走统一出口（自动代理、按主机限速、短暂错误自动重试一次、结果缓存 6 小时）。page_* 在共享浏览器里渲染页面，会自动拒绝 Cookie、隐藏浮层；遇到登录或验证会保留页面并亮红灯，你不需要也不能自己登录。证书错误不会被跳过。每次处理最多调用 10 次工具，用完请根据已有资料提交。",
+      environment: "网络走统一出口（自动代理、按主机限速、短暂错误自动重试一次、结果缓存 6 小时）。page_* 在共享浏览器里渲染页面，会自动拒绝 Cookie、隐藏浮层；遇到登录或验证会保留页面并亮红灯，你不需要也不能自己登录。证书错误不会被跳过。在本工位的 token 与时间预算内使用工具；完成后 submit，无法完成时 handoff。",
     };
   }
 

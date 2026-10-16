@@ -10,6 +10,8 @@ export interface McpTool {
 export interface McpResult { content: { type: "text"; text: string }[]; isError?: boolean }
 export interface McpBackend {
   name: string; instructions: string;
+  /** A scoped host may validate a submission to count same-session repairs. */
+  validateInBackend?: (name: string) => boolean;
   tools: (signal?: AbortSignal) => Promise<McpTool[]> | McpTool[];
   call: (name: string, args: Record<string, unknown>, signal: AbortSignal) => Promise<McpResult>;
 }
@@ -61,7 +63,7 @@ export class McpPeer {
               const tool = (await this.backend.tools(controller.signal)).find(t => t.name === params.name);
               if (!tool) throw new RpcError(-32602, "Unknown tool");
               const args = params.arguments ?? {};
-              if (!Check(tool.inputSchema, args)) throw new RpcError(-32602, [...Errors(tool.inputSchema, args)].slice(0, 4).map(e => `${e.instancePath}: ${e.message}`).join("; "));
+              if (!Check(tool.inputSchema, args) && !this.backend.validateInBackend?.(tool.name)) throw new RpcError(-32602, [...Errors(tool.inputSchema, args)].slice(0, 4).map(e => `${e.instancePath}: ${e.message}`).join("; "));
               controller.signal.throwIfAborted();
               try { result = await this.backend.call(tool.name, args as Record<string, unknown>, controller.signal); }
               catch (err) { result = mcpText({ ok: false, error: err instanceof Error ? err.message : "Tool execution failed" }, true); }
