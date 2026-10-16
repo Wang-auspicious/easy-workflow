@@ -120,6 +120,41 @@ test("LESSONS and pending CONTEXT persist from journal; private notes and stable
   } finally { f.close(); }
 });
 
+test('unchanged lessons skip writes while revisions and missing lessons or context files are repaired', t => {
+  const f = fixture();
+  try {
+    const file = path.join(f.dir, 'LESSONS.md');
+    // Missing-file recovery uses this existing default heading; human/template
+    // text outside the managed block cannot be recreated from journal events.
+    fs.writeFileSync(file, '# 经验（LESSONS）\n');
+    const draft = f.seed();
+    const original = fs.readFileSync(file, 'utf8');
+    const write = t.mock.method(fs, 'writeFileSync');
+    f.lessons.write();
+    assert.equal(write.mock.callCount(), 0, 'identical lessons and contexts require no file write');
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+
+    const context = f.docs.contextFile(station);
+    const contextBody = fs.readFileSync(context, 'utf8');
+    fs.unlinkSync(context);
+    f.lessons.write();
+    assert.equal(fs.readFileSync(context, 'utf8'), contextBody,
+      'unchanged LESSONS must still repair a missing station context');
+    assert.equal(write.mock.calls.filter(call => call.arguments[0] === file).length, 0);
+
+    f.lessons.revise(draft.id, {digest: draft.digest, suggestion: 'Changed fixture lesson with direct evidence.'}, 'user');
+    assert.equal(write.mock.calls.filter(call => call.arguments[0] === file).length, 1);
+    const revised = fs.readFileSync(file, 'utf8');
+    assert.match(revised, /Changed fixture lesson with direct evidence/);
+    fs.unlinkSync(file);
+    f.lessons.write();
+    assert.equal(fs.readFileSync(file, 'utf8'), revised, 'a missing lessons document is regenerated');
+    assert.equal(write.mock.calls.filter(call => call.arguments[0] === file).length, 2);
+    f.lessons.write();
+    assert.equal(write.mock.calls.filter(call => call.arguments[0] === file).length, 2);
+  } finally { f.close(); }
+});
+
 test('ordinary context reads retain only lesson records and do not rebuild the view for business events', t => {
   const f = fixture();
   try {
@@ -141,7 +176,20 @@ test('ordinary context reads retain only lesson records and do not rebuild the v
     assert.ok(!JSON.stringify(cache.cachedLessonEvents).includes(marker));
     const returned = f.lessons.list();
     returned[0].suggestion = 'External mutation';
+    returned[0].observations[0].framework.push('external framework');
     assert.deepEqual(f.lessons.list(), expected, 'callers still receive detached views');
+    const fetched = f.lessons.get(draft.id);
+    fetched.observations[0].message = 'External nested mutation';
+    fetched.framework.push('external framework');
+    assert.deepEqual(f.lessons.get(draft.id), expected[0], 'get also returns a detached nested view');
+    const clone = t.mock.method(globalThis, 'structuredClone');
+    const rendered = f.lessons.render();
+    for (const node of [station, 'dispatcher', 'curation/copy']) {
+      f.lessons.pendingContext(node);
+      assert.equal(f.lessons.render(), rendered);
+    }
+    assert.equal(clone.mock.callCount(), 0, 'internal context and document rendering do not clone the full lesson cache');
+    clone.mock.restore();
 
     f.create('ordinary', 'ordinary');
     f.emit({kind: 'attempt.started', attempt: 'ordinary-active', token: 'ordinary', node: station,

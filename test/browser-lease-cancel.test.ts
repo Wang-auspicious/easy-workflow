@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fork } from 'node:child_process';
+import {fork, spawn} from 'node:child_process';
 import path from 'node:path';
 import http from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -56,5 +56,80 @@ test('cancellation during CDP connection returns promptly and releases the nativ
   } finally {
     if (child.exitCode === null) { child.kill(); await exited; }
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('concurrent desktop leases share the pending lazy CDP connection and both release on cancellation', {timeout: 15000}, async () => {
+  let resolveDiscovery!: () => void;
+  const discovered = new Promise<void>(resolve => { resolveDiscovery = resolve; });
+  const responses: http.ServerResponse[] = [];
+  const server = http.createServer((_request, response) => {
+    responses.push(response);
+    resolveDiscovery();
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const endpoint = `http://127.0.0.1:${(server.address() as {port: number}).port}`;
+  const source = `
+    import {openPage, closeBrowser} from ${JSON.stringify(new URL('../server/browser.ts', import.meta.url).href)};
+    const controller = new AbortController();
+    process.on('message', message => {
+      if (message?.type === 'test:cancel') controller.abort(new Error('cancelled shared CDP'));
+    });
+    const results = await Promise.allSettled([
+      openPage(undefined, undefined, controller.signal),
+      openPage(undefined, undefined, controller.signal),
+    ]);
+    if (results.some(result => result.status !== 'rejected' || result.reason.message !== 'cancelled shared CDP')) {
+      throw new Error('Both pending leases must be cancelled');
+    }
+    process.send({type: 'test:aborted'});
+    await closeBrowser();
+    process.exit(0);
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+    env: {...process.env, FACTORY_BROWSER_BRIDGE: '1'}, windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  let stderr = '';
+  let leases = 0;
+  const releases = new Set<string>();
+  let resolveCancelled!: () => void;
+  const cancelled = new Promise<void>(resolve => { resolveCancelled = resolve; });
+  const exited = new Promise<number | null>((resolve, reject) => {
+    child.once('exit', resolve);
+    child.once('error', reject);
+  });
+  child.stderr!.on('data', value => { stderr += value; });
+  child.on('message', (message: any) => {
+    if (message.type === 'test:aborted') resolveCancelled();
+    if (message.type !== 'browser:request') return;
+    if (message.args.action === 'lease') {
+      const id = `concurrent-page-${++leases}`;
+      child.send({type: 'browser:reply', id: message.id, result: {id, marker: `about:blank#${id}`, endpoint}});
+    } else if (message.args.action === 'release') {
+      assert.equal(message.args.discard, true);
+      releases.add(message.args.id);
+      child.send({type: 'browser:reply', id: message.id, result: {}});
+    }
+  });
+  try {
+    await discovered;
+    child.send({type: 'test:cancel'});
+    assert.equal(await Promise.race([cancelled.then(() => true), delay(300, false)]), true);
+    assert.equal(leases, 2);
+    assert.deepEqual([...releases].sort(), ['concurrent-page-1', 'concurrent-page-2']);
+    assert.equal(responses.length, 1, 'both leases must share one pending CDP discovery');
+    for (const response of responses) {
+      response.writeHead(503);
+      response.end('Fixture connection stopped');
+    }
+    assert.equal(await exited, 0, stderr);
+  } finally {
+    if (child.exitCode === null) {
+      child.kill();
+      await exited;
+    }
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

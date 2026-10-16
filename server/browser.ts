@@ -5,7 +5,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
+import type {Browser, BrowserContext, Page} from 'playwright-core';
 import { emptyBrowser, type BrowserState, type BrowserAttentionKind } from "../shared/browser.ts";
 
 const desktop = process.env.FACTORY_BROWSER_BRIDGE === "1" && Boolean(process.send);
@@ -125,7 +125,10 @@ function persistHeadlessTabs() {
 }
 async function persistent(): Promise<BrowserContext> {
   if (!context) {
-    const startup = chromium.launchPersistentContext(path.join(profile, "profile"), { headless: true, executablePath: executable(), viewport: { width: 1280, height: 800 }, args: ["--hide-scrollbars", "--mute-audio"] }).then(async c => {
+    const startup = import('playwright-core').then(({chromium}) =>
+      chromium.launchPersistentContext(path.join(profile, 'profile'), {headless: true,
+        executablePath: executable(), viewport: {width: 1280, height: 800},
+        args: ['--hide-scrollbars', '--mute-audio']})).then(async c => {
       c.on("close", () => {
         if (context === startup) { context = null; clearInterval(authTimer); clearInterval(historyTimer); }
         for (const [id, tab] of tabs) if (tab.page.context() === c) { tabs.delete(id); titles.delete(id); }
@@ -216,7 +219,9 @@ export async function browserCommand(args: Record<string, any>): Promise<any> {
     let page = tabs.get(args.id)?.page;
     if (desktop) {
       const target=await rpc({action:"target",id:args.id});
-      if (!connection || !(await connection.catch(()=>null))?.isConnected()) connection=chromium.connectOverCDP(target.endpoint);
+      const previous = connection;
+      if (previous && !(await previous.catch(() => null))?.isConnected() && connection === previous) connection = null;
+      connection ??= import('playwright-core').then(({chromium}) => chromium.connectOverCDP(target.endpoint));
       for (const p of (await connection).contexts().flatMap(c=>c.pages())) { const s=await p.context().newCDPSession(p); try { if((await s.send("Target.getTargetInfo")).targetInfo.targetId===target.targetId) {page=p;break;} } finally {await s.detach();} }
     }
     if (!page) throw new Error("找不到标签页");
@@ -273,7 +278,9 @@ export async function openPage(viewport = { width: 1280, height: 800 }, _locale 
   }
   const lease = await rpc({ action:"lease" }, signal);
   try {
-    if (!connection || !(await cancellable(connection.catch(() => null), signal))?.isConnected()) connection = chromium.connectOverCDP(lease.endpoint);
+    const previous = connection;
+    if (previous && !(await cancellable(previous.catch(() => null), signal))?.isConnected() && connection === previous) connection = null;
+    connection ??= import('playwright-core').then(({chromium}) => chromium.connectOverCDP(lease.endpoint));
     const b = await cancellable(connection, signal);
     let page: Page | undefined;
     for (let i=0;i<40 && !page;i++) { signal?.throwIfAborted(); page = b.contexts().flatMap(c => c.pages()).find(p => p.url() === lease.marker); if (!page) await cancellable(new Promise(r => setTimeout(r,50)), signal); }

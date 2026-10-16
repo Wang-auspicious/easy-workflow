@@ -467,6 +467,11 @@ export class Docs implements Snapshottable {
 
   private atomicWrite(file: string, content: string) {
     this.assertOwnedPath(file);
+    try {
+      if (fs.readFileSync(file, 'utf8') === content) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
     fs.mkdirSync(path.dirname(file), { recursive: true });
     this.assertOwnedPath(file);
     const temp = path.join(path.dirname(file), `.${path.basename(file)}.${crypto.randomBytes(12).toString("hex")}.tmp`);

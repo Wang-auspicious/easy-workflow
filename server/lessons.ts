@@ -378,18 +378,22 @@ export class Lessons implements Snapshottable {
     return [...this.host.journal.read(0, undefined, through)];
   }
 
-  list() {
+  /** Internal rendering reads the cache without exposing it to callers. */
+  private views(): readonly LessonView[] {
     const events = this.lessonEvents();
     if (this.viewSeq !== this.lessonSeq) {
       this.cachedViews = projectLessons(events);
       this.viewSeq = this.lessonSeq;
     }
-    return structuredClone(this.cachedViews);
+    return this.cachedViews;
+  }
+  list(): LessonView[] {
+    return structuredClone(this.views()) as LessonView[];
   }
   get(id: string) {
-    const found = this.list().find((l) => l.id === id);
+    const found = this.views().find((l) => l.id === id);
     if (!found) throw new ControlError(404, "lesson_not_found", "找不到这条经验草案");
-    return found;
+    return structuredClone(found);
   }
   private emit(event: LessonEvent) { return this.host.journal.append(event); }
   private role(station: string) {
@@ -635,7 +639,7 @@ export class Lessons implements Snapshottable {
   }
 
   pendingContext(station: string) {
-    const lessons = this.list().filter((l) => (station === "dispatcher" || l.station === station) && ["pending", "validated", "approved"].includes(l.status)).sort((a, b) => b.updatedAt - a.updatedAt);
+    const lessons = this.views().filter((l) => (station === "dispatcher" || l.station === station) && ["pending", "validated", "approved"].includes(l.status)).sort((a, b) => b.updatedAt - a.updatedAt);
     const shown = lessons.slice(0, 8).map((l) => `- [${l.id}] ${l.station} · ${l.failureType} · ${clean(l.framework.join(" / "))}（${l.status === "validated" ? "验证已齐，待站长批准" : l.status === "approved" ? "已批准，待写入角色" : "待验证与批准"}；未写入 ROLE 前不作为生产规则）\n  ${clean(l.suggestion)}\n  证据：${l.runId}，事件 ${l.observations.slice(0, 8).map((o) => o.seq).join(", ")}${l.observations.length > 8 ? `…共 ${l.observations.length} 条，见 LESSONS.md` : ""}；草案 ${l.digest}`);
     if (lessons.length > 8) shown.push(`- 较早的 ${lessons.length - 8} 条经验已省略，完整记录见 LESSONS.md。`);
     return shown.join("\n");
@@ -643,7 +647,7 @@ export class Lessons implements Snapshottable {
 
   render() {
     const labels = { pending: "待验证与批准", validated: "验证已齐，待批准", approved: "已批准，待写入角色", applied: "已批准并写入 ROLE", rejected: "已拒绝" };
-    return [blockStart, "## 复盘记录", "", "> 以下内容由 Easy Workflow 从 journal 渲染。未批准经验不是生产规则；批准必须绑定草案摘要、失败样本重跑和至少两个已发布站点的回归证据。", "", ...this.list().flatMap((l) => [
+    return [blockStart, "## 复盘记录", "", "> 以下内容由 Easy Workflow 从 journal 渲染。未批准经验不是生产规则；批准必须绑定草案摘要、失败样本重跑和至少两个已发布站点的回归证据。", "", ...this.views().flatMap((l) => [
       `### ${l.id} · ${labels[l.status]}`, "", `- 工位：${l.station}；失败类型：${l.failureType}；站点框架：${clean(l.framework.join(" / "))}`,
       `- 轮次：${l.runId}；草案摘要：${l.digest}；角色版本：${l.roleRevision}`,
       `- 现象：${clean(l.problem)}`, `- 候选经验：${clean(l.suggestion)}`,
@@ -660,7 +664,8 @@ export class Lessons implements Snapshottable {
     const first = old.indexOf(blockStart), last = old.indexOf(blockEnd);
     if ((first < 0) !== (last < 0) || (first >= 0 && (last < first || old.indexOf(blockStart, first + blockStart.length) >= 0 || old.indexOf(blockEnd, last + blockEnd.length) >= 0))) throw new ControlError(409, "lesson_document_conflict", "LESSONS.md 的程序段标记损坏；保留原文件，等待修复");
     const rendered = this.render();
-    fs.writeFileSync(file, first < 0 ? `${old.trimEnd()}\n\n${rendered}\n` : `${old.slice(0, first)}${rendered}${old.slice(last + blockEnd.length)}`);
-    for (const station of unique(this.list().map((l) => l.station).concat("dispatcher"))) this.host.docs?.write("context", station);
+    const content = first < 0 ? `${old.trimEnd()}\n\n${rendered}\n` : `${old.slice(0, first)}${rendered}${old.slice(last + blockEnd.length)}`;
+    if (content !== old) fs.writeFileSync(file, content);
+    for (const station of unique(this.views().map((l) => l.station).concat("dispatcher"))) this.host.docs?.write("context", station);
   }
 }
