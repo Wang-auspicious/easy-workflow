@@ -167,6 +167,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {posts: factory.board.read(item, {field: url.searchParams.get('field') ?? undefined}), rooms: factory.board.rooms(item)});
     }
     if (p === '/api/lessons/shared' && req.method === 'GET') return send(res, 200, {lessons: factory.lessons.sharedLessons(url.searchParams.get('node') ?? undefined)});
+    if (p === '/api/kernel/streams' && req.method === 'GET') return send(res, 200, factory.streamSnapshot());
+    if (p === '/api/kernel/conversation' && req.method === 'GET') {
+      const result = factory.streamEvents(Number(url.searchParams.get('since') ?? 0), url.searchParams.get('includeProgress') === '1');
+      return send(res, 200, {...result, events: result.events.map(uiEvent)});
+    }
     if (p === "/api/events") {
       const since = Number(req.headers["last-event-id"] ?? url.searchParams.get("since") ?? 0);
       if (!Number.isSafeInteger(since) || since < 0) throw new ControlError(400, "invalid_cursor", "since 必须是非负整数");

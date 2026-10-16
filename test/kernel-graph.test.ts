@@ -7,6 +7,10 @@ import {compile} from '../server/spec/compile.ts';
 import {line, station, type Pack} from '../server/spec/dsl.ts';
 import {pack} from '../packs/vislexicon/pack.ts';
 import {apply, initialState} from '../shared/project.ts';
+import {BUDGET_ATTENTION_MS, streamOf} from '../shared/streams.ts';
+import {kernelStreams} from '../server/kernel/streams.ts';
+import {KernelStore} from '../server/kernel/store.ts';
+import {createItem, type ItemState} from '../server/kernel/item.ts';
 import type {Executor, StationContext, StationResult, TokenRun} from '../server/runtime.ts';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-kernel-graph-'));
@@ -206,7 +210,7 @@ test('v2 human correction preserves automated rounds and can undo an unexecuted 
   } finally {await fixture.close();}
 });
 
-test('v2 admission is FIFO and a resource shortage leaves nodes ready while the oldest item finishes first', async t => {
+test('v2 admission is FIFO and records resource waits while the oldest item finishes first', async t => {
   t.mock.timers.enable({apis: ['Date'], now: 1_000_000});
   const spec = returnPack();
   for (const node of spec.lines[0].stations) if (node.kind !== 'store') node.resource = 'cpu';
@@ -230,8 +234,9 @@ test('v2 admission is FIFO and a resource shortage leaves nodes ready while the 
       t.mock.timers.tick(1);
     }
     assert.equal(kernel.store.get(tokens[2].id)?.status, 'queued');
-    assert.equal(kernel.store.get(tokens[1].id)?.nodes['review/first'].status, 'ready');
-    assert.equal(kernel.store.get(tokens[1].id)?.nodes['review/first'].waitingFor, undefined);
+    assert.equal(kernel.store.get(tokens[1].id)?.nodes['review/first'].status, 'waiting');
+    assert.equal(kernel.store.get(tokens[1].id)?.nodes['review/first'].waitingFor, 'resource');
+    assert.equal(typeof kernel.store.get(tokens[1].id)?.nodes['review/first'].waitingSince, 'number');
     assert.equal(pending.length, 1);
     for (let i = 0; i < 9; i++) {
       assert.equal(pending.length, 1, 'one CPU lease must bound concurrent node execution');
@@ -401,4 +406,236 @@ test('v1 retains an agent handoff and its session without treating it as a retry
     assert.equal(state.nodes['review/first'].failed, 0);
     assert.equal(Object.keys(state.recoveries).length, 0);
   } finally {await runtime.close(); journal.close();}
+});
+
+test('E stream classification is pure and keeps claims out of conversation', t => {
+  t.mock.method(Date, 'now', () => {throw new Error('streamOf must use the receipt timestamp');});
+  for (const kind of ['attempt.started', 'attempt.progress', 'attempt.activity', 'attempt.finished',
+    'token.queued', 'token.data', 'token.created', 'evidence.added', 'resource.sample']) {
+    assert.equal(streamOf({kind}), 'progress', kind);
+  }
+  for (const type of ['challenge', 'answer', 'question', 'evidence', 'resolve', 'note']) {
+    assert.equal(streamOf({kind: 'board.posted', post: {type}}), 'conversation', type);
+  }
+  for (const kind of ['room.opened', 'room.round', 'room.closed', 'chat.user', 'chat.assistant', 'chat.message',
+    'chat.checkpoint', 'supervisor.summary']) assert.equal(streamOf({kind}), 'conversation', kind);
+  assert.equal(streamOf({kind: 'board.posted', post: {type: 'claim', status: 'superseded'}}), 'none');
+  assert.equal(streamOf({kind: 'alert.raised'}), 'attention');
+  assert.equal(streamOf({kind: 'spec.patched', status: 'proposed'}), 'attention');
+  assert.equal(streamOf({kind: 'spec.patched', status: 'accepted'}), 'none');
+  for (const value of [null, undefined, [], {}, {kind: 'run.started'}, {kind: 'board.posted'}]) {
+    assert.equal(streamOf(value), 'none');
+  }
+  for (const code of ['auth', 'tls', 'http_forbidden', 'EXTERNAL_OPERATION_UNKNOWN', 'room_unresolved', 'manual_store']) {
+    assert.equal(streamOf({kind: 'token.data', patch: {runtimeCheckpoint: {kernel: {
+      version: 2, status: 'parked', parked: {code}, nodes: {},
+    }}}}), 'attention', code);
+  }
+  assert.equal(streamOf({kind: 'token.data', patch: {runtimeCheckpoint: {kernel: {
+    version: 2, status: 'parked', parked: {code: 'retries_exhausted'}, nodes: {},
+  }}}}), 'progress');
+  const receipt = {kind: 'token.data', at: 1000 + BUDGET_ATTENTION_MS,
+    patch: {runtimeCheckpoint: {kernel: {version: 2, status: 'active', nodes: {
+      'review/first': {status: 'waiting', waitingFor: 'budget', waitingSince: 1000},
+    }}}}};
+  const before = structuredClone(receipt);
+  assert.equal(streamOf(receipt), 'progress', 'exactly ten minutes is not over ten minutes');
+  assert.equal(streamOf({...receipt, at: receipt.at + 1}), 'attention');
+  assert.equal(streamOf({...receipt, at: undefined}), 'progress', 'missing time must never use the wall clock');
+  assert.deepEqual(receipt, before);
+});
+
+test('E SQLite statistics count items once, retain current work across runs and remove handled attention', () => {
+  const compiled = compile([returnPack()]);
+  const file = path.join(root, 'stream-statistics.db');
+  const journal = new Journal(file);
+  const store = new KernelStore(journal);
+  const now = 2_000_000;
+  const make = (id: string, run = 'current', status: ItemState['status'] = 'active') => {
+    const item = createItem(compiled, {id, run, entry: 'review/first', item: id, title: `Title ${id}`,
+      url: '', source: 'fixture', now: 1000});
+    item.status = status;
+    for (const node of Object.values(item.nodes)) node.status = 'pending';
+    return item;
+  };
+  const mixed = make('mixed', 'older');
+  mixed.nodes['review/first'].status = 'running';
+  mixed.nodes['review/second'].status = 'running';
+  Object.assign(mixed.nodes['review/check'], {status: 'waiting', waitingFor: 'model'});
+  const resource = make('resource');
+  for (const key of ['review/first', 'review/second']) Object.assign(resource.nodes[key], {status: 'waiting', waitingFor: 'resource'});
+  const budget = make('budget');
+  Object.assign(budget.nodes['review/first'], {status: 'waiting', waitingFor: 'budget', waitingSince: now - 700_000});
+  Object.assign(budget.nodes['review/second'], {status: 'waiting', waitingFor: 'budget', waitingSince: now - BUDGET_ATTENTION_MS});
+  Object.assign(budget.nodes['review/check'], {status: 'waiting', waitingFor: 'room'});
+  const parked = make('parked', 'older', 'parked');
+  parked.nodes['review/first'].status = 'failed';
+  parked.parked = {node: 'review/first', reason: 'Login is required', code: 'auth', at: now - 10};
+  const excludedAttention = make('bounded-retry', 'current', 'parked');
+  excludedAttention.parked = {node: 'review/first', reason: 'Retry limit', code: 'retries_exhausted', at: now - 9};
+  const queued = make('queued', 'older', 'queued');
+  queued.nodes['review/first'].status = 'ready';
+  const otherWaits = make('other-waits');
+  Object.assign(otherWaits.nodes['review/first'], {status: 'waiting', waitingFor: 'backoff'});
+  Object.assign(otherWaits.nodes['review/second'], {status: 'waiting', waitingFor: 'supervisor'});
+  const published = make('published', 'current', 'published');
+  const oldPublished = make('old-published', 'older', 'published');
+  for (const item of [published, oldPublished]) for (const node of Object.values(item.nodes)) node.status = 'done';
+  const state = initialState(compiled);
+  state.alerts = {
+    duplicate: {id: 'duplicate', level: 'red', kind: 'auth', message: 'Same login issue', token: parked.id, node: 'review/first', at: now - 8},
+    globalA: {id: 'global-a', level: 'red', kind: 'auth', message: 'Connect the external account', item: 'External account', at: now - 5},
+    globalB: {id: 'global-b', level: 'red', kind: 'browser', message: 'Complete verification', at: now - 6},
+    completed: {id: 'completed', level: 'red', kind: 'auth', message: 'Outdated reminder', token: published.id, at: now - 3},
+  };
+  state.patches = [
+    {id: 'z', summary: 'Review model binding', status: 'proposed', at: now - 4},
+    {id: 'a', summary: 'Review another patch', status: 'proposed', at: now - 4},
+    {id: 'handled', summary: 'Already accepted', status: 'accepted', at: now},
+  ];
+  const projected = structuredClone({alerts: state.alerts, patches: state.patches});
+  try {
+    journal.atomic(() => {
+      for (const item of [mixed, resource, budget, parked, excludedAttention, queued, otherWaits, published, oldPublished]) store.save(item);
+    });
+    const options = {now, runId: 'current', alerts: state.alerts, patches: state.patches,
+      nodeKeys: [...compiled.nodes.map(node => node.key), 'empty/station']};
+    const result = kernelStreams(store, options);
+    assert.deepEqual(result.summary, {running: 1, waitingResource: 1, waitingModel: 1, published: 1, needsUser: 6});
+    assert.deepEqual(result.attention.map(card => card.id), ['patch:a', 'patch:z', 'alert:global-a', 'alert:global-b',
+      'parked:parked', 'budget:budget:review/first'], 'all unhandled cards are returned, with deterministic timestamp ties');
+    assert.equal(result.attention.find(card => card.item === budget.id)?.action, 'continue_budget');
+    assert.equal(result.attention.find(card => card.patchId === 'a')?.action, 'approval');
+    assert.equal(result.attention.find(card => card.id === 'alert:global-a')?.title, 'External account');
+    assert.deepEqual(result.stations['review/first'], {ready: 1, running: 1, done: 1, parked: 2,
+      waiting: {model: 0, budget: 1, room: 0, backoff: 1, resource: 1, supervisor: 0}});
+    assert.deepEqual(result.stations['review/check'].waiting, {model: 1, budget: 0, room: 1, backoff: 0, resource: 0, supervisor: 0});
+    assert.equal(result.stations['review/second'].waiting.supervisor, 1);
+    assert.deepEqual(result.stations['empty/station'], {ready: 0, running: 0, done: 0, parked: 0,
+      waiting: {model: 0, budget: 0, room: 0, backoff: 0, resource: 0, supervisor: 0}});
+    assert.deepEqual({alerts: state.alerts, patches: state.patches}, projected, 'aggregation must not modify projections');
+    const readonly = new Journal(file, true);
+    try {assert.deepEqual(kernelStreams(new KernelStore(readonly), options), result);} finally {readonly.close();}
+    const resumed = store.get(budget.id)!;
+    resumed.nodes['review/first'].status = 'ready';
+    delete resumed.nodes['review/first'].waitingFor;
+    delete resumed.nodes['review/first'].waitingSince;
+    const repaired = store.get(parked.id)!;
+    repaired.status = 'active';
+    repaired.nodes['review/first'].status = 'ready';
+    delete repaired.parked;
+    journal.atomic(() => {store.save(resumed); store.save(repaired);});
+    const after = kernelStreams(store, {...options, alerts: {}, patches: state.patches.map(patch => ({...patch, status: 'accepted'}))});
+    assert.deepEqual(after.attention, []);
+    assert.equal(after.summary.needsUser, 0);
+  } finally {journal.close();}
+});
+
+test('E resource waits are durable, do not spam receipts, and resume after a real broker lease is released', async () => {
+  const spec = returnPack();
+  for (const node of spec.lines[0].stations) if (node.kind !== 'store') node.resource = 'cpu';
+  const compiled = compile([spec]);
+  const journal = new Journal(path.join(root, 'resource-wait-stats.db'));
+  const capacity = new Broker({cpu: 1, browser: 0, model: 0, http: 0}, 0);
+  capacity.freeMem = () => 32768;
+  let release: (() => void) | undefined;
+  let calls = 0;
+  const kernel = new Kernel(compiled, journal, capacity, {}, () => async () => {
+    if (calls++ === 0) await new Promise<void>(resolve => {release = resolve;});
+    return {ok: true, summary: 'Resource fixture completed'};
+  });
+  try {
+    kernel.start('Observe bounded CPU admission');
+    const first = kernel.create('review/first', {item: 'first', url: '', source: 'fixture'});
+    const second = kernel.create('review/first', {item: 'second', url: '', source: 'fixture'});
+    await turn();
+    const waiting = kernel.store.get(second.id)!.nodes['review/first'];
+    assert.equal(waiting.status, 'waiting');
+    assert.equal(waiting.waitingFor, 'resource');
+    assert.equal(typeof waiting.waitingSince, 'number');
+    assert.deepEqual(kernelStreams(kernel.store, {now: Date.now(), runId: journal.run}).summary,
+      {running: 1, waitingResource: 1, waitingModel: 0, published: 0, needsUser: 0});
+    const receipt = [...journal.read()].findLast(event => event.kind === 'token.data' && event.token === second.id);
+    assert.ok(receipt?.kind === 'token.data');
+    const checkpoint = receipt.patch.runtimeCheckpoint as {kernel: {nodes: Record<string, {waitingSince?: number; waitingFor?: string}>}};
+    assert.equal(checkpoint.kernel.nodes['review/first'].waitingSince, waiting.waitingSince);
+    assert.equal(checkpoint.kernel.nodes['review/first'].waitingFor, 'resource');
+    const seq = journal.seq;
+    for (let index = 0; index < 3; index++) {kernel.schedule(); await turn();}
+    assert.equal(journal.seq, seq, 'unchanged resource waits must not append each scheduling tick');
+    assert.ok(release);
+    release();
+    await kernel.settle();
+    assert.equal(kernel.store.get(first.id)?.status, 'published');
+    assert.equal(kernel.store.get(second.id)?.status, 'published');
+    assert.equal(kernel.store.get(second.id)?.nodes['review/first'].waitingSince, undefined);
+    assert.deepEqual(kernelStreams(kernel.store, {now: Date.now(), runId: journal.run}).summary,
+      {running: 0, waitingResource: 0, waitingModel: 0, published: 2, needsUser: 0});
+  } finally {release?.(); await kernel.close(); journal.close();}
+});
+
+test('E parked item checkpoints carry their real attention code to the stream classifier', async () => {
+  const fixture = reviewFixture('parked-stream', async () => ({ok: false, summary: 'Login required',
+    failure: {tag: 'auth_required', category: 'auth', owner: 'user', retryable: false, code: 'AUTH', message: 'Login required'}}));
+  try {
+    const token = fixture.kernel.create('review/first', {item: 'login', url: '', source: 'fixture'});
+    await fixture.kernel.settle();
+    const receipt = [...fixture.journal.read()].findLast(event => event.kind === 'token.data' && event.token === token.id);
+    assert.ok(receipt);
+    assert.equal(streamOf(receipt), 'attention');
+    const cards = kernelStreams(fixture.kernel.store, {now: Date.now(), runId: fixture.journal.run}).attention;
+    assert.equal(cards.length, 1);
+    assert.equal(cards[0].code, 'auth');
+  } finally {await fixture.close();}
+});
+
+test('v2 real progress refreshes the durable item timestamp while silent scheduling does not', async t => {
+  t.mock.timers.enable({apis: ['Date'], now: 1_000_000});
+  let context: StationContext | undefined;
+  let release: (() => void) | undefined;
+  const fixture = reviewFixture('observed-progress', async ctx => {
+    if (!context) {
+      context = ctx;
+      await new Promise<void>(resolve => {release = resolve;});
+    }
+    return {ok: true, summary: 'Observed fixture work completed'};
+  });
+  const payload = {map: new Map([['preserved', new Set(['value'])]]), undefinedProperty: undefined};
+  try {
+    const token = fixture.kernel.create('review/first', {item: 'observed-progress', url: '', source: 'fixture', data: {payload}});
+    await turn();
+    assert.ok(context);
+    const started = fixture.kernel.store.get(token.id)!.updatedAt;
+    const seq = fixture.journal.seq;
+    t.mock.timers.tick(9 * 60_000);
+    fixture.kernel.schedule();
+    await turn();
+    assert.equal(fixture.kernel.store.get(token.id)!.updatedAt, started);
+    assert.equal(fixture.journal.seq, seq, 'elapsed time and scheduler ticks must not invent progress');
+    const receipts: string[] = [];
+    fixture.journal.subscribe(event => {
+      if (!['attempt.progress', 'attempt.activity'].includes(event.kind)) return;
+      const row = fixture.journal.database.prepare('SELECT updated_at FROM items WHERE id = ?').get(token.id) as {updated_at: number};
+      assert.equal(row.updated_at, event.at, 'the timestamp column commits with its actual progress receipt');
+      assert.equal(fixture.kernel.store.get(token.id)!.updatedAt, event.at, 'body.updatedAt agrees with the indexed column');
+      receipts.push(event.kind);
+    });
+    context.progress('Observed a real page result', {tool: 'fixture', text: 'An observed boundary', ok: true});
+    assert.equal(fixture.kernel.store.get(token.id)!.updatedAt, Date.now());
+    t.mock.timers.tick(1000);
+    context.activity!({id: 'observed-tool', kind: 'tool', source: 'tool-executor', startedAt: Date.now(), status: 'running', toolName: 'fixture'});
+    assert.equal(fixture.kernel.store.get(token.id)!.updatedAt, Date.now());
+    assert.deepEqual(receipts, ['attempt.progress', 'attempt.activity']);
+    assert.deepEqual(fixture.kernel.store.get(token.id)!.data.payload, payload, 'touching the JSON envelope preserves nested snapshot tags');
+    const observed = fixture.kernel.store.get(token.id)!.updatedAt;
+    const observedSeq = fixture.journal.seq;
+    t.mock.timers.tick(11 * 60_000);
+    fixture.kernel.schedule();
+    await turn();
+    assert.equal(fixture.kernel.store.get(token.id)!.updatedAt, observed);
+    assert.equal(fixture.journal.seq, observedSeq);
+    release!();
+    await fixture.kernel.settle();
+    assert.equal(fixture.kernel.store.get(token.id)?.status, 'published');
+  } finally {release?.(); await fixture.close();}
 });

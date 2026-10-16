@@ -1,0 +1,33 @@
+{
+  "kernel": "v2",
+  "mode": "packaged standalone",
+  "ok": true,
+  "checks": [
+    "bundled node ROLE.md accessible through the Agent interface",
+    "starts without API key or connected VisLexicon data",
+    "current compiled graph renders without running work",
+    "isolated writable workspace",
+    "sandbox and context isolation",
+    "unauthenticated local request rejected",
+    "real webview loads local page with Node disabled",
+    "native screenshot crop preserves offset coordinates and excludes the sidebar",
+    "bookmark right-click edits title and URL; separate menu removes; new bookmark remains independent",
+    "user and background worker share persistent browser session",
+    "real native tabs mounted inside workspace",
+    "Pi reads the same page through CDP",
+    "auth interruption retains tab and shows red badge",
+    "successful login/navigation clears alert",
+    "bookmark order and visit history",
+    "paused run ends via in-app confirmation; errors stay visible; retry opens report",
+    "backend exits with window",
+    "persistent webview session survives restart",
+    "inactive native browser views stay hidden across restore, capture, navigation and resize",
+    "bookmarks and history survive restart",
+    "backend exits with window",
+    "backend exits with window",
+    "read-only view rejects work and preserves journal bytes",
+    "no renderer exceptions",
+    "background screenshot and recording frames while canvas is active"
+  ],
+  "count": 25
+}

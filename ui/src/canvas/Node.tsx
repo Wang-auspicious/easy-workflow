@@ -14,6 +14,7 @@ import { useNow } from "../util/useNow.ts";
 import { bottleneck, trailOf } from "./stats.ts";
 import { nodeCountPresentation } from './node-counts.ts';
 import { nodeExecutionPresentation, stationStatus } from './status.ts';
+import {KernelCounts} from '../KernelPanels.tsx';
 
 export const fmt = (n: number) => (n >= 10000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : n.toLocaleString("en-US"));
 export const secs = (ms: number) => (ms >= 60000 ? `${(ms / 60000).toFixed(1)}m` : ms >= 10000 ? `${Math.round(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`);
@@ -40,6 +41,8 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const actualExecution = useStore(state => state.nodeExecutions[node.key]);
   const recoveryTokens = useStore(state => state.nodeRecoveries[node.key]);
   const replay = useStore(state => Boolean(state.replay));
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
+  const kernelNumbers = useStore(state => state.replay ? undefined : state.kernelSnapshot?.stations[node.key]);
   const colorOverride = useStore((s) => s.layout.colors[node.key]);
   const open = useStore((s) => s.inspectors.some((i) => i.key === node.key));
   const trail = useStore((s) => s.trail);
@@ -83,7 +86,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         data-tip={`${node.name}：${node.blurb ?? ""}${dormant ? "（休眠）" : ""}`} onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
         <StationIcon role={node.role} size={15} />
         <span className="node-name">{displayName}</span>
-        <span className="node-src-sub" data-tip={counts.detail}>{dormant ? '休眠 · ' : ''}库存 {fmt(n?.stock ?? 0)}</span>
+        <span className="node-src-sub" data-tip={counts.detail}>{dormant ? '休眠 · ' : ''}{kernel === 'v2' && kernelNumbers ? `就绪 ${kernelNumbers.ready} · 完成 ${kernelNumbers.done}` : `库存 ${fmt(n?.stock ?? 0)}`}</span>
       </div>
     );
   }
@@ -104,12 +107,14 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         {numPrefix && <span className="node-idx num">{numPrefix}</span>}
       </div>
       {visualEvidence.length ? <Strip items={visualEvidence} /> : <div className="node-metrics num">
-        <div className="node-metric"><span>{shape === "store" ? "当前库存" : "待处理"}</span><b>{fmt(shape === "store" ? n?.stock ?? 0 : n?.queue.length ?? 0)}<small> 件</small></b></div>
-        <div className="node-metric"><span>{shape === "store" ? "本轮流入" : "进行中"}</span><b>{fmt(shape === "store" ? n?.plus ?? 0 : n?.active.length ?? 0)}<small> 件</small></b></div>
+        <div className="node-metric"><span>{kernel === 'v2' ? '就绪' : shape === "store" ? "当前库存" : "待处理"}</span><b>{fmt(kernelNumbers?.ready ?? (shape === "store" ? n?.stock ?? 0 : n?.queue.length ?? 0))}<small> 件</small></b></div>
+        <div className="node-metric"><span>{kernel === 'v2' ? '运行' : shape === "store" ? "本轮流入" : "进行中"}</span><b>{fmt(kernelNumbers?.running ?? (shape === "store" ? n?.plus ?? 0 : n?.active.length ?? 0))}<small> 件</small></b></div>
       </div>}
       <div className="node-footer">
+        {kernel === 'v2' && kernelNumbers ? <KernelCounts numbers={kernelNumbers} compact /> : <>
         <span className="node-status" data-tip={counts.resource ? counts.detail : status.detail}><i className={`light light--${status.light} ${status.pulse ? 'is-pulse' : ''}`} />{status.label}</span>
         <span className={`node-staff num ${!counts.resource && n?.failed ? 'has-failures' : ''}`} data-tip={`${counts.resource ? '' : `${workers} 位工人 · `}${counts.detail}`}>{counts.footer}</span>
+        </>}
       </div>
     </div>
   );

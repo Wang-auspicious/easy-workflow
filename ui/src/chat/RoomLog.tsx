@@ -17,6 +17,8 @@ import base from "./pi-conversation.css?inline";
 import styles from "./transcript.css?inline";
 import avatar from "./avatar.css?inline";
 import roomStyles from "./rooms.css?inline";
+import {ProgressToggle} from '../KernelPanels.tsx';
+import {kernelRooms, kernelRoomLines} from '../kernel.ts';
 
 const VERB: Record<RoomLine["kind"], string> = {
   consult: "提出修改", verdict: "判定", return: "退回", channel: "交付", correction: "纠错", note: "播报",
@@ -31,11 +33,15 @@ export function RoomLog({ room, rooms }: { room: RoomSpec; rooms: readonly RoomS
   const fs = useStore((s) => s.fs);
   const factory = useStore((s) => s.factory);
   const bots = useStore((s) => s.layout.bots);
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
+  const events = useStore(state => state.kernelEvents);
+  const showProgress = useStore(state => state.showProgress);
   const now = useNow(2000);
   const lines = useMemo(() => {
-    const ctx: RoomContext = { factory, state: fs, look: stationLook(factory, fs, bots, now), now };
+    const ctx: RoomContext = { factory, state: fs, look: stationLook(factory, fs, bots, now), now,
+      ...(kernel === 'v2' ? {kernelEvents: events, showProgress} : {}) };
     return buildRoomLines(room, rooms, ctx);
-  }, [room, rooms, factory, fs, bots, now]);
+  }, [room, rooms, factory, fs, bots, now, kernel, events, showProgress]);
   const lineName = (id: string | null) => factory?.lines.find((l) => l.id === id)?.name ?? id ?? "";
 
   useLayoutEffect(() => {
@@ -78,6 +84,7 @@ export function RoomLog({ room, rooms }: { room: RoomSpec; rooms: readonly RoomS
           {room.peerLine && <span className="room-head-peer"><ArrowRight size={11} />{lineName(room.peerLine)}</span>}
         </div>
         <p className="room-head-sub">{room.subtitle}</p>
+        {kernel === 'v2' && <ProgressToggle />}
         <div className="room-head-members">
           <span className="room-mine" title="你永远在这个群里">你</span>
           {room.members.map((member) => (
@@ -112,7 +119,7 @@ export function RoomLog({ room, rooms }: { room: RoomSpec; rooms: readonly RoomS
   );
 }
 
-function RoomRow({ line }: { line: RoomLine }) {
+export function RoomRow({ line }: { line: RoomLine }) {
   const fs = useStore((s) => s.fs);
   const item = line.token ? fs.tokens[line.token]?.item ?? line.token : "";
   const open = () => { const key = line.actor.node; if (!key) return; setState({ view: "canvas" }); toggleInspector(key); };
@@ -128,11 +135,12 @@ function RoomRow({ line }: { line: RoomLine }) {
           {line.actor.node
             ? <button className="tr-who tr-who--link" onClick={open} data-tip="在画布上打开这个工位">{line.actor.name}</button>
             : <b className="tr-who">{line.actor.name}</b>}
-          <span className={`rlog-verb rlog-verb--${line.kind}`}>{VERB[line.kind]}</span>
+          <span className={`rlog-verb rlog-verb--${line.kind}`}>{line.label ?? VERB[line.kind]}</span>
           {line.to && <span className="rlog-to">→ {line.to.name}</span>}
           <time className="tr-time num">{time(line.at)}</time>
         </header>
         <p className="rlog-text">{line.text}</p>
+        {line.note && <span className="rlog-state">{({open: '待处理', resolved: '已解决', rejected: '已拒绝', superseded: '已替代', judged: '已裁决', parked: '待处理'} as Record<string, string>)[line.note] ?? line.note}</span>}
         {item && <span className="rlog-token" title="这件货">{item}</span>}
       </div>
     </article>
@@ -140,3 +148,29 @@ function RoomRow({ line }: { line: RoomLine }) {
 }
 
 export type { RoomActor };
+
+/** The root retains its normal chat transcript; progress remains optional. */
+export function KernelProgressLog() {
+  const host = useRef<HTMLDivElement>(null);
+  const [container, setContainer] = useState<HTMLElement | null>(null);
+  const fs = useStore(state => state.fs);
+  const factory = useStore(state => state.factory);
+  const events = useStore(state => state.kernelEvents);
+  const bots = useStore(state => state.layout.bots);
+  const now = useNow(2000);
+  const lines = kernelRoomLines(kernelRooms(factory)[0], {factory, state: fs,
+    look: stationLook(factory, fs, bots, now), now}, events, true).slice(-100);
+  useLayoutEffect(() => {
+    const shadow = host.current!.shadowRoot ?? host.current!.attachShadow({mode: 'open'});
+    const sheet = document.createElement('style');
+    sheet.textContent = `${base}\n${styles}\n${avatar}\n${roomStyles}`;
+    const slot = document.createElement('div');
+    slot.className = 'tr-root';
+    shadow.replaceChildren(sheet, slot);
+    setContainer(slot);
+    return () => shadow.replaceChildren();
+  }, []);
+  return <div className="pi-conversation" ref={host} aria-label="主调度进展流">
+    {container && createPortal(<div className="tr">{lines.map(line => <RoomRow key={line.id} line={line} />)}</div>, container)}
+  </div>;
+}

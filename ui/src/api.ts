@@ -8,6 +8,8 @@ import { legacyReply } from "../../shared/conversation.ts";
 import { idleDispatcher, reconcileChatLive, reduceChatLive, type ChatEvent, type DispatcherStatus } from "./chat/live.ts";
 import {executionIndex} from './canvas/status.ts';
 import type {UiEvent} from '../../shared/client-view.ts';
+import {mergeKernelEvents, type KernelSnapshot} from './kernel.ts';
+import type {Stamped} from '../../shared/types.ts';
 
 export const api = {
   async get<T>(path: string, options?: { signal?: AbortSignal }): Promise<T> {
@@ -44,6 +46,7 @@ let bootController: AbortController | null = null;
 let specGeneration = 0;
 
 interface FactorySnapshot {
+  kernel?: 'v1' | 'v2';
   factory: CompiledFactory;
   layout: Partial<LayoutFile>;
   defaultLayout: LayoutResult;
@@ -92,6 +95,7 @@ export async function boot() {
       layout.pos = {}; layout.capsules = {}; layout.open = {}; layout.designVersion = 4;
     }
     setState({
+      kernel: f.kernel ?? 'v1', kernelSnapshot: null, kernelEvents: [], boardRevisions: {},
       factory: f.factory, defaultLayout: f.defaultLayout,
       agentBindings: Object.fromEntries((f.agentBindings ?? []).map(binding => [binding.node, binding])),
       nodeExecutions: executionIndex(fs),
@@ -101,6 +105,7 @@ export async function boot() {
       live: reconcileChatLive(getState().live, fs.dispatcher ?? idleDispatcher()),
     });
     connect(fs.seq);
+    if (f.kernel === 'v2') void refreshKernel(true);
     void persistLayout();
     void api.get<import("../../shared/browser.ts").BrowserState>("/api/browser", {signal}).then(browser => {
       if (generation === bootGeneration && !getState().replay) setState({browser});
@@ -123,6 +128,11 @@ export function connect(since: number) {
     if (es !== stream || getState().replay) return;
     const event = JSON.parse(m.data) as UiEvent;
     ingest([event]);
+    if (getState().kernel === 'v2') {
+      setState(state => ({kernelEvents: mergeKernelEvents(state.kernelEvents, [event as Stamped])}));
+      if (event.kind === 'board.posted') setState(state => ({boardRevisions: {...state.boardRevisions, [event.post.item]: event.seq}}));
+      scheduleKernelRefresh();
+    }
     if (event.kind === 'agent.binding') void refreshAgentBindings(event.node);
     if (event.kind === 'agent.defaults') void refreshSpec();
     if (event.kind === "factory.loaded" || event.kind === "spec.patched") void refreshSpec();
@@ -182,7 +192,36 @@ export function disconnect() {
   bootController?.abort();
   es?.close();
   es = null;
+  clearTimeout(kernelRefreshTimer);
   setState({connected: false});
+}
+
+let kernelRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+let kernelRead = 0;
+export async function refreshKernel(history = false): Promise<void> {
+  if (getState().kernel !== 'v2' || getState().replay) return;
+  const generation = ++kernelRead;
+  const projectGeneration = bootGeneration;
+  try {
+    const snapshot = await api.get<KernelSnapshot>('/api/kernel/streams');
+    if (projectGeneration !== bootGeneration || getState().kernel !== 'v2' || getState().replay) return;
+    if (generation === kernelRead) setState({kernelSnapshot: snapshot});
+    if (history) {
+      let since = 0;
+      for (let page = 0; page < 4; page++) {
+        const response = await api.get<{events: Stamped[]; seq: number; hasMore?: boolean}>(`/api/kernel/conversation?since=${since}&includeProgress=1`);
+        if (projectGeneration !== bootGeneration || getState().replay) return;
+        setState(state => ({kernelEvents: mergeKernelEvents(state.kernelEvents, response.events)}));
+        if (!response.hasMore || response.seq <= since) break;
+        since = response.seq;
+      }
+    }
+  } catch { /* The last confirmed counts remain visible until the connection recovers. */ }
+}
+
+function scheduleKernelRefresh() {
+  if (kernelRefreshTimer) return;
+  kernelRefreshTimer = setTimeout(() => {kernelRefreshTimer = undefined; void refreshKernel();}, 350);
 }
 
 let layoutTimer = 0;

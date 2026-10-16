@@ -202,8 +202,33 @@ D 的 MCP 边界另补齐答疑／讨论终结工具的同会话 schema 错误�
 
 对 B.17 的时间戳，只有真实且仍有效的 progress/activity 回执会在同一事务更新 items.updated_at 与 body.updatedAt；没有定时假心跳。新测试验证无事件的 9/11 分钟与反复 schedule 不改变时间或 seq，序列化 Map/Set/undefined 仍保真。
 
-
 协作回合统一门卫最后补强：答疑与房间均校验 item.active 与节点 lastAttempt/rounds，房间另验 hold；失效回合不能发帖或覆盖会话。对应恢复／延迟结果回归 **5/5，通过，3.65 秒**。
+
+### E 实现与定向验证
+
+新增纯函数 shared/streams.ts，将进展、对话与注意事项分流；items 表提供总结、待处理卡片与逐工位计数。资源不足真实写 waiting(resource)，释放后按既有 FIFO 继续；统计不从旧 worker 配员猜测。后端提供有界分页对话记录，claim 仅在货的证据链读取。
+
+现有界面接入总结行、最近 5 张注意卡、主调度与 5 个字段群组、localStorage 进展开关、四种等待颜色、经验删除；v2 隐藏配员控件。对话与进展各保留最近 1000 条，隐藏进展不会挤掉对话；独立 board revision 使新 claim 刷新打开的证据链但不进入聊天。
+
+| 验证 | 结果 |
+|---|---|
+| E 后端图／重试／黑板目标套 | **51/51，通过，6.814 秒**，含新增 4 个 E 用例：全类别分流、10 分钟严格边界、SQLite/只读计数、处理后卡片消失、真实资源释放继续 |
+| `node --test --test-name-pattern='Factory selects v2' test/journal-atomic.test.ts` | **1/1，通过，3.612 秒**；追加 501 条真实帖子验证增量分页、不重复不丢失与 claim 排除 |
+| `npm run test:ui` | **45/45，通过，0.496 秒** |
+| `node ui/test/rooms-browser.mjs` | v1 浏览器验收通过 |
+| `node ui/test/rooms-browser.mjs --v2` | **7 项全部通过**：分组、总结/注意卡、证据链、开关持久化、真实 API 删除经验、等待颜色、隐藏配员 |
+| `npm run typecheck` / `npm run build` | 通过；**26.7 MiB / 766 文件 / 2 个原有运行依赖包** |
+| `FACTORY_KERNEL=v2 npm run desktop:smoke -- --app=dist/desktop --standalone` | **25 项全部通过**；`E-desktop-smoke.json` |
+
+五张截图及 fixture 回执位于 `v2-acceptance/E/`，已实际查看图像确认四种等待颜色和质疑往来可见。这些是隔离 UI fixture，不是 D.10 的真实模型记录。
+
+### B/C/D 真实副本集成记录（未通过长运行验收）
+
+副本先迁移 **171** 个已有未完成任务，原数据库未改；在副本正常结束旧轮以保留历史，再从候选库取 **30** 个未发布站、maxActiveItems=12 运行。约 **18.86 分钟**内记录 **18 次**每分钟快照、**155 次**实际尝试、可观测 token **1,933,083**。冻结记录为 **12 active / 14 queued / 4 parked / 0 published**，12 个节点在预算交接等待；**8 forced_handoff + 4 handoff，no-submit 失败 0**。每件 parked 保留 code/reason。
+
+这次运行有 **6 件**在预算等待中超过 10 分钟无状态变化；未达到 B.17 的 30 件终结与停滞要求，也没有 D.10 所需的 3 次 challenge 改正与 1 次讨论室。没有提高预算、放宽原 schema 或将等待强行改写成完成。副本已暂停并停止本轮测试服务，handoff 与所有业务证据保留。详情 `BCDE-real-integration.json`，逐分钟记录 `B-30sites.jsonl`。真实成功结果已建立 **36 个字段／17 个节点**的归属，另存 `D-ownership-after-integration.json`。
+
+强杀／重启验收在执行前被自动审批拒绝，返回 `blocked by policy`，**实际执行 0 次**；不能声称通过该项。最终完整 npm test 与 v1 源码桌面冒烟正在执行。
 
 
 ### C 新契约的旧测试对齐

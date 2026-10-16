@@ -17,6 +17,7 @@ import { pack } from "../packs/vislexicon/pack.ts";
 import { TOOLS, canonical, type Services } from "../packs/vislexicon/tools.ts";
 import { agentDefs, warmStyleLib } from "../packs/vislexicon/agents.ts";
 import {Kernel} from './kernel/kernel.ts';
+import {kernelStreams} from './kernel/streams.ts';
 import {asTokenRun} from './kernel/item.ts';
 import {BoardStore} from './board.ts';
 import {Collaboration, type CollaborationTurn} from './collaboration.ts';
@@ -685,6 +686,30 @@ export class Factory {
   continueAgentBudget(item: string, node: string) {
     if (!(this.runtime instanceof Kernel)) throw new ControlError(410, 'kernel_v2_required', '预算交接由 v2 内核处理');
     return this.runtime.continueBudget(item, node);
+  }
+
+  streamSnapshot() {
+    if (!(this.runtime instanceof Kernel)) throw new ControlError(410, 'kernel_v2_required', '三流统计需要 v2 内核');
+    return {kernel: 'v2' as const, ...kernelStreams(this.runtime.store, {now: Date.now(), runId: this.journal.run,
+      alerts: this.state.alerts, patches: this.state.patches, nodeKeys: this.compiled.nodes.map(node => node.key)})};
+  }
+
+  streamEvents(since: number, includeProgress: boolean) {
+    if (!(this.runtime instanceof Kernel)) throw new ControlError(410, 'kernel_v2_required', '三流记录需要 v2 内核');
+    if (!Number.isSafeInteger(since) || since < 0) throw new ControlError(400, 'invalid_cursor', 'since 必须是非负整数');
+    const conversation = "((kind = 'board.posted' AND json_extract(body, '$.post.type') != 'claim') OR kind LIKE 'room.%' OR kind LIKE 'chat.%' OR kind = 'supervisor.summary')";
+    const progress = "kind IN ('attempt.started', 'attempt.progress', 'attempt.activity', 'attempt.finished', 'token.queued', 'token.data', 'token.created', 'evidence.added', 'resource.sample')";
+    type Row = {seq: number; at: number; run: string; body: string};
+    const read = (where: string, order: 'ASC' | 'DESC', limit: number) => this.journal.database.prepare(
+      `SELECT seq, at, run, body FROM events WHERE seq > ? AND (${where}) ORDER BY seq ${order} LIMIT ?`
+    ).all(since, limit) as Row[];
+    const rows = since === 0
+      ? [...read(conversation, 'DESC', 500), ...(includeProgress ? read(progress, 'DESC', 500) : [])].sort((a, b) => a.seq - b.seq)
+      : read(includeProgress ? `${conversation} OR ${progress}` : conversation, 'ASC', 501);
+    const hasMore = since > 0 && rows.length > 500;
+    const selected = hasMore ? rows.slice(0, 500) : rows;
+    return {events: selected.map(row => ({...JSON.parse(row.body), seq: row.seq, at: row.at, run: row.run}) as Stamped),
+      seq: hasMore ? selected.at(-1)!.seq : this.journal.seq, hasMore};
   }
 
   private captureAgent(node: string, declared?: StationAgentBinding) {

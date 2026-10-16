@@ -9,6 +9,7 @@ import type { LayoutResult } from "../../shared/layout.ts";
 import { emptyLive, idleDispatcher, type DispatcherStatus, type LiveChat } from "./chat/live.ts";
 import {executionIndex, recordNodeExecution, runtimeRecoveryIndex, type NodeExecution} from './canvas/status.ts';
 import {applyUiEvent, isUiState, type UiEvent} from '../../shared/client-view.ts';
+import type {KernelSnapshot} from './kernel.ts';
 export type { LiveChat } from "./chat/live.ts";
 
 export type View = "canvas" | "board" | "candidates" | "library" | "runs" | "browser" | "settings" | "report";
@@ -38,6 +39,11 @@ export interface NodeAgentBinding {
 }
 
 export interface Store {
+  kernel: 'v1' | 'v2';
+  kernelSnapshot: KernelSnapshot | null;
+  kernelEvents: Stamped[];
+  boardRevisions: Record<string, number>;
+  showProgress: boolean;
   ready: boolean;
   bootError: string | null;
   connected: boolean;
@@ -95,6 +101,7 @@ const LS = (k: string, v?: unknown) => {
 };
 
 let state: Store = {
+  kernel: 'v1', kernelSnapshot: null, kernelEvents: [], boardRevisions: {}, showProgress: (LS('showProgress') as boolean) ?? false,
   ready: false, bootError: null, connected: false, factory: null, defaultLayout: null, replayLoading: null,
   layout: { pos: {}, open: {}, colors: {}, bots: {}, capsules: {} },
   fs: initialState(), version: 0, nodeRev: {}, agentBindings: {}, nodeExecutions: {}, nodeRecoveries: {},
@@ -123,6 +130,7 @@ export function setState(patch: Partial<Store> | ((s: Store) => Partial<Store>))
   if ("roomSeen" in p) LS("roomSeen", state.roomSeen);
   if ("userAvatar" in p) LS("userAvatar", state.userAvatar);
   if ("history" in p) LS("history", state.history);
+  if ('showProgress' in p) LS('showProgress', state.showProgress);
   for (const l of listeners) l();
 }
 export const subscribe = (l: () => void) => { listeners.add(l); return () => { listeners.delete(l); }; };

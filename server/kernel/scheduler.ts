@@ -23,7 +23,8 @@ export function sortReady(items: readonly ItemState[], compiled: CompiledFactory
     if (item.status !== 'active') continue;
     for (const [key, state] of Object.entries(item.nodes)) {
       const node = nodes.get(key);
-      if (state.status === 'ready' && node && !scopePaused(key)) ready.push({item, node});
+      const eligible = state.status === 'ready' || state.status === 'waiting' && state.waitingFor === 'resource';
+      if (eligible && node && !scopePaused(key)) ready.push({item, node});
     }
   }
   return ready.sort((left, right) =>

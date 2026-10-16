@@ -6,20 +6,22 @@ import { workflowCall } from './workflows.ts';
 import './workflows.css';
 
 export function AllocationShortcut() {
+  const kernel = useStore(state => state.kernel);
   const pending = useStore(s => s.fs.measurement?.status === 'proposed' && s.fs.measurement.runId === s.fs.run.id);
   const count = useStore(s => s.fs.measurement?.sampleItems ?? 0);
-  if (!pending) return null;
+  if (kernel === 'v2' || !pending) return null;
   return <button className="allocation-shortcut" onClick={() => setState({ view: 'library' })}><SlidersHorizontal size={13} />{count} 件实测 · 配员待确认</button>;
 }
 
 export function AllocationProposal() {
+  const kernel = useStore(state => state.kernel);
   useStore(s => s.version);
   const proposal = useStore(s => s.fs.measurement);
   const currentRun = useStore(s => s.fs.run.id);
   const disabled = useStore(s => !s.connected || Boolean(s.replay));
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
   const flight = useRef(false);
-  if (!proposal || proposal.runId !== currentRun || proposal.status !== 'proposed') return null;
+  if (kernel === 'v2' || !proposal || proposal.runId !== currentRun || proposal.status !== 'proposed') return null;
   const decide = async (action: 'accept' | 'reject') => {
     if (flight.current || !getState().connected || getState().replay) return;
     flight.current = true;

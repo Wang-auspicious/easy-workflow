@@ -100,6 +100,24 @@ test('Factory selects v2 without worker or legacy supervisor events and preserve
       error instanceof Error && 'status' in error && error.status === 403);
     await control.execute('delete_shared_lesson', {id: 'shared-factory'}, 'user');
     assert.deepEqual(factory.lessons.activeFor('curation/gate'), []);
+    const snapshot = factory.streamSnapshot();
+    assert.equal(snapshot.summary.published, 1);
+    assert.equal(snapshot.summary.running, 0);
+    assert.ok(factory.streamEvents(0, true).events.some(event => event.kind === 'attempt.started'));
+    assert.ok(factory.streamEvents(0, false).events.every(event => event.kind !== 'board.posted' || event.post.type !== 'claim'));
+    const cursor = factory.journal.seq;
+    factory.journal.atomic(() => {
+      for (let index = 0; index < 501; index++) factory!.board!.addPost({item: token.id, author: 'curation/gate',
+        type: 'note', field: 'gate', body: `Audit note ${index}`});
+    });
+    const page = factory.streamEvents(cursor, false);
+    assert.equal(page.events.length, 500);
+    assert.equal(page.hasMore, true);
+    const next = factory.streamEvents(page.seq, false);
+    assert.equal(next.events.length, 1);
+    assert.equal(next.hasMore, false);
+    assert.equal(next.seq, factory.journal.seq);
+    assert.ok(page.events.every(event => event.kind === 'board.posted' && event.post.type === 'note'));
     assert.ok([...factory.journal.read()].every(event => !/^(worker\.|measurement\.|consult\.|batch\.configured)/.test(event.kind)));
     await assert.rejects(() => control.execute('allocation_plan', {action: 'status'}), error =>
       error instanceof Error && 'status' in error && error.status === 410);

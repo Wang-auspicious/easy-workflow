@@ -27,6 +27,7 @@ import { recordedUsage, stationStatus, tokenStatus } from './status.ts';
 import { CrewStrip, CrewTimeline, WorkerTrace } from "./CrewTrace.tsx";
 import {useDetail, type TokenDetail} from '../details.ts';
 import {failureLabels} from '../../../shared/failures.ts';
+import {BoardChain, KernelCounts, SharedLessons} from '../KernelPanels.tsx';
 
 export function Inspectors({ geo, cam }: { geo: Geometry; cam: Camera }) {
   const list = useStore((s) => s.inspectors);
@@ -109,6 +110,8 @@ function Head({ onDrag, onClose, onPin, pinned, children }: { onDrag: (e: React.
 /* ------------------------------------------------------------------ station */
 
 function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspector; onDrag: (e: React.PointerEvent) => void; onClose: () => void; onPin: () => void; onWorker: (w: string) => void }) {
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
+  const kernelNumbers = useStore(state => state.replay ? undefined : state.kernelSnapshot?.stations[insp.key]);
   useStore((s) => s.nodeRev[insp.key]);
   const recoveryTokens = useStore(state => state.nodeRecoveries[insp.key]);
   const clock = useNow(1000);
@@ -177,14 +180,14 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
           <span className="muted">{({ agent: "agent 工位", program: "程序工位", review: "审查员", gate: "闸门", source: "来源", store: "库" } as Record<string, string>)[node.kind]} · {node.resource === "none" ? "无资源" : node.resource}</span>
         </div>
       </Head>
-      <div className="insp-stats num">
+      {kernel === 'v2' && kernelNumbers ? <KernelCounts numbers={kernelNumbers} /> : <div className="insp-stats num">
         <Stat k="在岗" v={`${onDuty}${workers.length > onDuty ? ` / ${workers.length}` : ""}`} />
         <Stat k="队列" v={`${n?.queue.length ?? 0}`} />
         <Stat k="中位" v={durations.length ? secs(median(durations)) : "—"} />
         <Stat k="P90" v={durations.length ? secs(quantile(durations, 0.9)) : "—"} />
         <Stat k="节拍" v={durations.length && onDuty ? secs(median(durations) / onDuty) : "—"} />
         <Stat k="已报 token" v={usage.total === null ? '—' : fmt(usage.total)} />
-      </div>
+      </div>}
       <div className="scope-notice" data-station-status={currentStatus.label}><i className={`light light--${currentStatus.light}`} /> {currentStatus.label} · {currentStatus.detail}</div>
       {replay ? <div className="scope-notice">回放为只读；退出回放后可调整工位。</div>
         : !connected ? <div className="scope-notice">连接已断开，恢复连接后可调整工位。</div> : null}
@@ -196,9 +199,11 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
       <div className="insp-actions">
         {node.kind !== "store" && node.kind !== "source" && <>
           <button className="btn btn--sm" disabled={controlsDisabled} onClick={() => void togglePause()}>{scopeBusy ? <Loader2 size={12} className="spin-i" /> : stationPaused ? <Play size={12} /> : <Pause size={12} />}{stationPaused ? '恢复此工位' : '暂停此工位'}</button>
+          {kernel !== 'v2' && <>
           <button className="btn btn--sm" disabled={controlsDisabled || onDuty >= node.workers.max} onClick={() => void changeWorkers('fork')} data-tip={`上限 ${node.workers.max}`}><GitFork size={13} />加一个人</button>
           <button className="btn btn--sm" disabled={controlsDisabled || onDuty <= node.workers.min || !workers.some(worker => !worker.retiredAt && !worker.busy)} onClick={() => void changeWorkers('retire')}><UserMinus size={13} />撤一个</button>
           <button className="btn btn--sm btn--ghost" disabled={controlsDisabled} onClick={() => void changeWorkers(locked ? 'unlock' : 'lock')}>{locked ? <Unlock size={13} /> : <Lock size={13} />}{locked ? "解锁人数" : "锁定人数"}</button>
+          </>}
         </>}
         <span className="grow" />
         <button className="btn btn--sm btn--ghost" onClick={() => attach({ type: "node", id: node.key, label: node.name })} data-tip="把这个工位加到对话附件"><MessageSquarePlus size={13} />问主调度</button>
@@ -208,6 +213,7 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
         <button className={tab === "metrics" ? "is-on" : ""} onClick={() => setTab("metrics")}>统计</button>
         <button className={tab === "spec" ? "is-on" : ""} onClick={() => setTab("spec")}>规格</button>
       </div>
+      {kernel === 'v2' && <SharedLessons node={node.key} />}
       {tab === "spec" ? <SpecView node={node} /> : tab === "metrics" ? <NodeMetrics attempts={attempts.filter(a=>a.startedAt>=s.fs.run.startedAt)} onSelect={id=>{setAttemptSel(id);setTab("work");}}/> : (
         <div className="insp-body">
           {workers.length > 0 && (
@@ -577,6 +583,7 @@ function EvThumbBody({ ev, tok, small }: { ev: EvidenceRef; tok?: TokenState; sm
 /* ------------------------------------------------------------------ token: evidence chain */
 
 function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onDrag: (e: React.PointerEvent) => void; onClose: () => void; onPin: () => void }) {
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
   useStore((s) => s.version);
   const now = useNow(1000);
   const s = getState();
@@ -618,6 +625,7 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
       </div>
       {d.copy?.takeawayZh && <div className="chain-copy sel">「{d.copy.takeawayZh}」<span className="muted">{d.copy.descriptionZh}</span></div>}
       {t.reason && t.status !== "active" && <div className="chain-reason">{t.reason}</div>}
+      {kernel === 'v2' && <BoardChain item={t.id} />}
       <div className="chain">
         {steps.map(({ node, a, ev }, i) => {
           const n = name(node);

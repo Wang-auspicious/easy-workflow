@@ -33,13 +33,14 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
   /** null = 每张卡片各记各的；true/false = 全部展开 / 全部收起。 */
   const [toolsOpen, setToolsOpen] = useState<boolean | null>(null);
   useStore((s) => s.version);
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
   const now = useNow(2000);
   const state = getState();
   const items = useMemo(
     () => buildTranscript({
-      entries, live, dispatcher, notes: state.fs.activity, factory: state.factory, station: stationLook(state.factory, state.fs, state.layout.bots, now),
+      entries, live, dispatcher, notes: kernel === 'v2' ? [] : state.fs.activity, factory: state.factory, station: stationLook(state.factory, state.fs, state.layout.bots, now),
     }),
-    [entries, entries.length, live, dispatcher, state.fs.activity, state.factory, state.version, now],
+    [entries, entries.length, live, dispatcher, state.fs.activity, state.factory, state.version, now, kernel],
   );
   const tools = items.reduce((n, item) => n + (item.parts?.filter((p) => p.type === "tool").length ?? 0), 0);
   useLayoutEffect(() => {

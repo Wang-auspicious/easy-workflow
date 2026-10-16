@@ -261,9 +261,10 @@ export class Kernel extends Runtime {
       done: Object.keys(next.nodes).filter(key => next.nodes[key].status === 'done'),
       rounds: Object.fromEntries(Object.entries(next.nodes).map(([key, value]) => [key, value.rounds])),
       notes: Object.entries(next.nodes).flatMap(([key, value]) => value.redo ? [[key, value.redo]] : []),
-      kernel: {version: 2, status: next.status,
+      kernel: {version: 2, status: next.status, parked: next.parked,
         nodes: Object.fromEntries(Object.entries(next.nodes).map(([key, value]) => [key, {
-          status: value.status, attempts: value.attempts, waitingFor: value.waitingFor, nextAt: value.nextAt,
+          status: value.status, attempts: value.attempts, waitingFor: value.waitingFor,
+          waitingSince: value.waitingSince, nextAt: value.nextAt,
         }]))}};
     next.data.runtimeCheckpoint = checkpoint;
     this.store.save(next, options.admittedAt);
@@ -552,7 +553,8 @@ export class Kernel extends Runtime {
       for (const {item: snapshot, node} of sortReady(this.store.list(['active']), this.f,
         id => this.store.admittedAt(id), key => this.scopePaused(key))) {
         const item = this.store.get(snapshot.id)!;
-        if (item.status !== 'active' || item.nodes[node.key]?.status !== 'ready') continue;
+        const state = item.nodes[node.key];
+        if (item.status !== 'active' || !(state?.status === 'ready' || state?.status === 'waiting' && state.waitingFor === 'resource')) continue;
         if (Object.values(item.roomHolds ?? {}).some(hold => hold.nodes.includes(node.key))) continue;
         if (node.kind === 'store') { this.atomicTransition(() => this.finishStore(item, node)); continue; }
         if (!this.runnable(node)) { this.atomicTransition(() => this.parkItem(item, node.key, '这条线还没接工具', 'station_unavailable')); continue; }
@@ -573,7 +575,16 @@ export class Kernel extends Runtime {
         // The breaker already selected the sole trial. Broker still owns all
         // capacity checks; bypassing only its old v1 circuit view is intentional.
         const lease = this.broker.tryAcquire(node.resource, {review: node.kind === 'review' || node.kind === 'gate', dependency, token: item.id});
-        if (!lease) continue;
+        if (!lease) {
+          if (state.status !== 'waiting') this.atomicTransition(() => {
+            const next = structuredClone(item);
+            next.nodes[node.key].status = 'waiting';
+            next.nodes[node.key].waitingFor = 'resource';
+            next.nodes[node.key].waitingSince = now;
+            this.persist(item, next);
+          });
+          continue;
+        }
         if (circuit && dependency) {
           const probe = claimModelProbe(circuit, item.id, node.key, this.journal.run, now);
           if (!probe) { lease.release(); continue; }
@@ -592,6 +603,7 @@ export class Kernel extends Runtime {
         const next = structuredClone(item);
         next.nodes[node.key].status = 'running'; next.nodes[node.key].lastAttempt = work.attempt;
         delete next.nodes[node.key].nextAt; delete next.nodes[node.key].waitingFor;
+        delete next.nodes[node.key].waitingSince;
         this.store.saveAttempt({id: work.attempt, item: item.id, node: node.key, startedAt: work.startedAt,
           status: 'running', body: {dependency: prepared.dependency, queuedMs: work.queuedMs}});
         this.persist(item, next);

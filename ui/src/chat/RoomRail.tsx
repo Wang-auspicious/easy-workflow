@@ -12,15 +12,18 @@ import { Avatar, type AvatarState } from "./Avatar.tsx";
 import { DISPATCHER_HUE, dispatcherState } from "./transcript.ts";
 import { useNow } from "../util/useNow.ts";
 import "./rooms.css";
+import {kernelRooms} from '../kernel.ts';
 
 /** 群组集合只由工厂图和观测到的咨询决定，跟界面状态无关。 */
 export function useRooms(): RoomSpec[] {
   const factory = useStore((s) => s.factory);
   const consults = useStore((s) => s.fs.consults);
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
   return useMemo(() => {
+    if (kernel === 'v2') return kernelRooms(factory);
     const observed = Object.values(consults ?? {}).map((c) => ({ reviewer: c.reviewer, owner: c.owner }));
     return deriveRooms(factory, observed);
-  }, [factory, consults]);
+  }, [factory, consults, kernel]);
 }
 
 const KIND_LABEL: Record<RoomSpec["kind"], string> = { root: "总台", part: "工序", loop: "返工", bridge: "跨段" };
@@ -53,9 +56,12 @@ export function RoomRail() {
   const factory = useStore((s) => s.factory);
   const fs = useStore((s) => s.fs);
   const bots = useStore((s) => s.layout.bots);
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
+  const events = useStore(state => state.kernelEvents);
   const now = useNow(2000);
   const dispatcher = useDispatcherActor();
-  const ctx: RoomContext = useMemo(() => ({ factory, state: fs, look: stationLook(factory, fs, bots, now), now }), [factory, fs, bots, now]);
+  const ctx: RoomContext = useMemo(() => ({ factory, state: fs, look: stationLook(factory, fs, bots, now), now,
+    ...(kernel === 'v2' ? {kernelEvents: events} : {}) }), [factory, fs, bots, now, kernel, events]);
   const summaries = useMemo(() => roomSummaries(rooms, ctx, seen), [rooms, ctx, seen]);
   const lineName = (id: string | null) => factory?.lines.find((l) => l.id === id)?.name ?? id ?? "";
 
