@@ -14,15 +14,21 @@ import { ControlError } from './errors.ts';
 import { invokeWorkflowTool, type WorkflowTool } from './workflow-tools.ts';
 import type { Journal } from './journal.ts';
 import {parseAgentBinding} from './agent-bindings.ts';
+import {decide} from './decision-model.ts';
 export type { WorkflowTool } from './workflow-tools.ts';
 
 export type JsonSchema = Record<string, unknown>;
 export interface WorkflowRole { station: string; path: string; revision: string; content: string }
 export type WorkflowInput = { path: string; default?: unknown } | { value: unknown };
 export interface WorkflowCondition { path: string; op: 'equals' | 'in' | 'exists' | 'truthy'; value?: unknown }
+export type WorkflowDecisionQuestion =
+  | {type: 'choice'; instructions: string; criteria: Record<string, string>}
+  | {type: 'noul'; instructions: string; criteria?: {true: string; false: string}}
+  | {type: 'score'; instructions: string; criteria: string[]};
 export type WorkflowExecution =
   | { kind: 'builtin'; name: 'normalize-text' | 'text-statistics' | 'keywords' | 'aggregate' | 'page-text' | 'prepare-source' | 'route' | 'publish-json' }
   | { kind: 'agent'; instructions: string; tools?: string[]; timeoutMs?: number; agent?: StationAgentBinding }
+  | {kind: 'system-one'; purpose: string; questions: Record<string, WorkflowDecisionQuestion>; minConfidence?: number}
   | { kind: 'node'; module: string; export?: string }
   | { kind: 'tool'; tool: string };
 export interface WorkflowBinding {
@@ -69,6 +75,52 @@ const digest = (value: string) => crypto.createHash('sha256').update(value).dige
 const record = (value: unknown): value is Record<string, any> => value !== null && typeof value === 'object' && !Array.isArray(value);
 function bad(message: string): never { throw new ControlError(422, 'invalid_workflow_pack', message); }
 const safeKey = (key: string) => key.length > 0 && !['__proto__', 'prototype', 'constructor'].includes(key);
+
+function validateDecisionExecution(value: Record<string, unknown>, key: string) {
+  const invalid = (detail: string): never => bad(`${key} 的 SystemOne 决策契约无效：${detail}`);
+  const text = (value: unknown) => typeof value === 'string' && value.trim().length > 0;
+  if (Object.keys(value).some(field => !['kind', 'purpose', 'questions', 'minConfidence'].includes(field))) {
+    invalid('只允许 purpose、questions 与 minConfidence；连接、凭据和 Agent 配置由宿主管理');
+  }
+  if (!text(value.purpose) || String(value.purpose).length > 160 || !record(value.questions)) invalid('必须声明 160 字符以内的 purpose 和静态 questions');
+  const questions = Object.entries(value.questions as Record<string, unknown>);
+  if (!questions.length || questions.length > 8) invalid('每次必须包含 1–8 个具名问题');
+  let choices = 0;
+  for (const [id, question] of questions) {
+    if (!safeKey(id) || !/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(id) || !record(question) ||
+        Object.keys(question).some(field => !['type', 'instructions', 'criteria'].includes(field)) ||
+        !text(question.instructions) || question.instructions.length > 2048) {
+      invalid('问题必须有安全名称、type、非空 instructions 与标准 criteria');
+    }
+    const declaration = question as Record<string, unknown>;
+    if (declaration.type === 'choice') {
+      if (!record(declaration.criteria)) invalid(`${id} 的 choice criteria 必须是选项字典`);
+      const criteria = Object.entries(declaration.criteria as Record<string, unknown>);
+      if (criteria.length < 2 || criteria.length > 16 || criteria.some(([name, description]) => !safeKey(name) ||
+          !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/.test(name) || !text(description) || String(description).length > 512)) {
+        invalid(`${id} 必须包含 2–16 个具名选项，每项说明不超过 512 字符`);
+      }
+      choices += criteria.length;
+    } else if (declaration.type === 'noul') {
+      const criteria = declaration.criteria;
+      if (criteria !== undefined && (!record(criteria) || Object.keys(criteria).length !== 2 ||
+          !text(criteria.true) || !text(criteria.false) || String(criteria.true).length > 512 || String(criteria.false).length > 512)) invalid(`${id} 的 noul criteria 必须同时声明 true 与 false，每项不超过 512 字符`);
+      choices += 2;
+    } else if (declaration.type === 'score') {
+      if (!Array.isArray(declaration.criteria) || declaration.criteria.length < 2 || declaration.criteria.length > 16 ||
+          declaration.criteria.some(criterion => !text(criterion) || String(criterion).length > 512)) {
+        invalid(`${id} 的 score criteria 必须包含 2–16 项说明，每项不超过 512 字符`);
+      }
+      choices += (declaration.criteria as string[]).length;
+    } else invalid(`${id} 只支持 choice、noul 与 score`);
+  }
+  if (choices > 64) invalid('决策选项总数不能超过 64');
+  if (Buffer.byteLength(JSON.stringify(value)) > 64 * 1024) invalid('静态问题声明不能超过 64KiB');
+  if (value.minConfidence !== undefined && (typeof value.minConfidence !== 'number' ||
+      !Number.isFinite(value.minConfidence) || value.minConfidence < 0 || value.minConfidence > 1)) {
+    invalid('minConfidence 必须在 0–1 之间');
+  }
+}
 
 export function assertWorkflowIdle(guard: WorkflowGuard) {
   guard.assertIdle?.();
@@ -166,7 +218,20 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
         }
       }
     }
+    if (binding.execute.kind === 'system-one') {
+      validateDecisionExecution(binding.execute, key);
+      const station = manifest.lines.flatMap(line => line.stations.map(station => ({line: line.id, station})))
+        .find(value => `${value.line}/${value.station.id}` === key)?.station;
+      if (station?.kind !== 'program') bad(`${key} 的 SystemOne 必须显式声明为程序工位，不能伪装成聊天 Agent`);
+    }
     if (!manifest.schemas[binding.inputSchema] || !manifest.schemas[binding.outputSchema]) bad(`${key} 缺少输入或输出 schema`);
+    if (binding.manualWhen !== undefined) {
+      if (!record(binding.manualWhen) || typeof binding.manualWhen.path !== 'string' || !binding.manualWhen.path ||
+          !Object.hasOwn(binding.manualWhen, 'equals') || binding.manualWhen.equals === undefined) {
+        bad(`${key} 的人工分支必须声明明确 path 与 equals，缺失字段不能当作命中`);
+      }
+      workflowValue({}, binding.manualWhen.path);
+    }
     for (const [field, selector] of Object.entries(binding.input)) {
       if (!safeKey(field) || !record(selector) || (!('value' in selector) && (!('path' in selector) || typeof selector.path !== 'string'))) bad(`${key} 的输入映射无效`);
       if ('path' in selector) workflowValue({}, selector.path);
@@ -183,7 +248,7 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
         if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || tool.method && !['GET', 'POST'].includes(tool.method)) bad(`${key} 的 HTTP 工具必须声明无内嵌凭据的 HTTP(S) 地址和 GET/POST 方法`);
       } else if (typeof tool.command !== 'string' || !tool.command.trim() || tool.args && (!Array.isArray(tool.args) || tool.args.some(arg => typeof arg !== 'string')) || tool.kind === 'mcp' && !tool.tool) bad(`${key} 的进程工具命令、参数或 MCP 工具名无效`);
       code += JSON.stringify(tool);
-    } else if (binding.execute.kind !== 'agent' && (binding.execute.kind !== 'builtin' || !['normalize-text', 'text-statistics', 'keywords', 'aggregate', 'page-text', 'prepare-source', 'route', 'publish-json'].includes(binding.execute.name))) bad(`${key} 没有已实现的执行器`);
+    } else if (binding.execute.kind !== 'agent' && binding.execute.kind !== 'system-one' && (binding.execute.kind !== 'builtin' || !['normalize-text', 'text-statistics', 'keywords', 'aggregate', 'page-text', 'prepare-source', 'route', 'publish-json'].includes(binding.execute.name))) bad(`${key} 没有已实现的执行器`);
     const declaredRecovery = manifest.lines.flatMap(line => line.stations.map(station => ({line: line.id, station})))
       .find(value => `${value.line}/${value.station.id}` === key)?.station.recovery;
     const revision = digest(content + code + JSON.stringify([binding, declaredRecovery,
@@ -235,7 +300,10 @@ export async function loadWorkflowPacks(projectDir: string, options: { builtins?
       const role = loaded.roles.get(key)!;
       executors.set(key, async (ctx, runAgent) => {
         ctx.signal.throwIfAborted();
-        const input = Object.fromEntries(Object.entries(binding.input).map(([name, selector]) => [name, 'value' in selector ? structuredClone(selector.value) : workflowValue(ctx.token.data, selector.path) ?? selector.default]).filter(([, value]) => value !== undefined));
+        const input = Object.fromEntries(Object.entries(binding.input).map(([name, selector]) => {
+          const value = 'value' in selector ? selector.value : workflowValue(ctx.token.data, selector.path);
+          return [name, structuredClone(value === undefined && 'default' in selector ? selector.default : value)];
+        }).filter(([, value]) => value !== undefined));
         verify(manifest.schemas[binding.inputSchema], input, `${key} 输入`);
         const workDir = path.join(projectDir, 'work', digest(ctx.token.id).slice(0, 20));
         const finish = (output: any): StationResult => {
@@ -243,10 +311,17 @@ export async function loadWorkflowPacks(projectDir: string, options: { builtins?
           for (const [field, source] of Object.entries(binding.preserveInput ?? {})) if (JSON.stringify(workflowValue(output, field)) !== JSON.stringify(workflowValue(input, source))) bad(`${key} 不得改写输入字段 ${source}`);
           const result: StationResult = { ok: true, summary: `${ctx.node.name}完成并通过输出契约校验`, data: { [binding.outputKey]: output } };
           if (binding.reviewTarget) {
+            if (!record(output) || !['pass', 'return', 'escalate', 'fix'].includes(output.verdict) ||
+                typeof output.reason !== 'string' || !output.reason.trim()) bad(`${key} 的审查输出必须包含明确 verdict 与 reason`);
             if (output.verdict === 'pass' && output.issues?.length) bad('审查通过不能同时保留未解决问题');
             result.verdict = { verdict: output.verdict, reason: output.reason, ...(output.verdict === 'return' ? { returnTo: binding.reviewTarget } : {}) };
           }
-          if (binding.manualWhen && JSON.stringify(workflowValue(output, binding.manualWhen.path)) === JSON.stringify(binding.manualWhen.equals)) result.finish = { status: 'manual', reason: '规则与独立分类均无法确定去向，请补充输入后继续' };
+          if (binding.manualWhen) {
+            const decision = workflowValue(output, binding.manualWhen.path);
+            if (decision !== undefined && JSON.stringify(decision) === JSON.stringify(binding.manualWhen.equals)) {
+              result.finish = {status: 'manual', reason: '命中工作流声明的人工处理条件，请核对证据后继续'};
+            }
+          }
           return result;
         };
         if (binding.execute.kind === 'agent') {
@@ -256,6 +331,33 @@ export async function loadWorkflowPacks(projectDir: string, options: { builtins?
           ] };
           const run = runAgent ?? options.services?.runAgent ?? (await import('./agent-station.ts')).runAgentStation;
           return run(def, ctx);
+        }
+        if (binding.execute.kind === 'system-one') {
+          const response = await decide(ctx, {purpose: binding.execute.purpose, state: input,
+            questions: binding.execute.questions});
+          ctx.signal.throwIfAborted();
+          const unavailable = (code: string, reason: string, model?: string): StationResult => ({
+            ok: false, summary: reason, error: reason,
+            ...(model ? {metrics: {execution: {adapter: 'system-one', model}}} : {}),
+            failure: {tag: 'tool_error', category: 'system', code, message: reason,
+              retryable: true, owner: 'system', nextAction: '核对专用决策服务或补充输入证据后，从当前工位重试。'},
+          });
+          if (!response) return unavailable('SYSTEM_ONE_UNAVAILABLE', 'SystemOne 未返回可用决策，保留原输入等待重试');
+          if (binding.execute.minConfidence !== undefined) {
+            for (const [id, answer] of Object.entries(response.answers)) {
+              // A confident negative is just as decisive as a confident positive.
+              // Scores use their confidence field, never the score itself.
+              const confidence = answer.type === 'noul'
+                ? Math.max(answer.noul, 1 - answer.noul) : answer.confidence;
+              if (!Number.isFinite(confidence) || confidence < binding.execute.minConfidence) {
+                return unavailable('SYSTEM_ONE_LOW_CONFIDENCE', `SystemOne 问题 ${id} 置信度不足，未接受本次决策`, response.model);
+              }
+            }
+          }
+          const result = finish({answers: structuredClone(response.answers), model: response.model});
+          result.summary = `${ctx.node.name}已取得 SystemOne 结构化决策并通过输出契约校验`;
+          result.metrics = {execution: {adapter: 'system-one', model: response.model}};
+          return result;
         }
         const output = binding.execute.kind === 'node' ? await moduleExecute!(input, { signal: ctx.signal, workDir, projectDir, node: ctx.node.key, item: ctx.token.item, progress: ctx.progress })
           : binding.execute.kind === 'tool' ? await invokeWorkflowTool(manifest.tools![binding.execute.tool], input, {
@@ -388,7 +490,23 @@ export async function addWorkflowLine(projectDir: string, packId: string, additi
   for (const [relative, content] of Object.entries(addition.files)) { if (files[relative] !== undefined && files[relative] !== content) bad('添加流水线不能同时改写已有职责或执行代码'); files[relative] = content; }
   if (Object.keys(addition.bindings).some(key => !key.startsWith(`${addition.line.id}/`))) bad('新增绑定必须属于新流水线');
   for (const [name, schema] of Object.entries(addition.schemas)) if (manifest.schemas[name] && JSON.stringify(manifest.schemas[name]) !== JSON.stringify(schema)) bad('添加流水线不能同时覆盖已有 schema');
-  const workflowEntry = manifest.entry || `${addition.line.id}/${addition.line.stations.find(station => station.kind !== 'source' && station.kind !== 'store')?.id ?? addition.line.stations[0]?.id ?? ''}`;
+  for (const [name, tool] of Object.entries(addition.tools ?? {})) {
+    if (Object.hasOwn(manifest.tools ?? {}, name) && JSON.stringify(manifest.tools![name]) !== JSON.stringify(tool)) {
+      bad(`添加流水线不能同时覆盖已有工具 ${name}；请使用新的工具名称`);
+    }
+  }
+  for (const [name, condition] of Object.entries(addition.conditions ?? {})) {
+    if (Object.hasOwn(manifest.conditions, name) && JSON.stringify(manifest.conditions[name]) !== JSON.stringify(condition)) {
+      bad(`添加流水线不能同时覆盖已有条件 ${name}；请使用新的条件名称`);
+    }
+  }
+  let workflowEntry = manifest.entry;
+  if (!workflowEntry && addition.line.wired) {
+    const roots = addition.line.stations.filter(station =>
+      !addition.line.edges.some(edge => edge.to === station.id && (!edge.kind || edge.kind === 'flow')));
+    if (roots.length !== 1) bad('新工作流必须有唯一入口，不能按工位排列顺序跳过上游');
+    workflowEntry = `${addition.line.id}/${roots[0].id}`;
+  }
   return installWorkflowPackUnlocked(projectDir, { manifest: { ...manifest, entry: workflowEntry, lines: [...manifest.lines, addition.line], bindings: { ...manifest.bindings, ...addition.bindings }, schemas: { ...manifest.schemas, ...addition.schemas }, tools: { ...manifest.tools, ...addition.tools }, conditions: { ...manifest.conditions, ...addition.conditions } }, files, replace: true }, guard, availableBuiltins);
   });
 }

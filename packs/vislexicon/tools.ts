@@ -1,5 +1,5 @@
-// Program stations of the VisLexicon pack (Spec §8): deterministic steps that never call a
-// model. Each returns a structured result; evidence is written to the content store and
+// Program stations of the VisLexicon pack (Spec §8), with optional model-assisted
+// candidate ordering. Each returns a structured result; evidence is written to the content store and
 // shows up next to its node on the canvas.
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -8,7 +8,7 @@ import type { EvidenceRef, Usage } from "../../shared/types.ts";
 import { EvidenceStore, aHashAsync, hamming } from "../../server/evidence.ts";
 import { openPage } from "../../server/browser.ts";
 import { webGet } from "../../server/network.ts";
-import { classifyFailure, candidateFailure, type Failure } from "../../shared/failures.ts";
+import { ClassifiedFailure, classifyFailure, candidateFailure, type Failure } from "../../shared/failures.ts";
 import { pickByImages, pickOne } from "../../server/agent-station.ts";
 import type { StationContext, StationResult } from "../../server/runtime.ts";
 import { KIND_ZH, PREVIEW_RULES, loadPublished } from "./env.ts";
@@ -17,10 +17,12 @@ import { publicationImages, videoPreview } from "./preview.ts";
 import { COMPONENT_TOOLS } from "./components.ts";
 import { MEDIA_TOOLS } from "./media-lines.ts";
 import { repoOf } from "../../server/repo.ts";
+import {prioritizeCaptureCandidates} from './decisions.ts';
 import { ALL_AXES, CHOSEN_AXES, derivedFacets, loadTaxonomy, validateV3, webpSize } from "./v3.ts";
 import {
-  VIEW, bestScrollFrame, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, breadthPreviewIssues, recordScroll, sameSite,
-  scoreLinks, shoot, stageClip, visit, pageKey, locateCaptureTarget, type CaptureLocation, type BreadthVisual, type Link,
+  VIEW, bestScrollFrame, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, breadthPreviewIssues, breadthRoleGuidance, recordScroll, sameSite,
+  scoreLinks, shoot, stageClip, visit, pageKey, locateCaptureTarget, sampleBrowserCapture, openReadOnlyPreview, waitProofCaptureReady,
+  type BrowserCaptureState, type CaptureLocation, type BreadthVisual, type Link,
 } from "./capture.ts";
 
 export interface Services {
@@ -35,6 +37,66 @@ export interface Services {
 
 type Tool = (ctx: StationContext, svc: Services) => Promise<StationResult>;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function siteEntryThreeShots(ctx: StationContext): boolean {
+  const external = ctx.token.data.externalResearch as Record<string, unknown> | undefined;
+  return external?.publicationContract === 'site-entry-three-shots' ||
+    external?.intakeId === 'vislexicon-20261014' && typeof external.entryId === 'string';
+}
+
+type CorrectedCaptureTarget = {url: string; locate: string; interaction?: {kind: 'open-preview'; index: number}};
+
+/** Keep an owner-validated entry target when another role invalidates this station. */
+function correctedCaptureTarget(ctx: StationContext, host: string, role: 'breadth' | 'proof'): CorrectedCaptureTarget | undefined {
+  if (!siteEntryThreeShots(ctx)) return undefined;
+  let target: unknown;
+  let explicit = false;
+  if (ctx.redo?.byHuman && ctx.redo.note) {
+    let note: unknown;
+    try {note = JSON.parse(ctx.redo.note) as unknown;} catch { /* Unstructured owner notes are not targets. */ }
+    if (note && typeof note === 'object' && Object.hasOwn(note, 'captureTarget')) {
+      target = (note as Record<string, unknown>).captureTarget;
+      explicit = true;
+    }
+  }
+  if (!explicit) {
+    const targets = ctx.token.data.ownerCaptureTargets as Record<string, unknown> | undefined;
+    if (!targets || !Object.hasOwn(targets, role)) return undefined;
+    const saved = targets[role];
+    const entryId = (ctx.token.data.externalResearch as Record<string, unknown> | undefined)?.entryId;
+    // An old entry binding must fail visibly, never become permission to select a sibling.
+    if (saved && typeof saved === 'object' && typeof entryId === 'string' &&
+        (saved as Record<string, unknown>).entryId === entryId) target = saved;
+  }
+  if (target && typeof target === 'object') {
+    const requested = target as Record<string, unknown>;
+    const interaction = requested.interaction as Record<string, unknown> | undefined;
+    const validInteraction = interaction === undefined || role === 'proof' && interaction !== null &&
+      interaction.kind === 'open-preview' && Number.isSafeInteger(interaction.index ?? 0) &&
+      Number(interaction.index ?? 0) >= 0 && Number(interaction.index ?? 0) <= 49;
+    if (requested.role === role && validInteraction && typeof requested.url === 'string' && typeof requested.locate === 'string' &&
+        requested.locate.trim().length >= 2 && requested.locate.length <= 1000) {
+      try {
+        const url = new URL(requested.url);
+        if (['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && sameSite(url.href, host)) {
+          return {url: url.href, locate: requested.locate.trim(),
+            ...(interaction ? {interaction: {kind: 'open-preview', index: Number(interaction.index ?? 0)}} : {})};
+        }
+      } catch { /* Invalid explicit target is rejected before opening a page. */ }
+    }
+  }
+  throw new ClassifiedFailure({tag: 'needs_selection', category: 'system', owner: 'agent', retryable: true,
+    message: `纠错取景目标必须是同站的 ${role} HTTP(S) 页面，并提供可在页面实际命中的 locate 文本；仅允许已核验的 open-preview。`});
+}
+
+/** Called only after the requested DOM target and ordinary image gates succeeded. */
+function ownerCaptureTargetPatch(ctx: StationContext, role: 'breadth' | 'proof',
+  target: CorrectedCaptureTarget | undefined, capturedAt: string): Record<string, unknown> {
+  const entryId = (ctx.token.data.externalResearch as Record<string, unknown> | undefined)?.entryId;
+  if (!target || typeof entryId !== 'string') return {};
+  return {ownerCaptureTargets: {...(ctx.token.data.ownerCaptureTargets as object ?? {}),
+    [role]: {entryId, role, ...target, verifiedAt: capturedAt}}};
+}
 
 export function canonical(raw: string): string | null {
   try {
@@ -213,7 +275,7 @@ const plan: Tool = async (ctx) => {
   const rules = PREVIEW_RULES.kinds[kind];
   const home = ctx.token.data.home as { navLinks: Link[] } | undefined;
   const ranked = rules?.roles.breadth ? scoreLinks(home?.navLinks ?? [], rules.roles.breadth).slice(0, 4) : [];
-  const mode = kind === "work" ? "video" : "shots";
+  const mode = kind === "work" && !siteEntryThreeShots(ctx) ? "video" : "shots";
   const reader = ctx.token.data.readerPlan as { breadth?: { url: string }; proof?: { url: string; locate?: string } } | undefined;
   if (reader) ctx.progress(`采用阅读员的拍摄单：目录 ${reader.breadth?.url ?? "-"}；特写 ${reader.proof?.url ?? "-"}${reader.proof?.locate ? `（${reader.proof.locate}）` : ""}`, { tool: "plan", text: "reader plan first, rules as fallback", ok: true });
   ctx.progress(`按 ${KIND_ZH[kind] ?? kind} 的规则选页：${mode === "video" ? "作品走录屏路线" : `目录候选 ${ranked.length} 个`}`, { tool: "rules", text: `preview-rules.kinds.${kind}` });
@@ -238,7 +300,8 @@ async function shotEvidence(ctx: StationContext, svc: Services, png: Buffer, rol
   return ctx.addEvidence({ id: `img-${card.sha.slice(0, 12)}-${ctx.attempt.slice(2, 8)}`, kind: "image", src: card.src, card: card.src, label: ROLE_ZH[role] ?? role, meta: { role, ...meta } });
 }
 const ROLE_ZH: Record<string, string> = { identity: "首屏", breadth: "目录", proof: "组件特写" };
-type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number; title?: string; previews?: number; visual?: BreadthVisual; location?: CaptureLocation };
+type ReadinessRef = {src: string; sha256: string};
+type ShotData = { file: string; href: string; hash: string; evidence: string; framing?: string; content?: number; title?: string; previews?: number; visual?: BreadthVisual; location?: CaptureLocation; capturedAt?: string; captureState?: BrowserCaptureState; readiness?: ReadinessRef };
 type ReaderPlan = { identity?: { url: string }; breadth?: { url: string; alternatives?: { url: string }[] }; proof?: { url: string; locate?: string; alternatives?: { url: string; locate?: string }[] } };
 const readerPlanOf = (ctx: StationContext) => ctx.token.data.readerPlan as ReaderPlan | undefined;
 const shotsOf = (ctx: StationContext) => ({ ...((ctx.token.data.shots as Record<string, ShotData>) ?? {}) });
@@ -279,12 +342,14 @@ const identity: Tool = async (ctx, svc) => {
       return { ok: false, summary: "首页没打开", error: home.issues.join(", ") };
     }
     const motion = await motionFirst(page);
+    let captureState = await sampleBrowserCapture(page);
     let png = await shoot(page, undefined, {signal: ctx.signal});
     let check = await checkImage(png, [], {signal: ctx.signal});
     if (check.issues.includes("flat-block")) {
       ctx.progress("首屏是大块单色：轻推滚动、等 4 秒再拍", { tool: "browser", text: "flat-block retry" });
       const firstHash = check.hash;
       await page.mouse.wheel(0, 2); await sleep(300); await page.mouse.wheel(0, -2); await sleep(4000);
+      captureState = await sampleBrowserCapture(page);
       png = await shoot(page, undefined, {signal: ctx.signal});
       check = await checkImage(png, [], {signal: ctx.signal});
       // Unchanged after 4s: not a placeholder that never rendered, but a real solid-colour design.
@@ -297,13 +362,13 @@ const identity: Tool = async (ctx, svc) => {
     const issues = [...home.issues, ...check.issues];
     const file = path.join(workDir(svc, ctx), "identity.png");
     fs.writeFileSync(file, png);
-    const ev = await shotEvidence(ctx, svc, png, "identity", { href: page.url(), issues, hidden: home.hidden.length, content: Number(check.stats.content.toFixed(3)) });
+    const ev = await shotEvidence(ctx, svc, png, "identity", { href: page.url(), issues, hidden: home.hidden.length, content: Number(check.stats.content.toFixed(3)), captureState });
     ctx.progress(`截首屏 ${issues.length ? `（问题：${issues.join("、")}）` : "✓"}`, { tool: "shot", text: "1280×800 视口", ok: !issues.length, evidence: [ev.id] });
-    const motionVideo = (motion.scrollHijacked || motion.canvasHero) && ctx.token.data.kind !== "component-source" && ctx.token.data.kind !== "design-system";
-    const mode = ctx.token.data.mode === "video" || motionVideo ? "video" : "shots";
+    const motionVideo = !siteEntryThreeShots(ctx) && (motion.scrollHijacked || motion.canvasHero) && ctx.token.data.kind !== "component-source" && ctx.token.data.kind !== "design-system";
+    const mode = !siteEntryThreeShots(ctx) && (ctx.token.data.mode === "video" || motionVideo) ? "video" : "shots";
     if (motionVideo) ctx.progress(`动效优先：${motion.scrollHijacked ? "滚动被劫持" : "画布盖住首屏"} → 改走录屏`, { tool: "rules", text: "motionFirstSignals" });
     const shots = shotsOf(ctx);
-    shots.identity = { file, href: page.url(), hash: check.hash, evidence: ev.id, content: check.stats.content, title: await page.title().catch(() => "") };
+    shots.identity = { file, href: page.url(), hash: check.hash, evidence: ev.id, content: check.stats.content, title: await page.title().catch(() => ""), capturedAt: captureState.capturedAt, captureState };
     if (issues.length && mode === "shots" && !issues.every((i) => i === "consentOverlay")) {
       return { ok: false, summary: `首屏不合格：${issues.join("、")}`, error: issues.join(", "), data: { shots, homeLinks: homeLinks.slice(0, 150) } };
     }
@@ -337,14 +402,22 @@ function siteFileLinks(ctx: StationContext, host: string): Link[] {
   return out;
 }
 
-const BREADTH_LOOK = (title: string, kind: string) => `Website "${title}" is a ${KIND_ZH[kind] ?? kind} (${kind}). Below is one screenshot per candidate page (some are scrolled down, as a person would scroll). Pick the ONE image where a person sees at a glance the RANGE of what this site offers: many of its actual items at once.
+export const breadthPageQuestion = (title: string, kind: string) => kind === 'tool'
+  ? `Website "${title}" is a ${KIND_ZH[kind] ?? kind} (${kind}). Below is one screenshot per candidate page (some are scrolled down, as a person would scroll). Pick the ONE image where a person sees at a glance the actual functional RANGE of this tool.
+${breadthRoleGuidance(kind)}
+- Prefer actual rendered items or a qualifying workspace, with basis = "rendered-items". Workspace controls must belong to this tool and be shown together with the actual rendered result.
+- Customer websites or "made with" showcases, company logos, testimonials, pricing and blog posts do not show this tool's functional range.
+- Only if no image shows rendered items or a qualifying workspace, a catalogue visibly listing many actual item or function names can use basis = "name-list"; feature marketing text alone cannot.
+- If no image shows the range, submit index 0 with basis "none".
+In reason, say in one Chinese sentence what actual items or output and different functions or controls the chosen image shows.`
+  : `Website "${title}" is a ${KIND_ZH[kind] ?? kind} (${kind}). Below is one screenshot per candidate page (some are scrolled down, as a person would scroll). Pick the ONE image where a person sees at a glance the RANGE of what this site offers: many of its actual items at once.
 - Prefer an image where the items themselves are rendered: component previews or demos, works, icons or other assets, templates. Then basis = "rendered-items".
 - Customer websites or "made with" showcases, company logos, testimonials, pricing, blog posts and marketing copy are NOT the site's items.
 - Only if no image shows rendered items, pick the page that lists the most item names (for example an index of all components). Then basis = "name-list".
 - If no image shows the range at all, submit index 0 with basis "none".
 In reason, say in one Chinese sentence what the chosen image shows.`;
 
-type Survey = { href: string; png: Buffer; hash: string; previews: number; y: number; file: string; links: Link[]; why: string; title: string };
+type Survey = { href: string; png: Buffer; hash: string; previews: number; y: number; file: string; links: Link[]; why: string; title: string; captureState: BrowserCaptureState };
 
 const breadth: Tool = async (ctx, svc) => {
   const kind = String(ctx.token.data.kind || "work");
@@ -354,7 +427,8 @@ const breadth: Tool = async (ctx, svc) => {
   const shots = shotsOf(ctx);
   const exclude = new Set<string>(((ctx.token.data.rejectedPages as string[]) ?? []).map(pageKey));
   const repair = (ctx.token.data.shotRepairs as Record<string, { action: string; url?: string }> | undefined)?.breadth;
-  const explicit = (ctx.token.data.previewChoices as Record<string, string> | undefined)?.breadth;
+  const corrected = correctedCaptureTarget(ctx, host, 'breadth');
+  const explicit = corrected?.url ?? (ctx.token.data.previewChoices as Record<string, string> | undefined)?.breadth;
   if (explicit) exclude.delete(pageKey(explicit));
   if (ctx.redo && shots.breadth?.href && (!repair || repair.action === "replace-page")) exclude.add(pageKey(shots.breadth.href));
   // The home page's first screen is the identity shot. Further down it can still be the
@@ -372,12 +446,12 @@ const breadth: Tool = async (ctx, svc) => {
   try {
     const hashes = [shots.identity?.hash ?? ""];
     const accessFailures: Failure[] = [];
-    const save = async (png: Buffer, hash: string, href: string, reason: string, previews: number, visual?: BreadthVisual, compared?: { href: string; previews: number; y: number }[]) => {
+    const save = async (png: Buffer, hash: string, href: string, reason: string, previews: number, captureState: BrowserCaptureState, visual?: BreadthVisual, compared?: { href: string; previews: number; y: number }[]) => {
       const file = path.join(workDir(svc, ctx), "breadth.png");
       fs.writeFileSync(file, png);
-      const ev = await shotEvidence(ctx, svc, png, "breadth", { href, reason, previews, visual, compared });
+      const ev = await shotEvidence(ctx, svc, png, "breadth", { href, reason, previews, visual, compared, captureState });
       ctx.progress(`截目录 ✓ ${pathOf(href)}（${reason}）`, { tool: "shot", text: `程序数到首屏预览 ${previews} 个${visual ? ` · 判定：${visual.basis === "name-list" ? "名称目录" : visual.basis === "owner-choice" ? "站长指定" : "渲染出的内容"}` : ""}`, ok: true, evidence: [ev.id] });
-      shots.breadth = { file, href, hash, evidence: ev.id, title: "", previews, visual };
+      shots.breadth = { file, href, hash, evidence: ev.id, title: "", previews, visual, capturedAt: captureState.capturedAt, captureState };
     };
 
     // 1. A page the owner named, or the reviewer's "same page, reframe" request.
@@ -386,13 +460,20 @@ const breadth: Tool = async (ctx, svc) => {
       const v = await visitCandidate(page, direct.href, host, ctx, accessFailures);
       retainedPage = Boolean(v.retainPage);
       if (!v.failure) {
-        if (direct.why === "review-reframe") {
+        if (corrected) {
+          const location = await locateCaptureTarget(page, [corrected.locate]);
+          if (!location.matched) return {ok: false, summary: '指定目录目标未在页面命中',
+            error: '需要重新选页：指定的目录定位文字未在原页实际命中，未使用默认680px取景。'};
+          ctx.progress(`目录实际定位到「${location.matched}」（${Math.round(location.scrollY ?? 0)}px）`,
+            {tool: 'browser', text: corrected.locate, ok: true});
+        } else if (direct.why === "review-reframe") {
           const stage = await findStage(page);
           if (stage) await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
           await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
           await sleep(1000);
           ctx.progress("按复审保留原页，等待预览并重新取景", { tool: "browser", text: "保留 URL，更新画面" });
         }
+        const captureState = await sampleBrowserCapture(page);
         const png = await shoot(page, undefined, {signal: ctx.signal});
         const check = await checkImage(png, hashes, {signal: ctx.signal});
         const previews = await previewsInViewport(page);
@@ -401,9 +482,10 @@ const breadth: Tool = async (ctx, svc) => {
         const issues = [...v.issues, ...check.issues, ...breadthPreviewIssues(kind, previews, visual)];
         if (!issues.length) {
           const pageLinks = (await links(page)).filter((l) => sameSite(l.href, host));
-          await save(png, check.hash, page.url(), direct.why === "explicit-choice" ? "已指定目录页" : "按复审重新取景", previews, visual);
+          await save(png, check.hash, page.url(), direct.why === "explicit-choice" ? "已指定目录页" : "按复审重新取景", previews, captureState, visual);
           shots.breadth!.title = await page.title().catch(() => "");
-          return { ok: true, summary: `目录 ✓ ${pathOf(page.url())}`, data: { shots, breadthLinks: pageLinks.slice(0, 200), candidateAccessFailures: accessFailures } };
+          return { ok: true, summary: `目录 ✓ ${pathOf(page.url())}`, data: { shots, breadthLinks: pageLinks.slice(0, 200), candidateAccessFailures: accessFailures,
+            ...ownerCaptureTargetPatch(ctx, 'breadth', corrected, captureState.capturedAt) } };
         }
         ctx.progress(`拒收 ${pathOf(direct.href)}：${issues.join("、")}`, { tool: "reject", text: issues.join(", "), ok: false });
       }
@@ -426,6 +508,13 @@ const breadth: Tool = async (ctx, svc) => {
     for (const r of scoreLinks(siteFileLinks(ctx, host), role).slice(0, 3)) add(r.href, "sitemap / llms.txt");
     for (const l of options.filter((l) => l.inNav || l.inMain)) { if (candidates.length >= 6) break; add(l.href, "导航"); }
     add(homeUrl, "首页往下滚", true);
+    if (!explicit && !repair) {
+      const planned = new Set((plan ? [plan.url, ...(plan.alternatives ?? []).map(item => item.url)] : []).map(pageKey));
+      const fixed = candidates.filter(candidate => planned.has(pageKey(candidate.href)));
+      const fallback = candidates.filter(candidate => !planned.has(pageKey(candidate.href)));
+      const ordered = await prioritizeCaptureCandidates(ctx, fallback, pool, 'breadth');
+      candidates.splice(0, candidates.length, ...fixed, ...ordered);
+    }
     ctx.progress(`目录候选 ${candidates.length} 个，逐页打开、往下滚、截图后一起比较：${candidates.map((c) => pathOf(c.href)).join("  ")}`, { tool: "rules", text: candidates.map((c) => `${pathOf(c.href)}（${c.why}）`).join("\n") });
     const seen: Survey[] = [];
     const deadline = Date.now() + 150_000;
@@ -440,13 +529,14 @@ const breadth: Tool = async (ctx, svc) => {
       if (seen.some((s) => pageKey(s.href) === key) || (!c.home && homeKeys.has(key))) { ctx.progress(`${pathOf(c.href)} 跳到了已看过的页面，略过`, { tool: "rules", text: page.url() }); continue; }
       const frame = await bestScrollFrame(page, { skipFirst: Boolean(c.home) });
       if (!frame) continue;
+      const captureState = await sampleBrowserCapture(page);
       const png = await shoot(page, undefined, {signal: ctx.signal});
       const check = await checkImage(png, [...hashes, ...seen.map((s) => s.hash)], {signal: ctx.signal});
       if (check.issues.length) { ctx.progress(`拒收 ${pathOf(page.url())}：${check.issues.join("、")}`, { tool: "reject", text: check.issues.join(", "), ok: false }); continue; }
       const file = path.join(workDir(svc, ctx), `breadth-look-${seen.length + 1}.png`);
       fs.writeFileSync(file, png);
       const pageLinks = (await links(page)).filter((l) => sameSite(l.href, host));
-      seen.push({ href: page.url(), png, hash: check.hash, previews: frame.previews, y: frame.y, file, links: pageLinks, why: c.why, title: await page.title().catch(() => "") });
+      seen.push({ href: page.url(), png, hash: check.hash, previews: frame.previews, y: frame.y, file, links: pageLinks, why: c.why, title: await page.title().catch(() => ""), captureState });
       ctx.progress(`看过 ${pathOf(page.url())}${frame.y ? `（下滚 ${frame.y}px）` : ""}：程序数到预览 ${frame.previews} 个`, { tool: "browser", text: c.why, ok: true });
       // Second hop, by eye: strong catalogue links inside the first pages join the comparison.
       if (i < 3) for (const r of scoreLinks(pageLinks, role).slice(0, 2)) if (candidates.length < 10) add(r.href, `第二跳（从 ${pathOf(c.href)}）`);
@@ -456,7 +546,7 @@ const breadth: Tool = async (ctx, svc) => {
     if (!seen.length) {
       return { ok: false, summary: "没有合格的目录页", error: candidates.length ? "所有候选都被拒收" : "需要重新选页：交阅读员重新查找公开目录页面", failure: accessFailures.length && accessFailures.length >= candidates.length ? accessFailures.at(-1) : undefined, data: { needsPick: { breadth: options.map((l, i) => `${i + 1}. ${l.text} → ${l.href}`) }, candidateAccessFailures: accessFailures } };
     }
-    const pick = await pickByImages(ctx, BREADTH_LOOK(title, kind), seen.map((s) => ({ file: s.file, label: `${pathOf(s.href)}${s.y ? `（下滚 ${s.y}px）` : ""}` })));
+    const pick = await pickByImages(ctx, breadthPageQuestion(title, kind), seen.map((s) => ({ file: s.file, label: `${pathOf(s.href)}${s.y ? `（下滚 ${s.y}px）` : ""}` })));
     if (pick) usage = pick.usage;
     let chosen: Survey | undefined, visual: BreadthVisual | undefined, reason = "";
     if (pick && pick.index >= 0 && pick.basis !== "none") {
@@ -472,7 +562,7 @@ const breadth: Tool = async (ctx, svc) => {
       const why = pick ? `看了 ${seen.length} 页截图，没有一页能体现范围：${pick.reason}` : `模型不可用，程序计数也不足 4 个预览（看过 ${seen.length} 页）`;
       return { ok: false, summary: "没有合格的目录页", error: `所有候选都被拒收：${why}`, usage, data: { needsPick: { breadth: [...seen.map((s) => s.href), ...options.map((l) => l.href)].filter((h, i, all) => all.indexOf(h) === i).map((h, i) => `${i + 1}. ${h}`) }, candidateAccessFailures: accessFailures, breadthCompared: compared } };
     }
-    await save(chosen.png, chosen.hash, chosen.href, reason, chosen.previews, visual, compared);
+    await save(chosen.png, chosen.hash, chosen.href, reason, chosen.previews, chosen.captureState, visual, compared);
     shots.breadth!.title = chosen.title;
     cleanup();
     return { ok: true, summary: `目录 ✓ ${pathOf(chosen.href)}`, data: { shots, breadthLinks: chosen.links.slice(0, 200), candidateAccessFailures: accessFailures }, usage };
@@ -486,6 +576,7 @@ const proof: Tool = async (ctx, svc) => {
   const role = PREVIEW_RULES.kinds[kind]?.roles.proof ?? {};
   const host = String(ctx.token.data.host);
   const shots = shotsOf(ctx);
+  const nativeViewport = siteEntryThreeShots(ctx);
   const usesStage = ["component-source", "design-system"].includes(kind) || Boolean(role.stageSelectors);
   const breadthLinks = (ctx.token.data.breadthLinks as Link[]) ?? [];
   const homeLinks = (ctx.token.data.homeLinks as Link[]) ?? [];
@@ -501,15 +592,36 @@ const proof: Tool = async (ctx, svc) => {
   const norm = pageKey;
   if(usesStage){const extra=scoreLinks([...breadthLinks,...homeLinks],{pathPatterns:['iframe[.]html','demo|example|playground','/components/'],linkText:['playground','examples','preview','demo','button','grid','dialog','table']}).map(l=>l.href);candidates=[...new Set([...extra,...candidates])];}
   const repair=(ctx.token.data.shotRepairs as Record<string,{action:string;url?:string;reason?:string}>|undefined)?.proof;
-  const explicit=(ctx.token.data.previewChoices as Record<string,string>|undefined)?.proof;
-  const taken = new Set([norm(String(ctx.token.data.canonical)), norm(shots.breadth?.href ?? ""), norm(shots.identity?.href ?? ""), ...(((ctx.token.data.rejectedPages as string[]) ?? []).map(norm))]);
+  const corrected = correctedCaptureTarget(ctx, host, 'proof');
+  const explicit=corrected?.url ?? (ctx.token.data.previewChoices as Record<string,string>|undefined)?.proof;
+  const rejected = new Set(((ctx.token.data.rejectedPages as string[]) ?? []).map(norm));
+  const taken = new Set([norm(String(ctx.token.data.canonical)), norm(shots.breadth?.href ?? ""), norm(shots.identity?.href ?? ""), ...rejected]);
   const planned=readerPlanOf(ctx)?.proof;
   const locateOf=new Map<string,string>();
-  if(planned&&!explicit){const picks=[planned,...(planned.alternatives??[])].filter(p=>p.url&&sameSite(p.url,host));for(const p of picks)if(p.locate)locateOf.set(norm(p.url),p.locate);candidates=[...picks.map(p=>p.url),...candidates];}
+  const locatedPages = new Set<string>();
+  if(planned&&!explicit){
+    const picks=[planned,...(planned.alternatives??[])].filter(p=>p.url&&sameSite(p.url,host));
+    for(const pick of picks)if(pick.locate){
+      const key = norm(pick.url);
+      locateOf.set(key,pick.locate);
+      if(nativeViewport&&!rejected.has(key)){locatedPages.add(key);taken.delete(key);}
+    }
+    candidates=[...picks.map(p=>p.url),...candidates];
+  }
+  if(nativeViewport&&repair?.action==='reframe'&&repair.url&&repair.reason&&sameSite(repair.url,host)&&!rejected.has(norm(repair.url))){
+    locatedPages.add(norm(repair.url));taken.delete(norm(repair.url));
+  }
   if(repair&&repair.action!=="replace-page"&&repair.url)candidates=[repair.url];
-  else if (ctx.redo && shots.proof?.href) taken.add(norm(shots.proof.href));
+  else if (ctx.redo && shots.proof?.href&&!locatedPages.has(norm(shots.proof.href))) taken.add(norm(shots.proof.href));
+  if(corrected){locateOf.set(norm(corrected.url),corrected.locate);locatedPages.add(norm(corrected.url));}
   if(explicit){candidates=[explicit];taken.delete(norm(explicit));}
   candidates = [...new Set(candidates.map(norm))].filter((h) => !taken.has(h)).slice(0, 6);
+  if (!explicit && !repair) {
+    const fixed = new Set((planned ? [planned.url, ...(planned.alternatives ?? []).map(item => item.url)] : []).map(norm));
+    const ordered = await prioritizeCaptureCandidates(ctx, candidates.filter(href => !fixed.has(href)).map(href => ({href})),
+      [...breadthLinks, ...homeLinks].map(link => ({...link, href: norm(link.href)})), 'proof');
+    candidates = [...candidates.filter(href => fixed.has(href)), ...ordered.map(candidate => candidate.href)];
+  }
   let usage: Usage | undefined;
   if (!candidates.length) {
     const options = dedupeLinks(breadthLinks.length ? breadthLinks : homeLinks).filter((l) => !taken.has(norm(l.href))).slice(0, 30);
@@ -521,7 +633,7 @@ const proof: Tool = async (ctx, svc) => {
   let retainedPage = false;
   try {
     const hashes = [shots.identity?.hash ?? "", shots.breadth?.hash ?? ""];
-    let best: { href: string; png: Buffer; content: number; hash: string; framing: string; title: string; location?: CaptureLocation } | null = null;
+    let best: { href: string; png: Buffer; content: number; hash: string; framing: string; title: string; location?: CaptureLocation; captureState: BrowserCaptureState; readiness?: ReadinessRef } | null = null;
     let tried = 0;
     const accessFailures:Failure[]=[];
     for (const href of candidates) {
@@ -532,43 +644,74 @@ const proof: Tool = async (ctx, svc) => {
       retainedPage = Boolean(v.retainPage);
       if (v.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${v.issues.join("、")}`, { tool: "reject", text: v.issues.join(", "), ok: false }); continue; }
       let png: Buffer | null = null;
+      let captureState: BrowserCaptureState | undefined;
       let framing = "viewport";
       const locate=locateOf.get(norm(href));
-      const hints = [repair?.action === "reframe" ? repair.reason : undefined, locate].filter((hint):hint is string=>Boolean(hint));
+      const hints = (corrected ? [corrected.locate] : [repair?.action === "reframe" ? repair.reason : undefined, locate]).filter((hint):hint is string=>Boolean(hint));
       const location = hints.length ? await locateCaptureTarget(page,hints) : undefined;
+      const readinessDeadline = Date.now() + 20000;
+      let readinessRef: ReadinessRef | undefined;
+      const actions: string[] = [];
       if (location?.matched) {
         await sleep(800);
         framing = `定位到「${location.matched}」（滚动 ${Math.round(location.scrollY ?? 0)}px）`;
         ctx.progress(framing,{tool:"browser",text:hints.join("\n")});
-      } else if (location && (location.anchors.length || repair?.action === "reframe")) {
-        const failure = classifyFailure(`没有合格的特写取景：未找到指定文本「${location.anchors[0] ?? hints[0]}」，需要阅读员重新定位公开页面，未使用首屏替代。`,{url:page.url(),requestedUrl:href});
+      } else if (location && (location.anchors.length || repair?.action === "reframe" || locatedPages.has(norm(href)))) {
+        const missing = location.anchors[0] ? `未找到指定文本「${location.anchors[0]}」` : '返修意见未提供可定位的页面文字';
+        const failure = classifyFailure(`没有合格的特写取景：${missing}，需要阅读员重新定位公开页面，未使用首屏替代。`,{url:page.url(),requestedUrl:href});
         accessFailures.push(failure);
         ctx.progress(failure.message,{tool:"reject",text:hints.join("\n"),ok:false});
         continue;
       }
+      if (corrected?.interaction) {
+        ctx.signal.throwIfAborted();
+        actions.push(await openReadOnlyPreview(page, corrected.interaction.index, ctx.signal));
+        ctx.progress('已点击原页图片预览，并核对真实灯箱图像已加载', {tool: 'browser', text: actions.at(-1)!, ok: true});
+      }
       const stageDeadline = Date.now() + 45000;
       const stageWait = { deadline: stageDeadline, signal: ctx.signal, anchorY: location?.y };
       if (usesStage) ctx.progress("等待实际舞台与 iframe 内容就绪（共用最多 45 秒）", { tool: "browser", text: "stage discovery and rendering" });
-      let stage = usesStage ? await findStage(page, stageWait) : kind === "tool" ? await findStage(page, { signal: ctx.signal, anchorY: location?.y }) : null;
+      let stage = corrected?.interaction ? null : usesStage ? await findStage(page, stageWait) : kind === "tool" ? await findStage(page, { signal: ctx.signal, anchorY: location?.y }) : null;
       if (stage) {
-        await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
+        if(!nativeViewport||!location?.matched)await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
         const settleBudget = Math.min(8000, stageDeadline - Date.now());
         if (settleBudget > 0) await page.waitForLoadState("networkidle", { timeout: settleBudget }).catch(() => {});
         stage = (await findStage(page, stageWait)) || stage;
         if (await iframeEmpty(page, stage, stageWait)) { ctx.progress(`拒收 ${new URL(href).pathname}：舞台 iframe 是空的`, { tool: "reject", text: "iframe-empty", ok: false }); continue; }
         const pageWidth = await page.evaluate(() => document.documentElement.scrollWidth);
         const clip = stageClip(stage, pageWidth);
-        png = await letterbox(await shoot(page, clip, {signal: ctx.signal}), clip, {signal: ctx.signal});
-        framing = `舞台 ${stage.sel} ${Math.round(stage.w)}×${Math.round(stage.h)}`;
+        captureState = await sampleBrowserCapture(page, nativeViewport ? null : clip);
+        png = nativeViewport ? await shoot(page, undefined, {signal: ctx.signal}) :
+          await letterbox(await shoot(page, clip, {signal: ctx.signal}), clip, {signal: ctx.signal});
+        framing = `${nativeViewport ? '原生视口；' : ''}舞台 ${stage.sel} ${Math.round(stage.w)}×${Math.round(stage.h)}`;
       }
       if (!png) {
-        if (usesStage) { ctx.progress(`拒收 ${new URL(href).pathname}：没找到舞台`, { tool: "reject", text: "no-stage-found", ok: false }); continue; }
+        if (usesStage && !corrected?.interaction) { ctx.progress(`拒收 ${new URL(href).pathname}：没找到舞台`, { tool: "reject", text: "no-stage-found", ok: false }); continue; }
+        if (location?.matched) {
+          const readiness = await waitProofCaptureReady(page, location, {deadline: readinessDeadline, signal: ctx.signal});
+          const raw = svc.store.put(Buffer.from(JSON.stringify(readiness)), 'json');
+          readinessRef = {src: raw.src, sha256: raw.sha};
+          const observed = ctx.addEvidence({id: `readiness-${ctx.attempt}-${tried}`, kind: 'text', src: raw.src,
+            label: '原页渲染等待观测（待独审）', meta: {role: 'proof', href: page.url(), review: 'pending',
+              readiness: readinessRef, status: readiness.status, elapsedMs: readiness.elapsedMs, budgetMs: readiness.budgetMs}});
+          if (readiness.status !== 'ready') {
+            ctx.progress('CAPTURE_NOT_READY：原页目标在有界等待内尚未就绪',
+              {tool: 'reject', text: 'CAPTURE_NOT_READY', ok: false, evidence: [observed.id]});
+            return {ok: false, summary: '原页特写尚未就绪', error: 'CAPTURE_NOT_READY',
+              failure: {tag: 'browser_capture', category: 'system', code: 'CAPTURE_NOT_READY',
+                message: '已定位的原页目标仍在淡入或等待媒体，未拍摄替代首屏', url: page.url(), requestedUrl: href,
+                retryable: true, owner: 'system', nextAction: '保留该精确目标及原观察，按现有恢复策略处理渲染等待。'},
+              data: {proofReadiness: readinessRef}, usage};
+          }
+        }
+        captureState = await sampleBrowserCapture(page);
         png = await shoot(page, undefined, {signal: ctx.signal});
       }
+      if (actions.length && captureState) captureState = {...captureState, actions};
       const check = await checkImage(png, hashes, {stage: Boolean(stage), signal: ctx.signal});
       if (check.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${check.issues.join("、")}`, { tool: "reject", text: check.issues.join(", "), ok: false }); continue; }
       ctx.progress(`候选 ${new URL(href).pathname}：${framing}，内容占比 ${(check.stats.content * 100).toFixed(1)}%`, { tool: "shot", text: framing, ok: true });
-      if (!best || check.stats.content > best.content || (locateOf.has(norm(href)) && !locateOf.has(norm(best.href)))) best = { href, png, content: check.stats.content, hash: check.hash, framing, title: await page.title().catch(() => ""), location };
+      if (!best || check.stats.content > best.content || (locateOf.has(norm(href)) && !locateOf.has(norm(best.href)))) best = { href, png, content: check.stats.content, hash: check.hash, framing, title: await page.title().catch(() => ""), location, captureState: captureState!, readiness: readinessRef };
       if (locateOf.has(norm(href)) && check.stats.content > 0.05) break;
       if (!usesStage) break;
       if (best && tried >= 3 && best.content > 0.12) break;
@@ -576,10 +719,11 @@ const proof: Tool = async (ctx, svc) => {
     if (!best) return { ok: false, summary: "没有合格的特写", error: tried ? `试了 ${tried} 页都不合格` : "需要重新选页：交阅读员重新查找公开特写页面",failure:accessFailures.length===tried?accessFailures.at(-1):undefined, data:{needsPick:{proof:candidates},candidateAccessFailures:accessFailures},usage };
     const file = path.join(workDir(svc, ctx), "proof.png");
     fs.writeFileSync(file, best.png);
-    const ev = await shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, location: best.location, content: Number(best.content.toFixed(3)), tried });
+    const ev = await shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, location: best.location, content: Number(best.content.toFixed(3)), tried, captureState: best.captureState, readiness: best.readiness });
     ctx.progress(`选中 ${new URL(best.href).pathname}（试 ${tried} 页，内容占比最高 ${(best.content * 100).toFixed(1)}%）`, { tool: "shot", text: best.framing, ok: true, evidence: [ev.id] });
-    shots.proof = { file, href: best.href, hash: best.hash, evidence: ev.id, framing: best.framing, content: best.content, title: best.title, location: best.location };
-    return { ok: true, summary: `特写 ✓ ${new URL(best.href).pathname}`, data: { shots, candidateAccessFailures: accessFailures }, usage };
+    shots.proof = { file, href: best.href, hash: best.hash, evidence: ev.id, framing: best.framing, content: best.content, title: best.title, location: best.location, capturedAt: best.captureState.capturedAt, captureState: best.captureState, readiness: best.readiness };
+    return { ok: true, summary: `特写 ✓ ${new URL(best.href).pathname}`, data: { shots, candidateAccessFailures: accessFailures,
+      ...ownerCaptureTargetPatch(ctx, 'proof', corrected, best.captureState.capturedAt) }, usage };
   } finally { await close(); }
 };
 
@@ -612,7 +756,7 @@ const processShots: Tool = async (ctx, svc) => {
   }
   const shots = shotsOf(ctx);
   const roles = ["identity", "breadth", "proof"].filter((r) => shots[r]);
-  const images: { role: string; src: string; card: string; sha256: string; ahash: string; href: string; evidence: string; title?: string }[] = [];
+  const images: { role: string; src: string; card: string; sha256: string; ahash: string; href: string; evidence: string; title?: string; capturedAt?: string; captureState?: BrowserCaptureState }[] = [];
   const t0 = Date.now();
   const previous = (ctx.token.data.images ?? []) as typeof images;
   const temporary:string[]=[];
@@ -620,7 +764,12 @@ const processShots: Tool = async (ctx, svc) => {
     ctx.signal.throwIfAborted();
     const s = shots[role];
     const reusable=previous.find(image=>image.role===role&&image.evidence===s.evidence&&fs.existsSync(svc.store.resolve(image.src)??""));
-    if(reusable){images.push(reusable);shots[role]={...s,file:svc.store.resolve(reusable.src)!};ctx.progress(`${ROLE_ZH[role]}沿用已验收的持久图像，无需重新拍摄`,{tool:"reuse",text:reusable.sha256,ok:true});continue;}
+    if(reusable){
+      const captureState = s.captureState ? {...s.captureState, sha256: reusable.sha256, finalWebPSha256: reusable.sha256} : reusable.captureState;
+      images.push({...reusable, capturedAt: s.capturedAt ?? reusable.capturedAt, captureState});
+      shots[role]={...s,file:svc.store.resolve(reusable.src)!,captureState};
+      ctx.progress(`${ROLE_ZH[role]}沿用已验收的持久图像，无需重新拍摄`,{tool:"reuse",text:reusable.sha256,ok:true});continue;
+    }
     if (!fs.existsSync(s.file)) return { ok: false, summary: `${ROLE_ZH[role]}原图丢失`, error: `${s.file} missing` };
     const png = fs.readFileSync(s.file);
     const fullBytes = await EvidenceStore.webpAsync(png, 1280, 82, {signal: ctx.signal});
@@ -629,8 +778,9 @@ const processShots: Tool = async (ctx, svc) => {
     ctx.signal.throwIfAborted();
     const full = svc.store.put(fullBytes, 'webp');
     const card = svc.store.put(cardBytes, 'webp');
-    images.push({ role, src: full.src, card: card.src, sha256: full.sha, ahash, href: s.href, evidence: s.evidence, title: s.title });
-    shots[role]={...s,file:full.file};
+    const captureState = s.captureState ? {...s.captureState, sha256: full.sha, finalWebPSha256: full.sha} : undefined;
+    images.push({ role, src: full.src, card: card.src, sha256: full.sha, ahash, href: s.href, evidence: s.evidence, title: s.title, capturedAt: s.capturedAt, captureState });
+    shots[role]={...s,file:full.file,captureState};
     if(path.resolve(s.file).startsWith(path.resolve(svc.workDir)+path.sep)&&path.extname(s.file)===".png")temporary.push(s.file);
   }
   const dupes: string[] = [];
@@ -647,7 +797,9 @@ const slug = (v: string) => v.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]
 
 export function buildV3(d: Record<string, any>, token: { id: string; url: string }, store: EvidenceStore, tax: Awaited<ReturnType<typeof loadTaxonomy>>) {
   const copy = d.copy ?? {}, facts = d.facts ?? {}, cat = d.catalogV3 ?? {};
-  const entryId = slug(copy.name || d.title || "") || slug(String(d.host));
+  const sourceEntryId = d.externalResearch?.entryId;
+  const entryId = typeof sourceEntryId === 'string' && /^[a-zA-Z0-9_-]+$/.test(sourceEntryId) ?
+    sourceEntryId : slug(copy.name || d.title || "") || slug(String(d.host));
   const derived = derivedFacets(facts, tax);
   const pages = publicationImages(d, store).map((im) => {
     const file = store.resolve(im.src);
@@ -672,6 +824,7 @@ export function buildV3(d: Record<string, any>, token: { id: string; url: string
     },
     facets: Object.fromEntries(ALL_AXES.map((a) => [a, a === "access" ? derived.access : a === "licenses" ? derived.licenses : (cat.facets?.[a] ?? [])])),
     pages, facts: factList,
+    ...(Array.isArray(d.offers) ? {offers: d.offers} : {}),
     curation: { atlasTerms: [], atlasTermsStatus: "editor-draft" },
     style: d.style ?? null,
     preview: d.mode === "video" ? { mode: "video", video: d.video } : { mode: "shots" },

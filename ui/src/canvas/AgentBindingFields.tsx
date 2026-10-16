@@ -80,10 +80,10 @@ export function AgentBindingFields({draft, disabled, scope, change, selectAdapte
   const modelLabel = scope === 'node' ? '本节点已接入模型' : scope === 'station' ? '工位默认已接入模型' : '主调度已接入模型';
   const selectedModel = models?.findIndex(model => model.provider === draft.provider && model.model === draft.model) ?? -1;
   return <>
-    {scope !== 'dispatcher' && <label>执行适配器<select aria-label="执行适配器" disabled={disabled} value={draft.adapter} onChange={event => selectAdapter(event.target.value as AgentBindingDraft['adapter'])}>
+    <label>执行适配器<select aria-label="执行适配器" disabled={disabled} value={draft.adapter} onChange={event => selectAdapter(event.target.value as AgentBindingDraft['adapter'])}>
       {inherited && <option value="inherit">继承默认</option>}
       <option value="pi">Pi</option><option value="opencode">OpenCode</option><option value="codex">Codex</option><option value="claude-code">Claude Code</option><option value="launcher">自定义 launcher</option>
-    </select></label>}
+    </select></label>
     {['pi', 'inherit'].includes(draft.adapter) && Boolean(models?.length) && selectModel &&
       <label>{modelLabel}<select aria-label={modelLabel} disabled={disabled} value={selectedModel < 0 ? '' : String(selectedModel)} onChange={event => {
         const model = models?.[Number(event.target.value)];
@@ -100,7 +100,7 @@ export function AgentBindingFields({draft, disabled, scope, change, selectAdapte
         <label>{native ? '启动命令（可留空自动查找本机 CLI）' : '启动命令（JSON argv）'}<textarea aria-label="Agent 启动命令" disabled={disabled} required={!native} rows={3} value={draft.command} onChange={event => change('command', event.target.value)} placeholder={native ? `例如 ["${draft.adapter === 'claude-code' ? 'claude' : draft.adapter}"]` : '["node", "path/to/launcher.mjs"]'} /></label>
         <label>单次请求超时（毫秒，可留空）<input aria-label="Agent 请求超时" disabled={disabled} type="number" min={1} max={900000} step={1} value={draft.requestTimeoutMs} onChange={event => change('requestTimeoutMs', event.target.value)} placeholder="使用适配器默认值" /></label>
       </>}
-      {native && <p className="muted">凭据从该客户端的本机配置读取。保存配置不会启动客户端；节点下次执行才使用它。客户端占用一个模型调用名额，工具中的额外模型调用也需要空位。</p>}
+      {native && <p className="muted">凭据从该客户端的本机配置读取。{scope === 'dispatcher' ? '保存配置不会启动客户端；主调度的新对话使用它，恢复中的对话沿用原底座。' : '保存配置不会启动客户端；节点下次执行才使用它。'}客户端占用一个模型调用名额，工具中的额外模型调用也需要空位。</p>}
     </>}
   </>;
 }

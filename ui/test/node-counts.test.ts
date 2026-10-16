@@ -145,6 +145,8 @@ test('node execution labels distinguish actual receipts, requested bindings and 
   const binding = {effective: {adapter: 'claude-code' as const, command: ['claude'], model: 'requested-model'}};
   assert.equal(nodeExecutionPresentation(node, undefined, binding).label, 'Claude Code · requested-model（配置）');
   assert.equal(nodeExecutionPresentation({kind: 'program'}, undefined, undefined).label, '程序执行');
+  const assist = {...binding, mode: 'model-assist' as const};
+  assert.equal(nodeExecutionPresentation({kind: 'program'}, undefined, assist).label, '程序 · 模型辅助 Claude Code · requested-model（配置）');
   assert.match(nodeExecutionPresentation(node, undefined, undefined).label, /待同步/);
   assert.match(nodeExecutionPresentation(node, undefined, binding, true).label, /历史执行模型未记录/);
   create('one');
@@ -157,6 +159,13 @@ test('node execution labels distinguish actual receipts, requested bindings and 
   recordNodeExecution(index, state.attempts.old);
   assert.equal(index['curation/reader'].model, 'actual-model', 'a late older receipt cannot replace the latest actual model');
   assert.equal(nodeExecutionPresentation(node, {...index['curation/reader'], model: 'unreported'}, binding).label, 'Claude Code · 模型未回报（实际）');
+  emit({kind: 'attempt.started', token: 'one', node: 'curation/proof', attempt: 'assist', worker: 'fixture', input: ''});
+  emit({kind: 'attempt.finished', attempt: 'assist', ok: true, summary: '', ms: 1, queuedMs: 0,
+    metrics: {modelResponses: [{dependency: {key: 'fixture-native', adapter: 'codex', model: 'requested'},
+      model: 'actual-helper-model', modelCalls: 1, usageReported: false}]}});
+  recordNodeExecution(index, state.attempts.assist);
+  assert.equal(nodeExecutionPresentation({kind: 'program'}, index['curation/proof'], assist).label,
+    '程序 · 模型辅助 Codex · actual-helper-model（实际）');
   const store = await import('../src/store.ts');
   const previous = store.getState();
   try {

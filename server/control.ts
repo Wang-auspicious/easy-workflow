@@ -5,7 +5,6 @@ import { elapsed, median, quantile, latestRunTokens } from "../shared/project.ts
 import type { Factory } from "./factory.ts";
 import { ControlError } from "./errors.ts";
 import { KIND_ZH } from "../packs/vislexicon/env.ts";
-import { piStatus } from "./pi.ts";
 import { layoutFactory } from "../shared/layout.ts";
 import { inspectPart } from "../shared/parts.ts";
 import { browserCommand } from "./browser.ts";
@@ -17,6 +16,8 @@ import { installWorkflowPack, addWorkflowLine, assertWorkflowIdle } from './work
 import { listWorkflowTemplates, instantiateWorkflowTemplate } from './templates.ts';
 import { pack } from '../packs/vislexicon/pack.ts';
 import { workflowEntry } from './workflow-entry.ts';
+import {proofCheckpointSha256, supplementProof} from './capture-supplement.ts';
+import {applyEntryUrlDecision} from './entry-url-decision.ts';
 
 const name = () => Type.String({ minLength: 1, maxLength: 200 });
 const choice = (...values: string[]) => Type.Union(values.map((x) => Type.Literal(x)));
@@ -91,7 +92,7 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'set_agent_defaults', label: '设置项目 Agent 默认配置',
-        description: 'User-only project station and dispatcher defaults. Omitted sections stay unchanged. Inheriting Pi stations and the independently configured Pi dispatcher use a changed model on their next model request; in-flight requests finish unchanged. The dispatcher currently supports Pi.',
+        description: 'User-only project station and dispatcher defaults. Omitted sections stay unchanged. Pi model changes apply on the next model request; in-flight requests finish unchanged. Station harness changes apply on the next attempt. Dispatcher harness and native model changes apply to the next conversation; recovery preserves the captured harness.',
         parameters: Type.Object({station: Type.Optional(agentBinding()), dispatcher: Type.Optional(agentBinding())}, {additionalProperties: false, minProperties: 1}),
         execute: async (_id, parameters, actor) => {
           if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '项目模型与主调度模型由用户选择，Agent 不能自行更换');
@@ -100,7 +101,7 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'agent_bindings', label: '工位 Agent 配置',
-        description: 'Read configured and effective per-station adapters and their capability boundaries. A program station returns no bindings. Actual model is reported separately from the requested model.',
+        description: 'Read configured and effective per-station adapters and their capability boundaries. Visual program stations expose their model-assist binding while remaining program executors. Other program stations return no bindings. Actual model is reported separately from the requested model.',
         parameters: object({node: Type.Optional(name())}),
         execute: async (_id, parameters) => ok(f.agentBindings(parameters.node), '读取工位 Agent 配置'),
       },
@@ -192,6 +193,23 @@ function definitions(f: Factory): Tool[] {
         const result=await adoptVerifiedResult(f,p.sourceProject,p.item);
         return ok(result,'已核验来源并接回当前项目，发布状态以当前闸门回执为准');
       }},
+      {name: 'external_intake', label: '接续已有入库资料',
+        description: 'Snapshot prior source observations, facts, capture plans, evidence and saved main receipts. Exact entry identities exclude published items from intake; current facts are reused without restarting the run. Import requires idle or paused workers.',
+        parameters: object({action: choice('status', 'import'), sourceRoot: Type.Optional(Type.String({minLength: 1, maxLength: 4000}))}),
+        execute: async (_id, p) => {
+          if (p.action === 'import') {
+            if (!p.sourceRoot) throw new ControlError(400, 'missing_source_root', '请提供已有资料所在目录');
+            return ok(f.syncExternalIntake(p.sourceRoot), '已接回原始资料和发布回执，保留原轮次');
+          }
+          return ok(f.externalIntake ? {intakeId: f.externalIntake.intakeId,
+            summary: f.externalIntake.summary, inventorySha256: f.externalIntake.inventorySha256,
+            publicationEvidenceScope: f.externalIntake.publicationEvidenceScope} : null, '读取资料接续状态');
+        }},
+      {name: 'publication_batches', label: '批量发布准备箱',
+        description: 'Inspect or flush verified local publication batches (five items or two minutes). Prepared manifests are not remote publication receipts; never performs a network push.',
+        parameters: object({action: choice('status', 'flush')}),
+        execute: async (_id, p) => ok(p.action === 'flush' ? f.publicationOutbox?.flush() ?? null :
+          f.publicationOutbox?.status() ?? null, '读取或整理已审核产物的批量交付清单')},
       {name:"read_role",label:"查看节点职责",description:"Read one node's ROLE.md: task identity, evidence, situation-specific recovery and handoff. Use dispatcher for the coordinator.",parameters:object({station:name()}),execute:async(_id,p)=>{
         if(p.station!=="dispatcher"&&!f.compiled.nodes.some(n=>n.key===p.station))throw new ControlError(404,"station_not_found","没有这个节点");
         return ok(f.runtime.roleResolver(p.station),`读取 ${p.station} 职责与异常处理契约`);
@@ -215,8 +233,11 @@ function definitions(f: Factory): Tool[] {
               failedAttempts:stations.reduce((n,station)=>n+station.failed,0)},
             phase:items.length&&items.every(t=>t.status!=="active")?"settled":items.length?"working":"waiting", batch: batchSummary(s),
             tokensActive: Object.values(s.tokens).filter((t) => t.status === "active").length, stations,
+            decisionModel: f.decisionModel?.status() ?? {enabled: false},
             bottleneck: bottleneck.at ? `${nodeName(bottleneck.at)} 节拍 ${bottleneck.takt.toFixed(1)}s` : "尚无实测", resources: s.resources,
             candidatePool: s.nodes["candidates/pool"]?.stock, published: s.nodes["curation/published"]?.stock,
+            externalIntake: f.externalIntake ? {summary: f.externalIntake.summary,
+              inventorySha256: f.externalIntake.inventorySha256, publicationEvidenceScope: f.externalIntake.publicationEvidenceScope} : null,
             candidateFailures:f.candidateFailures().reduce((out,c)=>{const k=`${c.disposition}:${c.failure?.tag??"unknown"}`;out[k]=(out[k]??0)+1;return out;},{} as Record<string,number>),
           }, "读取了工厂状态");
         },
@@ -232,7 +253,7 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'run_batch', label: '持续托管本轮目标', description: 'Persist a total unique-site target for this run. The backend refills idle intake stages with bounded in-flight work and retries transient failures from checkpoints, without a chat polling loop. Existing sites in the run count toward target. Pause/resume preserve progress; stop disables further admission and automatic retries, leaving current work running.',
-        parameters: object({ action: choice('start','configure','status','pause','resume','stop'), target: Type.Optional(Type.Integer({minimum:1,maximum:10000})), flow: Type.Optional(Type.Boolean()), maxInFlight: Type.Optional(Type.Integer({minimum:1,maximum:40})), intakeWindow: Type.Optional(Type.Integer({minimum:1,maximum:20})), category: Type.Optional(name()), query: Type.Optional(name()) }),
+        parameters: object({ action: choice('start','configure','status','pause','resume','stop'), target: Type.Optional(Type.Integer({minimum:1,maximum:10000})), flow: Type.Optional(Type.Boolean()), maxInFlight: Type.Optional(Type.Integer({minimum:1,maximum:40})), intakeWindow: Type.Optional(Type.Integer({minimum:1,maximum:20})), category: Type.Optional(name()), query: Type.Optional(name()), candidateIds: Type.Optional(Type.Array(name(), {minItems: 1, maxItems: 10000})) }),
         execute: async (_id, p, actor) => {
           if (p.action === 'status') return ok(batchSummary(f.state), '读取持久任务目标');
           if (p.action === 'configure') {
@@ -326,6 +347,22 @@ function definitions(f: Factory): Tool[] {
         execute:async(_id,p)=>{if(!f.runtime.running)await f.ensureReady();const t=f.choosePreview(p.item,p.role,p.url);return ok({token:t.id,item:t.item,station:`curation/${p.role}`,url:p.url},"已指定采集页，从对应工位继续");},
       },
       {
+        name: 'supplement_proof', label: '附加真实特写补证',
+        description: 'Attach existing SHA-bound proof and optionally one identity/breadth capture each to one exact manual Entry checkpoint. Reuses valid historical captures or pending native observations, preserves all rounds and unsupplied upstream evidence, queues process and independent review, and stays paused. Requires the original paused run and no in-flight workers; accepts no review approval.',
+        parameters: object({token: name(), runId: name(), expectedCheckpointSha256: Type.String({pattern: '^[a-f0-9]{64}$'}),
+          idempotencyKey: name(), manifestPath: Type.String({minLength: 1, maxLength: 4000}),
+          manifestSha256: Type.String({pattern: '^[a-f0-9]{64}$'}), reason: Type.String({minLength: 6, maxLength: 3000})}),
+        execute: async (_id, parameters, actor = 'agent') => ok(await supplementProof(f, parameters, actor), '真实 proof 输入已接回；独立审核待执行，原轮次保持暂停'),
+      },
+      {
+        name: 'apply_entry_url_decision', label: '应用已审入口 URL 决议',
+        description: 'Apply one retained independently reviewed exact Entry HTTP URL migration to its current parked identity checkpoint. Requires the original paused, drained run and exact checkpoint SHA. Preserves raw input, facts, offers, rounds, budgets and evidence; creates one idempotent successor, runs missing captures and fact review normally, and stays paused. Accepts no publication approval or entity merge.',
+        parameters: object({token: name(), runId: name(), expectedCheckpointSha256: Type.String({pattern: '^[a-f0-9]{64}$'}),
+          idempotencyKey: name(), manifestPath: Type.String({minLength: 1, maxLength: 4000}),
+          manifestSha256: Type.String({pattern: '^[a-f0-9]{64}$'}), reason: Type.String({minLength: 6, maxLength: 3000})}),
+        execute: async (_id, parameters, actor = 'agent') => ok(await applyEntryUrlDecision(f, parameters, actor), '入口 URL 决议已接入原检查点；实际采集与独立审核待执行，原轮次保持暂停'),
+      },
+      {
         name: "workers", label: "加人 / 撤人 / 锁定", description: "fork | retire | lock | unlock workers at a station (key like 'curation/proof').",
         parameters: Type.Object({ station: Type.String(), action: Type.Union(["fork", "retire", "lock", "unlock"].map((x) => Type.Literal(x))), reason: Type.String() }),
         execute: async (_id, p) => {
@@ -391,6 +428,7 @@ function definitions(f: Factory): Tool[] {
             id: t.id, item: t.item, status: t.status, at: t.at.map(nodeName), reason: t.reason, kind: d.kind && `${d.kind}（${KIND_ZH[d.kind]}）`, kindAgreed: d.kindAgreed, mode: d.mode,
             images: d.images?.map((i: any) => ({ role: i.role, href: i.href })), style: d.style, facts: d.facts, copy: d.copy, reviews: d.reviews, rounds: t.rounds,
             data: t.data, evidence: t.evidence.map((id) => s.evidence[id]).filter(Boolean),
+            proofCheckpointSha256: proofCheckpointSha256(f, t),
             attempts: t.attempts.map((a) => s.attempts[a]).filter(Boolean),
           }, `查看 ${t.item}`);
         },
@@ -544,7 +582,7 @@ export class FactoryControl {
     const readOnly = process.env.FACTORY_READONLY === "1";
     return {
       product: "Easy Workflow", protocol: CONTROL_PROTOCOL, revision, readOnly,
-      model: piStatus(this.f.getAgentDefaults().dispatcher), agentDefaults: this.f.getAgentDefaults(),
+      model: this.f.dispatcherModelStatus(), agentDefaults: this.f.getAgentDefaults(),
       instructions: `Easy Workflow 是可直接调用的流水线服务。无需浏览界面、读源码或通读 Spec。\n` +
         `先用 easy_workflow_help 获取能力索引；只为当前任务读取 easy_workflow_help({name}) 的参数，再以 easy_workflow_call({name,arguments}) 调用。客户端若只提供兼容入口，使用它已注册的工具名。read_role({station}) 读取一个节点的 ROLE.md 和异常处理边界。\n` +
         `查询：status 看状态，inspect 查任务/工位/证据，read_case 看一件货的案卷，read_context 看节点 CONTEXT，alerts 看红灯与开跑体检，read_report 看报告，browser 查共享网页/登录提醒及操作标签。给某个节点留长期指示用 note_context。开跑、恢复、投料前会自动体检，体检不过返回 412 和要修的项目。调度：feed_urls/pull_candidates 投料，run_control 启停，workers 配人，correct 纠错。规格：read_spec 按需读，propose_patch 起草，decide_patch 按用户决定接受或拒绝。settings 读写配额。\n` +
@@ -557,6 +595,7 @@ export class FactoryControl {
       agentEntrypoints: { help: CONTROL_HELP, call: CONTROL_CALL },
       routes: { schema: "/api/agent/tools/{name}", call: "/api/tools/{name}", events: "/api/events", journal: "/api/journal" },
       run: { id: this.f.state.run.id, status: this.f.state.run.status },
+      decisionModel: this.f.decisionModel?.status() ?? {enabled: false},
       lines: this.f.compiled.lines.map((l) => ({ id: l.id, name: l.name, wired: l.wired })),
       parts: (layoutFactory(this.f.compiled.nodes, this.f.compiled.edges, this.f.compiled.ui.order, this.f.compiled.ui.hints, this.f.compiled.ui.collapsed).bays ?? []).map((b) => ({ id: b.id, name: b.name, stations: b.stations.length })),
     };
@@ -571,6 +610,8 @@ export class FactoryControl {
   mutates(tool: string, input: unknown) {
     const args = (input ?? {}) as { action?: string; values?: unknown };
     return !READS.has(tool) && !(['run_batch', 'allocation_plan'].includes(tool) && args.action === 'status')
+      && !(tool === 'external_intake' && args.action === 'status')
+      && !(tool === 'publication_batches' && args.action === 'status')
       && !(tool === 'settings' && !args.values)
       && !(tool === 'browser' && ['state','read'].includes(args.action ?? ''))
       && !(tool === 'alerts' && !['clear','recheck','preflight'].includes(args.action ?? 'list'));

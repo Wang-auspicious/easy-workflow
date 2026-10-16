@@ -1,6 +1,6 @@
 // Metrics HUD (Spec §10.2): time, tokens, cost, one light per item in this run, done/total.
 // It floats on the canvas, top-left; clicking it opens the per-station breakdown.
-import { useState } from "react";
+import { memo, useRef, useState } from "react";
 import { Play, Pause, Square, PackagePlus, ChevronDown } from "lucide-react";
 import { elapsed, median } from "../../../shared/project.ts";
 import { getState, setState, useStore } from "../store.ts";
@@ -20,15 +20,50 @@ export function clock(ms: number) {
   return h ? `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}` : `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
 }
 
-export function Hud() {
+export const Hud = memo(function Hud() {
   useStore((s) => s.version);
   const replay = useStore((s) => s.replay);
+  const connected = useStore(state => state.connected);
   const selected = useStore((s) => s.selected);
   const now = useNow(1000);
   const [open, setOpen] = useState(false);
   const [pull, setPull] = useState(false);
-  const [ending,setEnding]=useState(false),[endConfirm,setEndConfirm]=useState(false),[endError,setEndError]=useState("");
-  const finishRun=async()=>{if(ending)return;setEnding(true);setEndError("");try{const result=await actions.run("end") as {runId?:string;run?:{id:string};result?:{id:string}};const runId=result.runId??result.run?.id??result.result?.id;if(!runId)throw new Error("结束请求未返回运行编号");setEndConfirm(false);setState({reportRun:runId,view:"report"});}catch(error){setEndError((error as Error).message);}finally{setEnding(false);}};
+  const [runBusy, setRunBusy] = useState(false);
+  const runPending = useRef(false);
+  const [ending, setEnding] = useState(false);
+  const [endConfirm, setEndConfirm] = useState(false);
+  const [endError, setEndError] = useState('');
+  const finishRun = async () => {
+    if (ending || runPending.current || !getState().connected || getState().replay) return;
+    runPending.current = true;
+    setEnding(true);
+    setEndError('');
+    try {
+      const result = await actions.run('end') as {runId?: string; run?: {id: string}; result?: {id: string}};
+      const runId = result.runId ?? result.run?.id ?? result.result?.id;
+      if (!runId) throw new Error('结束请求未返回运行编号');
+      setEndConfirm(false);
+      setState({reportRun: runId, view: 'report'});
+    } catch (error) {
+      setEndError(error instanceof Error ? error.message : '结束本轮失败，请重试。');
+    } finally {
+      runPending.current = false;
+      setEnding(false);
+    }
+  };
+  const toggleRun = async () => {
+    if (runPending.current || !getState().connected || getState().replay) return;
+    runPending.current = true;
+    setRunBusy(true);
+    try {
+      const status = getState().fs.run.status;
+      await actions.run(status === 'running' ? 'pause' : status === 'paused' ? 'resume' : 'start');
+    } catch { /* The API presents the error; leave the actual run state untouched. */ }
+    finally {
+      runPending.current = false;
+      setRunBusy(false);
+    }
+  };
   const s = getState();
   const run = s.fs.run;
   const t = replay ? replay.at : now;
@@ -45,14 +80,14 @@ export function Hud() {
     <>
       <div className="hud-wrap">
         <div className="hud">
-          <div className="canvas-title"><span>工作区</span><i>/</i><b>{isIdle ? "网站入库" : run.title || "网站入库"}</b><span className="hud-badge" data-tip={progress.detail}>{progress.label}</span></div>
+          <div className="canvas-title"><span>工作区</span><i>/</i><b>{isIdle ? '工作流待运行' : run.title || '工作流运行'}</b><span className="hud-badge" data-tip={progress.detail}>{progress.label}</span></div>
           {!replay && (
             <div className="hud-actions">
-              <button className="btn" onClick={() => setPull((p) => !p)}><PackagePlus size={15} />投料</button>
-              <button className="btn btn--primary" onClick={() => void actions.run(status === "running" ? "pause" : status === "paused" ? "resume" : "start").catch(() => {})}>
+              <button className="btn" disabled={!connected || ending} onClick={() => setPull((p) => !p)}><PackagePlus size={15} />投料</button>
+              <button className="btn btn--primary" disabled={!connected || runBusy || ending} onClick={() => void toggleRun()}>
                 {status === "running" ? <Pause size={14} /> : <Play size={14} />}{status === "running" ? "暂停" : status === "paused" ? "继续" : "运行"}
               </button>
-              {(status === "running" || status === "paused") && <button className="icon-btn hud-end" aria-label="结束本轮" data-tip="结束本轮并生成报告" onClick={() => {setEndError("");setEndConfirm(true);}}><Square size={12} /></button>}
+              {(status === "running" || status === "paused") && <button className="icon-btn hud-end" disabled={!connected || runBusy || ending} aria-label="结束本轮" data-tip="结束本轮并生成报告" onClick={() => {setEndError("");setEndConfirm(true);}}><Square size={12} /></button>}
             </div>
           )}
         </div>
@@ -74,33 +109,63 @@ export function Hud() {
           {memoryGuard && <span className="chip" title={memoryGuard.detail}>{memoryGuard.label}</span>}
         </div>
       </div>
-      {pull && <PullCard onClose={() => setPull(false)} />}
-      {endConfirm && <div className="end-run-card" role="dialog" aria-label="结束本轮确认"><b>结束本轮并生成报告</b><p>未完成的任务会退回候选库，保留原因与已有证据。</p>{endError&&<p role="alert" className="end-error">{endError}</p>}<div><button className="btn btn--sm" disabled={ending} onClick={()=>setEndConfirm(false)}>取消</button><button className="btn btn--sm btn--primary" disabled={ending} onClick={()=>void finishRun()}>{ending?"正在回收任务并生成报告…":"结束并生成报告"}</button></div></div>}
+      {pull && !replay && <PullCard onClose={() => setPull(false)} />}
+      {endConfirm && !replay && <div className="end-run-card" role="dialog" aria-label="结束本轮确认"><b>结束本轮并生成报告</b><p>未完成的任务会退回候选库，保留原因与已有证据。</p>{endError&&<p role="alert" className="end-error">{endError}</p>}<div><button className="btn btn--sm" disabled={ending} onClick={()=>setEndConfirm(false)}>取消</button><button className="btn btn--sm btn--primary" disabled={ending || runBusy || !connected} onClick={()=>void finishRun()}>{ending?"正在回收任务并生成报告…":"结束并生成报告"}</button></div></div>}
       {open && <HudCard onClose={() => setOpen(false)} />}
     </>
   );
-}
+});
 
 function PullCard({ onClose }: { onClose: () => void }) {
   const [count, setCount] = useState(10);
   const [cat, setCat] = useState(CATEGORIES[0]);
   const stock = useStore((s) => s.fs.nodes["candidates/pool"]?.stock ?? 0);
+  const connected = useStore(state => state.connected);
+  const replay = useStore(state => Boolean(state.replay));
+  const [busy, setBusy] = useState(false);
+  const pending = useRef(false);
+  const [error, setError] = useState('');
+  const submit = async () => {
+    if (pending.current || !getState().connected || getState().replay) return;
+    pending.current = true;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await actions.pull(count, cat || undefined);
+      if (!result || typeof result !== 'object' || !('pulled' in result) ||
+          typeof result.pulled !== 'number' || !Number.isSafeInteger(result.pulled) || result.pulled < 0 ||
+          'ok' in result && result.ok === false) throw new Error('取货结果未确认，请核对候选库与当前任务。');
+      if (!result.pulled) {
+        setError('当前分类没有可取出的候选，请切换分类或补充候选。');
+        return;
+      }
+      toast(`已取出 ${result.pulled} 件；执行状态请查看画布。`);
+      onClose();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '取货失败，请重试。');
+    } finally {
+      pending.current = false;
+      setBusy(false);
+    }
+  };
   return (
     <div className="hud-card pull-card">
       <div className="hud-card-title">从候选库取货 <span className="muted num">库存 {fmt(stock)}</span></div>
       <label className="field"><span>分类</span>
-        <select value={cat} onChange={(e) => setCat(e.target.value)}>
+        <select disabled={busy} value={cat} onChange={(e) => setCat(e.target.value)}>
           <option value="">全部</option>
           {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
         </select>
       </label>
       <label className="field"><span>件数</span>
-        <input type="range" min={1} max={60} value={count} onChange={(e) => setCount(Number(e.target.value))} />
+        <input disabled={busy} type="range" min={1} max={60} value={count} onChange={(e) => setCount(Number(e.target.value))} />
         <b className="num">{count}</b>
       </label>
+      {error && <p role="alert">{error}</p>}
+      {!connected && <p role="status">连接已断开，恢复连接后可取货。</p>}
       <div className="row-end">
-        <button className="btn btn--ghost btn--sm" onClick={onClose}>取消</button>
-        <button className="btn btn--primary btn--sm" onClick={async () => { const r: any = await actions.pull(count, cat || undefined); toast(`取了 ${r.pulled} 件，开始流动`); onClose(); }}>取货并开始</button>
+        <button className="btn btn--ghost btn--sm" disabled={busy} onClick={onClose}>取消</button>
+        <button className="btn btn--primary btn--sm" disabled={busy || !connected || replay || !stock} onClick={() => void submit()}>{busy ? '正在取货…' : '取货并开始'}</button>
       </div>
     </div>
   );

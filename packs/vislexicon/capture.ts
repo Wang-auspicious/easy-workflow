@@ -21,7 +21,110 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const runFile = promisify(execFile);
 const visitedPages = new WeakMap<Page, { requestedUrl: string; finalUrl: string }>();
 
+function fontDownloadURL(value: string): boolean {
+  try { return /\.(ttf|otf|ttc|woff2?)$/i.test(new URL(value).pathname); }
+  catch { return false; }
+}
+
 export interface Link { href: string; text: string; inNav: boolean; inMain: boolean; hasImage: boolean; visible: boolean; order: number }
+
+export interface BrowserCaptureState {
+  readonly method: 'browser-native';
+  readonly capturedAt: string;
+  readonly sourceUrl: string;
+  readonly finalUrl: string;
+  readonly viewport: {width: number; height: number};
+  readonly scroll: {x: number; y: number; containers: {selector: string; x: number; y: number}[]};
+  readonly clip: {x: number; y: number; width: number; height: number} | null;
+  readonly actions: readonly string[];
+  readonly controls: Record<string, string | boolean>[];
+  readonly text: string;
+  readonly sha256?: string;
+  readonly finalWebPSha256?: string;
+}
+
+/** Sample the actual page immediately before its screenshot, without changing it. */
+export async function sampleBrowserCapture(page: Page,
+    clip: BrowserCaptureState['clip'] = null): Promise<BrowserCaptureState> {
+  const capturedAt = new Date().toISOString();
+  const observed = await page.evaluate(() => {
+    const visible = (element: Element) => {
+      const box = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return box.width > 0 && box.height > 0 && box.bottom > 0 && box.top < innerHeight &&
+        box.right > 0 && box.left < innerWidth && style.display !== 'none' &&
+        style.visibility !== 'hidden' && Number(style.opacity) !== 0;
+    };
+    const selector = (element: Element) => element.id ? `#${CSS.escape(element.id)}` :
+      `${element.tagName.toLowerCase()}:nth-of-type(${[...element.parentElement?.children ?? []]
+        .filter(sibling => sibling.tagName === element.tagName).indexOf(element) + 1})`;
+    const controls = [...document.querySelectorAll('input,textarea,select,button,[role=slider]')]
+      .filter(visible).filter(element => {
+        const type = element.getAttribute('type') ?? '';
+        const identity = ['name', 'id', 'aria-label', 'autocomplete'].map(key => element.getAttribute(key) ?? '').join(' ');
+        return !/^(?:password|hidden|file)$/i.test(type) && !/password|secret|api[-_ ]?key|token|authorization/i.test(identity);
+      }).slice(0, 100).map(element => {
+        const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | HTMLButtonElement;
+        return {selector: selector(element), tag: element.tagName.toLowerCase(),
+          type: element.getAttribute('type') ?? '', name: element.getAttribute('name') ?? '',
+          label: (element.getAttribute('aria-label') ?? element.textContent ?? '').trim().slice(0, 200),
+          value: String(control.value ?? element.getAttribute('aria-valuenow') ?? '').slice(0, 500),
+          checked: element instanceof HTMLInputElement && element.checked, disabled: Boolean(control.disabled)};
+      });
+    const containers = [...document.querySelectorAll('body *')].filter(element =>
+      visible(element) && (element.scrollTop !== 0 || element.scrollLeft !== 0) &&
+      (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth))
+      .slice(0, 40).map(element => ({selector: selector(element), x: element.scrollLeft, y: element.scrollTop}));
+    return {finalUrl: location.href, viewport: {width: innerWidth, height: innerHeight},
+      scroll: {x: scrollX, y: scrollY, containers}, controls,
+      text: (document.body?.innerText ?? '').slice(0, 20000)};
+  });
+  return {method: 'browser-native', capturedAt,
+    sourceUrl: visitedPages.get(page)?.requestedUrl ?? observed.finalUrl,
+    ...observed, clip, actions: []};
+}
+
+/** Only open an original Webflow image lightbox; never arbitrary links or scripts. */
+export async function openReadOnlyPreview(page: Page, index: number,
+    signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  if (!Number.isSafeInteger(index) || index < 0 || index > 49) throw new Error('Invalid preview index');
+  const trigger = page.locator('a.w-lightbox').nth(index);
+  const expectedImage = await trigger.evaluate(element => {
+    if (!(element instanceof HTMLAnchorElement) || element.hasAttribute('download') ||
+        !['', '#'].includes(element.getAttribute('href') ?? '')) return null;
+    try {
+      const data = JSON.parse(element.querySelector('script.w-json[type="application/json"]')?.textContent ?? '{}') as
+        {items?: {type?: string; url?: string}[]};
+      const image = data.items?.find(item => item.type === 'image' && typeof item.url === 'string');
+      if (!image?.url) return null;
+      const url = new URL(image.url, location.href);
+      return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.href : null;
+    } catch {return null;}
+  });
+  if (!expectedImage) throw new Error('预览入口不是已核验的原页图片灯箱，或链接会导航/下载；未点击。');
+  const before = pageKey(page.url());
+  await trigger.scrollIntoViewIfNeeded({timeout: 5000});
+  signal?.throwIfAborted();
+  await trigger.click({timeout: 5000});
+  if (pageKey(page.url()) !== before) throw new Error('预览交互离开原页，不能作为只读灯箱截图');
+  const image = page.locator('.w-lightbox-backdrop .w-lightbox-image:visible').first();
+  await image.waitFor({state: 'visible', timeout: 8000});
+  const actual = await image.evaluate(async element => {
+    if (!(element instanceof HTMLImageElement)) return null;
+    if (!element.complete) await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Preview image did not load')), 8000);
+      element.addEventListener('load', () => {clearTimeout(timer); resolve();}, {once: true});
+      element.addEventListener('error', () => {clearTimeout(timer); reject(new Error('Preview image failed'));}, {once: true});
+    });
+    const box = element.getBoundingClientRect();
+    return element.naturalWidth >= 64 && element.naturalHeight >= 64 && box.width >= 64 && box.height >= 64 ?
+      element.currentSrc || element.src : null;
+  });
+  signal?.throwIfAborted();
+  if (actual !== expectedImage) throw new Error('预览未显示与原页绑定的实际图片，不能拍摄');
+  return `open-preview: click a.w-lightbox index=${index}; image=${actual}`;
+}
 
 export async function pageVerdict(page: Page, entryHost: string): Promise<string[]> {
   const access = await inspectBrowserAttention(page);
@@ -116,7 +219,7 @@ export async function links(page: Page): Promise<Link[]> {
     }catch{}
     return [];
   }).catch(()=>[]);
-  return [...found,...stories].filter((l,i,all)=>all.findIndex(a=>pageKey(a.href)===pageKey(l.href))===i);
+  return [...found,...stories].filter((l,i,all)=>!fontDownloadURL(l.href)&&all.findIndex(a=>pageKey(a.href)===pageKey(l.href))===i);
 }
 
 export function sameSite(href: string, entryHost: string) {
@@ -131,7 +234,7 @@ export function scoreLinks(candidates: Pick<Link, "href" | "text" | "inNav">[], 
   for (const link of candidates) {
     let url: URL;
     try { url = new URL(link.href); } catch { continue; }
-    if (/\.(pdf|zip|png|jpe?g|svg|mp4)$/i.test(url.pathname)) continue;
+    if (/\.(pdf|zip|png|jpe?g|svg|mp4|ttf|otf|ttc|woff2?)$/i.test(url.pathname)) continue;
     const reasons: string[] = [];
     let score = 0;
     const hit = pathRes.findIndex((re) => re.test(url.pathname+(url.searchParams.get('path')??'')));
@@ -148,6 +251,11 @@ export function scoreLinks(candidates: Pick<Link, "href" | "text" | "inNav">[], 
 }
 
 export async function visit(page: Page, url: string, entryHost: string, say?: (t: string) => void) {
+  if (fontDownloadURL(url)) {
+    throw new ClassifiedFailure({tag: 'needs_selection', category: 'system', owner: 'agent', retryable: true,
+      url, requestedUrl: url, message: '字体文件是下载资源，不能作为截图页面；请重新选择字体展示页',
+      nextAction: '从原站目录选择可浏览的 specimen、字体详情或演示页，保留已完成的事实和图片。'});
+  }
   say?.(`打开 ${url.replace(/^https?:\/\//, "")}`);
   const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 }).catch((error: Error) => ({ error }));
   if (response && "error" in response) throw new ClassifiedFailure(classifyFailure(response.error,{url,requestedUrl:url}));
@@ -279,6 +387,12 @@ export async function previewsInViewport(page: Page) {
  *  side-by-side visual comparison of candidate pages; `owner-choice` from 指定采集页. */
 export interface BreadthVisual { basis: "rendered-items" | "name-list" | "owner-choice"; reason: string; compared: number }
 
+/** A single tool shows functional range; a library still has to show its items. */
+export function breadthRoleGuidance(kind: string): string {
+  if (kind !== 'tool') return '';
+  return 'Tool breadth: a complete working workspace with its actual rendered output and multiple real visible functions or controls can show the range of this tool. It does not need a gallery of many works. A single output alone, empty or loading controls, or feature marketing text alone is insufficient. Identity, breadth and proof must still show distinct information: the same workspace with only a different seed or output colour does not add a role. Keep the actual capture state and independent three-image review; this tool rule does not relax library, asset or collection breadth.';
+}
+
 /** The element count is a program hint. It decides alone only when no one has looked:
  *  pure CSS effects and SVG icon grids count as 0 even when the screen is full of them. */
 export function breadthPreviewIssues(kind: string, previews: unknown, visual?: Partial<BreadthVisual> | null): string[] {
@@ -309,18 +423,39 @@ export async function bestScrollFrame(page: Page, { skipFirst = false } = {}) {
 
 /* ------------------------------------------------------------------ stage (component close-up) */
 
-export interface CaptureLocation { matched?: string; anchors: string[]; y?: number; scrollY?: number }
+export interface CaptureLocation { matched?: string; anchors: string[]; y?: number; scrollY?: number; selector?: string }
+
+/** Extract rendered labels from instructions; the explanation itself is not DOM text. */
+function captureAnchors(hints: readonly string[]): string[] {
+  const generic = /^(?:proof|breadth|identity|hero|svg|hex|iframe|html|css|dom|viewport|px|h[1-6]|l[1-6])$/i;
+  return [...new Set(hints.flatMap(hint => {
+    // A review often describes an old, incorrect frame before stating the new
+    // target. Do not scroll back to labels mentioned only in that old frame.
+    const request = hint.match(/(?:请|\bplease\b)([\s\S]*)/i)?.[1] ?? hint;
+    const text = request.replace(/https?:\/\/[^\s，。；、）)]+/gi, ' ');
+    const quoted = [...text.matchAll(/[「『“\"]([^」』”\"]{2,240})[」』”\"]/g)]
+      .map(match => match[1].trim());
+    // Chinese capture notes frequently name English headings without quotes:
+    // “拍到This sections hues/Click to copy的Elements…”. Keep those labels,
+    // rather than searching for the entire mixed-language instruction.
+    const labels = [...text.matchAll(/[A-Za-z][A-Za-z0-9]*(?:[ \t]+[A-Za-z][A-Za-z0-9'’!?-]*)*/g)]
+      .map(match => match[0].trim())
+      .filter(label => label.length >= 2 && label.length <= 120 && !generic.test(label) &&
+        !/^(?:scroll(?:ing)?|locate|reframe|capture|click|wait|please)\b/i.test(label));
+    const compact = text.trim();
+    const literal = compact.length >= 2 && compact.length <= 80 &&
+      !/[，,。；;：:\n（）()]/.test(compact) &&
+      !/(?:请|滚到|滚动|定位|重新|取景|拍到|拍摄|点击|不要|scroll|reframe|capture|click)/i.test(compact) ? [compact] : [];
+    return [...quoted, ...labels, ...literal];
+  }))];
+}
 
 /** Reader/reviewer prose contains quoted visible text, not a literal DOM text
  * node. Match the complete rendered heading (including nested spans and breaks)
  * and verify that scrolling actually brought it into the viewport. */
 export async function locateCaptureTarget(page: Page, hints: string[]): Promise<CaptureLocation> {
-  const quoted = (text: string) => [...text.matchAll(/[「『“\"]([^」』”\"]{2,240})[」』”\"]/g)].map(match => match[1].trim());
-  const anchors = [...new Set(hints.flatMap(text => {
-    const directed = [...text.matchAll(/(?:滚到|滚动到|滚动至|定位到|scroll(?:ing)? to|(?:L[1-6]|H[1-6])\s*(?:标题|heading))[^，。；\n「『“\"]{0,60}[「『“\"]([^」』”\"]{2,240})[」』”\"]/gi)].map(match => match[1].trim());
-    return [...directed, ...quoted(text)];
-  }))];
-  const candidates = [...new Set([...anchors, ...hints.flatMap(text => text.split(/[，,；;（）()]/).map(part => part.trim()).filter(part => part.length >= 2 && part.length <= 240))])];
+  const anchors = captureAnchors(hints);
+  const candidates = anchors;
   return page.evaluate(async ({ anchors, candidates }) => {
     const normalize = (text: string) => text.normalize('NFKC').toLowerCase().replace(/[\s\u200b]+/g, ' ').replace(/[.。…]+$/g, '').trim();
     const eligible = (el: Element) => {
@@ -328,7 +463,7 @@ export async function locateCaptureTarget(page: Page, hints: string[]): Promise<
       const box = el.getBoundingClientRect(), style = getComputedStyle(el);
       return box.width > 0 && box.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
     };
-    const elements = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role=heading],p,label,span,strong,a,div,section')].filter(eligible);
+    const elements = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role=heading],p,label,span,strong,a,button,[role=button],div,section')].filter(eligible);
     for (const candidate of candidates) {
       const wanted = normalize(candidate); if (wanted.length < 2) continue;
       const matches = elements.map(element => ({ element, text: normalize((element as HTMLElement).innerText || '') }))
@@ -336,10 +471,22 @@ export async function locateCaptureTarget(page: Page, hints: string[]): Promise<
         .sort((a, b) => Number(!a.element.matches('h1,h2,h3,h4,h5,h6,[role=heading]')) - Number(!b.element.matches('h1,h2,h3,h4,h5,h6,[role=heading]')) || a.text.length - b.text.length);
       const target = matches[0]?.element; if (!target) continue;
       target.scrollIntoView({ block: 'start', behavior: 'instant' });
-      window.scrollBy({ top: -Math.min(96, innerHeight / 6), behavior: 'instant' });
+      // At the page bottom scrollIntoView is already clamped. A relative -96px
+      // scroll can move that still-visible last heading below the viewport.
+      window.scrollTo({ top: Math.max(0, scrollY + target.getBoundingClientRect().top -
+        Math.min(96, innerHeight / 6)), behavior: 'instant' });
       await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
       const box = target.getBoundingClientRect();
-      if (box.bottom > 0 && box.top < innerHeight) return { matched: candidate, anchors, y: box.top + scrollY, scrollY };
+      if (box.bottom > 0 && box.top < innerHeight) {
+        const parts: string[] = [];
+        for (let element: Element | null = target; element; element = element.parentElement) {
+          if (element.id) {parts.unshift(`#${CSS.escape(element.id)}`); break;}
+          if (!element.parentElement) {parts.unshift(element.tagName.toLowerCase()); break;}
+          const siblings = [...element.parentElement?.children ?? []].filter(sibling => sibling.tagName === element!.tagName);
+          parts.unshift(`${element.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(element) + 1})`);
+        }
+        return { matched: candidate, anchors, y: box.top + scrollY, scrollY, selector: parts.join(' > ') };
+      }
     }
     return { anchors };
   }, { anchors, candidates });
@@ -347,6 +494,114 @@ export async function locateCaptureTarget(page: Page, hints: string[]): Promise<
 
 export interface Stage { sel: string; x: number; y: number; w: number; h: number; painted: number; media: number; locked: boolean }
 export interface CaptureWait { timeoutMs?: number; deadline?: number; signal?: AbortSignal; anchorY?: number }
+
+export interface ProofReadinessSample {
+  observedAt: string;
+  selector: string;
+  count: number;
+  visible: boolean;
+  finitePending: number;
+  elements: {selector: string; opacity: string; display: string; visibility: string;
+    layout: number[]; rect: number[]; animations: {properties: string[]; playState: string;
+      pending: boolean; currentTime: number | null; endTime: number | null; infinite: boolean}[]}[];
+  media: {selector: string; tag: string; ready: boolean; width: number; height: number;
+    readyState?: number; complete?: boolean; decodedFrames?: number; source: string}[];
+  stability: string;
+}
+
+export interface ProofCaptureReadiness {
+  status: 'ready' | 'timeout';
+  code?: 'CAPTURE_NOT_READY';
+  startedAt: string;
+  elapsedMs: number;
+  budgetMs: number;
+  samples: ProofReadinessSample[];
+}
+
+/** Observe the original located viewport; never alter opacity, timing or media.
+ * Finite entry transitions share one deadline, while natural infinite motion
+ * does not require frozen pixels or opacity1. Readiness is not image approval. */
+export async function waitProofCaptureReady(page: Page, location: CaptureLocation,
+    opts: CaptureWait = {}): Promise<ProofCaptureReadiness> {
+  const started = Date.now();
+  const budgetMs = Math.min(20000, Math.max(0, opts.timeoutMs ?? 20000),
+    Math.max(0, (opts.deadline ?? started + 20000) - started));
+  const deadline = started + budgetMs;
+  const samples: ProofReadinessSample[] = [];
+  let stable = 0, previous = '';
+  while (Date.now() < deadline) {
+    opts.signal?.throwIfAborted();
+    const sample = await boundedFrameRead(() => page.evaluate(({selector}) => {
+      const matches = selector ? [...document.querySelectorAll(selector)] : [];
+      const target = matches.length === 1 ? matches[0] : undefined;
+      const rect = (element: Element) => {
+        const box = element.getBoundingClientRect();
+        return [box.left, box.top, box.width, box.height];
+      };
+      const inView = (element: Element) => {
+        const box = element.getBoundingClientRect();
+        return box.width > 0 && box.height > 0 && box.bottom > 0 && box.top < innerHeight && box.right > 0 && box.left < innerWidth;
+      };
+      const name = (element: Element) => element.id ? `#${CSS.escape(element.id)}` : element.tagName.toLowerCase();
+      const scope = target?.closest('section,article,[role=region]') ?? target?.parentElement ?? target;
+      const mediaElements = scope ? [...scope.querySelectorAll('img,video')]
+        .filter(element => inView(element) && !element.closest('nav,header,footer,aside')) : [];
+      const ancestors = new Set<Element>();
+      for (const element of [target, ...mediaElements]) {
+        for (let current = element; current; current = current.parentElement ?? undefined) ancestors.add(current);
+      }
+      const elements = [...ancestors].map(element => {
+        const css = getComputedStyle(element), html = element as HTMLElement;
+        const animations = element.getAnimations().map(animation => {
+          const effect = animation.effect as KeyframeEffect | null;
+          const timing = effect?.getComputedTiming();
+          const properties = [...new Set((effect?.getKeyframes() ?? []).flatMap(frame => Object.keys(frame)))]
+            .filter(key => ['opacity', 'transform', 'translate', 'scale', 'rotate', 'filter', 'clipPath', 'visibility'].includes(key));
+          return {properties, playState: animation.playState, pending: animation.pending,
+            currentTime: typeof animation.currentTime === 'number' ? animation.currentTime : null,
+            endTime: typeof timing?.endTime === 'number' && Number.isFinite(timing.endTime) ? timing.endTime : null,
+            infinite: timing?.iterations === Infinity || timing?.endTime === Infinity};
+        }).filter(animation => animation.properties.length > 0);
+        return {selector: name(element), opacity: css.opacity, display: css.display, visibility: css.visibility,
+          layout: [html.offsetLeft, html.offsetTop, html.offsetWidth, html.offsetHeight], rect: rect(element), animations};
+      });
+      const finitePending = elements.flatMap(element => element.animations)
+        .filter(animation => !animation.infinite && (animation.pending || animation.playState === 'running')).length;
+      const visible = Boolean(target?.isConnected && inView(target) && elements.every(element =>
+        element.display !== 'none' && !['hidden', 'collapse'].includes(element.visibility) && Number(element.opacity) > 0));
+      const media = mediaElements.map(element => {
+        if (element instanceof HTMLImageElement) return {selector: name(element), tag: 'img',
+          ready: element.complete && element.naturalWidth > 0 && element.naturalHeight > 0,
+          complete: element.complete, width: element.naturalWidth, height: element.naturalHeight, source: element.currentSrc};
+        const video = element as HTMLVideoElement;
+        return {selector: name(element), tag: 'video', ready: video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0,
+          readyState: video.readyState, width: video.videoWidth, height: video.videoHeight,
+          decodedFrames: video.getVideoPlaybackQuality?.().totalVideoFrames, source: video.currentSrc};
+      });
+      // Layout coordinates exclude animated transforms; an infinite original
+      // opacity animation likewise must not demand an impossible final value.
+      const stability = JSON.stringify({scroll: [scrollX, scrollY], elements: elements.map(element => ({
+        selector: element.selector, layout: element.layout,
+        opacity: element.animations.some(animation => animation.infinite && animation.properties.includes('opacity')) ? undefined : element.opacity,
+      })), media: media.map(element => [element.selector, element.width, element.height, element.ready])});
+      return {observedAt: new Date().toISOString(), selector, count: matches.length, visible,
+        finitePending, elements, media, stability};
+    }, {selector: location.selector ?? ''}).catch(() => null), opts.signal, deadline - Date.now());
+    opts.signal?.throwIfAborted();
+    if (!sample) break;
+    samples.push(sample);
+    const ready = sample.visible && sample.finitePending === 0 && sample.media.every(media => media.ready);
+    stable = ready ? sample.stability === previous ? stable + 1 : 1 : 0;
+    previous = sample.stability;
+    if (stable >= 3) return {status: 'ready', startedAt: new Date(started).toISOString(), elapsedMs: Date.now() - started, budgetMs, samples};
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await wait(Math.min(200, remaining), undefined, {signal: opts.signal});
+  }
+  opts.signal?.throwIfAborted();
+  return {status: 'timeout', code: 'CAPTURE_NOT_READY', startedAt: new Date(started).toISOString(),
+    elapsedMs: Date.now() - started, budgetMs, samples};
+}
 // Selectors are descriptive (and can match several examples). Retain the exact
 // chosen DOM node for frame checks without adding attributes to the source page.
 const stageElements = new WeakMap<Stage, ElementHandle<Element>>();

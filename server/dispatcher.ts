@@ -5,8 +5,8 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { readRole } from "./roles.ts";
-import type { Attachment } from "../shared/types.ts";
-import { transcriptMessage, type DispatcherCheckpoint, type DispatcherStatus, type PiMessage } from "../shared/conversation.ts";
+import type { Attachment, StationAgentBinding } from "../shared/types.ts";
+import { piContextMessages, transcriptMessage, type DispatcherCheckpoint, type DispatcherStatus, type PiMessage } from "../shared/conversation.ts";
 import { models, MODEL_ID } from "./pi.ts";
 import type { Factory } from "./factory.ts";
 import { FactoryControl } from "./control.ts";
@@ -14,6 +14,8 @@ import { EvidenceStore } from "./evidence.ts";
 import {dispatcherContext, dispatcherError, dispatcherOperationKey, recoverDispatcherMessages,
   transientDispatcherError, uncertainToolResult} from './dispatcher-recovery.ts';
 import {withModelAdmission} from './model-requests.ts';
+import {resolveNativeCommand} from './agent-bindings.ts';
+import {NativeDispatcher} from './dispatcher-native.ts';
 
 const SYSTEM = `你是“主调度”，一个多 agent 流水线工厂的总调度，站长（用户）只和你说话。
 - 你只调度：投料、启停、加人撤人、纠错退回、查状态、起草规格补丁、结束本轮。
@@ -58,6 +60,7 @@ export class Dispatcher {
   private preparingInputs: Promise<void> = Promise.resolve();
   private readonly queuedInputIds = new Set<string>();
   private agentSignature = '';
+  private native: NativeDispatcher | null = null;
 
   constructor(f: Factory, control = new FactoryControl(f), options: DispatcherOptions = {}) {
     this.f = f; this.control = control;
@@ -107,16 +110,15 @@ export class Dispatcher {
   }
   private boundedStream(): StreamFn {
     return async (_model, context, options) => {
-      const binding = this.f.getAgentDefaults?.().dispatcher ?? this.checkpoint.agent;
-      if (binding && binding.adapter !== 'pi') throw new Error('主调度目前只支持 Pi 执行器');
+      const binding = this.piBinding();
       const selected = this.options.modelFactory(binding);
       if (this.agent) this.agent.state.model = selected.model;
       if (binding && JSON.stringify(binding) !== JSON.stringify(this.checkpoint.agent)) {
         this.checkpoint.agent = structuredClone(binding);
         this.save();
       }
-      const requestContext = {...context, messages: dispatcherContext(
-        context.messages, this.checkpoint.request.text, selected.model.contextWindow)};
+      const requestContext = {...context, messages: piContextMessages(dispatcherContext(
+        context.messages, this.checkpoint.request.text, selected.model.contextWindow))};
       this.requestTimedOut = false;
       const timeout = new AbortController();
       const timer = setTimeout(() => { this.requestTimedOut = true; timeout.abort(new DOMException("模型响应超时", "TimeoutError")); }, this.options.requestTimeoutMs);
@@ -131,9 +133,15 @@ export class Dispatcher {
       } catch (error) { clearTimeout(timer); throw error; }
     };
   }
+  private piBinding() {
+    const selected = this.f.getAgentDefaults?.().dispatcher;
+    // A harness change applies to the next conversation. Pi model changes can
+    // still take effect at the next request inside this captured Pi turn.
+    if (selected?.adapter === 'pi') return selected;
+    return this.checkpoint.agent?.adapter === 'pi' ? this.checkpoint.agent : undefined;
+  }
   private ensure(includeCurrent = false) {
-    const binding = this.f.getAgentDefaults?.().dispatcher ?? this.checkpoint.agent;
-    if (binding && binding.adapter !== 'pi') throw new Error('主调度目前只支持 Pi 执行器');
+    const binding = this.piBinding();
     const signature = JSON.stringify([binding, this.checkpoint.state.turn]);
     if (this.agent && this.agentSignature === signature) return this.agent;
     const {model} = this.options.modelFactory(binding);
@@ -143,6 +151,7 @@ export class Dispatcher {
       initialState: { systemPrompt: (this.f.docs ? this.f.docs.envelope("dispatcher").text : readRole("dispatcher").content) + "\n\n" + SYSTEM + "\n\n" + this.control.bootstrap().instructions,
         model, thinkingLevel: "off", tools: this.guardedTools() as never },
       streamFn: this.boundedStream(), sessionId: `easy-workflow-dispatcher-${project}-${this.checkpoint.state.turn}`, toolExecution: 'sequential',
+      convertToLlm: piContextMessages,
       transformContext: async (messages: AgentMessage[]) => dispatcherContext(
         messages, this.checkpoint.request.text, this.agent?.state.model.contextWindow ?? model.contextWindow),
     });
@@ -270,6 +279,8 @@ export class Dispatcher {
     const id = `m-${requestId ?? crypto.randomUUID()}`;
     this.checkpoint = {agent: this.f.getAgentDefaults?.().dispatcher,
       state: { ...idle(this.options.maxAttempts), turn: id }, prompted: false, messageNumber: 0, request: { text, attachments }, scope: id, inputs: [], operations: [] };
+    if (this.checkpoint.agent?.adapter !== 'pi' && this.checkpoint.agent) this.agent = null;
+    this.native = null;
     this.streamedAt = 0; this.toolLog = [];
     this.f.journal.append({ kind: "chat.user", id, text, attachments }); return this.run(false);
   }
@@ -292,6 +303,81 @@ export class Dispatcher {
     this.restored = false; return this.run(true);
   }
   async recover() { if (this.restored && process.env.FACTORY_READONLY !== "1") return this.resume(); }
+  private async runNative(binding: Exclude<StationAgentBinding, {adapter: 'pi'}>, continuing: boolean) {
+    const stop = this.stop!;
+    if (!binding.command && binding.adapter !== 'launcher') {
+      binding = {...binding, command: resolveNativeCommand(binding.adapter)};
+      this.checkpoint.agent = binding;
+      this.save();
+    }
+    this.agent = null;
+    const append = (message: PiMessage, id: string) => {
+      this.f.journal.append({kind: 'chat.message', id, turn: this.status.turn, message: safeMessage(message)});
+      this.save();
+    };
+    this.native = new NativeDispatcher({
+      projectDirectory: this.f.project.dir, turn: this.status.turn, binding,
+      envelope: (this.f.docs ? this.f.docs.envelope('dispatcher').text : readRole('dispatcher').content) +
+        '\n\n' + SYSTEM + '\n\n' + this.control.bootstrap().instructions,
+      tools: this.guardedTools(), append,
+      toolEvent: (name, status, summary) => {
+        if (status === 'end') this.toolLog.push({name, summary: summary ?? name});
+        this.f.emit({kind: 'chat.tool', name, status, ...(summary ? {summary} : {})});
+      },
+      checkpoint: session => {
+        this.checkpoint.nativeSession = session;
+        this.save();
+      },
+    });
+    if (continuing) this.replayOperations = this.checkpoint.operations.filter(operation => operation.phase === 'completed');
+    let resumeBoundary = continuing;
+    for (let attempt = 1; attempt <= this.options.maxAttempts; attempt++) {
+      this.checkpoint.state.attempt = attempt;
+      try {
+        let finalReply = '';
+        do {
+          stop.signal.throwIfAborted();
+          const next = this.checkpoint.prompted && !resumeBoundary ? this.checkpoint.inputs.find(input => !input.delivered) : undefined;
+          const current = next ?? this.checkpoint.inputs.findLast(input => input.delivered) ?? this.checkpoint.request;
+          const input = await this.promptContent(current.text, current.attachments);
+          const images = await this.images(current.attachments, stop.signal);
+          stop.signal.throwIfAborted();
+          if (next) {
+            next.delivered = true;
+            this.checkpoint.scope = next.id;
+          }
+          this.checkpoint.prompted = true;
+          this.save();
+          const history = recoverDispatcherMessages(this.orderedHistory().map(entry => entry.message), this.checkpoint.operations);
+          const message = await withModelAdmission(dependency => this.f.broker?.modelBlocked(dependency) ?? null,
+            () => this.native!.request(history, current.text, input, images, stop.signal, this.checkpoint.nativeSession),
+            this.f.broker ? (_dependency, owner) => this.f.broker.modelRequests.acquire(owner) : undefined);
+          finalReply = textOf(message);
+          this.checkpoint.messageNumber++;
+          append(message, `${this.status.turn}-native-${this.checkpoint.messageNumber}`);
+          resumeBoundary = false;
+        } while (this.checkpoint.inputs.some(input => !input.delivered));
+        this.f.journal.append({kind: 'chat.assistant', id: `${this.status.turn}-r`, text: finalReply, tools: this.toolLog});
+        this.update('completed', '回答已完成。', {recoverable: false, error: undefined});
+        return;
+      } catch (error) {
+        if (stop.signal.aborted) throw stop.signal.reason;
+        const message = dispatcherError(error);
+        if (!transientDispatcherError(message) || attempt === this.options.maxAttempts) {
+          this.update('failed', '本次回答未完成，已保存上下文和工具回执；可以从这里继续。',
+            {recoverable: true, error: message});
+          return;
+        }
+        const waitMs = this.options.retryDelaysMs[Math.min(attempt - 1, this.options.retryDelaysMs.length - 1)] ?? 1000;
+        this.update('recovering', '客户端连接中断，正在保留操作回执并恢复回答。',
+          {recoverable: true, error: message, nextRetryAt: Date.now() + waitMs});
+        await delay(waitMs, undefined, {signal: stop.signal});
+        this.replayOperations = this.checkpoint.operations.filter(operation => operation.phase === 'completed');
+        resumeBoundary = true;
+        this.update('running', '正在从已保存的工具结果继续。', {attempt: attempt + 1, recoverable: false});
+      }
+    }
+  }
   private async run(continuing: boolean) {
     this.busy = true; this.stop = new AbortController(); this.stopKind = null;
     this.preparingInputs = Promise.resolve();
@@ -300,6 +386,11 @@ export class Dispatcher {
     this.update("running", continuing ? "正在从已保存的工具结果继续回答。" : "正在处理你的请求。", { attempt: 1, maxAttempts: this.options.maxAttempts, recoverable: false, error: undefined });
     this.f.emit({ kind: "chat.start", id, turn: id });
     try {
+      const binding = this.checkpoint.agent;
+      if (binding && binding.adapter !== 'pi') {
+        await this.runNative(binding, continuing);
+        return {ok: this.status.status === 'completed', id, status: this.status.status};
+      }
       if (continuing) this.replayOperations = this.checkpoint.operations.filter(o => o.phase === "completed");
       const reloadAttachments = continuing && !this.agent;
       const agent = this.ensure(continuing && this.checkpoint.prompted);
@@ -377,8 +468,8 @@ export class Dispatcher {
     }
     return { ok: this.status.status === "completed", id, status: this.status.status };
   }
-  abort() { if (this.busy) { this.stopKind = "user"; this.stop?.abort(new DOMException("用户停止回答", "AbortError")); this.agent?.abort(); } }
-  interrupt() { if (this.busy) { this.stopKind = "shutdown"; this.stop?.abort(new DOMException("服务关闭", "AbortError")); this.agent?.abort(); } }
+  abort() { if (this.busy) { this.stopKind = "user"; this.stop?.abort(new DOMException("用户停止回答", "AbortError")); this.agent?.abort(); this.native?.abort(); } }
+  interrupt() { if (this.busy) { this.stopKind = "shutdown"; this.stop?.abort(new DOMException("服务关闭", "AbortError")); this.agent?.abort(); this.native?.abort(); } }
 }
 
 export { MODEL_ID };

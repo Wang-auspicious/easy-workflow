@@ -14,7 +14,8 @@ export const Edges = memo(function Edges({ geo, hover, selected }: { geo: Geomet
   useStore((s) => s.version);
   const trail = useStore((s) => s.trail);
   const layer = useStore((s) => s.layer);
-  const now = useNow(1000);
+  const clock = useNow(1000);
+  const now = useStore(state => state.replay?.at) ?? clock;
   const s = getState();
   const arrowId = `flow-arrow-${useId().replaceAll(":", "")}`;
   const last = new Map<string, number>();
@@ -93,10 +94,11 @@ export const Edges = memo(function Edges({ geo, hover, selected }: { geo: Geomet
 });
 
 /** Draw each physical socket once, above cards, so neither half is clipped by a card. */
-export function ConnectionPorts({ geo, hover, selected }: { geo: Geometry; hover: string | null; selected: string[] }) {
+export const ConnectionPorts = memo(function ConnectionPorts({ geo, hover, selected }: { geo: Geometry; hover: string | null; selected: string[] }) {
   useStore((s) => s.version);
   const layer = useStore((s) => s.layer);
-  const now = useNow(1000);
+  const clock = useNow(1000);
+  const now = useStore(state => state.replay?.at) ?? clock;
   const active = new Set(getState().fs.transfers.filter((t) => now - t.at < ACTIVE_MS).map((t) => `${t.from}->${t.to}`));
   const sockets = new Map<string, { owner: string; x: number; y: number; dir: string }>();
   for (const e of geo.edges) {
@@ -110,4 +112,4 @@ export function ConnectionPorts({ geo, hover, selected }: { geo: Geometry; hover
   return <svg className="connection-ports" width="1" height="1" aria-hidden="true">
     {[...sockets].map(([key, p]) => <circle key={key} data-node-port={`${p.owner}:${p.dir}`} cx={p.x} cy={p.y} r="7" className={hover === p.owner || selected.includes(p.owner) ? "is-highlighted" : ""} vectorEffect="non-scaling-stroke" />)}
   </svg>;
-}
+});

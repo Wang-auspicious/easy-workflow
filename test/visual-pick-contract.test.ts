@@ -7,6 +7,88 @@ import http from 'node:http';
 import { execFileSync } from 'node:child_process';
 import type { StationContext } from '../server/runtime.ts';
 
+test('a tool workspace reaches visual selection without requiring an imaginary asset catalogue', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-workspace-breadth-'));
+  const previous = Object.fromEntries(['PI_CODING_AGENT_DIR', 'FACTORY_VAR', 'VISLEXICON_ROOT'].map(key => [key, process.env[key]]));
+  process.env.PI_CODING_AGENT_DIR = root;
+  process.env.FACTORY_VAR = root;
+  process.env.VISLEXICON_ROOT = path.join(root, 'unconnected');
+  let observation: 'workspace' | 'catalogue' | 'marketing' = 'workspace';
+  const received: {accepted: boolean; images: number}[] = [];
+  // Replays the actual rejected observation: one output plus Generate, seed,
+  // Scatter/Grid, Points and Easing controls. This is a local contract oracle,
+  // not a test pretending that an online vision model was evaluated.
+  const model = http.createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const parts = request.messages.filter((message: {role: string}) => message.role === 'user').at(-1).content;
+    const text = parts.filter((part: {type: string}) => part.type === 'text').map((part: {text: string}) => part.text).join('\n');
+    const images = parts.filter((part: {type: string}) => part.type === 'image_url').length;
+    const workspacePermitted = /complete working workspace/i.test(text) && /multiple.*visible.*(?:functions|controls)/i.test(text);
+    const cataloguePermitted = /actual items|actual rendered items/i.test(text) && /name-list/.test(text);
+    const accepted = observation === 'workspace' && workspacePermitted || observation === 'catalogue' && cataloguePermitted;
+    received.push({accepted, images});
+    const answer = accepted
+      ? {index: 1, basis: 'rendered-items', reason: observation === 'workspace'
+        ? '完整生成器工作区显示实际渐变及Generate、seed、Scatter/Grid、Points和Easing多种可见功能。'
+        : '真实条目目录同时展示多个可取得条目。'}
+      : {index: 0, basis: 'none', reason: '两张截图仅展示单个渐变示例和功能介绍，未能一眼看出该工具的作品范围。'};
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    const send = (delta: unknown, finish_reason: string | null = null) => res.write(`data: ${JSON.stringify({id: 'workspace', object: 'chat.completion.chunk', created: 1, model: request.model, choices: [{index: 0, delta, finish_reason}]})}\n\n`);
+    send({role: 'assistant', tool_calls: [{index: 0, id: 'workspace-result', type: 'function', function: {name: 'submit', arguments: JSON.stringify(answer)}}]});
+    send({}, 'tool_calls');
+    res.end('data: [DONE]\n\n');
+  });
+  await new Promise<void>(resolve => model.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(model.address() as {port: number}).port}/v1`;
+  fs.writeFileSync(path.join(root, 'auth.json'), JSON.stringify({fixture: {type: 'api_key', key: 'local-test-only'}}));
+  fs.writeFileSync(path.join(root, 'models.json'), JSON.stringify({providers: {fixture: {api: 'openai-completions', baseUrl: origin, models: [{id: 'fixture', input: ['text', 'image']}]}}}));
+  const shot = path.join(root, 'workspace.png');
+  execFileSync('ffmpeg', ['-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=32x32', '-frames:v', '1', shot], {windowsHide: true});
+  const {breadthPageQuestion} = await import('../packs/vislexicon/tools.ts');
+  const {shotReview} = await import('../packs/vislexicon/agents.ts');
+  const {pickByImages} = await import('../server/agent-station.ts');
+  const {closeModelTransport} = await import('../server/pi.ts');
+  const ctx = {node: {key: 'curation/breadth'}, token: {id: 'workspace-fixture', data: {}}, attempt: 'workspace-fixture', worker: {id: 'fixture'},
+    modelAssist: {binding: {adapter: 'pi', provider: 'fixture', model: 'fixture'}, projectDirectory: root},
+    signal: new AbortController().signal, progress() {}, addEvidence: () => ({})} as unknown as StationContext;
+  try {
+    const select = (kind: string) => pickByImages(ctx, breadthPageQuestion('Easy Mesh Gradient fixture', kind), [{file: shot, label: 'Generator workspace'}]);
+    const selected = await select('tool');
+    assert.equal(selected?.index, 0, 'a complete single-tool workspace can show functional breadth without an imaginary gallery');
+    assert.equal(selected?.basis, 'rendered-items');
+    for (const kind of ['component-source', 'assets', 'collection']) assert.equal((await select(kind))?.index, -1,
+      `${kind} must retain its multi-item catalogue requirement`);
+    observation = 'marketing';
+    assert.equal((await select('tool'))?.index, -1, 'a single output or feature marketing alone is insufficient');
+    observation = 'catalogue';
+    for (const kind of ['tool', 'component-source', 'assets', 'collection']) assert.equal((await select(kind))?.index, 0,
+      `${kind} retains the existing actual-items catalogue path`);
+    assert.ok(received.every(request => request.images === 1), 'the actual helper still receives its screenshot');
+    const reviewer = shotReview({resolve: () => shot} as never);
+    for (const kind of ['tool', 'assets']) {
+      const context = {...ctx, token: {...ctx.token, data: {kind, images: [], shots: {}}}};
+      const text = (await reviewer.input(context)).text;
+      assert.equal(/complete working workspace/i.test(text), kind === 'tool', 'independent review receives the same narrowly scoped rule');
+    }
+    const duplicateProof = {perImage: [{role: 'identity', ok: true, reason: 'identity'}, {role: 'breadth', ok: true, reason: 'functional range'},
+      {role: 'proof', ok: false, reason: 'proof is the home first screen again'}], verdict: 'return' as const,
+      returnTo: 'proof', repair: 'replace-page' as const, reason: 'proof重复首页首屏，应为编辑器实际取景'};
+    const returned = await reviewer.after!(duplicateProof, {...ctx, token: {...ctx.token, data: {kind: 'tool', shots: {}}}}, {rounds: 1} as never);
+    assert.equal(returned.verdict?.verdict, 'return');
+    assert.equal(returned.verdict?.returnTo, 'curation/proof', 'tool breadth guidance cannot approve duplicate proof');
+  } finally {
+    await closeModelTransport();
+    await new Promise<void>(resolve => model.close(() => resolve()));
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
+
 test('a positive screenshot verdict with index zero is repaired rather than silently turned into rejection', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-visual-contract-'));
   const previous = Object.fromEntries(['PI_CODING_AGENT_DIR', 'FACTORY_VAR', 'VISLEXICON_ROOT'].map(key => [key, process.env[key]]));

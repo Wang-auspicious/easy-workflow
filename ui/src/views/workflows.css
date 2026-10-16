@@ -54,5 +54,27 @@
 .source-row-foot > span { margin-right: auto; font-size: 11px; }
 .source-address { color: #718095; overflow-wrap: anywhere; }
 .source-attention { color: #9a542e; }
+.draft-add, .draft-connections { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
+.draft-add > label:first-child, .draft-connections > label { flex: 1; min-width: 150px; }
+.draft-graph { overflow: auto; border: 1px solid var(--line-2); border-radius: 9px; background: radial-gradient(var(--dot) 1px, transparent 1px) 0 0 / 16px 16px; }
+.draft-stage { position: relative; min-width: 650px; }
+.draft-stage > svg { position: absolute; inset: 0; pointer-events: none; }
+.draft-node { position: absolute; width: 180px; height: 70px; border: 1px solid var(--line-2); border-radius: 9px; background: var(--panel); }
+.draft-node-body { width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; gap: 5px; padding: 12px; text-align: left; cursor: grab; touch-action: none; border-radius: inherit; }
+.draft-node-body:active { cursor: grabbing; }
+.draft-node-body:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.draft-port { position: absolute; top: 25px; width: 18px; height: 18px; border-radius: 50%; border: 2px solid #7c8ea8; background: white; }
+.draft-port--input { left: -9px; }
+.draft-port--output { right: -9px; }
+.draft-port.is-on, .draft-port--input:enabled { border-color: var(--accent); background: var(--accent-soft); }
+.draft-port:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.draft-node strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.draft-node.is-selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.draft-node:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.draft-empty { padding: 30px; }
+.draft-node-editor { margin-top: 18px; padding: 16px; border: 1px solid var(--line-2); border-radius: 8px; }
+.draft-edge-list { list-style: none; margin: 0; padding: 0; }
+.draft-edge-list li { display: flex; align-items: center; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+.workflow-builder summary { cursor: pointer; font-size: 12px; color: var(--ink-2); }
 @media (max-width: 640px) { .source-fields { grid-template-columns: 1fr; gap: 0; } }
 @media (max-width: 1100px) { .workflows .view-head { flex-direction: column; } }

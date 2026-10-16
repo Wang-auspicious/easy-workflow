@@ -61,7 +61,8 @@ export class SourceSupervisor {
     this.f = factory;
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
-    for (const event of factory.journal.read()) this.apply(event);
+    for (const event of factory.journal.readKinds(['source.configured', 'source.polled', 'source.requested',
+      'source.candidate', 'source.reputation'])) this.apply(event);
     this.unsubscribe = () => {};
     if (process.env.FACTORY_READONLY === '1') return;
     // The complete committed batch must be projected before terminal consumers

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<title>Easy Workflow</title>
+<style>
+  :root{font-family:system-ui,"Microsoft YaHei",sans-serif;color:#263241;background:#f7f8fa}
+  body{margin:0;min-height:100vh;display:grid;place-items:center}
+  main{max-width:420px;padding:40px}
+  h1{font-size:23px;font-weight:600;margin:0 0 20px}
+  p{font-size:15px;line-height:1.8;color:#687484;margin:8px 0}
+  .status{display:flex;gap:10px;align-items:center;color:#263241}
+  .dot{width:9px;height:9px;border-radius:50%;background:#3478ed;animation:pulse 1.2s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.35}}
+  @media(prefers-reduced-motion:reduce){.dot{animation:none}}
+</style>
+<main>
+  <h1>Easy Workflow</h1>
+  <p class="status" role="status"><span class="dot" aria-hidden="true"></span>正在恢复工作区</p>
+  <p>正在读取运行记录与任务检查点，完成后会自动进入工作区。已有任务和产物会保留。</p>
+</main>
+</html>

@@ -1,6 +1,6 @@
 // Settings: model and key status, global resource quotas (Spec §6.3), social rate limits,
 // and layout resets. Quotas apply to every line at once.
-import {useCallback, useEffect, useState, type FormEvent} from 'react';
+import {useCallback, useEffect, useRef, useState, type FormEvent} from 'react';
 import type {ProjectAgentDefaults} from '../../../shared/types.ts';
 import { getState, setState, useStore } from "../store.ts";
 import {actions, refreshSpec, saveLayout} from '../api.ts';
@@ -22,12 +22,45 @@ const FIELDS: { k: string; label: string; hint: string; min: number; max: number
 export function Settings() {
   const settings = useStore((s) => s.settings);
   const key = useStore((s) => s.keyPresent);
+  const dispatcherAdapter = useStore(state => state.fs.agentDefaults?.dispatcher.adapter);
   const connected = useStore(state => state.connected);
   const replay = useStore(state => Boolean(state.replay));
   const [models, setModels] = useState<PiModelChoice[]>([]);
   const [modelError, setModelError] = useState('');
   const [draft, setDraft] = useState<Record<string, number>>(settings);
-  const dirty = FIELDS.some((f) => draft[f.k] !== settings[f.k]);
+  const [edited, setEdited] = useState<Set<string>>(new Set());
+  const [quotaBusy, setQuotaBusy] = useState(false);
+  const [quotaError, setQuotaError] = useState('');
+  const quotaFlight = useRef(false);
+  const dirty = FIELDS.some(field => edited.has(field.k) && draft[field.k] !== settings[field.k]);
+  const readOnly = !connected || replay;
+  useEffect(() => {
+    setDraft(current => Object.fromEntries(Object.entries(settings).map(([key, value]) =>
+      [key, edited.has(key) ? current[key] : value])));
+  }, [settings, edited]);
+  const saveQuotas = async () => {
+    if (quotaFlight.current || !getState().connected || getState().replay || !dirty) return;
+    quotaFlight.current = true;
+    setQuotaBusy(true);
+    setQuotaError('');
+    try {
+      const changes = Object.fromEntries([...edited].map(key => [key, draft[key]]));
+      const response = await actions.settings(changes) as {settings?: unknown};
+      const saved = response.settings;
+      if (!saved || typeof saved !== 'object' || Array.isArray(saved) ||
+        Object.values(saved).some(value => typeof value !== 'number' || !Number.isFinite(value))) {
+        throw new Error('配额保存回执无效，请重新读取设置核对。');
+      }
+      setState({settings: saved as Record<string, number>});
+      setEdited(new Set());
+      toast('配额已更新，立即生效');
+    } catch (reason) {
+      setQuotaError(reason instanceof Error ? reason.message : '配额保存失败，修改内容已保留。');
+    } finally {
+      quotaFlight.current = false;
+      setQuotaBusy(false);
+    }
+  };
   const readModels = useCallback(async (signal?: AbortSignal) => {
     try {
       const response = await fetch('/api/tools/agent_bindings', {
@@ -66,27 +99,33 @@ export function Settings() {
           {modelError && <p className="agent-binding-error" role="alert">{modelError} <button className="btn btn--sm" disabled={!connected || replay} onClick={() => void readModels()}>重新读取模型列表</button></p>}
           <AgentDefaultEditor scope="station" models={models} readModels={readModels} />
           <AgentDefaultEditor scope="dispatcher" models={models} readModels={readModels} />
-          <div className="set-row"><span>主调度凭据</span><b className={key ? 'ok-c' : 'bad-c'}>{key ? '已找到对应 Provider 的本机凭据' : '未就绪，请检查所选 Provider 的模型与本机凭据'}</b></div>
+          <div className="set-row"><span>主调度凭据</span><b className={dispatcherAdapter !== 'pi' ? 'muted' : key ? 'ok-c' : 'bad-c'}>{dispatcherAdapter !== 'pi' ? '由所选客户端管理，实际调用时验证' : key ? '已找到对应 Provider 的本机凭据' : '未就绪，请检查所选 Provider 的模型与本机凭据'}</b></div>
         </section>
         <FlowSettings />
         <section className="set-sec">
           <h3>资源配额</h3>
+          {readOnly && <p className="muted" role="status">{replay ? '回放为只读，退出回放后可修改配额。' : '连接恢复后可修改配额。'}</p>}
           {FIELDS.map((f) => (
             <div key={f.k} className="set-field">
               <div><b>{f.label}</b><span className="muted">{f.hint}</span></div>
-              <input type="range" min={f.min} max={f.max} step={f.step ?? 1} value={draft[f.k] ?? 0} onChange={(e) => setDraft({ ...draft, [f.k]: Number(e.target.value) })} />
+              <input aria-label={f.label} disabled={readOnly || quotaBusy} type="range" min={f.min} max={f.max} step={f.step ?? 1} value={draft[f.k] ?? 0} onChange={event => {
+                setDraft(current => ({...current, [f.k]: Number(event.target.value)}));
+                setEdited(current => new Set([...current, f.k]));
+                setQuotaError('');
+              }} />
               <b className="num set-val">{draft[f.k]}</b>
             </div>
           ))}
+          {quotaError && <p className="agent-binding-error" role="alert">{quotaError}</p>}
           <div className="row-end">
-            <button className="btn btn--ghost btn--sm" disabled={!dirty} onClick={() => setDraft(settings)}>还原</button>
-            <button className="btn btn--primary btn--sm" disabled={!dirty} onClick={async () => { const r: any = await actions.settings(draft); setState({ settings: r.settings }); toast("配额已更新，立即生效"); }}>保存</button>
+            <button className="btn btn--ghost btn--sm" disabled={!dirty || quotaBusy} onClick={() => {setDraft(settings); setEdited(new Set()); setQuotaError('');}}>还原</button>
+            <button className="btn btn--primary btn--sm" disabled={!dirty || readOnly || quotaBusy} onClick={() => void saveQuotas()}>{quotaBusy ? '正在保存…' : '保存'}</button>
           </div>
         </section>
         <section className="set-sec">
           <h3>画布</h3>
-          <div className="set-row"><span>布局</span><button className="btn btn--sm" onClick={() => { const L = getState().layout; saveLayout({ ...L, pos: {}, capsules: {}, open: {} }); toast("已重置为默认布局"); }}>重置为默认布局</button></div>
-          <div className="set-row"><span>节点颜色与 bot</span><button className="btn btn--sm" onClick={() => { const L = getState().layout; saveLayout({ ...L, colors: {}, bots: {} }); toast("节点颜色与 bot 形象已恢复默认"); }}>一并恢复默认</button></div>
+          <div className="set-row"><span>布局</span><button className="btn btn--sm" disabled={readOnly} onClick={() => { const L = getState().layout; saveLayout({ ...L, pos: {}, capsules: {}, open: {} }); toast("画布已重置，正在保存布局…"); }}>重置为默认布局</button></div>
+          <div className="set-row"><span>节点颜色与 bot</span><button className="btn btn--sm" disabled={readOnly} onClick={() => { const L = getState().layout; saveLayout({ ...L, colors: {}, bots: {} }); toast("节点外观已恢复默认，正在保存…"); }}>一并恢复默认</button></div>
           <div className="set-row muted">拖动只写布局文件 <code className="mono">layout/factory.layout.json</code>，不改规格、不影响运行。</div>
         </section>
       </div>
@@ -106,6 +145,7 @@ function AgentDefaultEditor({scope, models, readModels}: {
   const [draft, setDraft] = useState(() => agentBindingDraft(configured ?? {adapter: 'pi'}));
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
+  const flight = useRef(false);
   const [error, setError] = useState('');
   const [receipt, setReceipt] = useState('');
   const title = scope === 'station' ? '工位默认' : '主调度';
@@ -122,6 +162,8 @@ function AgentDefaultEditor({scope, models, readModels}: {
     setDirty(false);
   };
   const read = async () => {
+    if (flight.current || !getState().connected || getState().replay) return;
+    flight.current = true;
     setBusy(true);
     setError('');
     setReceipt('');
@@ -136,17 +178,19 @@ function AgentDefaultEditor({scope, models, readModels}: {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '项目配置读取失败');
     } finally {
+      flight.current = false;
       setBusy(false);
     }
   };
   const save = async (event: FormEvent) => {
     event.preventDefault();
-    if (disabled) return;
+    if (disabled || flight.current || !getState().connected || getState().replay) return;
     setError('');
     setReceipt('');
     try {
       const binding = parseBindingDraft(draft, true);
       if (!binding) throw new Error('请选择明确的项目默认配置。');
+      flight.current = true;
       setBusy(true);
       const response = await fetch('/api/agents/defaults', {
         method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({[scope]: binding}),
@@ -157,13 +201,15 @@ function AgentDefaultEditor({scope, models, readModels}: {
       reflect(body.result);
       setReceipt(scope === 'station'
         ? '已保存。继承此默认的 Pi 工位从下一次模型请求生效；更换运行底座从下次尝试生效。'
-        : '已保存，主调度从下一次模型请求使用此选择。');
+        : binding.adapter === 'pi' ? '已保存。Pi 会话内切换模型从下一次请求生效；更换底座从新对话生效。'
+          : '已保存，主调度的新对话使用此底座与模型；当前对话及检查点保留原选择。');
       await refreshSpec();
     } catch (reason) {
       setError(reason instanceof Error && reason.name === 'TimeoutError'
         ? '保存结果尚未确认，请重新读取核对，勿重复提交。'
         : reason instanceof Error ? reason.message : '配置保存失败');
     } finally {
+      flight.current = false;
       setBusy(false);
     }
   };
@@ -173,7 +219,7 @@ function AgentDefaultEditor({scope, models, readModels}: {
     setReceipt('');
   };
   return <form className="agent-binding agent-default" aria-label={`${title}配置`} onSubmit={save}>
-    <div className="agent-binding-heading"><b>{title}</b><span className="muted">{scope === 'dispatcher' ? '独立 Pi 会话' : '各工位独立执行'}</span></div>
+    <div className="agent-binding-heading"><b>{title}</b><span className="muted">{scope === 'dispatcher' ? '独立会话与底座' : '各工位独立执行'}</span></div>
     <p className="agent-binding-effective">{configured ? `${adapterLabel(configured.adapter)} · ${configured.model || '客户端默认模型'}` : '项目配置尚未加载'}</p>
     <AgentBindingFields draft={draft} disabled={disabled} scope={scope} change={change} selectAdapter={adapter => {
       setDraft(selectBindingAdapter(adapter, configured ?? null));
@@ -184,7 +230,9 @@ function AgentDefaultEditor({scope, models, readModels}: {
       setDirty(true);
       setReceipt('');
     }} />
-    <p className="muted">{scope === 'dispatcher' ? '主调度使用独立 Pi 会话。' : '节点的独立配置优先，此处只影响继承默认的工位。'}运行中也能修改 Pi 模型，下一次模型请求生效；已经发出的请求完成后再切换。</p>
+    <p className="muted">{scope === 'dispatcher'
+      ? '主调度独立选择底座和模型。Pi 会话内换模型从下一次请求生效；更换底座或原生模型从新对话生效，恢复沿用原底座。'
+      : '节点的独立配置优先，此处只影响继承默认的工位。运行中也能修改 Pi 模型，下一次模型请求生效；已经发出的请求完成后再切换。'}</p>
     {error && <p className="agent-binding-error" role="alert">{error}</p>}
     {receipt && <p className="agent-binding-receipt" role="status">{receipt}</p>}
     <div className="agent-binding-actions">

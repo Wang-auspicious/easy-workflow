@@ -6,6 +6,14 @@
 }
 .cv.is-dragging { cursor: grabbing; }
 .cv-world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
+/* Keep live status motion on composited properties: animating each lamp's
+   box-shadow repaints its entire station card on every frame. */
+.cv .light.is-pulse { animation-name: canvas-status-pulse; will-change: transform, opacity; }
+.cv .node.is-busy::after { will-change: transform, opacity; }
+@keyframes canvas-status-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.3); opacity: 0.5; }
+}
 
 /* Stage columns: clean vertical lanes with header and subtle dashed dividers */
 .bay {

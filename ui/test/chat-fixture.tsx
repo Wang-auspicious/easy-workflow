@@ -9,8 +9,12 @@ import "../src/views/recovery.css";
 import { Chat } from "../src/chat/Chat.tsx";
 import { Rail } from "../src/shell/Rail.tsx";
 import { Toasts } from "../src/shell/Toasts.tsx";
+import {Settings} from '../src/views/Settings.tsx';
+import {Library} from '../src/views/Library.tsx';
+import {BrowserView} from '../src/views/BrowserView.tsx';
+import {PreviewChoice} from '../src/views/PreviewChoice.tsx';
 import { connect } from "../src/api.ts";
-import { getState, setState } from "../src/store.ts";
+import {getState, setState, useStore} from '../src/store.ts';
 import { apply, initialState, type TokenState } from "../../shared/project.ts";
 import { legacyReply } from "../../shared/conversation.ts";
 import { botFor } from "../../shared/palette.ts";
@@ -88,5 +92,13 @@ setState({ fs, factory, ready: true, connected: true, chatOpen: true, chatWidth:
   browser: { tabs: [{ id: "login-tab", title: "素材账户", url: "https://account.example.test/login", owner: "agent", loading: false, attention: "登录后查看私有文件", attentionKind: "auth" }], active: "login-tab", bookmarks: [], history: [], retentionDays: 30, mode: "headless" },
 });
 (window as any).chatFixture = { getState, setState };
-createRoot(document.getElementById("root")!).render(<div className="app" style={{ "--chat-w": "420px" } as React.CSSProperties}><Rail /><main className="workspace" style={{ padding: 40 }}><h2>恢复流程验收</h2><p>隔离测试数据 · 不连接真实工厂</p></main><Chat /><Toasts /></div>);
+function FixtureWorkspace() {
+  const view = useStore(state => state.view);
+  if (view === 'settings') return <Settings />;
+  if (view === 'library') return <Library />;
+  if (view === 'browser') return <BrowserView />;
+  if (view === 'candidates') return <PreviewChoice item="fixture-item" onMessage={message => setState({draft: message})} />;
+  return <><h2>恢复流程验收</h2><p>隔离测试数据 · 不连接真实工厂</p></>;
+}
+createRoot(document.getElementById("root")!).render(<div className="app" style={{ "--chat-w": "420px" } as React.CSSProperties}><Rail /><main className="workspace" style={{ padding: 40 }}><FixtureWorkspace /></main><Chat /><Toasts /></div>);
 connect(0);

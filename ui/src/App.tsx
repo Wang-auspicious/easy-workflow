@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 import { useStore, setState, getState } from "./store.ts";
 import { Rail } from "./shell/Rail.tsx";
-import { Chat } from "./chat/Chat.tsx";
+import { Chat, chatPanelWidth } from "./chat/Chat.tsx";
 import { Canvas } from "./canvas/Canvas.tsx";
 import { EvidenceBoard } from "./board/EvidenceBoard.tsx";
 import { Library } from "./views/Library.tsx";
@@ -15,12 +15,14 @@ import { Report } from "./report/Report.tsx";
 import { Tooltip } from "./shell/Tooltip.tsx";
 import { Toasts } from "./shell/Toasts.tsx";
 import { HoverPreviewHost } from "./shell/HoverPreview.tsx";
+import {boot} from './api.ts';
 
 export function App() {
   const ready = useStore((s) => s.ready);
   const view = useStore((s) => s.view);
   const chatOpen = useStore((s) => s.chatOpen);
   const chatWidth = useStore((s) => s.chatWidth);
+  const roomRailOpen = useStore((s) => s.roomRailOpen);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -35,7 +37,7 @@ export function App() {
   }, []);
 
   return (
-    <div className="app" style={{ ["--chat-w" as string]: `${chatOpen ? chatWidth : 64}px` }}>
+    <div className="app" style={{ ["--chat-w" as string]: `${chatOpen ? chatPanelWidth(chatWidth, roomRailOpen) : 64}px` }}>
       <Rail />
       <main className="workspace">
         {!ready ? <Booting /> : (
@@ -60,10 +62,12 @@ export function App() {
 }
 
 function Booting() {
+  const error = useStore(state => state.bootError);
   return (
-    <div className="booting">
-      <div className="booting-dots"><i /><i /><i /></div>
-      <div>正在连接工厂…</div>
+    <div className="booting" role={error ? 'alert' : 'status'}>
+      {!error && <div className="booting-dots"><i /><i /><i /></div>}
+      <div>{error ? '暂时无法打开工作台' : '正在连接工厂…'}</div>
+      {error && <><p className="muted">{error}</p><button className="btn" onClick={() => void boot().catch(() => {})}>重新连接</button></>}
     </div>
   );
 }

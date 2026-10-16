@@ -12,12 +12,16 @@ const profileDirectory = userDataDirectory({ appData: process.env.FACTORY_PROFIL
 app.setName(PRODUCT_NAME);
 fs.mkdirSync(profileDirectory, { recursive: true });
 app.setPath('userData', profileDirectory);
+// app.quit() is asynchronous: continuing this entry point would start a second
+// backend and overwrite the running instance's debugger discovery file.
+if (!app.requestSingleInstanceLock()) app.exit(0);
 app.commandLine.appendSwitch('disable-background-networking');
 app.commandLine.appendSwitch('remote-debugging-port', '0');
 app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
 try { fs.unlinkSync(path.join(app.getPath('userData'), 'DevToolsActivePort')); } catch {}
 const partitions = ['persist:social-x', 'persist:social-xhs', 'persist:social-douyin', 'persist:social-bilibili'];
 let window, backend, baseURL, browserManager, closing = false;
+let pendingBrowserTabs;
 let viewDir = process.env.FACTORY_VIEW_VAR || null;
 const configFile = () => path.join(app.getPath('userData'), 'desktop.json');
 const config = () => { try { return JSON.parse(fs.readFileSync(configFile(), 'utf8')); } catch { return {}; } };
@@ -35,7 +39,6 @@ function rememberProject(dir) {
   const recent = recentProjectDirectories(projectPaths(), config(), dir);
   saveConfig({ activeProject: dir, recentProjects: recent });
 }
-if (!app.requestSingleInstanceLock()) app.quit();
 app.on('second-instance', () => { if (window) { if (window.isMinimized()) window.restore(); window.show(); window.focus(); } });
 
 async function stopBackend() {
@@ -50,14 +53,28 @@ async function stopBackend() {
 }
 
 async function startBackend() {
+  const startedAt = performance.now();
+  const profile = app.getPath('userData');
+  const logDir = path.join(profile, 'logs');
+  fs.mkdirSync(logDir, { recursive: true });
+  // Only bounded lifecycle metadata: never credentials, URLs, or project data.
+  const startup = (phase, details = {}) => {
+    try {
+      fs.appendFileSync(path.join(logDir, 'startup.log'), `${JSON.stringify({
+        at: new Date().toISOString(), phase,
+        elapsedMs: Math.round(performance.now() - startedAt), ...details,
+      })}\n`);
+    } catch { /* Logging must not prevent a healthy backend from starting. */ }
+  };
+  startup('start');
   const saved = config();
   const legacy = path.join(app.getPath('userData'), 'workspace');
   const project = viewDir || activeProject();
   if (!viewDir && project === defaultProject() && !fs.existsSync(project) && fs.existsSync(path.join(legacy, 'journal.db'))) {
     await copyProjectSnapshot(legacy, project);
   }
+  if (closing) return;
   const token = crypto.randomBytes(32).toString('hex');
-  const profile = app.getPath('userData');
   const env = {
     ...process.env, ELECTRON_RUN_AS_NODE: '1', FACTORY_ROOT: root,
     FACTORY_PORT: '0', FACTORY_TOKEN: token,
@@ -70,13 +87,17 @@ async function startBackend() {
     VISLEXICON_BUNDLED: path.join(root, 'resources', 'vislexicon'),
     ...(saved.vislexiconRoot ? { VISLEXICON_ROOT: saved.vislexiconRoot } : {}),
   };
-  const logDir = path.join(profile, 'logs');
-  fs.mkdirSync(logDir, { recursive: true });
   const log = fs.createWriteStream(path.join(logDir, 'desktop.log'), { flags: 'a' });
-  const child = fork(path.join(__dirname, 'server-runner.cjs'), [], {
-    execPath: process.execPath, env, cwd: root, windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-  });
+  let child;
+  try {
+    child = fork(path.join(__dirname, 'server-runner.cjs'), [], {
+      execPath: process.execPath, env, cwd: root, windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+  } catch (error) {
+    startup('failure', {reason: 'fork_error'}); log.end(); throw error;
+  }
+  startup('fork', {pid: child.pid});
   backend = child;
   child.on('message', message => {
     if (message?.type !== 'browser:request') return;
@@ -85,13 +106,29 @@ async function startBackend() {
   child.stdout.pipe(log, { end: false }); child.stderr.pipe(log, { end: false });
   child.once('exit', () => log.end());
   const ready = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { child.kill(); reject(new Error('后台启动超时；请查看用户数据目录中的 logs/desktop.log。')); }, 30000);
-    child.once('error', (e) => { clearTimeout(timer); reject(e); });
-    child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`后台退出（${code}）；请查看 logs/desktop.log。`)); });
-    child.on('message', (message) => {
+    let settled = false;
+    const finish = (error, message, details) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      // Keep the existing once-only child error guard after ready/kill, while
+      // removing the startup-only IPC and exit listeners.
+      child.off('exit', onExit); child.off('message', onMessage);
+      startup(error ? 'failure' : 'ready', details);
+      error ? reject(error) : resolve(message);
+    };
+    const onError = error => finish(error, null, {reason: 'child_error'});
+    const onExit = code => finish(new Error(`后台退出（${code}）；请查看 logs/desktop.log。`), null,
+      {reason: 'child_exit', exitCode: code});
+    const onMessage = message => {
       if (message?.type !== 'ready') return;
-      clearTimeout(timer); resolve(message);
-    });
+      finish(null, message);
+    };
+    const timer = setTimeout(() => {
+      finish(new Error('后台启动超时；请查看用户数据目录中的 logs/desktop.log。'), null,
+        {reason: 'ready_timeout', deadlineMs: 180000});
+      child.kill();
+    }, 180000);
+    child.once('error', onError); child.once('exit', onExit); child.on('message', onMessage);
   });
   baseURL = ready.url;
   await session.defaultSession.cookies.set({ url: baseURL, name: 'pf_auth', value: token, httpOnly: true, sameSite: 'strict', path: '/' });
@@ -109,7 +146,9 @@ const windowTitle = () => viewDir ? `${PRODUCT_NAME} · 只读查看已有运行
 async function changeWorkspace(dir) {
   viewDir = dir;
   await stopBackend();
+  if (closing) return;
   await startBackend();
+  if (closing) return;
   window.setTitle(windowTitle());
   Menu.setApplicationMenu(menu());
   await window.loadURL(baseURL);
@@ -159,7 +198,17 @@ function menu() {
   ]);
 }
 
-const showError = (error) => dialog.showErrorBox(PRODUCT_NAME, String(error?.stack || error));
+const showError = (error) => {
+  const details = String(error?.stack || error);
+  // Keep startup failures inspectable through the local logs even when the
+  // owner has disabled desktop interaction or the error dialog is obscured.
+  try {
+    const logDirectory = path.join(app.getPath('userData'), 'logs');
+    fs.mkdirSync(logDirectory, {recursive: true});
+    fs.appendFileSync(path.join(logDirectory, 'startup-error.log'), `${new Date().toISOString()} ${details}\n`);
+  } catch {}
+  dialog.showErrorBox(PRODUCT_NAME, details);
+};
 if (process.env.FACTORY_DESKTOP_TEST === '1') {
   globalThis.__factoryDesktop = () => ({ backendPid: backend?.pid, url: baseURL, readOnly: Boolean(viewDir) });
   globalThis.__factoryBrowser = args => browserManager.command(args);
@@ -178,8 +227,11 @@ app.whenReady().then(async () => {
   secureSession(session.defaultSession);
   for (const partition of partitions) secureSession(session.fromPartition(partition));
   browserManager = new BrowserManager(app.getPath('userData'), state => { if (backend?.connected) backend.send({ type:'browser:state', state }); }, secureSession);
+  pendingBrowserTabs = [...browserManager.data.tabs];
   await browserManager.migrate(partitions);
-  await startBackend();
+  if (closing) return;
+  const savedTabs = [...browserManager.data.tabs];
+  pendingBrowserTabs = savedTabs;
   window = new BrowserWindow({
     width: 1440, height: 900, minWidth: 900, minHeight: 600,
     title: windowTitle(),
@@ -199,23 +251,29 @@ app.whenReady().then(async () => {
     if (event.sender !== window?.webContents) throw new Error('Forbidden');
     return { version: app.getVersion(), platform: process.platform, workspace: viewDir || activeProject(), project: path.basename(viewDir || activeProject()), readOnly: Boolean(viewDir) };
   });
-  Menu.setApplicationMenu(menu());
   ipcMain.handle('desktop:browser-bounds', (event, bounds) => {
     if (event.sender !== window?.webContents) throw new Error('Forbidden');
     if (bounds && !['x','y','width','height'].every(k => Number.isFinite(bounds[k]))) throw new Error('Invalid bounds');
     browserManager.setBounds(bounds); return true;
   });
-  window.once('ready-to-show', () => { window.show(); if (process.env.FACTORY_MINIMIZED === '1') window.minimize(); });
   window.on('page-title-updated', (event) => event.preventDefault());
+  await window.loadFile(path.join(__dirname, 'loading.html'));
+  if (closing) return;
+  window.show();
+  if (process.env.FACTORY_MINIMIZED === '1') window.minimize();
+  await startBackend();
+  if (closing) return;
+  Menu.setApplicationMenu(menu());
   await window.loadURL(baseURL);
-  const savedTabs = [...browserManager.data.tabs];
+  if (closing) return;
   if (savedTabs.length) for (const tab of savedTabs) { try { browserManager.create(tab.url); } catch {} }
   else browserManager.create();
-}).catch((error) => { showError(error); app.quit(); });
+  pendingBrowserTabs = undefined;
+}).catch((error) => { if (!closing) showError(error); app.quit(); });
 
 app.on('window-all-closed', () => app.quit());
 app.on('before-quit', (event) => {
   if (closing) return;
   event.preventDefault(); closing = true;
-  stopBackend().then(() => browserManager?.close()).finally(() => Promise.all(partitions.map((p) => session.fromPartition(p).cookies.flushStore())).finally(() => app.quit()));
+  stopBackend().then(() => browserManager?.close({savedTabs: pendingBrowserTabs})).finally(() => Promise.all(partitions.map((p) => session.fromPartition(p).cookies.flushStore())).finally(() => app.quit()));
 });

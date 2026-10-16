@@ -5,8 +5,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { liveApp } from './live-app.mjs';
 
-const app = await liveApp('canvas-performance');
-const out = path.join(app.root, 'var/verification/canvas-performance');
+const app = await liveApp('canvas-performance', {production: process.env.CANVAS_PRODUCTION === '1'});
+const out = path.join(app.root, `var/verification/canvas-performance${app.production ? '-production' : ''}`);
 await fs.mkdir(out, { recursive: true });
 let page, cdp;
 const errors = [], packs = [], phases = [];
@@ -48,8 +48,8 @@ try {
   await page.getByRole('button', { name: '全图', exact: true }).click();
   assert.equal(await page.locator('[data-node]').count(), 24);
   await pause(600);
-  await page.evaluate(async () => {
-    const store = await import('/src/store.ts');
+  await page.evaluate(async production => {
+    const store = await import(production ? '/assets/performance-probe.js' : '/src/store.ts');
     const data = window.canvasPerformance = { current: null, phases: [], latency: [], longTasks: [], getState: store.getState, live: true };
     const tick = now => {
       const phase = data.current;
@@ -70,7 +70,7 @@ try {
         pending = [];
       });
     });
-  });
+  }, app.production);
   cdp = await page.context().newCDPSession(page);
   await cdp.send('Performance.enable');
   await cdp.send('Tracing.start', { categories: 'devtools.timeline,blink.user_timing,toplevel,disabled-by-default-devtools.timeline.frame', transferMode: 'ReturnAsStream' });
@@ -97,7 +97,7 @@ try {
   await page.getByRole('button', { name: '全图', exact: true }).click(); await pause(500);
   await measure('zoom', async () => {
     await page.mouse.move(box.x + box.width * 0.6, box.y + box.height * 0.55);
-    for (let step = 0; step < 50; step++) { await page.mouse.wheel(0, step % 20 < 10 ? -36 : 36); await pause(80); }
+    for (let step = 0; step < 50; step++) { await page.mouse.wheel(0, step % 20 < 10 ? -100 : 100); await pause(80); }
   });
   await page.getByRole('button', { name: '全图', exact: true }).click(); await pause(500);
   const node = page.locator('[data-node="perf-0/step-2"]'), rect = await node.boundingBox();
@@ -115,7 +115,7 @@ try {
   for (;;) { const chunk = await cdp.send('IO.read', { handle: stream }); trace.push(chunk.base64Encoded ? Buffer.from(chunk.data, 'base64') : Buffer.from(chunk.data)); if (chunk.eof) break; }
   await cdp.send('IO.close', { handle: stream });
   await fs.writeFile(path.join(out, 'chrome-performance-trace.json'), Buffer.concat(trace));
-  const measurements = { at: new Date().toISOString(), description: 'Real isolated HTTP runtime and Chrome UI; 500 synthetic input tokens, 20 program workers plus 4 stores. No production data or model workload.', viewport: { width: 1440, height: 900 },
+  const measurements = { at: new Date().toISOString(), mode: app.production ? 'production-bundle' : 'development', description: 'Real isolated HTTP runtime and Chrome UI; 500 synthetic input tokens, 20 program workers plus 4 stores. No production data or model workload.', viewport: { width: 1440, height: 900 },
     browser: app.browser.version(), phases, latency: { samples: data.latency.length, p95Ms: quantile(data.latency.map(event => event.milliseconds), 0.95), maxMs: Math.max(0, ...data.latency.map(event => event.milliseconds)), allProjected: data.latency.every(event => event.projected) },
     longTasks: data.longTasks, totals: { tokens: data.tokens, attempts: data.attempts }, before, after, errors };
   await fs.writeFile(path.join(out, 'result.json'), JSON.stringify(measurements, null, 2));

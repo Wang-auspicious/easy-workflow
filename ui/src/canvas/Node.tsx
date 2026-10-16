@@ -60,10 +60,26 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const stop = trail ? trailOf(s.fs, trail).indexOf(node.key) : -1;
   const vars = { ["--c" as string]: c.border, ["--c-strong" as string]: c.strong, ["--fill" as string]: c.fill, ["--fill-h" as string]: c.fillHover, ["--ink-c" as string]: c.ink, ["--soft" as string]: c.soft, ["--glow" as string]: c.glow };
   const cls = `node node--${shape} ${dormant ? "is-dormant" : ""} ${selected ? "is-selected" : ""} ${open ? "is-open" : ""} ${dim ? "is-dim" : ""} ${n?.active.length ? "is-busy" : ""} ${slow ? "is-slow" : ""} ${trail ? (stop >= 0 ? "is-trail" : "is-off-trail") : ""}`;
+  const keyboardProps = {
+    tabIndex: 0,
+    role: 'button',
+    'aria-label': `${displayName}：${status.label}，查看工位详情`,
+    'aria-expanded': open,
+    onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (event.target !== event.currentTarget || !['Enter', ' '].includes(event.key)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.shiftKey || event.ctrlKey || event.metaKey) {
+        const selection = getState().selected;
+        setState({selected: selection.includes(node.key)
+          ? selection.filter(key => key !== node.key) : [...selection, node.key]});
+      } else toggleInspector(node.key);
+    },
+  };
 
   if (shape === "source") {
     return (
-      <div className={cls} data-node={node.key} style={{ left: place.x, top: place.y, width: place.w, height: place.h, ...vars }}
+      <div {...keyboardProps} className={cls} data-node={node.key} style={{ left: place.x, top: place.y, width: place.w, height: place.h, ...vars }}
         data-tip={`${node.name}：${node.blurb ?? ""}${dormant ? "（休眠）" : ""}`} onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
         <StationIcon role={node.role} size={15} />
         <span className="node-name">{displayName}</span>
@@ -76,7 +92,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const {usesModel, label: execution} = nodeExecutionPresentation(node, actualExecution, agentBinding, replay);
 
   return (
-    <div className={cls} data-node={node.key} style={{ left: place.x, top: place.y, width: place.w, height: place.h, ...vars, borderStyle: node.role === "channel" ? "dashed" : undefined }}
+    <div {...keyboardProps} className={cls} data-node={node.key} style={{ left: place.x, top: place.y, width: place.w, height: place.h, ...vars, borderStyle: node.role === "channel" ? "dashed" : undefined }}
       onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
       {stop >= 0 && <span className="node-stop num">{stop + 1}</span>}
       <div className="node-header">
@@ -97,7 +113,10 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
       </div>
     </div>
   );
-});
+}, (previous, next) => previous.node === next.node && previous.selected === next.selected &&
+  previous.dim === next.dim && previous.onHover === next.onHover &&
+  previous.place.x === next.place.x && previous.place.y === next.place.y &&
+  previous.place.w === next.place.w && previous.place.h === next.place.h);
 
 function Strip({ items }: { items: EvidenceRef[] }) {
   useStore((s) => s.flashes);

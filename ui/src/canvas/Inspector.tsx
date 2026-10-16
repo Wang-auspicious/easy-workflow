@@ -30,11 +30,15 @@ import {failureLabels} from '../../../shared/failures.ts';
 
 export function Inspectors({ geo, cam }: { geo: Geometry; cam: Camera }) {
   const list = useStore((s) => s.inspectors);
-  return <>{list.map((i, idx) => <Card key={i.key} insp={i} idx={idx} geo={geo} cam={cam} />)}</>;
+  const factory = useStore(state => state.factory);
+  return <>{list.filter(item => item.kind !== 'node' || factory?.nodes.some(node => node.key === item.key))
+    .map((i, idx) => <Card key={i.key} insp={i} idx={idx} geo={geo} cam={cam} />)}</>;
 }
 
 function Card({ insp, idx, geo, cam }: { insp: Inspector; idx: number; geo: Geometry; cam: Camera }) {
   const ref = useRef<HTMLDivElement>(null);
+  const dragCleanup = useRef<(() => void) | null>(null);
+  useEffect(() => () => dragCleanup.current?.(), []);
   const [bounds, setBounds] = useState({ width: 0, height: 0, cardHeight: 0 });
   useLayoutEffect(() => {
     const element = ref.current, parent = element?.parentElement;
@@ -63,14 +67,22 @@ function Card({ insp, idx, geo, cam }: { insp: Inspector; idx: number; geo: Geom
   const update = (patch: Partial<Inspector>) => setState({ inspectors: getState().inspectors.map((x) => (x.key === insp.key ? { ...x, ...patch } : x)) });
   const close = () => setState({ inspectors: getState().inspectors.filter((x) => x.key !== insp.key) });
   const startDrag = (e: React.PointerEvent) => {
-    if ((e.target as HTMLElement).closest("button")) return;
+    if (e.button !== 0 || (e.target as HTMLElement).closest('button, a')) return;
     e.stopPropagation();
+    dragCleanup.current?.();
     const r = ref.current!.getBoundingClientRect(), pr = ref.current!.parentElement!.getBoundingClientRect();
     const ox = e.clientX - r.left, oy = e.clientY - r.top;
     const move = (ev: PointerEvent) => update({ pinned: true, pinScale: insp.pinned ? insp.pinScale : cam.k, x: (ev.clientX - pr.left - ox - cam.x) / cam.k, y: (ev.clientY - pr.top - oy - cam.y) / cam.k });
-    const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+      dragCleanup.current = null;
+    };
+    dragCleanup.current = up;
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+    window.addEventListener('pointercancel', up);
   };
   const pin = () => update({ pinned: !insp.pinned, pinScale: cam.k, x: (left - cam.x) / cam.k, y: (top - cam.y) / cam.k });
   return (
@@ -89,7 +101,7 @@ function Head({ onDrag, onClose, onPin, pinned, children }: { onDrag: (e: React.
       {children}
       <span className="grow" />
       <button className="icon-btn" onClick={onPin} aria-label={pinned ? "取消钉住" : "钉在画布上"} data-tip={pinned ? "取消钉住（回到节点旁）" : "钉在画布上，随缩放和平移移动"}>{pinned ? <PinOff size={14} /> : <Pin size={14} />}</button>
-      <button className="icon-btn" onClick={onClose} data-tip="关闭  Esc"><X size={15} /></button>
+      <button className="icon-btn" onClick={onClose} aria-label="关闭详情" data-tip="关闭  Esc"><X size={15} /></button>
     </div>
   );
 }
@@ -99,11 +111,18 @@ function Head({ onDrag, onClose, onPin, pinned, children }: { onDrag: (e: React.
 function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspector; onDrag: (e: React.PointerEvent) => void; onClose: () => void; onPin: () => void; onWorker: (w: string) => void }) {
   useStore((s) => s.nodeRev[insp.key]);
   const recoveryTokens = useStore(state => state.nodeRecoveries[insp.key]);
-  const now = useNow(1000);
+  const clock = useNow(1000);
+  const now = useStore(state => state.replay?.at) ?? clock;
   const [tab, setTab] = useState<"work" | "metrics" | "spec">("work");
   const [attemptSel, setAttemptSel] = useState<string | null>(null);
   const [scopeBusy, setScopeBusy] = useState(false);
+  const [controlError, setControlError] = useState('');
+  const controlPending = useRef(false);
   const stationPaused = useStore(s => s.fs.pausedScopes?.stations.includes(insp.key) ?? false);
+  const connected = useStore(state => state.connected);
+  const replay = useStore(state => Boolean(state.replay));
+  const runPaused = useStore(state => state.fs.run.status === 'paused');
+  const pausedLines = useStore(state => state.fs.pausedScopes?.lines);
   const s = getState();
   const node = s.factory!.nodes.find((n) => n.key === insp.key) as CompiledNode;
   const n = s.fs.nodes[insp.key];
@@ -120,11 +139,35 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
   const lineWired = s.factory!.lines.find((l) => l.id === node.line)?.wired;
   const currentStatus = stationStatus(node, s.fs, s.replay?.at ?? now, Boolean(node.dormant) || (!lineWired && node.kind !== 'store'), recoveryTokens);
   const usage = recordedUsage(attempts.filter(attempt => attempt.startedAt >= s.fs.run.startedAt));
-  const togglePause = async () => {
+  const controlsDisabled = scopeBusy || replay || !connected || !lineWired || Boolean(node.dormant);
+  const linePaused = pausedLines?.includes(node.line) ?? false;
+  const control = async (operation: () => Promise<void>) => {
+    if (controlsDisabled || controlPending.current) return;
+    controlPending.current = true;
     setScopeBusy(true);
-    try { await workflowCall('run_control', { action: stationPaused ? 'resume' : 'pause', station: node.key, reason: '用户在工位详情调整领取状态' }); await boot(); }
-    catch { /* The API reports the failure without changing the displayed scope. */ } finally { setScopeBusy(false); }
+    setControlError('');
+    try {
+      await operation();
+    } catch (reason) {
+      setControlError(reason instanceof Error ? reason.message : '工位操作失败，请重试。');
+    } finally {
+      controlPending.current = false;
+      setScopeBusy(false);
+    }
   };
+  const togglePause = (scope: 'station' | 'line' = 'station') => control(async () => {
+    await workflowCall('run_control', {action: scope === 'line' || stationPaused ? 'resume' : 'pause',
+      [scope]: scope === 'line' ? node.line : node.key, reason: '用户在工位详情调整领取状态'});
+    await boot();
+  });
+  const changeWorkers = (action: 'fork' | 'retire' | 'lock' | 'unlock') => control(async () => {
+    const receipt = await actions.workers(node.key, action);
+    if (!receipt || typeof receipt !== 'object' || !('ok' in receipt) || receipt.ok !== true) {
+      throw new Error(action === 'fork' ? '没有增加工人：请检查人数上限与工位状态。'
+        : action === 'retire' ? '没有撤下工人：已到下限或工人仍在忙。' : '人数锁定状态未修改，请核对后重试。');
+    }
+    if (action === 'lock' || action === 'unlock') toast(action === 'unlock' ? '已解锁人数：恢复自动伸缩' : '已锁定人数：不再自动伸缩');
+  });
   return (
     <>
       <Head onDrag={onDrag} onClose={onClose} onPin={onPin} pinned={insp.pinned}>
@@ -143,12 +186,19 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
         <Stat k="已报 token" v={usage.total === null ? '—' : fmt(usage.total)} />
       </div>
       <div className="scope-notice" data-station-status={currentStatus.label}><i className={`light light--${currentStatus.light}`} /> {currentStatus.label} · {currentStatus.detail}</div>
+      {replay ? <div className="scope-notice">回放为只读；退出回放后可调整工位。</div>
+        : !connected ? <div className="scope-notice">连接已断开，恢复连接后可调整工位。</div> : null}
+      {runPaused && <div className="scope-notice">本轮已暂停；恢复此工位不会恢复整轮，请使用本轮的继续入口。</div>}
+      {linePaused && <div className="scope-notice">所属流水线已暂停。恢复流水线后，单独暂停的工位仍保持暂停。
+        <button className="btn btn--sm" disabled={controlsDisabled} onClick={() => void togglePause('line')}>恢复所属流水线</button>
+      </div>}
+      {controlError && <div className="scope-notice" role="alert">{controlError}</div>}
       <div className="insp-actions">
         {node.kind !== "store" && node.kind !== "source" && <>
-          <button className="btn btn--sm" disabled={scopeBusy || Boolean(s.replay) || !s.connected || !lineWired} onClick={() => void togglePause()}>{scopeBusy ? <Loader2 size={12} className="spin-i" /> : stationPaused ? <Play size={12} /> : <Pause size={12} />}{stationPaused ? '恢复此工位' : '暂停此工位'}</button>
-          <button className="btn btn--sm" onClick={() => actions.workers(node.key, "fork").then((r: any) => !r.ok && toast("没有 fork：已到人数上限"))} data-tip={`上限 ${node.workers.max}`}><GitFork size={13} />加一个人</button>
-          <button className="btn btn--sm" onClick={() => actions.workers(node.key, "retire").then((r: any) => !r.ok && toast("没有撤：已到下限或都在忙"))}><UserMinus size={13} />撤一个</button>
-          <button className="btn btn--sm btn--ghost" onClick={() => void actions.workers(node.key, locked ? "unlock" : "lock").then(() => toast(locked ? "已解锁人数：恢复自动伸缩" : "已锁定人数：不再自动伸缩")).catch(() => {})}>{locked ? <Unlock size={13} /> : <Lock size={13} />}{locked ? "解锁人数" : "锁定人数"}</button>
+          <button className="btn btn--sm" disabled={controlsDisabled} onClick={() => void togglePause()}>{scopeBusy ? <Loader2 size={12} className="spin-i" /> : stationPaused ? <Play size={12} /> : <Pause size={12} />}{stationPaused ? '恢复此工位' : '暂停此工位'}</button>
+          <button className="btn btn--sm" disabled={controlsDisabled || onDuty >= node.workers.max} onClick={() => void changeWorkers('fork')} data-tip={`上限 ${node.workers.max}`}><GitFork size={13} />加一个人</button>
+          <button className="btn btn--sm" disabled={controlsDisabled || onDuty <= node.workers.min || !workers.some(worker => !worker.retiredAt && !worker.busy)} onClick={() => void changeWorkers('retire')}><UserMinus size={13} />撤一个</button>
+          <button className="btn btn--sm btn--ghost" disabled={controlsDisabled} onClick={() => void changeWorkers(locked ? 'unlock' : 'lock')}>{locked ? <Unlock size={13} /> : <Lock size={13} />}{locked ? "解锁人数" : "锁定人数"}</button>
         </>}
         <span className="grow" />
         <button className="btn btn--sm btn--ghost" onClick={() => attach({ type: "node", id: node.key, label: node.name })} data-tip="把这个工位加到对话附件"><MessageSquarePlus size={13} />问主调度</button>
@@ -193,7 +243,10 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
 const Stat = ({ k, v }: { k: string; v: string }) => <div className="stat"><span>{k}</span><b>{v}</b></div>;
 
 function NodeMetrics({attempts,onSelect}:{attempts:AttemptState[];onSelect:(id:string)=>void}) {
-  const done=attempts.filter(a=>a.endedAt),work=done.reduce((n,a)=>n+(a.ms??0),0),wait=done.reduce((n,a)=>n+(a.queuedMs??0),0),input=done.reduce((n,a)=>n+a.usage.input,0),output=done.reduce((n,a)=>n+a.usage.output,0),recent=done.slice(-20),max=Math.max(1,...recent.map(a=>a.ms??0));
+  const done=attempts.filter(a=>a.endedAt),work=done.reduce((n,a)=>n+(a.ms??0),0),wait=done.reduce((n,a)=>n+(a.queuedMs??0),0),recent=done.slice(-20),max=Math.max(1,...recent.map(a=>a.ms??0));
+  const reported = attempts.filter(attempt => recordedUsage([attempt]).reported > 0);
+  const input = reported.reduce((sum, attempt) => sum + (attempt.metrics?.tokenUsage ?? attempt.usage).input, 0);
+  const output = reported.reduce((sum, attempt) => sum + (attempt.metrics?.tokenUsage ?? attempt.usage).output, 0);
   const usage = recordedUsage(attempts);
   return <div className="insp-body node-metrics"><div className="node-metrics-caption">本轮尝试 {attempts.length} 次 · 成功返回 {done.filter(a=>a.ok&&!a.cancelled).length} 次 · 取消 {done.filter(a=>a.cancelled).length} 次</div><div className="node-metrics-row"><span>执行 <b>{secs(work)}</b></span><span>排队 <b>{secs(wait)}</b></span><span>异常 <b>{done.filter(a=>!a.ok&&!a.cancelled).length}</b></span></div><div className="node-time-share"><i style={{width:`${work/Math.max(1,work+wait)*100}%`}}/></div><div className="node-metrics-row"><span>已报输入 <b>{usage.total === null ? '—' : fmt(input)} tok</b></span><span>已报输出 <b>{usage.total === null ? '—' : fmt(output)} tok</b></span></div><div className="node-duration-chart">{recent.map(a=><button key={a.id} title={`${a.summary || a.input} · ${secs(a.ms??0)}`} onClick={()=>onSelect(a.id)}><i className={a.ok||a.cancelled?"":"is-failed"} style={{height:`${(a.ms??0)/max*100}%`}}/></button>)}</div><div className="node-metrics-caption">{done.length?"最近 20 次处理耗时 · 点击查看对应过程":"本轮尚无结束的尝试"}</div></div>;
 }
@@ -202,7 +255,9 @@ function PartInspector({ insp, geo, onDrag, onClose, onPin }: { insp: Inspector;
   useStore((s) => s.version);
   const [tab, setTab] = useState<"stations" | "process">("stations");
   const [attempt, setAttempt] = useState<string | null>(null);
-  const now = useNow(1000), s = getState();
+  const clock = useNow(1000);
+  const now = useStore(state => state.replay?.at) ?? clock;
+  const s = getState();
   const part = geo.bays.find((b) => b.id === insp.key);
   if (!part) return null;
   const result = inspectPart(s.factory!, s.fs, part), total = result.totals;
@@ -376,11 +431,12 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
   };
   const effective = entry?.effective;
   return <section className="agent-binding" aria-label="工位 Agent 配置">
-    <div className="agent-binding-heading"><b>{entry ? '工位 Agent' : loaded ? '执行方式' : '工位 Agent 配置'}</b><button className="btn btn--sm btn--ghost" disabled={disabled} onClick={() => setRevision(value => value + 1)}>重新读取配置</button></div>
+    <div className="agent-binding-heading"><b>{entry?.mode === 'model-assist' ? '程序的模型辅助' : entry ? '工位 Agent' : loaded ? '执行方式' : '工位 Agent 配置'}</b><button className="btn btn--sm btn--ghost" disabled={disabled} onClick={() => setRevision(value => value + 1)}>重新读取配置</button></div>
     {error && <p className="agent-binding-error" role="alert">{error}</p>}
     {receipt && <p className="agent-binding-receipt" role="status">{receipt}</p>}
     {!loaded ? <p className="muted">{loading ? '正在读取工位配置…' : replay ? '回放期间不能修改工位配置。' : !connected ? '连接恢复后可读取工位配置。' : '配置未读取，请重试。'}</p> : !entry ? <p className="muted">{node.kind === 'source' || node.kind === 'store' ? '此节点不运行 Agent。' : node.kind === 'agent' || node.kind === 'review' ? '此工位尚未接入可配置的 Agent 执行器。' : '程序执行，不使用 Agent 模型。'}</p> : <>
       <p className="agent-binding-effective">{effective ? `${adapterLabel(effective.adapter)} · ${effective.model || '客户端默认模型'}` : '当前配置不可执行'}<small>来源：{({project: '本节点覆盖', workflow: '工作流包默认', default: '本项目默认'})[entry.source]}</small></p>
+      {entry.mode === 'model-assist' && <p className="muted">此工位由程序完成采集，以下配置只用于需要看图或选链接时的模型辅助。</p>}
       {entry.lastModel && <p className="muted">最近回报模型：{entry.lastModel === 'unreported' ? '未回报' : entry.lastModel}</p>}
       {entry.error && <p className="agent-binding-error" role="alert">{entry.error}</p>}
       <p className="agent-binding-capabilities">流式 {entry.capabilities.stream ? '支持' : '不支持'} · 取消 {entry.capabilities.cancel ? '支持' : '不支持'} · 续接 {entry.capabilities.resume ? '支持' : '不支持'} · 用量 {entry.capabilities.usage === 'reported' ? '客户端回报' : entry.capabilities.usage === 'tokens-only' ? '仅 Token 回报，费用未知' : '未提供'}</p>
@@ -391,7 +447,7 @@ function AgentBindingSettings({node}: {node: CompiledNode}) {
             setDirty(true);
             setReceipt('');
           }} />
-        <p className="muted">运行中也能修改。Pi 在下一次模型请求时切换，保留对话和已完成的工具；已经发出的请求正常完成。节点也可用 station_model 调整自己的 Pi 模型，其他节点和主调度不变。</p>
+        <p className="muted">运行中也能修改。Pi 在下一次模型请求时切换，已经发出的请求正常完成；更换底座从下次工位尝试生效。{entry.mode !== 'model-assist' && 'Pi 节点也可用 station_model 调整自己的模型，其他节点和主调度不变。'}</p>
         <div className="agent-binding-actions"><button type="button" className="btn btn--sm" disabled={disabled || !entry.configured} onClick={() => void save(null)}>恢复继承</button><button className="btn btn--sm btn--primary" disabled={disabled || !dirty}>{busy ? '正在保存…' : '保存配置'}</button></div>
       </form>
     </>}

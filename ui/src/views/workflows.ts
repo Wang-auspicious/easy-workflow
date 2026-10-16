@@ -1,7 +1,7 @@
 import type { EdgeSpec, PackSpec } from '../../../shared/types.ts';
 import { api } from '../api.ts';
 
-export type InputSchema = { type?: string; title?: string; description?: string; minLength?: number; required?: string[]; properties?: Record<string, InputSchema>; items?: InputSchema; enum?: unknown[] };
+export type InputSchema = { type?: string; title?: string; description?: string; minLength?: number; maxLength?: number; minimum?: number; maximum?: number; minItems?: number; required?: string[]; properties?: Record<string, InputSchema>; items?: InputSchema; enum?: unknown[] };
 export interface WorkflowTemplate { id: string; name: string; description: string; inputSchema: InputSchema }
 export interface InstalledWorkflow extends PackSpec {
   entry: string; inputSchema: string; schemas: Record<string, InputSchema>; links?: EdgeSpec[];
@@ -15,8 +15,8 @@ const userRoutes: Record<string, string> = {
   allocation_plan: '/api/allocation-plan', undo_correction: '/api/correct/undo',
   business_feed: '/api/business/feed', run_control: '/api/run',
 };
-export async function workflowCall<T>(name: string, parameters: Record<string, unknown>) {
-  const receipt = await api.post<WorkflowReceipt<T>>(userRoutes[name] ?? `/api/tools/${name}`, parameters);
+export async function workflowCall<T>(name: string, parameters: Record<string, unknown>, options?: {signal?: AbortSignal}) {
+  const receipt = await api.post<WorkflowReceipt<T>>(userRoutes[name] ?? `/api/tools/${name}`, parameters, options);
   if (!receipt.ok) throw new Error(receipt.summary || '操作没有完成，请查看服务回执。');
   return receipt;
 }
@@ -30,16 +30,37 @@ export function workflowInput(schema: InputSchema, values: Record<string, string
   const input: Record<string, unknown> = {};
   for (const [field, rule] of Object.entries(schema.properties ?? {})) {
     const value = values[field] ?? '';
-    if (!value.trim() && !schema.required?.includes(field)) continue;
+    const required = schema.required?.includes(field);
+    const label = rule.title || inputLabel(field);
+    if (!value.trim()) {
+      if (!required) continue;
+      if (rule.type !== 'boolean') throw new Error(`${label}不能为空。`);
+    }
     if (rule.enum) {
       const option = rule.enum.find(option => JSON.stringify(option) === value);
       if (option === undefined) throw new Error(`${field} 需要选择一个有效选项。`);
       input[field] = option;
-    } else if (rule.type === 'array' && rule.items?.type === 'string') input[field] = value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    } else if (rule.type === 'array' && rule.items?.type === 'string') {
+      const items = value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+      if (rule.minItems !== undefined && items.length < rule.minItems) throw new Error(`${label}至少需要 ${rule.minItems} 项。`);
+      input[field] = items;
+    }
     else if (rule.type === 'number' || rule.type === 'integer') {
-      const number = Number(value); if (!value.trim() || !Number.isFinite(number)) throw new Error(`${field} 需要有效数字。`); input[field] = number;
-    } else if (rule.type === 'boolean') input[field] = value === 'true';
-    else if (rule.type === 'string' || !rule.type) input[field] = value;
+      const number = Number(value);
+      if (!value.trim() || !Number.isFinite(number)) throw new Error(`${label}需要有效数字。`);
+      if (rule.type === 'integer' && !Number.isInteger(number)) throw new Error(`${label}需要整数。`);
+      if (rule.minimum !== undefined && number < rule.minimum) throw new Error(`${label}不能小于 ${rule.minimum}。`);
+      if (rule.maximum !== undefined && number > rule.maximum) throw new Error(`${label}不能大于 ${rule.maximum}。`);
+      input[field] = number;
+    } else if (rule.type === 'boolean') {
+      if (value && value !== 'true' && value !== 'false') throw new Error(`${label}需要选择是或否。`);
+      input[field] = value === 'true';
+    }
+    else if (rule.type === 'string' || !rule.type) {
+      if (rule.minLength !== undefined && value.length < rule.minLength) throw new Error(`${label}至少需要 ${rule.minLength} 个字符。`);
+      if (rule.maxLength !== undefined && value.length > rule.maxLength) throw new Error(`${label}最多支持 ${rule.maxLength} 个字符。`);
+      input[field] = value;
+    }
     else { try { input[field] = JSON.parse(value); } catch { throw new Error(`${field} 需要有效 JSON。`); } }
   }
   return input;

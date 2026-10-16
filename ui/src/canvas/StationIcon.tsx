@@ -1,5 +1,6 @@
 import { Globe2, Database, Inbox, GitBranch, ScanLine, SlidersHorizontal, PenLine, ShieldCheck, FileCheck2, ArrowUpRight, Network, Search, Layers3, Command, type LucideIcon } from "lucide-react";
 import type { Role } from "../../../shared/types.ts";
+import {memo} from 'react';
 
 const icons: Record<Role | "dispatcher", LucideIcon> = {
   source: Globe2, social: Globe2, candidate: Inbox, sort: GitBranch, judge: Search,
@@ -9,7 +10,7 @@ const icons: Record<Role | "dispatcher", LucideIcon> = {
 };
 
 /** A quiet, consistent glyph; live state is communicated separately by the status dot. */
-export function StationIcon({ role, size = 18, className = "" }: { role: Role | "dispatcher"; size?: number; className?: string }) {
+export const StationIcon = memo(function StationIcon({ role, size = 18, className = "" }: { role: Role | "dispatcher"; size?: number; className?: string }) {
   const Icon = icons[role] ?? Layers3;
   return <span className={`station-icon ${className}`} data-role={role}><Icon size={size} strokeWidth={1.7} aria-hidden="true" /></span>;
-}
+});

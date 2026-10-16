@@ -1,12 +1,13 @@
 // The floor plan under the DAG: stage columns from left to right (来源接入 · 候选处理 · 预处理 ·
 // 分类校验 · 资源采集 · 内容生成 · 发布管理), the source dock, and the bottom shelf of other lines.
 import type { CompiledFactory } from "../../../shared/types.ts";
+import {memo} from 'react';
 import type { FactoryState } from "../../../shared/project.ts";
 import { roleColors } from "../../../shared/palette.ts";
 import type { BayBox } from "../../../shared/layout.ts";
 import { getState, useStore } from "../store.ts";
 import type { Geometry } from "./geometry.ts";
-import { inspectPart, partTone } from "../../../shared/parts.ts";
+import { partTone } from "../../../shared/parts.ts";
 import { toggleInspector } from "./Canvas.tsx";
 
 const STAGE_TONES: Record<string, string> = {
@@ -19,7 +20,7 @@ const STAGE_TONES: Record<string, string> = {
   "发布管理": "#dc2626",
 };
 
-export function Floor({ geo, hover, onHover }: { geo: Geometry; hover: string | null; onHover: (k: string | null) => void }) {
+export const Floor = memo(function Floor({ geo, hover, onHover }: { geo: Geometry; hover: string | null; onHover: (k: string | null) => void }) {
   useStore((s) => s.version);
   const s = getState();
   const factory = s.factory!;
@@ -50,13 +51,13 @@ export function Floor({ geo, hover, onHover }: { geo: Geometry; hover: string | 
       {geo.shelf && (
         <div className="shelf" style={{ left: geo.shelf.x, top: geo.shelf.y, width: geo.shelf.w, height: geo.shelf.h }}>
           <div className="shelf-label">
-            <b>其他流水线（{geo.capsules.length} 个，待接入）</b>
+            <b>其他流水线（{geo.capsules.length} 条）</b>
           </div>
         </div>
       )}
     </>
   );
-}
+});
 
 function StageColumn({ bay, isLast, factory, fs }: { bay: BayBox; isLast: boolean; factory: CompiledFactory; fs: FactoryState }) {
   const ns = bay.stations.map((k) => factory.nodes.find((n) => n.key === k)!).filter(Boolean);
@@ -64,7 +65,6 @@ function StageColumn({ bay, isLast, factory, fs }: { bay: BayBox; isLast: boolea
   const queued = ns.reduce((s, n) => s + (fs.nodes[n.key]?.queue.length ?? 0), 0);
   const c = roleColors(ns.find((n) => n.kind !== "store")?.role ?? ns[0]?.role ?? "process");
   const tone = partTone(bay.name);
-  const summary = inspectPart(factory, fs, bay);
   const name = bay.name === bay.line ? factory.lines.find((l) => l.id === bay.line)?.name ?? bay.name : bay.name;
 
   return (
@@ -81,7 +81,7 @@ function StageColumn({ bay, isLast, factory, fs }: { bay: BayBox; isLast: boolea
       }}
     >
       <button className="bay-label" aria-label={`查看${name}详情`} onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); toggleInspector(bay.id, "part"); }}>
-        <b>{name}</b><em className="num">{summary.totals.stations} 工位{busy ? ` · ${busy} 运行` : queued ? ` · ${queued} 排队` : ""}</em><span className="part-open">查看详情 ↗</span>
+        <b>{name}</b><em className="num">{ns.length} 工位{busy ? ` · ${busy} 运行` : queued ? ` · ${queued} 排队` : ""}</em><span className="part-open">查看详情 ↗</span>
       </button>
     </div>
   );

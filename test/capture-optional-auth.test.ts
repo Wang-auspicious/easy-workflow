@@ -13,7 +13,33 @@ test('breadth and proof keep public captures when an optional page redirects to 
   for (const key of keys) delete process.env[key];
   process.env.FACTORY_VAR = root; process.env.PI_CODING_AGENT_DIR = root;
   const tiles = Array.from({ length: 9 }, (_, i) => `<section style="display:inline-block;vertical-align:top;width:250px;height:175px;margin:12px;background:hsl(${i * 39} 65% 62%);border:3px solid #16304a;border-radius:${i * 3}px"><h2>Public prototype ${i + 1}</h2><svg width="180" height="80"><circle cx="45" cy="40" r="30" fill="white"/><path d="M85 15h80v50H85z" fill="#133455"/></svg></section>`).join('');
-  const fixture = http.createServer((req, res) => {
+  const comparisons: {labels: string[]; images: number; model: string}[] = [];
+  const fixture = http.createServer(async (req, res) => {
+    if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const user = request.messages.filter((message: {role: string}) => message.role === 'user').at(-1);
+      const parts = Array.isArray(user.content) ? user.content : [{type: 'text', text: user.content}];
+      const text = parts.filter((part: {type: string}) => part.type === 'text')
+        .map((part: {text: string}) => part.text).join('\n');
+      const labels = [...text.matchAll(/^image (\d+): (.+)$/gm)].map(match => match[2]);
+      const index = labels.findIndex(label => label.startsWith('/gallery')) + 1;
+      comparisons.push({labels, images: parts.filter((part: {type: string}) => part.type === 'image_url').length,
+        model: request.model});
+      const args = index ? {index, basis: 'rendered-items', reason: 'The public gallery shows nine rendered prototypes.'} :
+        {index: 0, basis: 'none', reason: 'No public gallery screenshot was supplied.'};
+      res.writeHead(200, {'content-type': 'text/event-stream'});
+      const send = (delta: unknown, finish_reason: string | null = null) => res.write(`data: ${JSON.stringify({
+        id: 'optional-auth-pick', object: 'chat.completion.chunk', created: 1, model: request.model,
+        choices: [{index: 0, delta, finish_reason}],
+      })}\n\n`);
+      send({role: 'assistant', tool_calls: [{index: 0, id: 'gallery-pick', type: 'function',
+        function: {name: 'submit', arguments: JSON.stringify(args)}}]});
+      send({}, 'tool_calls');
+      res.end('data: [DONE]\n\n');
+      return;
+    }
     res.setHeader('content-type', 'text/html');
     if (req.url === '/cloud') { res.writeHead(302, { location: '/login' }); res.end(); return; }
     if (req.url === '/login') { res.end('<title>Log in | Cloud</title><main><h1>Log in to continue</h1><input type=password><button>Log in</button></main>'); return; }
@@ -22,6 +48,13 @@ test('breadth and proof keep public captures when an optional page redirects to 
   });
   await new Promise<void>(resolve => fixture.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(fixture.address() as { port: number }).port}`;
+  fs.writeFileSync(path.join(root, 'auth.json'), JSON.stringify({
+    'optional-auth-fixture': {type: 'api_key', key: 'local-optional-auth-fixture'},
+  }));
+  fs.writeFileSync(path.join(root, 'models.json'), JSON.stringify({providers: {
+    'optional-auth-fixture': {api: 'openai-completions', baseUrl: `${base}/v1`,
+      models: [{id: 'optional-auth-fixture', input: ['text', 'image']}]},
+  }}));
   const { TOOLS } = await import('../packs/vislexicon/tools.ts');
   const { EvidenceStore } = await import('../server/evidence.ts');
   const { compile } = await import('../server/spec/compile.ts');
@@ -36,11 +69,18 @@ test('breadth and proof keep public captures when an optional page redirects to 
     const context = {
       token: { id: role, item: 'fixture', url: base, data: { canonical: base, kind: 'assets', host: '127.0.0.1', title: 'Public fixture', home: { finalUrl: base + '/', navLinks: links }, homeLinks: links, readerPlan: role === 'proof' ? { proof: { url: base + '/cloud', alternatives: [{ url: base + '/gallery' }] } } : undefined, shots: {} } },
       node: compiled.nodes.find(node => node.key === `curation/${role}`), attempt: `a-${role}`, worker: { id: role }, signal: new AbortController().signal,
+      modelAssist: {binding: {adapter: 'pi', provider: 'optional-auth-fixture', model: 'optional-auth-fixture'},
+        projectDirectory: root},
       progress: (message: string) => messages.push(message), activity() {}, addEvidence: (evidence: unknown) => evidence,
     } as unknown as StationContext;
     const result = await TOOLS[`curation.${role}`](context, svc);
     assert.equal(result.ok, true, messages.join('\n'));
     assert.equal((result.data!.shots as any)[role].href, base + '/gallery');
+    const captureState = (result.data!.shots as any)[role].captureState;
+    assert.equal(captureState.sourceUrl, base + '/gallery');
+    assert.equal(captureState.finalUrl, base + '/gallery', 'candidate metadata must belong to the captured gallery, not the last visited login page');
+    assert.ok(captureState.text.includes('Public interactive prototypes'));
+    assert.equal(captureState.clip, null);
     const failures = result.data!.candidateAccessFailures as any[];
     assert.equal(failures.length, 1);
     assert.equal(failures[0].requestedUrl, base + '/cloud');
@@ -50,7 +90,17 @@ test('breadth and proof keep public captures when an optional page redirects to 
     assert.ok((await browserCommand({ action: 'state' })).tabs.some((tab: any) => tab.url === base + '/login' && tab.attentionKind === 'auth'), 'the real access wall stays available without blocking capture');
   };
   try {
-    await t.test('breadth still compares the gallery captured before the private Cloud page', () => run('breadth'));
+    await t.test('breadth still compares the gallery captured before the private Cloud page', async () => {
+      await run('breadth');
+      assert.ok(comparisons.length > 0, 'the real gallery screenshots reach the configured comparison model');
+      for (const comparison of comparisons) {
+        assert.equal(comparison.model, 'optional-auth-fixture');
+        assert.ok(comparison.labels.some(label => label.startsWith('/gallery')));
+        assert.equal(comparison.images, comparison.labels.length, 'each compared candidate includes its native screenshot');
+        assert.ok(comparison.images > 0);
+        assert.ok(comparison.labels.every(label => !/^\/(?:cloud|login)/.test(label)), 'the login wall is not compared as public gallery content');
+      }
+    });
     await t.test('proof skips the private Cloud page and visits the public alternative', () => run('proof'));
   } finally {
     await closeBrowser(); await closeModelTransport(); fixture.closeAllConnections(); await new Promise<void>(resolve => fixture.close(() => resolve()));

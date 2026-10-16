@@ -13,6 +13,7 @@ let open: { items: Item[]; x: number; y: number; choose: boolean } | null = null
 const ls = new Set<() => void>();
 
 export function openCorrection(items: Item[], anchor: HTMLElement, choose = false) {
+  if (!items.length) return;
   const r = anchor.getBoundingClientRect();
   open = { items, x: Math.min(window.innerWidth - 300, r.left), y: Math.min(window.innerHeight - 330, r.bottom + 6), choose };
   for (const l of ls) l();
@@ -25,6 +26,7 @@ export function CorrectionPopover() {
   const [note, setNote] = useState("");
   const [node, setNode] = useState("");
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
+  const submitting = useRef(false);
   const [results, setResults] = useState<Array<{ ok: boolean; message: string; correction?: string }> | null>(null);
   const disabled = useStore(s => !s.connected || Boolean(s.replay));
   const ref = useRef<HTMLDivElement>(null);
@@ -32,12 +34,12 @@ export function CorrectionPopover() {
   useEffect(() => {
     if (!cur) return;
     const onKey = (e: KeyboardEvent) => {
-      if (busy) return;
-      if ((e.target as HTMLElement).tagName === "TEXTAREA") { if (e.key === "Escape") close(); return; }
+      if (busy || e.defaultPrevented || e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
+      if ((e.target as HTMLElement).closest('input, textarea, select, [contenteditable]')) { if (e.key === "Escape") close(); return; }
       const n = Number(e.key);
       if (n >= 1 && n <= REASONS.length) { e.preventDefault(); setReason(n - 1); }
       if (e.key === "Escape") close();
-      if (e.key === "Enter" && reason !== null && !results) { e.preventDefault(); void submit(); }
+      if (e.key === "Enter" && !(e.target as HTMLElement).closest('button, a') && reason !== null && !results) { e.preventDefault(); void submit(); }
     };
     const onDown = (e: PointerEvent) => { if (!busy && !ref.current?.contains(e.target as Node)) close(); };
     window.addEventListener("keydown", onKey, true);
@@ -46,12 +48,13 @@ export function CorrectionPopover() {
   });
   if (!cur) return null;
   const submit = async () => {
-    if (reason === null || busy || disabled || results) return;
+    if (reason === null || submitting.current || disabled || results) return;
     const items = cur.items.map((i) => ({ token: i.token, node: cur.choose ? node : i.node, evidence: i.evidence }));
+    submitting.current = true;
     setBusy(true); setError('');
-    try { const r = await actions.correct(items, REASONS[reason], note || undefined); setResults(r.results); }
-    catch (reason) { setError((reason as Error).message); }
-    finally { setBusy(false); }
+    try { const r = await actions.correct(items, REASONS[reason], note || undefined); if (open === cur) setResults(r.results); }
+    catch (reason) { if (open === cur) setError((reason as Error).message); }
+    finally { submitting.current = false; setBusy(false); }
   };
   const state = getState();
   const stations = state.factory!.nodes.filter(n => !['store', 'source'].includes(n.kind) && cur.items.every(item => item.node === n.key || state.fs.tokens[item.token]?.attempts.some(id => state.fs.attempts[id]?.node === n.key)));

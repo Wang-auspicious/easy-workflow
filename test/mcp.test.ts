@@ -40,7 +40,10 @@ test("MCP lifecycle, schema errors and cancellation are real protocol messages",
 test("stdio MCP reaches the existing authenticated control registry without credential output", { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "h2-mcp-test-")), secret = "mcp-fixture-private-credential";
   const compiled = compile([pack]);
-  const control = new FactoryControl({ compiled, state: initialState(compiled), patches: [], journal: { seq: 0 } } as unknown as Factory);
+  const control = new FactoryControl({ compiled, state: initialState(compiled), patches: [], journal: { seq: 0 },
+    dispatcherModelStatus: () => ({adapter: 'pi', model: 'fixture-model'}),
+    getAgentDefaults: () => ({station: {adapter: 'pi'}, dispatcher: {adapter: 'pi'}}),
+  } as unknown as Factory);
   let authorized = 0;
   const service = http.createServer(async (req, res) => {
     res.setHeader("content-type", "application/json");

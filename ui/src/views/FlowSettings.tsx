@@ -1,6 +1,6 @@
-import {useEffect, useState, type FormEvent} from 'react';
+import {useEffect, useRef, useState, type FormEvent} from 'react';
 import type {BatchGoal} from '../../../shared/batch.ts';
-import {setState, useStore} from '../store.ts';
+import {getState, setState, useStore} from '../store.ts';
 
 type SavedAdmission = Pick<BatchGoal, 'runId' | 'maxInFlight' | 'intakeWindow' | 'admission'>;
 
@@ -38,6 +38,7 @@ export function FlowSettings() {
   const [intake, setIntake] = useState(current?.admission?.intakeWindowLimit ?? current?.intakeWindow ?? 2);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
+  const flight = useRef(false);
   const [error, setError] = useState('');
   const [receipt, setReceipt] = useState('');
   const revision = JSON.stringify([current?.runId, current?.admission, current?.maxInFlight, current?.intakeWindow]);
@@ -51,7 +52,8 @@ export function FlowSettings() {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (disabled) return;
+    if (disabled || flight.current || !getState().connected || getState().replay) return;
+    flight.current = true;
     setBusy(true);
     setError('');
     setReceipt('');
@@ -74,6 +76,7 @@ export function FlowSettings() {
         ? '保存结果未确认，请刷新页面核对，勿重复提交。'
         : reason instanceof Error ? reason.message : '入场策略保存失败');
     } finally {
+      flight.current = false;
       setBusy(false);
     }
   };

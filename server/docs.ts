@@ -241,29 +241,32 @@ export class Docs {
   /** Index only new journal rows. Progress never reads or writes a file synchronously
    * in the event listener; batched writes and envelopes consume this small tail. */
   private refresh() {
-    for (const e of this.f.journal.read(this.indexedSeq)) {
-      this.indexedSeq = e.seq;
-      if (e.kind.startsWith("run.")) {
-        this.runSeq = e.seq;
-        const id = e.run;
-        const run = this.runs.get(id) ?? { id, title: null, startedAt: null, endedAt: null, status: "unknown" };
-        if (e.kind === "run.started") { this.currentRun = e.runId; run.title = e.title; run.startedAt = e.at; run.status = "running"; }
-        if (e.kind === "run.paused") run.status = "paused";
-        if (e.kind === "run.resumed") run.status = "running";
-        if (e.kind === "run.ended") { run.status = "ended"; run.endedAt = e.at; }
-        this.runs.set(id, run);
-      }
-      if (e.kind === "token.created") this.tokenCases.set(e.token, e.item);
-      if (e.kind === "attempt.started") this.attemptTokens.set(e.attempt, e.token);
-      const token = "token" in e && typeof e.token === "string" ? e.token : e.kind === "evidence.added" ? e.evidence.token : e.kind === "candidate.disposition" ? e.candidate.token : "attempt" in e ? this.attemptTokens.get(e.attempt) : undefined;
-      const item = e.kind === "case.noted" ? e.caseId : e.kind === "candidate.disposition" ? this.tokenCases.get(e.candidate.token) ?? e.candidate.item : token ? this.tokenCases.get(token) : undefined;
-      // Keep a lightweight index. Full progress and payloads stay in SQLite and
-      // are read only for the requested case, including after a process restart.
-      if (item !== undefined && e.kind !== "attempt.activity" && e.kind !== "channel.emitted") {
-        const sequences = this.caseSequences.get(item) ?? [];
-        sequences.push(e.seq);
-        this.caseSequences.set(item, sequences);
-      }
+    for (const e of this.f.journal.read(this.indexedSeq)) this.observeReplay(e);
+  }
+
+  /** Share Factory's ordered startup replay; retain only IDs and sequence numbers. */
+  observeReplay(e: Stamped) {
+    if (e.seq <= this.indexedSeq) return;
+    this.indexedSeq = e.seq;
+    if (e.kind.startsWith('run.')) {
+      this.runSeq = e.seq;
+      const id = e.run;
+      const run = this.runs.get(id) ?? {id, title: null, startedAt: null, endedAt: null, status: 'unknown'};
+      if (e.kind === 'run.started') { this.currentRun = e.runId; run.title = e.title; run.startedAt = e.at; run.status = 'running'; }
+      if (e.kind === 'run.paused') run.status = 'paused';
+      if (e.kind === 'run.resumed') run.status = 'running';
+      if (e.kind === 'run.ended') { run.status = 'ended'; run.endedAt = e.at; }
+      this.runs.set(id, run);
+    }
+    if (e.kind === 'token.created') this.tokenCases.set(e.token, e.item);
+    if (e.kind === 'attempt.started') this.attemptTokens.set(e.attempt, e.token);
+    const token = 'token' in e && typeof e.token === 'string' ? e.token : e.kind === 'evidence.added' ? e.evidence.token : e.kind === 'candidate.disposition' ? e.candidate.token : 'attempt' in e ? this.attemptTokens.get(e.attempt) : undefined;
+    const item = e.kind === 'case.noted' ? e.caseId : e.kind === 'candidate.disposition' ? this.tokenCases.get(e.candidate.token) ?? e.candidate.item : token ? this.tokenCases.get(token) : undefined;
+    // Full progress and payloads stay in SQLite and are read for the requested case.
+    if (item !== undefined && e.kind !== 'attempt.activity' && e.kind !== 'channel.emitted') {
+      const sequences = this.caseSequences.get(item) ?? [];
+      sequences.push(e.seq);
+      this.caseSequences.set(item, sequences);
     }
   }
 

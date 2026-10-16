@@ -28,6 +28,7 @@ export interface LayoutFile {
 export interface Inspector { key: string; kind: "node" | "token" | "part"; x: number; y: number; pinned: boolean; pinScale?: number; worker?: string }
 export interface NodeAgentBinding {
   node: string;
+  mode?: 'agent' | 'model-assist';
   configured: StationAgentBinding | null;
   effective: StationAgentBinding | null;
   source: 'project' | 'workflow' | 'default';
@@ -38,6 +39,7 @@ export interface NodeAgentBinding {
 
 export interface Store {
   ready: boolean;
+  bootError: string | null;
   connected: boolean;
   factory: CompiledFactory | null;
   defaultLayout: LayoutResult | null;
@@ -55,6 +57,12 @@ export interface Store {
   chatOpen: boolean;
   chatWidth: number;
   unread: number;
+  /** 右侧栏当前展开的是哪个群（'root' = 主调度）。 */
+  chatRoom: string;
+  /** 群组栏是否展开；收起时只留一列头像。 */
+  roomRailOpen: boolean;
+  /** 每个群看到哪一刻，用来算未读。 */
+  roomSeen: Record<string, number>;
   live: LiveChat;
   dispatcher: DispatcherStatus;
   browser: BrowserState;
@@ -87,11 +95,12 @@ const LS = (k: string, v?: unknown) => {
 };
 
 let state: Store = {
-  ready: false, connected: false, factory: null, defaultLayout: null, replayLoading: null,
+  ready: false, bootError: null, connected: false, factory: null, defaultLayout: null, replayLoading: null,
   layout: { pos: {}, open: {}, colors: {}, bots: {}, capsules: {} },
   fs: initialState(), version: 0, nodeRev: {}, agentBindings: {}, nodeExecutions: {}, nodeRecoveries: {},
   view: (LS("view") as View) ?? "canvas", layer: "pipeline", reportRun: null,
   attachments: [], chatOpen: (LS("chatOpen") as boolean) ?? false, chatWidth: (LS("chatWidth") as number) ?? 320, unread: 0,
+  chatRoom: (LS("chatRoom") as string) ?? "root", roomRailOpen: (LS("roomRailOpen") as boolean) ?? true, roomSeen: (LS("roomSeen") as Record<string, number>) ?? {},
   live: emptyLive(), dispatcher: idleDispatcher(),
   browser: emptyBrowser(),
   inspectors: [], selected: [], follow: false, trail: null, flashes: {}, settings: {}, model: "", keyPresent: false, replay: null, focus: null, draft: "", boardFocus: null,
@@ -109,6 +118,9 @@ export function setState(patch: Partial<Store> | ((s: Store) => Partial<Store>))
   if ("view" in p) LS("view", state.view);
   if ("chatOpen" in p) LS("chatOpen", state.chatOpen);
   if ("chatWidth" in p) LS("chatWidth", state.chatWidth);
+  if ("chatRoom" in p) LS("chatRoom", state.chatRoom);
+  if ("roomRailOpen" in p) LS("roomRailOpen", state.roomRailOpen);
+  if ("roomSeen" in p) LS("roomSeen", state.roomSeen);
   if ("userAvatar" in p) LS("userAvatar", state.userAvatar);
   if ("history" in p) LS("history", state.history);
   for (const l of listeners) l();

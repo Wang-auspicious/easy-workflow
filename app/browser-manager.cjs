@@ -89,6 +89,13 @@ class BrowserManager {
     this.tabs = new Map(); this.active = null; this.window = null; this.bounds = null; this.mounted = null;
     this.partition = 'persist:h2-browser'; // Stable storage key keeps existing browser sessions and cookies.
     this.secureSession(session.fromPartition(this.partition));
+    this.downloadGuard = (event, _item, contents) => {
+      const tab = [...this.tabs.values()].find(candidate => candidate.view.webContents.id === contents?.id);
+      // Background exploration must never summon a native Save As dialog. Only
+      // an explicit user tab may delegate a download to Electron's normal UI.
+      if (tab?.owner !== 'user') event.preventDefault();
+    };
+    session.fromPartition(this.partition).on('will-download', this.downloadGuard);
     this.timer = setInterval(() => { this.data.prune(); this.data.save(); this.publish(); }, 3600000); this.timer.unref();
     this.authTimer = setInterval(() => { for(const t of this.tabs.values())if(!t.loading)void this.check(t); },30000);this.authTimer.unref();
     session.fromPartition(this.partition).webRequest.onCompleted(details=>{
@@ -247,6 +254,15 @@ class BrowserManager {
     else throw new Error('未知浏览器操作');
     this.publish(); return this.snapshot();
   }
-  async close() { clearInterval(this.timer);clearInterval(this.authTimer); this.persistTabs(); for (const t of [...this.tabs.values()]) { t.view.webContents.removeAllListeners('destroyed'); t.view.webContents.close(); } this.tabs.clear(); await session.fromPartition(this.partition).cookies.flushStore(); }
+  async close({savedTabs} = {}) {
+    clearInterval(this.timer); clearInterval(this.authTimer);
+    // Closing during recovery must not replace saved user tabs with an empty,
+    // not-yet-restored browser or only the background agent's temporary pages.
+    if (Array.isArray(savedTabs)) { this.data.tabs = savedTabs; this.data.save(); }
+    else this.persistTabs();
+    for (const t of [...this.tabs.values()]) { t.view.webContents.removeAllListeners('destroyed'); t.view.webContents.close(); }
+    this.tabs.clear(); session.fromPartition(this.partition).removeListener('will-download', this.downloadGuard);
+    await session.fromPartition(this.partition).cookies.flushStore();
+  }
 }
 module.exports = { BrowserManager, browserAttentionProbe, browserAttentionKind, retainBrowserAttention, noteBrowserResponse, applyBrowserAttention, attentionKey, boundedProbe };

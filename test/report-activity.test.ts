@@ -168,6 +168,24 @@ test('large journal reports have bounded summaries without losing totals or unkn
     assert.ok(!/"(?:intervals|spans|workers)":\[/.test(serialized));
     assert.equal(JSON.stringify(report), original, 'compaction never mutates authoritative report data');
     assert.deepEqual(JSON.parse(JSON.stringify(compactReport(summary))), JSON.parse(serialized), 'recompaction preserves full counts');
+    const circuits = Array.from({length: 20}, (_, index) => ({
+      dependency: {key: `service-${index}`, adapter: 'pi', provider: `provider-${index}`, model: `model-${index}`},
+      state: index === 0 ? 'trial' : 'open', failures: index + 1, nextAt: 10000 + index,
+      runId, station: nodes[index % nodes.length].key,
+      ...(index === 0 ? {trialToken: 'large-0'} : {}), reason: 'Recorded provider outage '.repeat(1000),
+    }));
+    const blockedReport = {...report, batch: {...report.batch!, modelCircuits: circuits}};
+    const blockedSummary = compactReport(blockedReport)!;
+    const blockedBatch = blockedSummary.batch as {modelCircuits: typeof circuits; modelCircuitCount: number};
+    assert.equal(blockedBatch.modelCircuits.length, 6, 'provider history cannot make summaries unbounded');
+    assert.equal(blockedBatch.modelCircuitCount, 20, 'the full dependency count survives truncation');
+    assert.deepEqual(blockedBatch.modelCircuits.map(circuit => circuit.dependency), circuits.slice(0, 6).map(circuit => circuit.dependency));
+    assert.deepEqual(blockedBatch.modelCircuits.map(circuit => circuit.nextAt), circuits.slice(0, 6).map(circuit => circuit.nextAt));
+    assert.equal(blockedBatch.modelCircuits[0].trialToken, 'large-0');
+    assert.equal(blockedBatch.modelCircuits[0].station, circuits[0].station);
+    assert.ok(JSON.stringify(blockedSummary).length < 24000);
+    assert.deepEqual(JSON.parse(JSON.stringify(compactReport(blockedSummary))), JSON.parse(JSON.stringify(blockedSummary)),
+      'restoring an already compacted report must retain the complete dependency count');
     const station = stationReport(report, nodes[0].key);
     const stationSummary = compactReport(station)!;
     assert.equal(stationSummary.totals, undefined);

@@ -17,15 +17,15 @@ export function Controls({ cam, zoomBy, fitAll, focusWork, resetLayout }: { cam:
   return (
     <div className="controls" onPointerDown={(e) => e.stopPropagation()}>
       <div className="ctl-group">
-        <button className="icon-btn" onClick={() => zoomBy(1 / 1.25)} data-tip="缩小  −" data-tip-side="top"><Minus size={14} /></button>
+        <button className="icon-btn" onClick={() => zoomBy(1 / 1.25)} aria-label="缩小画布" data-tip="缩小  −" data-tip-side="top"><Minus size={14} /></button>
         <button className="ctl-zoom num" onClick={fitAll} data-tip="适配全部  F / 双击空白" data-tip-side="top">{Math.round(cam.k * 100)}%</button>
-        <button className="icon-btn" onClick={() => zoomBy(1.25)} data-tip="放大  +" data-tip-side="top"><Plus size={14} /></button>
+        <button className="icon-btn" onClick={() => zoomBy(1.25)} aria-label="放大画布" data-tip="放大  +" data-tip-side="top"><Plus size={14} /></button>
       </div>
       <div className="ctl-group">
         <button className="ctl-btn" onClick={focusWork} data-tip="回到可读的工作视图  W" data-tip-side="top">工作视图</button>
         <button className="ctl-btn" onClick={fitAll} data-tip="查看全图  F" data-tip-side="top"><Maximize size={13} />全图</button>
-        <button className={`ctl-btn ${follow ? "is-on" : ""}`} onClick={() => setState({ follow: !follow })} data-tip={follow ? "停止跟随" : "跟随活跃工位"} data-tip-side="top"><Crosshair size={13} /></button>
-        <button className={`ctl-btn ${layer !== "pipeline" ? "is-on" : ""}`} onClick={() => setMenu((m) => !m)} data-tip="切换图层" data-tip-side="top"><Layers size={13} /> 图层</button>
+        <button className={`ctl-btn ${follow ? "is-on" : ""}`} onClick={() => setState({ follow: !follow })} aria-label={follow ? '停止跟随' : '跟随活跃工位'} aria-pressed={follow} data-tip={follow ? "停止跟随" : "跟随活跃工位"} data-tip-side="top"><Crosshair size={13} /></button>
+        <button className={`ctl-btn ${layer !== "pipeline" ? "is-on" : ""}`} onClick={() => setMenu((m) => !m)} aria-expanded={menu} data-tip="切换图层" data-tip-side="top"><Layers size={13} /> 图层</button>
         <button className="ctl-btn" onClick={resetLayout} data-tip="一键重新排列回默认布局" data-tip-side="top"><RotateCcw size={13} /> 重排</button>
       </div>
       {menu && (

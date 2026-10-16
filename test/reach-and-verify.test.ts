@@ -33,7 +33,8 @@ test("passing a verification wall in the built-in browser continues that candida
     walled: new Set<string>(), resuming: false, runtime: { running: true },
     ensureReady: async () => null,
     retryCandidates: (filter: { items: string[] }) => { retried.push(filter.items); return [{ id: "t", item: filter.items[0] }]; },
-    resumeVerifiedCandidates: () => { retried.push(['uiverse.io']); return [{ id: 't', item: 'uiverse.io' }]; },
+    recoveryForAlert: () => fake.state.recoveries['uiverse.io'],
+    resumeVerifiedCandidates: () => { retried.push(['uiverse.io']); return [{ id: 't-next', item: 'uiverse.io', data: {retryOf: 't'} }]; },
     clearAlert: () => { delete (fake.state.alerts as Record<string, unknown>)['auth:uiverse.io']; },
     journal: { append: (e: { kind: string; text: string }) => { if (e.kind === 'dispatch.note') notes.push(e.text); } },
   };

@@ -12,6 +12,7 @@ process.env.FACTORY_VAR = dir; process.env.FACTORY_PREFLIGHT = '0'; process.env.
 process.env.VISLEXICON_ROOT = path.join(dir, 'unconnected');
 const { Factory } = await import('../server/factory.ts');
 const { batchSummary } = await import('../shared/batch.ts');
+const {apply, initialState} = await import('../shared/project.ts');
 const { classifyFailure } = await import('../shared/failures.ts');
 const { SourceSupervisor } = await import('../server/sources.ts');
 const { OperationUnknownError } = await import('../server/operations.ts');
@@ -39,6 +40,65 @@ const start = (factory: InstanceType<typeof Factory>, target = 2) => {
   factory.runtime.create('curation/scout', { item: 'checkpoint-site', url: 'https://checkpoint.example/', source: 'manual' });
   factory.batch.configure({ target, maxInFlight: 1, intakeWindow: 1 });
 };
+
+test('batch summary reports keyed model recovery without borrowing unrelated or obsolete outages', () => {
+  const state = initialState();
+  const dependency = {key: 'summary-current-endpoint', adapter: 'pi' as const,
+    provider: 'fixture-provider', model: 'fixture-model'};
+  const unrelated = {...dependency, key: 'summary-other-endpoint'};
+  const nextAt = Date.now() + 900000;
+  const reason = 'Connection error: ECONNRESET before TLS was established';
+  let seq = 0;
+  const append = (event: import('../shared/types.ts').JournalEvent) => apply(state,
+    {...event, seq: ++seq, at: Date.now(), run: 'summary-run'});
+  append({kind: 'run.started', runId: 'summary-run', title: 'Preserved batch'});
+  append({kind: 'batch.configured', batch: {runId: 'summary-run', target: 500,
+    maxInFlight: 3, intakeWindow: 1, maxRecoveries: 2, mode: 'running', startedAt: Date.now()}});
+  append({kind: 'token.created', token: 'summary-token', item: 'saved-item',
+    line: 'curation', url: 'https://fixture.invalid/', source: 'candidates/pool'});
+  append({kind: 'token.queued', token: 'summary-token', node: 'curation/reader'});
+  append({kind: 'token.data', token: 'summary-token', patch: {
+    __runtimeRecovery: {version: 1, runId: 'summary-run', kind: 'model', state: 'waiting',
+      station: 'curation/reader', nextAt, dependency},
+    failure: {tag: 'model_transport', dependency},
+  }});
+  append({kind: 'model.circuit', key: dependency.key, circuit: {dependency,
+    state: 'open', failures: 6, nextAt, runId: 'summary-run', station: 'curation/reader', reason}});
+  append({kind: 'model.circuit', key: unrelated.key, circuit: {dependency: unrelated,
+    state: 'open', failures: 8, nextAt: nextAt - 60000, runId: 'old-run',
+    station: 'skills/review', reason: 'Unrelated old endpoint'}});
+  const blocked = batchSummary(state)!;
+  assert.equal(blocked.status, 'blocked', 'an active queued item cannot conceal its keyed model hold');
+  assert.equal(blocked.nextRetryAt, nextAt, 'show the deadline for this batch dependency only');
+  assert.ok(blocked.reason.includes(reason), blocked.reason);
+  assert.ok(blocked.reason.includes(dependency.provider), blocked.reason);
+  assert.ok(!blocked.reason.includes('Unrelated old endpoint'));
+  assert.equal(state.batch?.modelCircuit, undefined, 'reading status does not rewrite the durable goal');
+
+  append({kind: 'model.circuit', key: dependency.key,
+    circuit: {...state.modelCircuits[dependency.key], state: 'trial', nextAt: 0,
+      trialToken: 'summary-token', reason: 'One original station is verifying recovery'}});
+  const trial = batchSummary(state)!;
+  assert.equal(trial.status, 'blocked');
+  assert.equal(trial.nextRetryAt, undefined, 'a running trial has no fictitious cooldown deadline');
+  assert.match(trial.reason, /真实工位验证恢复/);
+
+  append({kind: 'token.data', token: 'summary-token', patch: {
+    __runtimeRecovery: {version: 1, runId: 'summary-run', kind: 'model', state: 'waiting',
+      station: 'curation/reader', nextAt: Date.now(), dependency: {...dependency, key: 'healthy-new-selection'}},
+  }});
+  append({kind: 'model.circuit', key: dependency.key,
+    circuit: {...state.modelCircuits[dependency.key], state: 'open', nextAt, trialToken: undefined}});
+  assert.equal(batchSummary(state)!.status, 'running',
+    'a current recovery selection supersedes its old failed model identity');
+
+  append({kind: 'batch.configured', batch: {...state.batch!, modelCircuit: {
+    state: 'open', failures: 4, nextAt: nextAt + 60000}}});
+  assert.equal(batchSummary(state)!.status, 'blocked', 'legacy goals retain their existing model hold');
+  assert.equal(batchSummary(state)!.nextRetryAt, nextAt + 60000);
+  append({kind: 'run.paused', runId: 'summary-run'});
+  assert.equal(batchSummary(state)!.status, 'paused', 'an explicit pause retains precedence');
+});
 
 test('an hour-long model outage sends one trial per deadline and reopens intake only after its real station succeeds', async t => {
   const began = Date.now(); t.mock.timers.enable({ apis: ['Date'], now: began });
@@ -812,6 +872,10 @@ test('keyed outages and trials preserve healthy providers and program work in ma
       assert.equal(factory.state.modelCircuits[a.key].failures, 1);
       assert.equal(factory.broker.modelHold, null, 'known faults do not become a global legacy hold');
       assert.equal(factory.state.batch?.modelCircuit, undefined);
+      if (managed) {
+        assert.equal(batchSummary(factory.state)!.status, 'blocked');
+        assert.equal(batchSummary(factory.state)!.nextRetryAt, factory.state.modelCircuits[a.key].nextAt);
+      }
       const same = factory.runtime.create('curation/reader', {item: 'a-queued', url: 'https://a2.example/', source: 'manual'});
       const healthy = factory.runtime.create('skills/provenance', {item: 'healthy-b', url: 'https://b.example/', source: 'manual'});
       const program = factory.runtime.create('skills/fetch-file', {item: 'healthy-program', url: '', source: 'manual'});

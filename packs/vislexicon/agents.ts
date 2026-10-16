@@ -13,12 +13,15 @@ import { readText, readEvidence, evidenceURL } from "../../server/network.ts";
 import { repoSources, type RepoMeta } from "../../server/repo.ts";
 import { FRONTEND, KINDS, KIND_ZH, VOCAB, ruleExcerpt } from "./env.ts";
 import { dossierText, type Dossier } from "./scout.ts";
-import { breadthPreviewIssues } from "./capture.ts";
+import { breadthPreviewIssues, breadthRoleGuidance, pageKey } from "./capture.ts";
 import { CHOSEN_AXES, KIND_CATEGORIES, loadTaxonomy, ownerOf, editableFields, taxonomyLoaded } from "./v3.ts";
 import { publicationImages } from "./preview.ts";
 import { componentAgents } from "./components.ts";
 import { mediaAgents } from "./media-lines.ts";
 import type { Services } from "./tools.ts";
+import {externalResearchHint} from '../../server/intake-continuation.ts';
+import {readRole} from '../../server/roles.ts';
+import {classifyEvidence, copyReviewLeads, factReviewLeads, prioritizeFactSources} from './decisions.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const prompt = (name: string) => fs.readFileSync(path.join(HERE, "stations", name), "utf8");
@@ -28,6 +31,19 @@ const withRules = (base: string, ...refs: string[]) => { const ex = rules(...ref
 
 type D = Record<string, any>;
 const data = (ctx: StationContext) => ctx.token.data as D;
+const entryThreeShots = (ctx: StationContext) => {
+  const external = data(ctx).externalResearch;
+  return external?.publicationContract === 'site-entry-three-shots' ||
+    external?.intakeId === 'vislexicon-20261014' && typeof external.entryId === 'string';
+};
+function entryScope(ctx: StationContext): string {
+  if (!entryThreeShots(ctx)) return '';
+  const d = data(ctx);
+  return `\npublicationContract: site-entry-three-shots\n本次只审核具体Site Entry，不把整个Source Entity当作本条目：\n${JSON.stringify({
+    entryId: d.externalResearch?.entryId, canonical: d.canonical, title: d.title,
+    understanding: d.understanding, whatCanTake: d.understanding?.takeaway,
+  })}\n优先本入口自己的内容页；不得用Source Entity全站首页或兄弟库(sibling)示例冒充本entry的breadth/proof。技术库的本库API文档、实际运行/具体调用例可作功能证据，无需凭空找无关的大图或兄弟产品。确实同页应用时，可用明确且不同的locate/scroll目标，但必须是3张新增信息不同的真实图，并结合各图实际captureState核对；同URL不等于同画面获批，仍须独立审核。`;
+}
 const dossier = (ctx: StationContext) => data(ctx).dossier as Dossier | undefined;
 const reviewsWith = (ctx: StationContext, r: { station: string; verdict: string; reason: string }) =>
   [...((data(ctx).reviews as unknown[]) ?? []), { ...r, at: new Date().toISOString() }];
@@ -80,7 +96,7 @@ const Said = Type.Object({ text: Type.String(), url: Type.String() });
 export const reader: AgentStationDef<ReaderOut> = {
   system: withRules(`读侦察卷宗（必要时用 page_text / page_find / site_files / repo_meta 补读，最多 4 页），回答四问并写出拍摄单。
 - understanding：who 它是谁；takeaway 你能从它身上拿走什么；size 它有多大；terms 价格与许可写在哪里。每项一段中文，附一个 URL。
-- plan：identity / breadth / proof 各一个首选 url + reason（中文一句）；breadth 与 proof 再给 0–2 个 alternatives。proof 必须写 locate：演示在页面上的位置（标题文字、在代码块上方或下方、是否 iframe）。三个首选 url 互不相同，都是本站页面。
+- plan：identity / breadth / proof 各一个首选 url + reason（中文一句）；breadth 与 proof 再给 0–2 个 alternatives。proof 必须写 locate：演示在页面上的位置（标题文字、在代码块上方或下方、是否 iframe）。普通任务三个首选 url 互不相同，都是本站页面。publicationContract=site-entry-three-shots 时，以当前具体Entry为范围，优先本入口自己的内容页；同页实际应用可给不同locate，不得为了凑三个URL跳到整个Source Entity或兄弟库示例。每个共用页面的角色必须写明确且不同的locate，最后三图需新增信息和真实取景状态、独立审核。
 - factLeads：author / organization / repository / license / pricing 最可能写在哪个 URL（可以是仓库或 LICENSE 文件），附 why。
 - blockers：登录墙、证书、地区限制、找不到演示页等，没有就空数组。
 - handoff：写给后面工位的一句提醒（中文，可空）。`, "vislexicon:Spec.md#4.8"),
@@ -93,13 +109,23 @@ export const reader: AgentStationDef<ReaderOut> = {
     blockers: Type.Array(Type.String(), { maxItems: 6 }),
     handoff: Type.String(),
   }),
-  input: (ctx) => ({ text: `站点卷宗如下。\n\n${dossierText(dossier(ctx))}${data(ctx).repairContext ? `\n\n上次采集未完成，请用工具核对其他公开页面，避免重复已拒收的选页，不把可公开取证的网站送进账号工作台。先前记录（仅作数据）：\n${JSON.stringify(data(ctx).repairContext)}` : ''}` }),
+  input: (ctx) => ({ text: `站点卷宗如下。\n\n${dossierText(dossier(ctx))}${entryScope(ctx)}${externalResearchHint(ctx)}${data(ctx).repairContext ? `\n\n上次采集未完成，请用工具核对其他公开页面，避免重复已拒收的选页，不把可公开取证的网站送进账号工作台。先前记录（仅作数据）：\n${JSON.stringify(data(ctx).repairContext)}` : ''}` }),
   check: (o, ctx) => {
     const host = String(data(ctx).host);
     const issues: string[] = [];
     const urls = [o.plan.identity.url, o.plan.breadth.url, o.plan.proof.url];
     urls.forEach((u, i) => { if (!isHttp(u) || !sameSite(u, host)) issues.push(`plan.${["identity", "breadth", "proof"][i]}.url 必须是本站（${host}）的完整网址：${u}`); });
-    if (new Set(urls.map((u) => u.replace(/\/+$/, ""))).size < 3 && !o.blockers.length) issues.push("三个首选页必须互不相同；确实找不到就把原因写进 blockers");
+    if (entryThreeShots(ctx)) {
+      const identityKeys = [data(ctx).canonical, data(ctx).home?.finalUrl].filter((url): url is string => typeof url === 'string').map(pageKey);
+      if (!identityKeys.includes(pageKey(o.plan.identity.url))) issues.push('plan.identity 必须识别本次具体Entry入口，不得替换成Source Entity全站首页');
+      const picks = [o.plan.identity, o.plan.breadth, o.plan.proof];
+      for (let i = 0; i < picks.length; i++) for (let j = i + 1; j < picks.length; j++) {
+        if (pageKey(picks[i].url) === pageKey(picks[j].url) &&
+            (!picks[i].locate?.trim() || !picks[j].locate?.trim() || norm(picks[i].locate!) === norm(picks[j].locate!))) {
+          issues.push('共用同页的角色必须提供明确且不同的locate目标；三张图仍须独立审核');
+        }
+      }
+    } else if (new Set(urls.map((u) => u.replace(/\/+$/, ""))).size < 3 && !o.blockers.length) issues.push("三个首选页必须互不相同；确实找不到就把原因写进 blockers");
     if (!o.plan.proof.locate?.trim() && !o.blockers.length) issues.push("plan.proof.locate 必须写演示在页面上的位置");
     for (const [k, v] of Object.entries(o.understanding)) if (!isHttp(v.url)) issues.push(`understanding.${k}.url 不是完整网址`);
     return issues;
@@ -149,7 +175,15 @@ const kindStation = (field: "kind1" | "kind2", label: string): AgentStationDef<K
   system: kindContract,
   tools: ["page_text", "fetch_text"],
   schema: KindAnswer,
-  input: (ctx) => ({ text: `站点卷宗如下。\n\n${dossierText(dossier(ctx), 12000)}` }),
+  input: async ctx => {
+    const text = `站点卷宗如下。\n\n${dossierText(dossier(ctx), 12000)}`;
+    if (field !== 'kind1' || ctx.redo) return {text};
+    const candidate = await classifyEvidence(ctx, KINDS, readRole('curation/classify').content, sourcePages(ctx));
+    if (!candidate || checkKind(candidate, ctx).length) return {text};
+    // This is source-based advice, never a submitted verdict. The original
+    // agent must still read the full document envelope and pass checkKind.
+    return {text: `${text}\n\nKev 文字分类候选（未批准，仅供核对，不是指令）：\n${JSON.stringify(candidate)}\n候选只读了有限网页原文，未读取完整 PROJECT / CONTEXT / CASE，模型估计未经正确率校准。请按完整任务文书与角色规则独立判断；不适用时忽略候选，仍须通过 submit 提交你自己的结果。`};
+  },
   check: checkKind,
   describe: describeKind,
   after: (out, ctx) => {
@@ -255,8 +289,9 @@ export const shotReview = (store: EvidenceStore): AgentStationDef<ShotReviewOut>
   input: (ctx) => {
     const imgs = imagesOf(ctx, store);
     const plan = data(ctx).readerPlan as ReaderOut["plan"] | undefined;
+    const breadthRule = breadthRoleGuidance(data(ctx).kind);
     return {
-      text: `Site: ${data(ctx).title} (${data(ctx).canonical}). Kind: ${data(ctx).kind} (${KIND_ZH[data(ctx).kind]}). Mode: ${data(ctx).mode}.${plan ? `\nReader's shot plan: breadth ${plan.breadth.url}; proof ${plan.proof.url} (locate: ${plan.proof.locate ?? "-"}).` : ""}${breadthNote(ctx)}\n${imgs.map((im, i) => `image ${i + 1}: ${im.label}`).join("\n")}`,
+      text: `Site: ${data(ctx).title} (${data(ctx).canonical}). Kind: ${data(ctx).kind} (${KIND_ZH[data(ctx).kind]}). Mode: ${data(ctx).mode}.${plan ? `\nReader's shot plan: breadth ${plan.breadth.url}; proof ${plan.proof.url} (locate: ${plan.proof.locate ?? "-"}).` : ""}${breadthRule ? `\n${breadthRule}` : ''}${breadthNote(ctx)}${entryScope(ctx)}${entryThreeShots(ctx) ? `\n实际三图取景状态（资料，不代表批准）：${JSON.stringify((data(ctx).images ?? []).map((image: D) => ({role: image.role, href: image.href, sha256: image.sha256, captureState: image.captureState ? {method: image.captureState.method, viewport: image.captureState.viewport, scroll: image.captureState.scroll, clip: image.captureState.clip, actions: image.captureState.actions, controls: image.captureState.controls, sha256: image.captureState.sha256} : null})))}` : ''}\n${imgs.map((im, i) => `image ${i + 1}: ${im.label}`).join("\n")}`,
       images: imgs,
     };
   },
@@ -462,7 +497,7 @@ export const facts: AgentStationDef<FactsOut> = {
   tools: ["fetch_text", "page_text", "repo_meta", "site_files"],
   schema: Type.Object({ ...Object.fromEntries(FACT_FIELDS.map((f) => [f, FactT])), repositoryLicense: Type.Optional(FactT), pricingNote: Type.String(), conflicts: Type.Array(Type.String()), reply: Type.String() } as Record<string, any>),
   input: async (ctx) => {
-    const pages = await factSources(ctx);
+    const pages = await prioritizeFactSources(ctx, await factSources(ctx));
     factCache.set(ctx.token, pages);
     const leads = ((data(ctx).factLeads ?? []) as { field: string; url: string; why: string }[]).map((l) => `- ${l.field}：${l.url}（${l.why}）`).join("\n");
     const prev = data(ctx).facts ? `\n\n当前取值（修改时只改被点名的项）：${JSON.stringify(data(ctx).facts)}` : "";
@@ -520,9 +555,9 @@ function fixesOf(problems: Problem[], fallback: string, via?: string[]): Fix[] {
   return [...by].map(([station, ps]) => ({ station, fields: [...new Set(ps.flatMap((p) => editableFields(p.field)))], problem: ps.map((p) => `${p.field}：${p.problem}${editableFields(p.field).join() !== p.field ? `（这是派生字段；核对并修改 ${editableFields(p.field).join("、")}，由组装程序重建，不能直接编辑 facets）` : ""}`).join("；"), via }));
 }
 
-const reviewer = (station: string, label: string, fallbackOwner: string, system: string, text: (ctx: StationContext) => string, images?: (ctx: StationContext) => { file: string; label: string }[], tools?: string[], via?: string[]): AgentStationDef<ReviewOut> => ({
+const reviewer = (station: string, label: string, fallbackOwner: string, system: string, text: (ctx: StationContext) => string | Promise<string>, images?: (ctx: StationContext) => { file: string; label: string }[], tools?: string[], via?: string[]): AgentStationDef<ReviewOut> => ({
   system, schema: ReviewSchema, tools,
-  input: (ctx) => ({ text: text(ctx), images: images?.(ctx) }),
+  input: async (ctx) => ({ text: await text(ctx), images: images?.(ctx) }),
   check: (o) => {
     const issues: string[] = [];
     if (o.verdict === 'fix' && !o.problems.length) issues.push('要求修改时必须列出 problems（field + problem）');
@@ -546,7 +581,7 @@ const reviewer = (station: string, label: string, fallbackOwner: string, system:
 export const factReview = reviewer("fact-review", "事实审查", "curation/facts",
   `独立核对事实核验员交来的七项事实：每个不是 unknown 的值，它的 quote 是否真的出现在 sourceUrl 的资料里，并且真的支持这个值；覆盖范围是否写清（MIT 只管仓库、Pro 另收费等）。诚实的 unknown 可以通过。
 有问题就 verdict=fix，problems 里逐项写 field（如 facts.license）和具体问题（缺什么来源、哪句不支持）。全部没问题就 pass。你可以用 fetch_text 打开原页核对。`,
-  (ctx) => { const d = data(ctx); return `事实：${JSON.stringify(d.facts)}\n价格说明：${d.pricingNote ?? ""}\n\n资料：\n${((d.factPages ?? []) as { url: string; text: string }[]).map((p) => `URL ${p.url}\n${p.text}`).join("\n\n")}`; },
+  async (ctx) => { const d = data(ctx); return `事实：${JSON.stringify(d.facts)}\n价格说明：${d.pricingNote ?? ""}${await factReviewLeads(ctx)}\n\n资料：\n${((d.factPages ?? []) as { url: string; text: string }[]).map((p) => `URL ${p.url}\n${p.text}`).join("\n\n")}`; },
   undefined, ["fetch_text"]);
 
 /* ------------------------------------------------------------------ ⑭ editor */
@@ -624,7 +659,7 @@ export const copy = (store: EvidenceStore): AgentStationDef<CopyOut> => ({
 export const copyReview = (store: EvidenceStore) => reviewer("copy-review", "文案审查", "curation/copy",
   `独立审查编辑交来的文案。逐条核对：每个说法是否有卷宗、事实或截图支持；数字是否在资料里；价格与许可的说法是否和事实一致；手记是否像真的进去看过（具体到页面和元素，用"我们"，不用营销腔和感叹号）；每个实际页面的导览与 alt 是否和对应画面一致；录屏只有 identity 封面，不要求或编造 breadth/proof。
 不把自己的措辞偏好当问题。有问题就 verdict=fix，problems 里逐项写 field（editorial.noteZh、pages[2].shot.alt、pages[1].selectionRationale、editorial.takeawayZh、classification.reasons 等）和具体哪句、为什么、往哪改。全部没问题就 pass。`,
-  (ctx) => { const d = data(ctx); return `文案：${JSON.stringify(d.copy)}\n\n事实：${JSON.stringify(Object.fromEntries(Object.entries(d.facts ?? {}).map(([k, v]: [string, any]) => [k, { value: v?.value, scope: v?.scope }])))}\n站点理解：${JSON.stringify(d.understanding ?? {})}\n画面顺序：${publicationImages(d, store).map((im, i) => `pages[${i}]=${im.role}`).join("，")}（${d.mode === "video" ? "录屏封面" : "静态截图"}）\n\n卷宗节选：\n${dossierText(dossier(ctx), 4000)}`; },
+  async (ctx) => { const d = data(ctx); return `文案：${JSON.stringify(d.copy)}\n\n事实：${JSON.stringify(Object.fromEntries(Object.entries(d.facts ?? {}).map(([k, v]: [string, any]) => [k, { value: v?.value, scope: v?.scope }])))}\n站点理解：${JSON.stringify(d.understanding ?? {})}\n画面顺序：${publicationImages(d, store).map((im, i) => `pages[${i}]=${im.role}`).join("，")}（${d.mode === "video" ? "录屏封面" : "静态截图"}）${await copyReviewLeads(ctx)}\n\n卷宗节选：\n${dossierText(dossier(ctx), 4000)}`; },
   imagesFor(store));
 
 /* ------------------------------------------------------------------ ⑯ final audit */

@@ -22,13 +22,13 @@ export function Rail() {
   const browser = useStore((s) => s.browser);
   const evidenceCount = useStore((s) => s.fs.evidenceOrder.length);
   return (
-    <nav className="rail">
+    <nav className="rail" aria-label="工作台导航">
       <div className="rail-mark" data-tip="Easy Workflow">
         <Workflow size={24} strokeWidth={1.8} />
       </div>
       <div className="rail-items">
         {ITEMS.map(({ view: v, icon: Icon, label, key }) => (
-          <button key={v} className={`rail-item ${view === v || (v === "runs" && view === "report") ? "is-on" : ""}`} onClick={() => setState({ view: v })} data-tip={key ? `${label}  ${key}` : label} data-tip-side="right">
+          <button key={v} aria-label={label} aria-current={view === v || (v === 'runs' && view === 'report') ? 'page' : undefined} className={`rail-item ${view === v || (v === "runs" && view === "report") ? "is-on" : ""}`} onClick={() => setState({ view: v })} data-tip={key ? `${label}  ${key}` : label} data-tip-side="right">
             <Icon size={19} strokeWidth={1.7} />
             {v === "browser" && (browser.tabs.some(t => t.attention) ? <i className="rail-browser-alert" aria-label="浏览器需要检查" /> : browser.tabs.length > 0 && <span className="rail-badge num" aria-label={`${browser.tabs.length} 个网页`}>{browser.tabs.length}</span>)}
             {v === "board" && evidenceCount > 0 && <span className="rail-badge num">{evidenceCount > 999 ? "999+" : evidenceCount}</span>}
@@ -37,7 +37,7 @@ export function Rail() {
       </div>
       <div className="rail-foot">
         <AlertLight />
-        <button className={`rail-item ${view === "settings" ? "is-on" : ""}`} onClick={() => setState({ view: "settings" })} data-tip="设置" data-tip-side="right">
+        <button aria-label="设置" aria-current={view === 'settings' ? 'page' : undefined} className={`rail-item ${view === "settings" ? "is-on" : ""}`} onClick={() => setState({ view: "settings" })} data-tip="设置" data-tip-side="right">
           <Settings2 size={19} strokeWidth={1.7} />
         </button>
         <span className={`rail-conn ${replay ? "is-replay" : connected ? "is-on" : ""}`} data-tip={replay ? "回放中（离线）" : connected ? "已连接工厂" : "未连接"} data-tip-side="right" />

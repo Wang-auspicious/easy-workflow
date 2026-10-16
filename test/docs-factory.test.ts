@@ -31,12 +31,20 @@ test("Factory rebuilds legacy cases on boot, batches live progress and flushes l
   let f: InstanceType<typeof Factory> | undefined;
   try {
     let bootWrites = 0;
+    let fullReads = 0;
+    const originalRead = Journal.prototype.read;
+    const bootRead = t.mock.method(Journal.prototype, 'read', function* (this: Journal, since = 0, run?: string, through?: number) {
+      if (since === 0 && run === undefined && through === undefined) fullReads++;
+      yield* originalRead.call(this, since, run, through);
+    });
     const originalWrite = Docs.prototype.write;
     const bootMock = t.mock.method(Docs.prototype, 'write', function(this: Docs, kind: 'context' | 'case', id: string) {
       if (kind === 'case') bootWrites++;
       return originalWrite.call(this, kind, id);
     });
     f = new Factory(); await f.boot();
+    assert.equal(fullReads, 1, 'startup replays the whole journal once; derived modules read only their event kinds');
+    bootRead.mock.restore();
     assert.equal(bootWrites, 0, 'startup must not synchronously rebuild historical case files');
     await waitForCase(f, 'case-site');
     bootMock.mock.restore();

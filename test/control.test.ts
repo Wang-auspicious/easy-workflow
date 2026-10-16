@@ -358,6 +358,11 @@ test("headless service: real HTTP capability discovery, control, validation, act
       assert.equal(effective.lastModel, undefined, 'configuration is not evidence of a real model call');
       assert.deepEqual((await tool('agent_bindings', {node: 'curation/classify'})).body.result.bindings, previous);
       assert.deepEqual((await request('/api/state')).body.agentBindings[node], binding);
+      const assist = await request('/api/agents/binding', {node: 'curation/proof', binding});
+      assert.equal(assist.status, 200, 'program visual assistance has its own configurable executor');
+      assert.equal(assist.body.result.bindings[0].mode, 'model-assist');
+      assert.deepEqual(assist.body.result.bindings[0].effective, binding);
+      assert.equal((await tool('read_spec')).body.result.factory.nodes.find((value: {key: string}) => value.key === 'curation/proof').kind, 'program');
     });
     const stationDefault = {adapter: 'pi', provider: 'project-station-provider', model: 'project-station-model'};
     const dispatcherDefault = {adapter: 'pi', provider: 'project-dispatcher-provider', model: 'project-dispatcher-model'};
@@ -365,7 +370,7 @@ test("headless service: real HTTP capability discovery, control, validation, act
       const before = (await tool('agent_defaults')).body.result;
       assert.equal((await tool('set_agent_defaults', {station: stationDefault})).status, 403);
       assert.equal((await request('/api/agents/defaults', {})).status, 400);
-      assert.equal((await request('/api/agents/defaults', {dispatcher: {adapter: 'launcher', command: ['fixture-no-launch'], model: 'fixture'}})).status, 422);
+      assert.equal((await request('/api/agents/defaults', {dispatcher: {adapter: 'launcher', command: ['fixture-no-launch']}})).status, 400);
       assert.deepEqual((await tool('agent_defaults')).body.result, before, 'invalid defaults do not partially commit');
       const saved = await request('/api/agents/defaults', {station: stationDefault});
       assert.equal(saved.status, 200);
@@ -394,6 +399,29 @@ test("headless service: real HTTP capability discovery, control, validation, act
         assert.equal(native.body.result.bindings[0].lastModel, undefined, 'saving a binding never launches a native client');
       }
       await request('/api/agents/binding', {node: 'curation/facts', binding: null});
+    });
+    await t.test('native dispatcher selection stays independent and never falls back to global Pi metadata', async () => {
+      const before = (await tool('agent_defaults')).body.result;
+      for (const adapter of ['opencode', 'claude-code', 'codex', 'launcher']) {
+        const binding = {adapter, command: ['fixture-must-not-launch'], ...(adapter === 'launcher' ? {model: 'fixture-native'} : {})};
+        const saved = await request('/api/agents/defaults', {dispatcher: binding});
+        assert.equal(saved.status, 200);
+        assert.deepEqual(saved.body.result.station, before.station);
+        const bootstrap = (await request('/api/agent/bootstrap')).body;
+        assert.equal(bootstrap.model.adapter, adapter);
+        assert.equal(bootstrap.model.id, adapter === 'launcher' ? 'fixture-native' : 'native-default');
+        assert.equal(bootstrap.model.verification, 'client-managed');
+        const factory = (await request('/api/factory')).body;
+        assert.equal(factory.pi, null, 'native status must not imply a Pi credential was checked');
+        assert.equal(factory.keyPresent, false);
+      }
+      const native = {adapter: 'codex', command: ['fixture-must-not-launch']};
+      const explicitPi = {adapter: 'pi', provider: 'explicit-provider', model: 'explicit-model'};
+      assert.equal((await request('/api/agents/binding', {node: 'curation/breadth', binding: explicitPi})).status, 200);
+      assert.equal((await request('/api/agents/defaults', {station: native, dispatcher: native})).status, 200);
+      assert.deepEqual((await tool('agent_bindings', {node: 'curation/breadth'})).body.result.bindings[0].effective, explicitPi,
+        'an explicit Pi node remains valid when both project defaults use native clients');
+      assert.equal((await request('/api/agents/defaults', before)).status, 200);
     });
     await stop(server.child);
     server = await start(dir);

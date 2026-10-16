@@ -3,6 +3,7 @@ import type { Placed } from "../../../shared/layout.ts";
 import { roleColors } from "../../../shared/palette.ts";
 import { getState, useStore } from "../store.ts";
 import { fmt } from "./Node.tsx";
+import {openLine} from './Canvas.tsx';
 
 export function Capsule({ line, place }: { line: string; place: Placed }) {
   useStore((s) => s.version);
@@ -17,7 +18,13 @@ export function Capsule({ line, place }: { line: string; place: Placed }) {
   const c = roleColors(nodes[1]?.role ?? "process");
   return (
     <div className={`capsule ${l.wired ? "" : "is-unwired"}`} data-capsule={line} style={{ left: place.x, top: place.y, width: place.w, height: place.h, ["--c" as string]: c.border, ["--fill" as string]: c.fill, ["--ink-c" as string]: c.ink }}
-      data-tip={`${l.name}：${l.blurb}（点开展开）`}>
+      data-tip={`${l.name}：${l.blurb}（点开展开）`} tabIndex={0} role="button" aria-label={`展开 ${l.name}`} aria-expanded={false}
+      onKeyDown={event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        event.stopPropagation();
+        openLine(line, true);
+      }}>
       <span className="capsule-name">{l.name}</span>
       <span className="capsule-row">
         {/* One dot per station in the role's colour: a glimpse of the folded DAG. */}

@@ -1,6 +1,6 @@
 import type {FactoryState, TokenState} from './project.ts';
 import { latestRunTokens } from './project.ts';
-import type {CompiledFactory} from './types.ts';
+import type {CompiledFactory, ModelCircuit} from './types.ts';
 
 export interface FlowAdmission {
   mode: 'flow';
@@ -121,6 +121,8 @@ export interface BatchGoal {
   startedAt: number;
   category?: string;
   query?: string;
+  /** An exact retained cohort takes precedence over unrelated fresh sources. */
+  candidateIds?: string[];
   supplyExhausted?: boolean;
   /** Missing means an existing or explicitly chosen fixed admission policy. */
   admission?: FlowAdmission;
@@ -152,6 +154,44 @@ export function latestBatchTokens(s: FactoryState) {
   return latestRunTokens(s).filter(isBatchToken);
 }
 
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined;
+}
+
+/** Saved recovery choices supersede failed attempts when a station changes model. */
+function batchModelCircuits(s: FactoryState, items: readonly TokenState[]): ModelCircuit[] {
+  const keys = new Set<string>();
+  const add = (value: unknown) => {
+    const key = record(value)?.key;
+    if (typeof key === 'string') keys.add(key);
+  };
+  for (const token of items) {
+    if (['published', 'merged', 'rejected'].includes(token.status) || token.data.retriedBy) continue;
+    const recovery = record(token.data.__runtimeRecovery);
+    if (recovery?.runId === s.run.id) {
+      if (recovery.kind === 'model' && ['waiting', 'trial', 'blocked'].includes(String(recovery.state))) {
+        add(recovery.dependency);
+      }
+    } else if (token.status !== 'active') {
+      const failure = record(token.data.failure);
+      if (['model_transport', 'model_unavailable'].includes(String(failure?.tag))) add(failure?.dependency);
+    }
+    const waiting = record(token.data.modelWait);
+    for (const node of token.at) add(record(waiting?.[node])?.dependency);
+    for (const id of token.attempts) {
+      const attempt = s.attempts[id];
+      if (attempt && !attempt.endedAt && token.at.includes(attempt.node)) {
+        add(attempt.metrics?.dependency ?? attempt.dependency);
+      }
+    }
+    for (const circuit of Object.values(s.modelCircuits)) {
+      if (circuit.state === 'trial' && circuit.trialToken === token.id) add(circuit.dependency);
+    }
+  }
+  return Object.values(s.modelCircuits).filter(circuit => keys.has(circuit.dependency.key));
+}
+
 export function batchSummary(s: FactoryState) {
   const goal = s.batch;
   if (!goal || goal.runId !== s.run.id) return null;
@@ -160,23 +200,33 @@ export function batchSummary(s: FactoryState) {
   const completed = items.filter(t => ['published', 'merged', 'rejected'].includes(t.status)).length;
   const blocked = items.filter(t => ['manual', 'parked', 'failed'].includes(t.status)).length;
   const recovery = items.filter(t => t.status === 'parked').map(t => t.data.batchRecovery as BatchRecovery | undefined).filter((r): r is BatchRecovery => !!r && r.nextAt > 0);
+  const modelCircuits = batchModelCircuits(s, items);
+  const modelBlocked = Boolean(goal.modelCircuit || modelCircuits.length);
+  const modelDeadlines = [goal.modelCircuit, ...modelCircuits]
+    .filter(circuit => circuit?.state === 'open' && circuit.nextAt > 0)
+    .map(circuit => circuit!.nextAt);
   const remaining = Math.max(0, goal.target - items.length);
   const paused = goal.mode === 'paused' || s.run.status === 'paused';
   const status = goal.mode === 'stopped' || s.run.status === 'ended' ? 'stopped'
-    : paused ? 'paused' : goal.modelCircuit ? 'blocked' : active ? 'running' : recovery.length ? 'recovering'
+    : paused ? 'paused' : modelBlocked ? 'blocked' : active ? 'running' : recovery.length ? 'recovering'
     : completed >= goal.target ? 'completed' : blocked || goal.supplyExhausted ? 'blocked' : 'running';
   const reason = status === 'completed' ? '目标已处理完，发布、合并与排除分别记录'
     : status === 'paused' ? '本轮已暂停；目标和检查点已保存'
     : status === 'stopped' ? '托管已停止；保留已有成果'
     : status === 'recovering' ? '按退避时间自动从检查点继续'
     : goal.modelCircuit ? `模型服务异常，已停止投料；${goal.modelCircuit.state === 'trial' ? '正在用一个真实工位验证恢复' : goal.modelCircuit.nextAt ? goal.modelCircuit.failures > 3 ? '每 15 分钟只用一个真实工位试恢复' : '冷却后用一个真实工位试恢复' : '等待确认模型凭据、额度或证书问题'}，网站检查点已保留`
+    : modelCircuits.length ? `模型服务异常，已停止投料；${modelCircuits.some(circuit => circuit.state === 'trial')
+      ? '正在用一个真实工位验证恢复' : modelDeadlines.length ? '冷却后用一个真实工位验证恢复'
+      : '等待确认模型凭据、额度或证书问题'}；${modelCircuits.map(circuit =>
+      `${circuit.dependency.provider ?? circuit.dependency.adapter}/${circuit.dependency.model}：${circuit.reason}`).join('；')}；网站检查点已保留`
     : status === 'blocked' ? `${blocked} 件仍未完成${goal.supplyExhausted && remaining ? `；候选库存不足，还缺 ${remaining} 件` : '；已保存具体原因与恢复记录'}`
     : goal.admission?.mode === 'flow'
       ? `入口工位有空位时持续补料，当前窗口 ${goal.maxInFlight} 件，上限 ${goal.admission.maxInFlightLimit} 件；共享资源配额不变`
       : `前段有空位时自动补料，最多 ${goal.maxInFlight} 件同时在途`;
-  return { ...goal, status, admitted: items.length, active, completed, blocked, remaining,
+  return { ...goal, modelCircuits, status, admitted: items.length, active, completed, blocked, remaining,
     published: items.filter(t => t.status === 'published').length,
     merged: items.filter(t => t.status === 'merged').length,
     rejected: items.filter(t => t.status === 'rejected').length,
-    retrying: recovery.length, nextRetryAt: goal.modelCircuit?.state === 'open' && goal.modelCircuit.nextAt ? goal.modelCircuit.nextAt : recovery.length ? Math.min(...recovery.map(r => r.nextAt)) : undefined, reason };
+    retrying: recovery.length, nextRetryAt: modelDeadlines.length ? Math.min(...modelDeadlines)
+      : modelBlocked ? undefined : recovery.length ? Math.min(...recovery.map(r => r.nextAt)) : undefined, reason };
 }

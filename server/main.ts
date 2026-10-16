@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { Factory, ROOT, VAR } from "./factory.ts";
 import { Dispatcher, MODEL_ID } from "./dispatcher.ts";
 import { apiKeyPresent } from "./agent-station.ts";
-import { piStatus, closeModelTransport } from "./pi.ts";
+import { closeModelTransport } from "./pi.ts";
 import { publishConnection } from "./discovery.ts";
 import { readReportJson, closeReportReaders } from './report-reader.ts';
 import { setImmediate as yieldLoop } from 'node:timers/promises';
@@ -139,8 +139,9 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/factory") {
       const c = factory.compiled;
       const agentDefaults = factory.getAgentDefaults();
-      const pi = piStatus(agentDefaults.dispatcher);
-      return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: pi.id, pi, keyPresent: pi.ready, patches: factory.patches, agentDefaults, agentBindings: factory.agentBindings().bindings });
+      const modelStatus = factory.dispatcherModelStatus();
+      const pi = modelStatus.adapter === 'pi' ? modelStatus : null;
+      return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: modelStatus.id === 'native-default' ? modelStatus.name : modelStatus.id, modelStatus, pi, keyPresent: pi?.ready ?? false, patches: factory.patches, agentDefaults, agentBindings: factory.agentBindings().bindings });
     }
     const view = url.searchParams.get('view');
     if (['/api/state', '/api/events'].includes(p) && view !== null && view !== 'raw' && view !== 'ui-v1') {
@@ -352,6 +353,7 @@ const shutdown = async () => {
   for (const client of clients) client.close();
   server.close(); server.closeAllConnections();
   await Promise.all([sourceTask, factory.runtime.close(), chatTask]);
+  factory.publicationOutbox?.close();
   await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]); factory.docs.flush(); factory.lessons.close(); factory.journal.close(); process.exit(0);
 };
 process.on("SIGINT", shutdown);

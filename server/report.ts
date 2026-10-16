@@ -140,7 +140,9 @@ export function aggregateMetrics(attempts: FactoryState["attempts"][string][], e
       toolMs: timed.length ? sum(timed.map(a => a.metrics!.time!.toolMs)) : null,
       programMs: timed.length ? sum(timed.map(a => a.metrics!.time!.programMs)) : null,
       otherMs: sum(finished.map(a => { const t = a.metrics?.time; return Math.max(0, (a.ms ?? 0) - (t ? t.toolMs + t.programMs + (a.metrics?.modelTimeReported === false ? 0 : t.firstTokenMs + t.outputMs) : 0)); })),
-      modelCalls: modelTimed.length ? sum(modelTimed.map(a => a.metrics!.time!.modelCalls)) : null,
+      // Non-streaming decisions report actual request counts without inventing
+      // first-token/output timing. Counting is independent of that coverage.
+      modelCalls: timed.length ? sum(timed.map(a => a.metrics!.time!.modelCalls)) : null,
       toolCalls: timed.length ? sum(timed.map(a => a.metrics!.time!.toolCalls)) : null,
       outputTokensPerSecond: outputMs > 0 ? sum(speedSamples.map(x => x.usage.output)) * 1000 / outputMs : null,
     },

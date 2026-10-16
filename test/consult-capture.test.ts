@@ -8,7 +8,7 @@ import { pack } from "../packs/vislexicon/pack.ts";
 import { Runtime, type StationContext, type StationResult } from "../server/runtime.ts";
 import { Journal } from "../server/journal.ts";
 import { Broker } from "../server/broker.ts";
-import { shotReview, style } from "../packs/vislexicon/agents.ts";
+import { reader, shotReview, style } from "../packs/vislexicon/agents.ts";
 import { breadthPreviewIssues, previewsInViewport } from "../packs/vislexicon/capture.ts";
 import type { EvidenceStore } from "../server/evidence.ts";
 
@@ -16,6 +16,33 @@ const compiled = compile([pack]);
 const ctx = (data: Record<string, unknown>) => ({ token: { data }, attempt: "fixture", addEvidence: () => ({}) }) as unknown as StationContext;
 const hidden = { subjectVisible: false, mixed: false, styles: [], signatureZh: "" };
 const pass = { perImage: [], verdict: "pass" as const, reason: "all visible" };
+
+test('external reader permits distinct same-entry frames and supplies exact entry scope to independent image review', async () => {
+  const canonical = 'https://d3js.org/d3-color';
+  const understanding = Object.fromEntries(['who', 'takeaway', 'size', 'terms'].map(key =>
+    [key, {url: canonical, text: key === 'takeaway' ? 'd3-color colour parsing and colour-space conversion functions' : key}]));
+  const plan = {identity: {url: canonical, reason: 'Library identity', locate: '「d3-color」'},
+    breadth: {url: canonical, reason: 'Own API range', locate: '「API reference」', alternatives: []},
+    proof: {url: canonical, reason: 'Own conversion example', locate: '「color.rgb」', alternatives: []}};
+  const external = ctx({canonical, host: 'd3js.org', title: 'd3-color', kind: 'tool', mode: 'shots',
+    externalResearch: {intakeId: 'vislexicon-20261014', entryId: 'd3-color-1241bf3b'},
+    understanding, readerPlan: plan, images: ['identity', 'breadth', 'proof'].map((role, index) => ({
+      role, href: canonical, card: role + '.webp', sha256: role, captureState: {
+        method: 'browser-native', viewport: {width: 1280, height: 800}, scroll: {x: 0, y: index * 1000}, sha256: role,
+      },
+    }))});
+  const output = {understanding, plan, factLeads: [], blockers: [], handoff: ''};
+  assert.deepEqual(await reader.check!(output as never, external), []);
+  assert.ok((await reader.check!({...output, plan: {...plan, proof: {...plan.proof, locate: plan.breadth.locate}}} as never, external)).length);
+  assert.ok((await reader.check!({...output, plan: {...plan, identity: {...plan.identity, url: 'https://d3js.org/'}}} as never, external)).length);
+  assert.ok((await reader.check!(output as never, ctx({canonical, host: 'd3js.org'}))).length, 'ordinary paths retain their different-page contract');
+  const input = await shotReview({resolve: (value: string) => value} as EvidenceStore).input(external);
+  assert.ok(input.text.includes('d3-color-1241bf3b'));
+  assert.ok(input.text.includes(understanding.takeaway.text));
+  assert.match(input.text, /兄弟|sibling/);
+  assert.match(input.text, /API|技术库/);
+  assert.ok(input.text.includes('browser-native') && input.text.includes('2000'));
+});
 
 test("style sends invisible subjects back to photography through processing and review", async () => {
   const result = await style({} as EvidenceStore).after!(hidden, ctx({ kind: "component-source", shots: {} }), { rounds: 1 } as never);

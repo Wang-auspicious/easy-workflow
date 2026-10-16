@@ -9,15 +9,15 @@ import type { Camera } from "./Canvas.tsx";
 const W = 180, H = 112;
 
 export function Minimap({ geo, cam, box, setCam }: { geo: Geometry; cam: Camera; box: RefObject<HTMLDivElement | null>; setCam: (c: Camera) => void }) {
-  useStore((s) => s.version);
   const [hidden, setHidden] = useState(true);
+  useStore(state => hidden ? 0 : state.version);
+  if (hidden) return <button className="minimap-show icon-btn" aria-label="显示小地图" onPointerDown={(e) => e.stopPropagation()} onClick={() => setHidden(false)} data-tip="显示小地图" data-tip-side="top"><MapIcon size={15} /></button>;
   const b = geo.bounds;
   const s = Math.min(W / (b.w + 200), H / (b.h + 200));
   const ox = (W - b.w * s) / 2 - b.x * s, oy = (H - b.h * s) / 2 - b.y * s;
   const r = box.current?.getBoundingClientRect();
   const vw = r ? r.width / cam.k : 0, vh = r ? r.height / cam.k : 0;
   const vx = -cam.x / cam.k, vy = -cam.y / cam.k;
-  if (hidden) return <button className="minimap-show icon-btn" onPointerDown={(e) => e.stopPropagation()} onClick={() => setHidden(false)} data-tip="显示小地图" data-tip-side="top"><MapIcon size={15} /></button>;
   const panTo = (e: React.PointerEvent<SVGSVGElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const wx = (e.clientX - rect.left - ox) / s, wy = (e.clientY - rect.top - oy) / s;
@@ -36,7 +36,7 @@ export function Minimap({ geo, cam, box, setCam }: { geo: Geometry; cam: Camera;
         })}
         <rect x={ox + vx * s} y={oy + vy * s} width={vw * s} height={vh * s} className="minimap-view" />
       </svg>
-      <button className="minimap-hide" onClick={() => setHidden(true)} data-tip="隐藏小地图" data-tip-side="top"><EyeOff size={12} /></button>
+      <button className="minimap-hide" aria-label="隐藏小地图" onClick={() => setHidden(true)} data-tip="隐藏小地图" data-tip-side="top"><EyeOff size={12} /></button>
     </div>
   );
 }

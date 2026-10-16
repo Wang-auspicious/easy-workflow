@@ -26,7 +26,7 @@ export class ChannelSupervisor {
     this.f = factory;
     const replayData = new Map<string, Record<string, unknown>>();
     const emissions: Extract<Stamped, { kind: 'channel.emitted' }>[] = [];
-    for (const event of factory.journal.read()) {
+    for (const event of factory.journal.readKinds(['token.data', 'channel.emitted', 'channel.delivery'])) {
       this.project(event, replayData);
       if (event.kind === 'channel.emitted') emissions.push(event);
     }

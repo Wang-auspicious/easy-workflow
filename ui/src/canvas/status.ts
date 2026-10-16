@@ -10,7 +10,8 @@ export interface NodeExecution {
 }
 
 export function recordNodeExecution(index: Record<string, NodeExecution>, attempt: AttemptState | undefined) {
-  const execution = attempt?.metrics?.execution;
+  const response = attempt?.metrics?.modelResponses?.at(-1);
+  const execution = attempt?.metrics?.execution ?? (response ? {adapter: response.dependency.adapter, model: response.model} : undefined);
   if (attempt && execution && attempt.startedAt >= (index[attempt.node]?.at ?? 0)) {
     index[attempt.node] = {...execution, at: attempt.startedAt};
   }
@@ -36,31 +37,32 @@ const adapterNames: Record<string, string> = {
 export function nodeExecutionPresentation(
   node: Pick<CompiledNode, 'kind'>,
   actual: NodeExecution | undefined,
-  metadata: {effective: StationAgentBinding | null; error?: string} | undefined,
+  metadata: {effective: StationAgentBinding | null; error?: string; mode?: 'agent' | 'model-assist'} | undefined,
   replay = false,
 ) {
   if (node.kind === 'source' || node.kind === 'store') {
     return {label: node.kind === 'store' ? '资源库' : '来源', usesModel: false};
   }
   const usesModel = Boolean(metadata) || node.kind === 'agent' || node.kind === 'review';
+  const prefix = metadata?.mode === 'model-assist' ? '程序 · 模型辅助 ' : '';
   if (!usesModel) {
     return {label: node.kind === 'gate' ? '规则门禁 · 程序' : '程序执行', usesModel: false};
   }
   if (actual) {
     const adapter = adapterNames[actual.adapter] ?? actual.adapter;
     const model = actual.model === 'unreported' ? '模型未回报' : actual.model;
-    return {label: `${adapter} · ${model}（实际）`, usesModel};
+    return {label: `${prefix}${adapter} · ${model}（实际）`, usesModel};
   }
   if (replay) {
-    return {label: 'Agent · 历史执行模型未记录', usesModel};
+    return {label: prefix ? `${prefix}· 历史模型未记录` : 'Agent · 历史执行模型未记录', usesModel};
   }
   if (metadata?.error) {
-    return {label: 'Agent · 配置错误', usesModel};
+    return {label: prefix ? `${prefix}· 配置错误` : 'Agent · 配置错误', usesModel};
   }
   const binding = metadata?.effective;
   const adapter = binding ? adapterNames[binding.adapter] ?? binding.adapter : '';
   return {
-    label: binding ? `${adapter} · ${binding.model || '默认模型'}（配置）` : 'Agent · 配置待同步',
+    label: binding ? `${prefix}${adapter} · ${binding.model || '默认模型'}（配置）` : prefix ? `${prefix}· 配置待同步` : 'Agent · 配置待同步',
     usesModel,
   };
 }

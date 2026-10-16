@@ -178,6 +178,7 @@ export function Canvas({ active }: { active: boolean }) {
   };
 
   const zoomAt = (cx: number, cy: number, factor: number) => {
+    if (getState().follow) setState({follow: false});
     fitMode.current = false;
     workMode.current = false;
     cancelAnimationFrame(anim.current);
@@ -198,7 +199,11 @@ export function Canvas({ active }: { active: boolean }) {
       if (getState().follow) setState({ follow: false });
       const mouseWheel = e.deltaMode === 1 || (Math.abs(e.deltaY) >= 100 && Math.abs(e.deltaX) < 1 && Number.isInteger(e.deltaY));
       if (e.ctrlKey || e.metaKey || mouseWheel) zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * (e.ctrlKey ? 0.012 : 0.0016)));
-      else setCam({ ...camRef.current, x: camRef.current.x - e.deltaX, y: camRef.current.y - e.deltaY });
+      else {
+        fitMode.current = false;
+        workMode.current = false;
+        setCam({ ...camRef.current, x: camRef.current.x - e.deltaX, y: camRef.current.y - e.deltaY });
+      }
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -208,6 +213,7 @@ export function Canvas({ active }: { active: boolean }) {
     if (e.button !== 0 && e.button !== 1) return;
     const target = e.target as HTMLElement;
     if (target.closest(".inspector, .hud, .controls, .minimap, .replay-bar, .hud-card, .thumb, button, a, input")) return;
+    boxRef.current?.focus({preventScroll: true});
     const nodeEl = target.closest("[data-node]") as HTMLElement | null;
     const capsuleEl = target.closest("[data-capsule]") as HTMLElement | null;
     cancelAnimationFrame(anim.current);
@@ -274,16 +280,24 @@ export function Canvas({ active }: { active: boolean }) {
       setMarquee({ x0: w0.x, y0: w0.y, x1: w0.x, y1: w0.y });
       const move = (ev: PointerEvent) => { const w = toWorld(ev.clientX, ev.clientY); setMarquee({ x0: w0.x, y0: w0.y, x1: w.x, y1: w.y }); };
       const up = (ev: PointerEvent) => {
-        window.removeEventListener("pointermove", move);
-        window.removeEventListener("pointerup", up);
+        cleanup();
         const w = toWorld(ev.clientX, ev.clientY);
         const x0 = Math.min(w0.x, w.x), x1 = Math.max(w0.x, w.x), y0 = Math.min(w0.y, w.y), y1 = Math.max(w0.y, w.y);
         const hit = geoRef.current.nodes.filter(({ place: p }) => p.x < x1 && p.x + p.w > x0 && p.y < y1 && p.y + p.h > y0).map(({ node }) => node.key);
         setState({ selected: [...new Set([...getState().selected, ...hit])] });
         setMarquee(null);
       };
+      const cancel = () => { cleanup(); setMarquee(null); };
+      const cleanup = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        window.removeEventListener('pointercancel', cancel);
+        gestureCleanup.current = null;
+      };
+      gestureCleanup.current = cancel;
       window.addEventListener("pointermove", move);
       window.addEventListener("pointerup", up);
+      window.addEventListener('pointercancel', cancel);
       return;
     }
     // Pan.
@@ -295,23 +309,40 @@ export function Canvas({ active }: { active: boolean }) {
       setCam({ ...c0, x: c0.x + ev.clientX - start.x, y: c0.y + ev.clientY - start.y });
     };
     const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
+      cleanup();
       if (!moved && getState().selected.length) setState({ selected: [] });
     };
+    const cleanup = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', cleanup);
+      gestureCleanup.current = null;
+    };
+    gestureCleanup.current = cleanup;
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+    window.addEventListener('pointercancel', cleanup);
   };
 
   const onDoubleClick = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest("[data-node], [data-capsule], .inspector, .hud, .controls, .minimap, .hud-card")) return;
+    if (getState().follow) setState({follow: false});
     fitAll();
   };
 
   useEffect(() => {
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).closest("input, textarea")) return;
+      const target = e.target;
+      if (e.defaultPrevented || e.isComposing || e.ctrlKey || e.metaKey || e.altKey ||
+          !(target instanceof Element) ||
+          target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="dialog"], [aria-modal="true"]') ||
+          (target !== document.body && !boxRef.current?.contains(target))) return;
+      if (!['f', 'F', 'w', 'W', '0', 'Escape', '=', '+', '-'].includes(e.key)) return;
+      // A focused button keeps its own shortcuts. Escape may still dismiss its card.
+      if (e.key !== 'Escape' && target.closest('button, a, .inspector')) return;
+      e.preventDefault();
+      if (getState().follow) setState({follow: false});
       if (e.key === "f" || e.key === "F") fitAll();
       if (e.key === "w" || e.key === "W") focusWork();
       if (e.key === "0" && !e.altKey) { const box = boxRef.current!.getBoundingClientRect(); zoomAt(box.left + box.width / 2, box.top + box.height / 2, 1 / camRef.current.k); }
@@ -340,6 +371,9 @@ export function Canvas({ active }: { active: boolean }) {
   return (
     <div
       ref={boxRef}
+      tabIndex={0}
+      role="region"
+      aria-label="工作流画布"
       className={`cv ${cam.k < 0.5 ? "is-overview" : ""} ${live ? "is-dragging" : ""} ${follow ? "is-follow" : ""}`}
       onPointerDown={onPointerDown}
       onDoubleClick={onDoubleClick}
@@ -360,8 +394,8 @@ export function Canvas({ active }: { active: boolean }) {
         {marquee && <div className="marquee" style={{ left: Math.min(marquee.x0, marquee.x1), top: Math.min(marquee.y0, marquee.y1), width: Math.abs(marquee.x1 - marquee.x0), height: Math.abs(marquee.y1 - marquee.y0) }} />}
       </div>
       <Hud />
-      <Controls cam={cam} zoomBy={(f) => { const b = boxRef.current!.getBoundingClientRect(); zoomAt(b.left + b.width / 2, b.top + b.height / 2, f); }} fitAll={() => fitAll()} focusWork={() => focusWork()} resetLayout={resetLayout} />
-      <Minimap geo={geo} cam={cam} box={boxRef} setCam={(c) => { fitMode.current = false; workMode.current = false; cancelAnimationFrame(anim.current); setCam(c); }} />
+      <Controls cam={cam} zoomBy={(f) => { const b = boxRef.current!.getBoundingClientRect(); zoomAt(b.left + b.width / 2, b.top + b.height / 2, f); }} fitAll={() => { setState({follow: false}); fitAll(); }} focusWork={() => { setState({follow: false}); focusWork(); }} resetLayout={resetLayout} />
+      <Minimap geo={geo} cam={cam} box={boxRef} setCam={(c) => { fitMode.current = false; workMode.current = false; cancelAnimationFrame(anim.current); if (getState().follow) setState({follow: false}); setCam(c); }} />
       <Inspectors geo={geo} cam={cam} />
       <ReplayBar />
     </div>

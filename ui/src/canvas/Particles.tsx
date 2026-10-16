@@ -1,7 +1,7 @@
 // Goods flowing along the edges: every transfer in the journal becomes a cargo tag — a
 // coloured dot with the item's domain — riding its bezier (CSS offset-path). Long carriage
 // returns take a little longer than short hops; returns ride amber and backwards (§10.5).
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { roleColors } from "../../../shared/palette.ts";
 import { getState, onEvent, setState } from "../store.ts";
 import type { Geometry } from "./geometry.ts";
@@ -10,7 +10,7 @@ import { shortItem } from "./stats.ts";
 interface P { id: number; edge: string; token: string; label: string; color: string; ret: boolean; delay: number }
 let seq = 0;
 
-export function Particles({ geo }: { geo: Geometry }) {
+export const Particles = memo(function Particles({ geo }: { geo: Geometry }) {
   const [ps, setPs] = useState<P[]>([]);
   const geoRef = useRef(geo);
   geoRef.current = geo;
@@ -60,4 +60,4 @@ export function Particles({ geo }: { geo: Geometry }) {
       })}
     </div>
   );
-}
+});

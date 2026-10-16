@@ -188,6 +188,8 @@ export interface AttemptMetrics {
   modelResponses?: ModelResponse[];
   /** Actual token receipts, including clients that disclose no monetary cost. */
   tokenUsage?: ModelTokenUsage;
+  /** Dedicated typed-inference receipts; added exactly once to chat-model totals. */
+  decisionUsage?: {input: number; output: number; requests: number; reported: number};
   costReported?: boolean;
   costComplete?: boolean;
   usageReported?: boolean;

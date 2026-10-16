@@ -1547,8 +1547,8 @@ test('project defaults, dispatcher turns and concurrent station contexts remain 
     assert.ok(requests.some(request => request.provider === 'b' && request.body.includes('Independent dispatch 0')));
     assert.ok(requests.some(request => request.provider === 'a' && request.body.includes('Independent dispatch 1')));
     for (const dispatcher of dispatchers) dispatcher.interrupt();
-    assert.throws(() => left.setAgentDefaults({dispatcher: {adapter: 'launcher', command: ['never-run'], model: 'unused'}}),
-      /主调度目前支持 Pi/);
+    left.setAgentDefaults({dispatcher: {adapter: 'launcher', command: ['never-run'], model: 'unused'}});
+    assert.equal(left.dispatcherModelStatus().id, 'unused', 'configuring a native dispatcher must not launch it');
     const persisted = left.getAgentDefaults();
     left.recovery.close(); await left.sources.close(); left.channels?.close(); await left.runtime.close();
     left.docs.flush(); left.lessons.close(); left.journal.close();

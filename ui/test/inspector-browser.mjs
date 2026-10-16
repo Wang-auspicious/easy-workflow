@@ -6,7 +6,7 @@ import path from "node:path";
 import { createServer } from "vite";
 import { chromium } from "playwright-core";
 
-const server = await createServer({ configFile: path.resolve("ui/vite.config.ts"), logLevel: "error", server: { host: "127.0.0.1", port: 0, strictPort: false } });
+const server = await createServer({ configFile: path.resolve("ui/vite.config.ts"), logLevel: "error", server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false } });
 await server.listen();
 const address = server.httpServer.address();
 const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
@@ -16,6 +16,17 @@ const errors = [];
 let page;
 try {
   page = await browser.newPage({ viewport: { width: 1000, height: 900 } });
+  await page.addInitScript(() => {
+    // The fixture supplies journal events directly; snapshot refreshes must not
+    // open an actual backend stream or turn a synthetic connection into an error.
+    window.EventSource = class extends EventTarget {
+      constructor() {
+        super();
+        queueMicrotask(() => this.onopen?.(new Event('open')));
+      }
+      close() {}
+    };
+  });
   page.on("pageerror", (error) => errors.push(error.message));
   const calls = [];
   const savedBindings = [];
@@ -36,10 +47,18 @@ try {
   const defaultWrites = [];
   const admissionWrites = [];
   const candidateRetries = [];
+  const workerWrites = [];
+  const pullWrites = [];
+  let releasePull;
+  const scopeWrites = [];
+  let holdWorkers = false;
+  let rejectWorkers = false;
+  let releaseWorkers;
   let rejectCandidateRetry = false;
   let holdCandidateRetry = false;
   let releaseCandidateRetry;
   let rejectDefaultSave = false;
+  let exposeModelAssist = false;
   const bindingResult = () => ({bindings: [{
     node: 'curation/review', configured,
     effective: configured?.adapter === 'pi'
@@ -55,6 +74,31 @@ try {
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(url.pathname);
+    if (url.pathname === '/api/pull') {
+      pullWrites.push(route.request().postDataJSON());
+      await new Promise(resolve => { releasePull = resolve; });
+      await route.fulfill({json: {ok: true, pulled: 0}});
+      return;
+    }
+    if (url.pathname === '/api/workers') {
+      workerWrites.push(route.request().postDataJSON());
+      if (holdWorkers) await new Promise(resolve => { releaseWorkers = resolve; });
+      await route.fulfill({json: {ok: !rejectWorkers}});
+      return;
+    }
+    if (url.pathname === '/api/run') {
+      const request = route.request().postDataJSON();
+      scopeWrites.push(request);
+      await page.evaluate(request => window.inspectorFixture.emit({kind: 'scope.paused',
+        scope: request.line ? 'line' : 'station', key: request.line || request.station,
+        paused: request.action === 'pause', reason: request.reason}), request);
+      await route.fulfill({json: {ok: true, result: {}}});
+      return;
+    }
+    if (url.pathname === '/api/state') {
+      await route.fulfill({json: await page.evaluate(() => window.inspectorFixture.getState().fs)});
+      return;
+    }
     if (url.pathname === '/api/candidates/retry') {
       const request = route.request().postDataJSON();
       candidateRetries.push(request);
@@ -88,8 +132,11 @@ try {
       return;
     }
     if (url.pathname === '/api/factory') {
-      const factory = await page.evaluate(() => window.inspectorFixture.getState().factory);
-      await route.fulfill({json: {factory, defaultLayout: null, agentBindings: bindingResult().bindings,
+      const snapshot = await page.evaluate(() => {
+        const state = window.inspectorFixture.getState();
+        return {factory: state.factory, defaultLayout: state.defaultLayout, layout: state.layout, settings: state.settings};
+      });
+      await route.fulfill({json: {...snapshot, agentBindings: bindingResult().bindings,
         agentDefaults: projectDefaults, model: projectDefaults.dispatcher.model, keyPresent: true}});
       return;
     }
@@ -116,6 +163,12 @@ try {
     }
     if (url.pathname === '/api/tools/agent_bindings') {
       const args = route.request().postDataJSON();
+      if (args.node === 'curation/capture' && exposeModelAssist) {
+        const result = bindingResult();
+        await route.fulfill({json: {ok: true, result: {...result, bindings: [{...result.bindings[0],
+          node: args.node, mode: 'model-assist', capabilities: {...result.bindings[0].capabilities, resume: false}}]}}});
+        return;
+      }
       await route.fulfill({json: {ok: true, result: !args.node || args.node === 'curation/review' ? bindingResult() : {bindings: []}}});
       return;
     }
@@ -134,6 +187,45 @@ try {
   await page.goto(`http://127.0.0.1:${address.port}/test/inspector-fixture.html`);
   await page.locator(".insp-title b").waitFor();
   assert.match(await page.locator(".insp-title b").innerText(), /截图审查员/);
+
+  // Inspectors must remain read-only during replay/disconnection, including staff controls.
+  const addWorker = page.getByRole('button', {name: '加一个人', exact: true});
+  const lockWorkers = page.getByRole('button', {name: '锁定人数', exact: true});
+  await page.evaluate(() => window.inspectorFixture.setState({connected: false}));
+  assert.equal(await addWorker.isDisabled(), true);
+  assert.equal(await lockWorkers.isDisabled(), true);
+  await page.evaluate(() => window.inspectorFixture.setState({connected: true,
+    replay: {run: 'fixture-run', speed: 1, playing: false, at: Date.now(), start: 1, end: Date.now(), events: [], cursor: 0}}));
+  assert.equal(await addWorker.isDisabled(), true);
+  assert.equal(await lockWorkers.isDisabled(), true);
+  assert.equal(workerWrites.length, 0);
+  await page.evaluate(() => window.inspectorFixture.setState({replay: null}));
+  holdWorkers = true;
+  rejectWorkers = true;
+  const workerRequest = page.waitForRequest(request => request.url().endsWith('/api/workers'));
+  await addWorker.dblclick();
+  await workerRequest;
+  assert.equal(workerWrites.length, 1, 'double click sends one staff mutation');
+  assert.equal(await lockWorkers.isDisabled(), true);
+  holdWorkers = false;
+  releaseWorkers();
+  await page.getByRole('alert').filter({hasText: '没有增加工人'}).waitFor();
+  rejectWorkers = false;
+  await lockWorkers.click();
+  assert.equal(await page.getByRole('alert').count(), 0, 'a new successful mutation clears the old failure');
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    fixture.emit({kind: 'scope.paused', scope: 'line', key: 'curation', paused: true, reason: 'fixture'});
+    fixture.emit({kind: 'scope.paused', scope: 'station', key: 'curation/review', paused: true, reason: 'fixture'});
+  });
+  await page.getByRole('button', {name: '恢复所属流水线', exact: true}).click();
+  await page.waitForFunction(() => !window.inspectorFixture.getState().fs.pausedScopes.lines.includes('curation'));
+  assert.equal(await page.evaluate(() => window.inspectorFixture.getState().fs.pausedScopes.stations.includes('curation/review')), true,
+    'line resume cannot clear an independent station pause');
+  await page.getByRole('button', {name: '恢复此工位', exact: true}).click();
+  await page.waitForFunction(() => !window.inspectorFixture.getState().fs.pausedScopes.stations.includes('curation/review'));
+  assert.deepEqual(scopeWrites.map(request => [request.action, request.line || request.station]),
+    [['resume', 'curation'], ['resume', 'curation/review']]);
 
   // 人：含自动 fork 出来的和被撤下的，各带自己的小人。
   assert.equal(await page.locator(".crew-row").count(), 3);
@@ -289,6 +381,23 @@ try {
   rejectDefaultSave = false;
   await stationDefaults.getByRole('button', {name: '重新读取', exact: true}).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="工位默认配置"] [aria-label="Agent 请求模型"]').value === 'muse-spark-1.3-contributor');
+  for (const adapter of ['opencode', 'claude-code', 'codex', 'launcher']) {
+    await dispatcherDefaults.getByLabel('执行适配器').selectOption(adapter);
+    if (adapter === 'launcher') {
+      await dispatcherDefaults.getByLabel('Agent 启动命令').fill('["fixture-must-not-launch"]');
+      await dispatcherDefaults.getByLabel('Agent 请求模型').fill('fixture-native');
+    }
+    await dispatcherDefaults.getByRole('button', {name: '保存主调度'}).click();
+    await dispatcherDefaults.getByRole('status').waitFor();
+    assert.equal(projectDefaults.dispatcher.adapter, adapter);
+    assert.equal(projectDefaults.station.model, 'muse-spark-1.3-contributor', 'the dispatcher harness is independent');
+    assert.match(await page.locator('.set-sec').first().innerText(), /由所选客户端管理，实际调用时验证/);
+    assert.match(await dispatcherDefaults.getByRole('status').innerText(), /新对话.*当前对话及检查点保留原选择/);
+  }
+  await dispatcherDefaults.getByLabel('执行适配器').selectOption('pi');
+  await dispatcherDefaults.getByLabel('主调度已接入模型').selectOption({label: 'opencode-go / Muse Spark 1.3 Contributor'});
+  await dispatcherDefaults.getByRole('button', {name: '保存主调度'}).click();
+  await dispatcherDefaults.getByRole('status').waitFor();
   await page.locator('.set-sec').first().screenshot({path: path.join(out, 'project-model-defaults.png')});
   await page.evaluate(() => {
     const fixture = window.inspectorFixture;
@@ -317,6 +426,12 @@ try {
   await page.getByRole('button', {name: '规格', exact: true}).click();
   await settings.getByText('程序执行，不使用 Agent 模型。').waitFor();
   assert.equal(await settings.getByLabel('执行适配器').count(), 0, 'programs never show a fake Agent selector');
+  exposeModelAssist = true;
+  await settings.getByRole('button', {name: '重新读取配置'}).click();
+  await settings.getByText('程序的模型辅助', {exact: true}).waitFor();
+  assert.match(await settings.innerText(), /程序完成采集.*模型辅助/);
+  assert.equal(await settings.getByLabel('执行适配器').count(), 1, 'program helpers expose their own model executor');
+  assert.match(await settings.locator('.agent-binding-capabilities').innerText(), /续接 不支持/);
   const policyDetails = page.getByRole('region', {name: '自动恢复策略'});
   assert.match(await policyDetails.innerText(), /网络超时.*最多 5 次.*首次 2 秒.*×2.*最长 30 秒.*±20%.*60 秒.*暂停.*转人工复核/s);
   assert.equal(await policyDetails.locator('input, select, button').count(), 0, 'policy details are read-only');
@@ -450,6 +565,121 @@ try {
   assert.equal(detailRequests.length, liveDetailCount, 'historical replay renders original steps without reading live details');
 
   await page.locator(".inspector").screenshot({ path: path.join(out, "station-card.png") });
+
+  await page.emulateMedia({reducedMotion: 'reduce'});
+  await page.goto(`http://127.0.0.1:${address.port}/test/inspector-fixture.html?canvas=1`);
+  const canvas = page.getByRole('region', {name: '工作流画布'});
+  await canvas.waitFor();
+  await page.evaluate(() => window.inspectorFixture.setState({connected: false}));
+  assert.equal(await page.getByRole('button', {name: '投料', exact: true}).isDisabled(), true);
+  assert.equal(await page.getByRole('button', {name: '暂停', exact: true}).isDisabled(), true);
+  assert.equal(await page.getByRole('button', {name: '结束本轮', exact: true}).isDisabled(), true);
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    const fs = fixture.getState().fs;
+    fixture.setState({connected: true, fs: {...fs, nodes: {...fs.nodes,
+      'candidates/pool': {...fs.nodes['curation/capture'], key: 'candidates/pool', stock: 5}}}});
+  });
+  await page.getByRole('button', {name: '投料', exact: true}).click();
+  const pullRequest = page.waitForRequest(request => request.url().endsWith('/api/pull'));
+  await page.getByRole('button', {name: '取货并开始', exact: true}).dblclick();
+  await pullRequest;
+  assert.equal(pullWrites.length, 1, 'double-clicking intake cannot submit the same batch twice');
+  assert.equal(await page.getByRole('button', {name: '正在取货…', exact: true}).isDisabled(), true);
+  releasePull();
+  await page.getByRole('alert').filter({hasText: '当前分类没有可取出的候选'}).waitFor();
+  assert.equal(await page.locator('.pull-card').count(), 1, 'empty intake does not pretend work has started or discard the form');
+  await page.getByRole('button', {name: '取消', exact: true}).click();
+  const node = page.locator('[data-node="curation/review"]');
+  await node.focus();
+  await node.press('Enter');
+  await page.locator('[data-inspector="curation/review"]').waitFor();
+  await node.press('Shift+Space');
+  assert.deepEqual(await page.evaluate(() => window.inspectorFixture.getState().selected), ['curation/review']);
+  const transform = () => page.locator('.cv-world').evaluate(element => element.style.transform);
+  const originalTransform = await transform();
+  await canvas.evaluate(element => {
+    for (const key of ['f', 'w', '0', '+', '-']) {
+      element.dispatchEvent(new KeyboardEvent('keydown', {key, ctrlKey: true, bubbles: true}));
+      element.dispatchEvent(new KeyboardEvent('keydown', {key, metaKey: true, bubbles: true}));
+    }
+    for (const tag of ['select', 'div']) {
+      const input = document.createElement(tag);
+      if (tag === 'div') input.contentEditable = 'true';
+      element.append(input);
+      input.dispatchEvent(new KeyboardEvent('keydown', {key: '0', bubbles: true}));
+      input.remove();
+    }
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    element.append(dialog);
+    dialog.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+    dialog.remove();
+  });
+  assert.equal(await transform(), originalTransform, 'editing and host shortcuts cannot move the canvas');
+  assert.equal(await page.locator('[data-inspector="curation/review"]').count(), 1,
+    'Escape owned by another dialog must not close the station inspector');
+  await canvas.focus();
+  await canvas.press('Escape');
+  assert.equal(await page.locator('.inspector').count(), 0);
+  await page.evaluate(() => window.inspectorFixture.setState({follow: true}));
+  await page.getByRole('button', {name: '放大画布', exact: true}).click();
+  assert.equal(await page.evaluate(() => window.inspectorFixture.getState().follow), false);
+  await canvas.focus();
+  await canvas.press('0');
+  assert.equal(await page.locator('.ctl-zoom').innerText(), '100%');
+  const blank = await canvas.evaluate(element => {
+    const box = element.getBoundingClientRect();
+    for (let y = box.top + 180; y < box.bottom - 100; y += 45) {
+      for (let x = box.left + 16; x < box.right - 16; x += 45) {
+        const target = document.elementFromPoint(x, y);
+        if (element.contains(target) && !target.closest('[data-node], [data-capsule], .inspector, .hud, .controls, .minimap, .replay-bar, button')) return {x, y};
+      }
+    }
+    throw new Error('Fixture has no blank canvas location');
+  });
+  await page.mouse.move(blank.x, blank.y);
+  await page.mouse.down({button: 'middle'});
+  await page.mouse.move(blank.x + 20, blank.y + 20);
+  await page.evaluate(() => window.dispatchEvent(new PointerEvent('pointercancel')));
+  const cancelledPan = await transform();
+  await page.mouse.move(blank.x + 70, blank.y + 70);
+  assert.equal(await transform(), cancelledPan, 'cancelled pointer gestures cannot keep panning');
+  await page.mouse.up({button: 'middle'});
+  await page.mouse.move(blank.x, blank.y);
+  await page.keyboard.down('Shift');
+  await page.mouse.down();
+  await page.mouse.move(blank.x + 15, blank.y + 15);
+  assert.equal(await page.locator('.marquee').count(), 1);
+  await page.evaluate(() => window.dispatchEvent(new PointerEvent('pointercancel')));
+  assert.equal(await page.locator('.marquee').count(), 0, 'pointer cancellation clears the selection rectangle');
+  await page.mouse.up();
+  await page.keyboard.up('Shift');
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    const at = fixture.getState().fs.attempts.a2.startedAt + 5000;
+    fixture.setState({inspectors: [{key: 'curation/review', kind: 'node', x: 20, y: 20, pinned: false}],
+      replay: {run: 'fixture-run', speed: 1, playing: false, at, start: 1, end: Date.now(), events: [], cursor: 0}});
+  });
+  await page.locator('.crew-row').nth(1).click();
+  assert.equal(await page.locator('.wt-input .num').innerText(), '5.0s', 'history uses the replay position for ongoing attempt duration');
+  await page.evaluate(() => window.inspectorFixture.setState({replay: null}));
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    fixture.emit({kind: 'attempt.finished', attempt: 'a2', ok: true, summary: '原生用量回执', ms: 1000,
+      metrics: {usageReported: true, tokenUsage: {input: 84, output: 16}, costReported: false}});
+    fixture.setState({inspectors: [{key: 'curation/review', kind: 'node', x: 20, y: 20, pinned: false}]});
+  });
+  await page.locator('.crew-row').nth(1).click();
+  assert.match(await page.locator('.wt-foot').innerText(), /100 tok/);
+  await page.getByRole('button', {name: '统计', exact: true}).click();
+  assert.match(await page.locator('.node-metrics-row').last().innerText(), /1,284 tok.*316 tok/s,
+    'token-only model receipts are included in station input/output totals');
+  await page.evaluate(() => {
+    const fixture = window.inspectorFixture;
+    fixture.setState({factory: {...fixture.getState().factory, nodes: []}});
+  });
+  assert.equal(await page.locator('.inspector').count(), 0, 'a removed station cannot crash its stale inspector');
   assert.deepEqual(errors, [], `页面不能有运行时错误：${errors.join(" | ")}`);
   console.log(`PASS: isolated station card checks, screenshot in ${path.relative(process.cwd(), out)}`);
 } catch (error) {

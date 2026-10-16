@@ -97,16 +97,45 @@ test("scout waits for the shared browser only when HTTP cannot supply the dossie
     });
     await t.test("both browser tools release a granted slot when cancellation prevents page creation", async () => {
       const { Toolbox } = await import("../server/toolbox.ts");
-      for (const name of ["page_text", "page_find"] as const) {
-        const broker = new Broker({ browser: 1 }, 0), ctrl = new AbortController();
-        const acquire = broker.acquire.bind(broker);
-        broker.acquire = async (cls, opts) => {
-          const lease = await acquire(cls, opts);
-          ctrl.abort(new Error("fixture cancellation after grant")); return lease;
-        };
-        const toolbox = new Toolbox({ broker, journal: {} as never, docs: () => { throw new Error("unused fixture docs"); } });
-        await assert.rejects(toolbox.call([name], name, name === "page_text" ? { url: base } : { url: base, query: "source" }, { node: "curation/facts", signal: ctrl.signal }), /fixture cancellation after grant/);
-        assert.equal(broker.used.browser, 0, `${name} must return the slot even though openPage rejected`);
+      const {Journal} = await import('../server/journal.ts');
+      const {Docs} = await import('../server/docs.ts');
+      const {compile} = await import('../server/spec/compile.ts');
+      const {pack} = await import('../packs/vislexicon/pack.ts');
+      const {initialState} = await import('../shared/project.ts');
+      const journal = new Journal(path.join(root, 'toolbox-cancellation.db'));
+      const compiled = compile([pack]);
+      const docs = new Docs({journal, compiled, state: initialState(compiled)}, root, 'Cancellation fixture');
+      try {
+        for (const name of ['page_text', 'page_find'] as const) {
+          const broker = new Broker({browser: 1}, 0);
+          const ctrl = new AbortController();
+          const acquire = broker.acquire.bind(broker);
+          let grants = 0;
+          let releases = 0;
+          broker.acquire = async (cls, opts) => {
+            const lease = await acquire(cls, opts);
+            assert.ok(lease, `${name} must actually receive the shared browser lease`);
+            grants++;
+            assert.equal(broker.used.browser, 1);
+            ctrl.abort(new Error('fixture cancellation after grant'));
+            return {...lease, release: () => {
+              releases++;
+              lease.release();
+            }};
+          };
+          const toolbox = new Toolbox({broker, journal, docs: () => docs});
+          const visits = browserVisits;
+          await assert.rejects(toolbox.call([name], name,
+            name === 'page_text' ? {url: base} : {url: base, query: 'source'},
+            {node: 'curation/facts', signal: ctrl.signal}), /fixture cancellation after grant/);
+          assert.equal(grants, 1, `${name} cancellation happens after capacity was granted`);
+          assert.equal(releases, 1, `${name} must release its granted lease exactly once`);
+          assert.equal(broker.used.browser, 0, `${name} must return the slot even though openPage rejected`);
+          assert.equal(browserVisits, visits, `${name} must not navigate after cancellation`);
+        }
+      } finally {
+        docs.flush();
+        journal.close();
       }
     });
   } finally {

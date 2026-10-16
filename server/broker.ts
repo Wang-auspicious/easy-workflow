@@ -1,16 +1,22 @@
 // Resource broker (Spec §6.3, §30.6): one set of global quotas shared by every line.
-// Browser pages default to 8 and shrink with free memory (≈250MB per page above the
-// floor), then grow back when memory recovers. Model workers hold lifecycle
+// Browser pages shrink with physical RAM and system commit headroom. Verified
+// commit permits one controlled page below the ordinary RAM floor, but cannot
+// bypass the physical emergency floor. Model workers hold lifecycle
 // leases; ModelRequests independently limits actual calls. The last model worker
 // is kept for reviewers so production stations cannot starve review.
-import os from "node:os";
+import os from 'node:os';
 import type {ModelCircuit, ModelDependency, ResourceClass} from '../shared/types.ts';
 import {ModelRequests} from './model-requests.ts';
+import {MEMORY_MAX_AGE_MS, physicalMemorySnapshot, readSystemMemory, refreshSystemMemory,
+  type MemorySnapshot} from './memory.ts';
 
 export interface Lease { cls: ResourceClass; id: number; release: () => void }
 
 const PRIORITY = { high: 0, mid: 1, low: 2 } as const;
 export const PAGE_MB = 250;
+export const PAGE_COMMIT_MB = 512;
+export const COMMIT_RESERVE_MB = 1024;
+export const PHYSICAL_EMERGENCY_MB = 512;
 
 export class Broker {
   limits: Record<string, number>;
@@ -25,7 +31,10 @@ export class Broker {
   private next = 1;
   private waiters = new Set<() => void>();
   onRelease: () => void = () => {};
-  freeMem: () => number = () => Math.round(os.freemem() / 1048576);
+  private readonly systemFreeMem = () => Math.round(os.freemem() / 1048576);
+  freeMem: () => number = this.systemFreeMem;
+  memorySnapshot: () => MemorySnapshot = () => this.freeMem === this.systemFreeMem ?
+    readSystemMemory() : {...physicalMemorySnapshot(), physicalAvailableMB: this.freeMem()};
 
   constructor(limits: Record<string, number>, memoryFloorMB = 1024) {
     this.limits = { ...limits };
@@ -33,14 +42,61 @@ export class Broker {
     this.modelRequests = new ModelRequests(() => this.limits.model ?? 1);
   }
 
-  freeMemMB() { return this.freeMem(); }
+  freeMemMB() { return this.memorySnapshot().physicalAvailableMB; }
+
+  async refreshMemory(): Promise<void> {
+    if (this.freeMem === this.systemFreeMem) await refreshSystemMemory();
+  }
+
+  memoryStatus() {
+    const memory = this.memorySnapshot();
+    const used = this.used.browser ?? 0;
+    const cap = Math.max(0, this.limits.browser ?? 1);
+    const physicalFloorMB = Math.max(0, this.memoryFloorMB);
+    const emergencyFloorMB = PHYSICAL_EMERGENCY_MB;
+    const commitKnown = memory.commitAvailableMB !== null && memory.commitLimitMB !== null &&
+      Date.now() - memory.checkedAt <= MEMORY_MAX_AGE_MS;
+    const commitAvailableMB = commitKnown ? memory.commitAvailableMB! : null;
+    let browserCapacity = cap;
+    let reason: string | null = null;
+    let mode: 'normal' | 'pressure' | 'blocked' = 'normal';
+    if (memory.physicalAvailableMB < emergencyFloorMB) {
+      browserCapacity = Math.min(cap, used);
+      mode = 'blocked';
+      reason = `物理可用内存 ${memory.physicalAvailableMB}MB < 紧急底线 ${emergencyFloorMB}MB`;
+    } else if (commitKnown && commitAvailableMB! < COMMIT_RESERVE_MB + PAGE_COMMIT_MB) {
+      browserCapacity = Math.min(cap, used);
+      mode = 'blocked';
+      reason = `系统提交余量 ${commitAvailableMB}MB < ${COMMIT_RESERVE_MB + PAGE_COMMIT_MB}MB`;
+    } else if (memory.physicalAvailableMB < physicalFloorMB) {
+      if (commitKnown) {
+        browserCapacity = Math.min(cap, 1);
+        mode = 'pressure';
+      } else {
+        browserCapacity = Math.min(cap, used);
+        mode = 'blocked';
+        reason = `空闲内存 ${memory.physicalAvailableMB}MB < ${physicalFloorMB}MB（物理 RAM），系统提交余量尚未验证`;
+      }
+    } else {
+      const sparePhysicalMB = memory.physicalAvailableMB - physicalFloorMB;
+      const physicalPages = Math.floor(Math.max(0, sparePhysicalMB) / PAGE_MB);
+      browserCapacity = Math.min(cap, sparePhysicalMB > 0 ? Math.max(1, used + physicalPages) : used);
+      if (commitKnown) {
+        const commitPages = Math.floor((commitAvailableMB! - COMMIT_RESERVE_MB) / PAGE_COMMIT_MB);
+        browserCapacity = Math.min(browserCapacity, used + commitPages);
+      }
+      if (browserCapacity <= used && cap > used) {
+        reason = `内存不足，物理可用 ${memory.physicalAvailableMB}MB 尚不足再分配一页`;
+      }
+    }
+    return {...memory, commitAvailableMB, commitLimitMB: commitKnown ? memory.commitLimitMB : null,
+      browserCapacity, mode, reason, physicalFloorMB, emergencyFloorMB,
+      commitReserveMB: COMMIT_RESERVE_MB, pageCommitMB: PAGE_COMMIT_MB};
+  }
 
   /** Browser pages allowed right now: the configured cap, shrunk while memory is short. */
   effectiveBrowser() {
-    const cap = this.limits.browser ?? 1;
-    const spare = this.freeMemMB() - this.memoryFloorMB;
-    if (spare <= 0) return Math.min(cap, this.used.browser ?? 0);
-    return Math.max(1, Math.min(cap, (this.used.browser ?? 0) + Math.floor(spare / PAGE_MB)));
+    return this.memoryStatus().browserCapacity;
   }
 
   /** Capacity for station lifecycles, distinct from concurrent model requests. */
@@ -69,7 +125,10 @@ export class Broker {
     }
     const limit = this.capacity(cls);
     const used = this.used[cls] ?? 0;
-    if (cls === "browser" && this.freeMemMB() < this.memoryFloorMB) return `空闲内存 ${this.freeMemMB()}MB < ${this.memoryFloorMB}MB`;
+    if (cls === 'browser') {
+      const memory = this.memoryStatus();
+      if (memory.reason && memory.browserCapacity <= used) return memory.reason;
+    }
     if (used >= limit) return cls === "browser" && limit < (this.limits.browser ?? 1) ? `browser ${used}/${limit}（内存不足，上限暂降自 ${this.limits.browser}）` : `${cls} ${used}/${limit}`;
     if (cls === "model" && !opts.review && used >= limit - 1 && limit > 1) return `model ${used}/${limit}（最后一个位置留给审查）`;
     return null;
@@ -99,6 +158,7 @@ export class Broker {
    * timer also observes memory recovery, which need not release an existing lease. */
   async acquire(cls: ResourceClass, opts: {review?: boolean; dependency?: ModelDependency; token?: string; signal?: AbortSignal; timeoutMs?: number} = {}): Promise<Lease | null> {
     opts.signal?.throwIfAborted();
+    if (cls === 'browser') void this.refreshMemory();
     const immediate = this.tryAcquire(cls, opts);
     if (immediate) return immediate;
     const timeout = opts.timeoutMs ?? 20000;
@@ -130,6 +190,6 @@ export class Broker {
 
   static order(p: keyof typeof PRIORITY) { return PRIORITY[p]; }
 
-  sample() { return { used: { ...this.used }, limits: { ...this.limits, browserEffective: this.effectiveBrowser(), modelWorkers: this.capacity('model') }, freeMemMB: this.freeMemMB(),
+  sample() { return { used: { ...this.used }, limits: { ...this.limits, browserEffective: this.effectiveBrowser(), modelWorkers: this.capacity('model') }, freeMemMB: this.freeMemMB(), memory: this.memoryStatus(),
     modelRequests: {active: this.modelRequests.active, queued: this.modelRequests.queued, limit: this.modelRequests.limit} }; }
 }

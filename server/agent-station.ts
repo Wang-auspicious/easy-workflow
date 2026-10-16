@@ -55,7 +55,7 @@ export interface AgentStationDef<T = any> {
   system: string;
   schema: TSchema;
   /** Skip the model entirely (e.g. style is not applicable to this kind). */
-  skip?: (ctx: StationContext) => StationResult | null;
+  skip?: (ctx: StationContext) => StationResult | null | Promise<StationResult | null>;
   input: (ctx: StationContext) => Promise<AgentInput> | AgentInput;
   check?: (out: T, ctx: StationContext) => string[];
   /** Last resort when the repaired answer still fails checks; null = fail the attempt. */
@@ -118,7 +118,7 @@ export async function runAgentStation<T>(def: AgentStationDef<T>, ctx: StationCo
 
 async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationContext): Promise<StationResult> {
   ctx.signal.throwIfAborted();
-  const skipped = def.skip?.(ctx);
+  const skipped = await def.skip?.(ctx);
   if (skipped) return skipped;
   const input = await def.input(ctx);
   ctx.signal.throwIfAborted();

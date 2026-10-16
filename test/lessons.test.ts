@@ -146,11 +146,11 @@ test('ordinary context reads retain only lesson records and do not rebuild the v
     f.create('ordinary', 'ordinary');
     f.emit({kind: 'attempt.started', attempt: 'ordinary-active', token: 'ordinary', node: station,
       worker: 'ordinary-worker', input: 'Ordinary production work'});
-    const read = f.journal.read.bind(f.journal);
+    const read = f.journal.readKinds.bind(f.journal);
     const reads: number[] = [];
-    const observer = t.mock.method(f.journal, 'read', function* (since = 0, run?: string, through?: number) {
+    const observer = t.mock.method(f.journal, 'readKinds', function* (kinds: Parameters<Journal['readKinds']>[0], since = 0, through?: number) {
       reads.push(since);
-      yield* read(since, run, through);
+      yield* read(kinds, since, through);
     });
     assert.equal(f.lessons.validationContext(station, 'ordinary', {token: 'ordinary', attempt: 'ordinary-active'}), '');
     assert.ok(reads.length > 0 && reads.every(since => since > 0),

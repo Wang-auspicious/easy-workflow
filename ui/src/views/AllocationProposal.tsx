@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import {useRef, useState} from 'react';
 import { SlidersHorizontal, Loader2 } from 'lucide-react';
 import { boot } from '../api.ts';
 import { getState, setState, useStore } from '../store.ts';
@@ -18,11 +18,14 @@ export function AllocationProposal() {
   const currentRun = useStore(s => s.fs.run.id);
   const disabled = useStore(s => !s.connected || Boolean(s.replay));
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
+  const flight = useRef(false);
   if (!proposal || proposal.runId !== currentRun || proposal.status !== 'proposed') return null;
   const decide = async (action: 'accept' | 'reject') => {
+    if (flight.current || !getState().connected || getState().replay) return;
+    flight.current = true;
     setBusy(true); setError('');
     try { await workflowCall('allocation_plan', { action, id: proposal.id }); await boot(); }
-    catch (reason) { setError((reason as Error).message); } finally { setBusy(false); }
+    catch (reason) { setError((reason as Error).message); } finally { flight.current = false; setBusy(false); }
   };
   const state = getState();
   return <section className="allocation-proposal" aria-label="实测配员建议">

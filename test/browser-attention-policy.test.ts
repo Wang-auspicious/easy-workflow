@@ -5,7 +5,53 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { createRequire } from 'node:module';
+import { spawn } from 'node:child_process';
 import { classifyFailure, candidateFailure } from '../shared/failures.ts';
+
+test('desktop background font downloads cannot open save dialogs while manual downloads remain available', {timeout: 30000}, async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-download-'));
+  const env = {...process.env};
+  delete env.ELECTRON_RUN_AS_NODE;
+  const child = spawn(createRequire(import.meta.url)('electron'), [path.resolve('test/fixtures/browser-download.cjs'), profile], {
+    env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '', errors = '';
+  child.stdout.on('data', value => {output += value;});
+  child.stderr.on('data', value => {errors += value;});
+  try {
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', resolve);
+    });
+    assert.equal(code, 0, errors);
+    const result = output.match(/^DOWNLOAD_RESULT (.+)$/m);
+    assert.ok(result, output + errors);
+    const decisions = JSON.parse(result[1]) as {owner: string; blocked: boolean}[];
+    assert.deepEqual(decisions.map(({owner, blocked}) => ({owner, blocked})), [
+      {owner: 'agent', blocked: true}, {owner: 'agent', blocked: true},
+      {owner: 'agent', blocked: true}, {owner: 'user', blocked: false},
+    ]);
+  } finally {
+    if (child.exitCode === null) child.kill();
+    assert.ok(path.resolve(profile).startsWith(path.join(path.resolve(os.tmpdir()), 'easy-workflow-download-')));
+    fs.rmSync(profile, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+  }
+});
+
+test('font assets are excluded from capture selection and rejected before browser navigation', async () => {
+  const {scoreLinks, visit} = await import('../packs/vislexicon/capture.ts');
+  const page = {goto: async () => {throw new Error('Unexpected font navigation');}};
+  const font = 'https://static.example.test/explore/specimen/font.ttf?download=1';
+  await assert.rejects(visit(page as never, font, 'example.test'), (error: any) => {
+    assert.equal(error.failure?.tag, 'needs_selection');
+    assert.equal(error.failure?.owner, 'agent');
+    assert.equal(error.failure?.requestedUrl, font);
+    return true;
+  });
+  const choices = ['font.ttf', 'font.otf', 'font.ttc', 'font.woff', 'font.woff2', 'specimen.html']
+    .map(file => ({href: `https://example.test/specimen/${file}?download=1`, text: 'Specimen', inNav: true}));
+  assert.deepEqual(scoreLinks(choices, {pathPatterns: ['specimen']}).map(link => new URL(link.href).pathname), ['/specimen/specimen.html']);
+});
 
 test('access-denied status and validation errors do not invent a request for user login', () => {
   const forbidden = classifyFailure('HTTP 403', { status: 403 });

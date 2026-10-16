@@ -105,3 +105,95 @@ async function exerciseStorageFailure(t: TestContext, boundary: 'result checkpoi
 
 test('result commit failure blocks the polluted runtime and restarts from durable checkpoints', { timeout: 15000 }, t => exerciseStorageFailure(t, 'result checkpoint'));
 test('attempt-start storage failure releases capacity and preserves queued work for restart', { timeout: 15000 }, t => exerciseStorageFailure(t, 'attempt start'));
+
+test('failed manual intake never leaves a durable task without its input or queue checkpoint', {timeout: 15000}, async () => {
+  for (const boundary of ['input', 'queue'] as const) {
+    let factory = new Factory();
+    try {
+      await factory.boot();
+      factory.broker.memoryFloorMB = 0;
+      factory.runtime.start(`Intake failure at ${boundary}`);
+      factory.runtime.pause();
+      const before = [...factory.journal.read()];
+      const tokens = Object.keys(factory.state.tokens);
+      const append = factory.journal.append.bind(factory.journal);
+      let rejectedToken = '';
+      factory.journal.append = event => {
+        if (event.kind === 'token.created') rejectedToken = event.token;
+        if (boundary === 'input' && event.kind === 'token.data' ||
+            boundary === 'queue' && event.kind === 'token.queued') {
+          throw new Error(`fixture intake failure at ${boundary}`);
+        }
+        return append(event);
+      };
+      assert.throws(() => factory.runtime.create('curation/facts', {
+        item: `missing-${boundary}`, url: 'https://fixture.test/', source: 'manual',
+        data: {paidArtifact: 'must accompany the durable task'},
+      }), /fixture intake failure/);
+      assert.equal(factory.runtime.running, false);
+      assert.equal(factory.runtime.paused, true);
+      assert.deepEqual([...factory.journal.read()], before);
+      assert.deepEqual(Object.keys(factory.state.tokens), tokens);
+      assert.throws(() => factory.runtime.resume(), /日志提交失败/);
+      factory.journal.append = append;
+      await close(factory);
+      factory = new Factory();
+      await factory.boot();
+      assert.equal(factory.runtime.tokens.has(rejectedToken), false);
+      assert.deepEqual(Object.keys(factory.state.tokens), tokens);
+    } finally {
+      await close(factory);
+    }
+  }
+  assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
+  fs.rmSync(root, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+});
+
+test('a failed resume receipt keeps queued work stopped until durable restart', {timeout: 15000}, async () => {
+  let factory = new Factory();
+  let calls = 0;
+  try {
+    await factory.boot();
+    factory.broker.memoryFloorMB = 0;
+    factory.runtime.start('Resume receipt failure');
+    factory.runtime.pause();
+    const token = factory.runtime.create('curation/facts', {
+      item: 'paused-intake', url: 'https://fixture.test/', source: 'manual', data: {kept: true},
+    });
+    factory.runtime.executors = () => async () => {
+      calls++;
+      return {ok: true, summary: 'fixture completed', finish: {status: 'published', reason: 'fixture'}};
+    };
+    const append = factory.journal.append.bind(factory.journal);
+    factory.journal.append = event => {
+      if (event.kind === 'run.resumed') throw new Error('fixture resume write failure');
+      return append(event);
+    };
+    assert.throws(() => factory.runtime.resume(), /fixture resume write failure/);
+    factory.runtime.schedule();
+    await factory.runtime.settle();
+    assert.equal(calls, 0);
+    assert.equal(factory.state.run.status, 'paused');
+    assert.equal(factory.runtime.running, false);
+    assert.throws(() => factory.runtime.resume(), /日志提交失败/);
+    factory.journal.append = append;
+    await close(factory);
+    factory = new Factory();
+    await factory.boot();
+    factory.broker.memoryFloorMB = 0;
+    factory.runtime.executors = () => async () => {
+      calls++;
+      return {ok: true, summary: 'fixture resumed', finish: {status: 'published', reason: 'fixture'}};
+    };
+    assert.equal(factory.state.tokens[token.id].data.kept, true);
+    assert.equal(factory.runtime.paused, true);
+    factory.runtime.resume();
+    await factory.runtime.settle();
+    assert.equal(calls, 1);
+    assert.equal(factory.state.tokens[token.id].status, 'published');
+  } finally {
+    await close(factory);
+    assert.equal(path.dirname(path.resolve(root)), path.resolve(os.tmpdir()));
+    fs.rmSync(root, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+  }
+});

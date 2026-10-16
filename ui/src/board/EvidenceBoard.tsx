@@ -25,7 +25,10 @@ const evAttachment = (ev: EvidenceRef, t?: TokenState): Attachment => ({ type: "
 export function EvidenceBoard() {
   useStore((s) => s.version);
   const atts = useStore((s) => s.attachments);
-  const [mode, setMode] = useState<Mode>(() => (localStorage.getItem("pf.boardMode") as Mode) ?? "rows");
+  const [mode, setMode] = useState<Mode>(() => {
+    try { return localStorage.getItem('pf.boardMode') === 'tiles' ? 'tiles' : 'rows'; }
+    catch { return 'rows'; }
+  });
   const [q, setQ] = useState("");
   const [f, setF] = useState({ run: "current", kind: "", status: "", station: "", review: "", corrected: false, suspicious: false, source: "" });
   const [cursor, setCursor] = useState<{ r: number; c: number }>({ r: 0, c: 0 });
@@ -33,6 +36,8 @@ export function EvidenceBoard() {
   const [box, setBox] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   const anchor = useRef<string | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
+  const cancelDrag = useRef<(() => void) | null>(null);
+  useEffect(() => () => cancelDrag.current?.(), []);
   useEffect(() => { try { localStorage.setItem("pf.boardMode", mode); } catch { /* ignore */ } }, [mode]);
   const s = getState();
   const selected = new Set(atts.filter((a) => a.type === "evidence").map((a) => a.id));
@@ -100,7 +105,8 @@ export function EvidenceBoard() {
     if (e.shiftKey && anchor.current) {
       const ids = flat.map((x) => x.e.id);
       const a = ids.indexOf(anchor.current), b = ids.indexOf(id);
-      select(ids.slice(Math.min(a, b), Math.max(a, b) + 1), "add");
+      select(a < 0 ? [id] : ids.slice(Math.min(a, b), Math.max(a, b) + 1), "add");
+      if (a < 0) anchor.current = id;
     } else if (e.ctrlKey || e.metaKey) { select([id], "toggle"); anchor.current = id; }
     else { select(selected.has(id) && selected.size === 1 ? [] : [id], "set"); anchor.current = id; }
   };
@@ -108,7 +114,8 @@ export function EvidenceBoard() {
   // Keyboard scanning: J/K rows, H/L within a row, space zoom, Enter to canvas, X select.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).closest("input, textarea, select") || light && e.key !== "Escape" && e.key !== " ") return;
+      if (e.defaultPrevented || e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
+      if ((e.target as HTMLElement).closest('input, textarea, select, button, a, [contenteditable], [role="dialog"]') || light && e.key !== "Escape" && e.key !== " ") return;
       const k = e.key.toLowerCase();
       if (k === "escape") { if (light) setLight(null); else select([], "set"); return; }
       if (!rows.length) return;
@@ -132,14 +139,24 @@ export function EvidenceBoard() {
 
   // Box select (drag on empty space).
   const onDown = (e: React.PointerEvent) => {
+    if (e.button !== 0 || light) return;
     if ((e.target as HTMLElement).closest(".ev, .bd-note, button, input, select, .bd-row-main")) return;
     const sc = scroller.current!;
     const rect = sc.getBoundingClientRect();
     const x0 = e.clientX - rect.left + sc.scrollLeft, y0 = e.clientY - rect.top + sc.scrollTop;
     const additive = e.ctrlKey || e.metaKey || e.shiftKey;
+    cancelDrag.current?.();
+    const cleanup = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', cancel);
+      window.removeEventListener('blur', cancel);
+      cancelDrag.current = null;
+    };
+    const cancel = () => { cleanup(); setBox(null); };
     const move = (ev: PointerEvent) => setBox({ x0, y0, x1: ev.clientX - rect.left + sc.scrollLeft, y1: ev.clientY - rect.top + sc.scrollTop });
     const up = (ev: PointerEvent) => {
-      window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up);
+      cleanup();
       const x1 = ev.clientX - rect.left + sc.scrollLeft, y1 = ev.clientY - rect.top + sc.scrollTop;
       setBox(null);
       if (Math.abs(x1 - x0) < 6 && Math.abs(y1 - y0) < 6) { if (!additive) select([], "set"); return; }
@@ -153,6 +170,9 @@ export function EvidenceBoard() {
       select(hit, additive ? "add" : "set");
     };
     window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
+    window.addEventListener('pointercancel', cancel);
+    window.addEventListener('blur', cancel);
+    cancelDrag.current = cleanup;
   };
 
   const kinds = [...new Set(Object.values(s.fs.tokens).map((t) => String((t.data as any).kind ?? "")).filter(Boolean))];
@@ -265,10 +285,23 @@ function Lightbox({ e, onClose }: { e: EvidenceRef; onClose: () => void }) {
   const t = getState().fs.tokens[e.token];
   const detail = useDetail<EvidenceRef>({kind: 'evidence', id: e.id}, e, !isVisual(e));
   const document = useMemo(() => JSON.stringify(detail.data?.meta ?? {}, null, 2), [detail.data]);
+  const dialog = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const previous = window.document.activeElement;
+    dialog.current?.focus();
+    return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
+  }, [e.id]);
   return (
     <div className="lightbox" onClick={onClose}>
-      <div className="lb-inner" onClick={(ev) => ev.stopPropagation()}>
-        {e.kind === "video" ? <video src={e.src} poster={e.poster} autoPlay loop muted controls /> : e.kind==="image"?<img src={e.src?.replace(/\.webp$/, ".webp") ?? e.card} alt="" />:<article className="evidence-document"><h2>{e.label}</h2><p>{e.verdict}</p>
+      <div ref={dialog} className="lb-inner" role="dialog" aria-modal="true" aria-label={e.label} tabIndex={-1} onClick={(ev) => ev.stopPropagation()} onKeyDown={event => {
+        if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onClose(); }
+        if (event.key !== 'Tab') return;
+        const controls = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input, textarea, select, video[controls]')];
+        const first = controls[0], last = controls.at(-1);
+        if (event.shiftKey && (event.target === first || event.target === dialog.current)) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && event.target === last) { event.preventDefault(); first?.focus(); }
+      }}>
+        {e.kind === "video" ? <video src={e.src} poster={e.poster} autoPlay loop muted controls /> : e.kind==="image"?<img src={e.src?.replace(/\.webp$/, ".webp") ?? e.card} alt={e.label} />:<article className="evidence-document"><h2>{e.label}</h2><p>{e.verdict}</p>
           {detail.loading && <p role="status">正在读取完整证据…</p>}
           {detail.error && <p role="alert">完整证据读取失败：{detail.error} <button className="btn btn--sm" onClick={detail.retry}>重新读取</button></p>}
           {detail.data && <pre>{document}</pre>}
@@ -292,7 +325,7 @@ function Seg({ value, onChange, options }: { value: string; onChange: (v: string
 function Sel({ value, onChange, label, options }: { value: string; onChange: (v: string) => void; label: string; options: [string, string][] }) {
   return (
     <label className={`bd-sel ${value ? "is-on" : ""}`}>
-      <select value={value} onChange={(e) => onChange(e.target.value)}>
+      <select aria-label={label} value={value} onChange={(e) => onChange(e.target.value)}>
         <option value="">{label}</option>
         {options.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
       </select>

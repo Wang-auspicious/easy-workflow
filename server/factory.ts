@@ -34,10 +34,15 @@ import { flushAtlas } from '../packs/vislexicon/components.ts';
 import { ChannelSupervisor } from './channels.ts';
 import { SourceSupervisor } from './sources.ts';
 import {agentCapabilities, closedModelDependency, parseAgentBinding, resolveNativeCommand} from './agent-bindings.ts';
-import {models, piModelCatalog, piSelection} from './pi.ts';
+import {models, piModelCatalog, piSelection, piStatus} from './pi.ts';
 import {UnmanagedRecoverySupervisor} from './recovery.ts';
 import {ModelCircuits} from './model-circuits.ts';
 import {withModelAdmission} from './model-requests.ts';
+import {importExternalIntake, readExternalIntake, type ExternalIntakeManifest} from './external-intake.ts';
+import {continuationPriority, externalResearchFor, reuseExternalStation} from './intake-continuation.ts';
+import {reuseExternalCapture} from './intake-captures.ts';
+import {PublicationOutbox} from './publication-outbox.ts';
+import {projectDecisionClient, withDecisionAttempt} from './decision-model.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
@@ -55,6 +60,8 @@ export class Factory {
   taken = new Set<string>();
   patches: Patch[] = [];
   importing = false;
+  externalIntake: ExternalIntakeManifest | null = null;
+  publicationOutbox?: PublicationOutbox;
   settings: Settings;
   ephemeral = new Set<(e: Record<string, unknown>) => void>();
   project: ProjectInfo;
@@ -69,6 +76,7 @@ export class Factory {
   modelCircuits!: ModelCircuits;
   private services!: Services;
   private stationAgents: Record<string, AgentStationDef> = {};
+  decisionModel: ReturnType<typeof projectDecisionClient> = null;
 
   constructor(projectDirectory = VAR) {
     const readOnly = process.env.FACTORY_READONLY === "1";
@@ -94,12 +102,20 @@ export class Factory {
   private readJson<T>(file: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; } catch { return fallback; } }
 
   async boot() {
+    this.decisionModel = projectDecisionClient(this.project.dir);
+    this.externalIntake = readExternalIntake(this.project.dir);
     this.workflowPacks = await this.loadWorkflowPacks();
     this.compiled = compile(this.workflowPacks.packs, this.patches);
     if (this.compiled.issues.length) throw new ControlError(422, "invalid_spec", "规格校验失败，未启动运行时", this.compiled.issues);
     if (process.env.FACTORY_READONLY !== '1') this.project = synchronizeProjectPacks(this.project.dir, this.workflowPacks.packs.map(entry => entry.id));
     this.state = initialState(this.compiled);
-    for (const e of this.journal.read(0)) apply(this.state, e);
+    this.docs = new Docs(this, this.project.dir, this.project.name);
+    const completedRuns = new Set<string>();
+    for (const e of this.journal.read(0)) {
+      apply(this.state, e);
+      this.docs.observeReplay(e);
+      if (e.kind === 'run.ended') completedRuns.add(e.runId);
+    }
     this.journal.subscribeProjection((e) => apply(this.state, e));
     if (!this.state.agentDefaults) {
       const selection = piSelection();
@@ -110,7 +126,6 @@ export class Factory {
     }
     if (process.env.FACTORY_READONLY !== "1" && this.state.digest !== this.compiled.digest) this.journal.append({ kind: "factory.loaded", digest: this.compiled.digest, specVersion: this.compiled.specVersion });
     this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, modelWorkers: this.settings.modelWorkers, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
-    this.docs = new Docs(this, this.project.dir, this.project.name);
     this.lessons = new Lessons(this, this.project.dir);
     this.toolbox = new Toolbox({ journal: this.journal, broker: this.broker, docs: () => this.docs });
     const services: Services = {
@@ -122,8 +137,9 @@ export class Factory {
     this.services = services;
     const defs = agentDefs(this.store, services);
     this.stationAgents = defs;
-    const scoped = (execute: Executor): Executor => context => withNetworkCache(
-      process.env.FACTORY_HTTP_CACHE === '0' ? null : projectPaths(this.project.dir).cache, () => execute(context));
+    const scoped = (execute: Executor): Executor => context => withDecisionAttempt(this.decisionModel, context, () => withNetworkCache(
+      process.env.FACTORY_HTTP_CACHE === '0' ? null : projectPaths(this.project.dir).cache,
+      async () => await reuseExternalCapture(context, this.store) ?? reuseExternalStation(context, execute)));
     const executors = (n: CompiledNode): Executor | ExecutorRegistration | null => {
       const installed = this.workflowPacks?.executor(n);
       if (installed) {
@@ -146,14 +162,16 @@ export class Factory {
         if (!['curation.breadth', 'curation.proof'].includes(n.tool)) return execute;
         return {prepare: () => {
           try {
-            const binding = this.resolveAgentBinding({adapter: 'pi'});
-            if (binding.adapter !== 'pi') throw new Error('内置看图工具需要项目的 Pi 选择');
-            const selected = models(binding);
-            return {execute: ctx => execute({...ctx, piRuntime: selected}), dependency: selected.dependency};
+            const captured = this.captureAgent(n.key);
+            const modelAssist = {binding: captured.binding, projectDirectory: this.project.dir,
+              piRuntime: captured.piRuntime, piControl: captured.piControl};
+            return {execute: ctx => execute({...ctx, piRuntime: captured.piRuntime, modelAssist}),
+              dependency: captured.dependency};
           }
           catch (error) {
-            return {execute: ctx => execute(Object.defineProperty({...ctx}, 'piRuntime', {
-              get: () => { throw error; },
+            return {execute: ctx => execute(Object.defineProperties({...ctx}, {
+              piRuntime: {get: () => { throw error; }},
+              modelAssist: {get: () => { throw error; }},
             }))};
           }
         }};
@@ -172,12 +190,12 @@ export class Factory {
           } catch (error) {
             // Deterministic rules still run without a configured model. If a
             // model is needed, preserve this attempt's original capture error.
-            return {execute: async context => {
+            return {execute: scoped(async context => {
               context.signal.throwIfAborted();
-              const skipped = def.skip?.(context);
+              const skipped = await def.skip?.(context);
               if (skipped) return skipped;
               throw error;
-            }};
+            })};
           }
         },
       };
@@ -198,7 +216,6 @@ export class Factory {
     this.wireStock();
     this.wireDocs();
     try { this.lessons.recoverApproved(); } catch (error) { this.lessonIssue(error); }
-    const completedRuns = [...new Set([...this.journal.read()].filter(e => e.kind === "run.ended").map(e => e.runId))];
     for (const run of completedRuns) { try { this.lessons.draftRun(run); } catch (error) { this.lessonIssue(error); } }
     try { this.lessons.write(); } catch (error) { this.lessonIssue(error); }
     if (this.runtime.nodes.has('curation/style')) void warmStyleLib();
@@ -217,6 +234,9 @@ export class Factory {
     this.reconcileBusinessStock();
     this.channels = new ChannelSupervisor(this);
     this.sources = new SourceSupervisor(this);
+    if (this.runtime.nodes.has('curation/gate') && this.runtime.nodes.has('curation/published')) {
+      this.publicationOutbox = new PublicationOutbox(this.project.dir, this.journal);
+    }
     this.recovery.start();
     this.sources.start();
     this.runtime.tick();
@@ -231,13 +251,26 @@ export class Factory {
       return;
     }
     this.catalog = loadCatalog();
+    if (this.externalIntake) {
+      const present = new Set(this.catalog.map(candidate => candidate.id));
+      for (const candidate of this.externalIntake.candidates) {
+        if (candidate.disposition !== 'continue' || present.has(candidate.entryId)) continue;
+        this.catalog.push({id: candidate.entryId, name: candidate.title, canonicalUrl: candidate.url});
+        present.add(candidate.entryId);
+      }
+    }
+    const external = new Map(this.externalIntake?.candidates.map(candidate => [candidate.entryId, candidate]));
     const publishedHosts = new Set(loadPublished().map((p) => p.domain.replace(/^www\./, "")));
     for (const t of Object.values(this.state.tokens)) if (t.source === "candidates/pool") this.taken.add(t.item);
-    const left = this.catalog.filter((c) => !this.taken.has(c.id) && !publishedHosts.has(this.hostOf(c.canonicalUrl)));
+    const left = this.catalog.filter((c) => !this.taken.has(c.id) &&
+      (external.has(c.id) ? external.get(c.id)!.disposition === 'continue' : !publishedHosts.has(this.hostOf(c.canonicalUrl))));
     const pool = "candidates/pool";
     const localPublished = fs.existsSync(path.join(this.project.dir, 'published')) ? fs.readdirSync(path.join(this.project.dir, 'published'), { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.endsWith('.json')).length : 0;
     const deferred=Object.values(this.state.recoveries).filter(c=>c.disposition==="retry").length;
-    const want: Record<string, number> = { [pool]: left.length+deferred, "curation/published": publishedHosts.size + localPublished };
+    const publishedIds = new Set(loadPublished().map(entry => entry.entryId));
+    const externalPublished = this.externalIntake?.candidates.filter(candidate =>
+      candidate.disposition === 'published' && !publishedIds.has(candidate.entryId)).length ?? 0;
+    const want: Record<string, number> = { [pool]: left.length+deferred, "curation/published": publishedHosts.size + localPublished + externalPublished };
     for (const [node, stock] of Object.entries(want)) {
       this.runtime.stock.set(node, stock);
       if (this.state.nodes[node]?.stock !== stock) this.journal.append({ kind: "stock.set", node, stock, note: node === pool ? "VisLexicon 候选目录（去掉已发布、已取走）" : "VisLexicon 已发布 + 本工厂发布" });
@@ -315,11 +348,13 @@ export class Factory {
     return {binding: captured, piRuntime: undefined, piControl: undefined, dependency: closedModelDependency(captured)};
   }
 
-  private agentDefault(node: string): {binding?: StationAgentBinding} | undefined {
+  private agentDefault(node: string): {binding?: StationAgentBinding; mode?: 'model-assist'} | undefined {
     const installed = this.workflowPacks?.manifests.find(manifest => manifest.bindings[node]);
     const execution = installed?.bindings[node].execute;
     if (execution) return execution.kind === 'agent' ? {binding: execution.agent} : undefined;
     const definition = this.stationAgents[node];
+    const tool = this.compiled.nodes.find(current => current.key === node)?.tool;
+    if (tool && ['curation.breadth', 'curation.proof'].includes(tool)) return {mode: 'model-assist'};
     return definition ? {binding: definition.agent} : undefined;
   }
 
@@ -336,6 +371,7 @@ export class Factory {
   private resolveAgentBinding(input: StationAgentBinding): StationAgentBinding {
     const binding = parseAgentBinding(input);
     if (binding.adapter !== 'pi') return binding;
+    if (binding.provider && binding.model) return binding;
     const defaults = this.getAgentDefaults();
     const fallback = defaults.station.adapter === 'pi' ? defaults.station : defaults.dispatcher;
     if (fallback.adapter !== 'pi') throw new ControlError(422, 'explicit_pi_selection_required', '请为 Pi 工位配置明确的供应商和模型');
@@ -347,15 +383,27 @@ export class Factory {
     return structuredClone(this.state.agentDefaults);
   }
 
+  dispatcherModelStatus() {
+    const binding = this.getAgentDefaults().dispatcher;
+    if (binding.adapter === 'pi') return {adapter: 'pi' as const, ...piStatus(binding)};
+    return {
+      adapter: binding.adapter,
+      provider: 'provider' in binding ? binding.provider : undefined,
+      id: binding.model ?? 'native-default',
+      name: binding.model ?? `${binding.adapter} 客户端默认模型`,
+      source: 'explicit' as const,
+      ready: false,
+      error: null,
+      verification: 'client-managed' as const,
+    };
+  }
+
   setAgentDefaults(update: {station?: StationAgentBinding; dispatcher?: StationAgentBinding}): ProjectAgentDefaults {
     if (process.env.FACTORY_READONLY === '1') throw new ControlError(403, 'read_only', '只读项目不能配置 Agent');
     const defaults = this.getAgentDefaults();
     for (const key of ['station', 'dispatcher'] as const) {
       if (!update[key]) continue;
       let binding = parseAgentBinding(update[key]);
-      if (key === 'dispatcher' && binding.adapter !== 'pi') {
-        throw new ControlError(422, 'unsupported_dispatcher_adapter', '主调度目前支持 Pi；其他客户端尚未接入主调度协议');
-      }
       if (binding.adapter === 'pi') {
         const prior = defaults[key].adapter === 'pi' ? defaults[key] : undefined;
         binding = {...binding, provider: binding.provider ?? prior?.provider, model: binding.model ?? prior?.model};
@@ -381,7 +429,7 @@ export class Factory {
     const bindings = [];
     const latestModels = new Map<string, {at: number; model: string}>();
     for (const attempt of Object.values(this.state.attempts)) {
-      const execution = attempt.metrics?.execution;
+      const execution = attempt.metrics?.execution ?? attempt.metrics?.modelResponses?.at(-1);
       if (execution && (!node || attempt.node === node) &&
           attempt.startedAt >= (latestModels.get(attempt.node)?.at ?? 0)) {
         latestModels.set(attempt.node, {at: attempt.startedAt, model: execution.model});
@@ -408,7 +456,10 @@ export class Factory {
       }
       bindings.push({
         node: current.key, configured, effective, source, error,
-        capabilities: effective ? agentCapabilities(effective) : {stream: false, cancel: false, resume: false, usage: 'unknown' as const},
+        mode: declared.mode ?? 'agent',
+        capabilities: effective ? {...agentCapabilities(effective),
+          ...(declared.mode === 'model-assist' ? {resume: false} : {})}
+          : {stream: false, cancel: false, resume: false, usage: 'unknown' as const},
         lastModel: latestModels.get(current.key)?.model,
       });
     }
@@ -670,21 +721,15 @@ export class Factory {
     const invalid = entries.find(entry => !entry.effective);
     if (invalid) throw new ControlError(412, 'invalid_agent_binding', `${invalid.node}：${invalid.error}`);
     const selected = entries.flatMap(entry => entry.effective ? [entry.effective] : []);
-    // Built-in browser selectors call pickByImages directly and still use Pi.
-    // A pure installed Claude workflow must not be blocked by an unused Pi key.
-    if (runnable.some(node => node.tool && ['curation.breadth', 'curation.proof'].includes(node.tool))) {
-      const selection = this.defaultAgentBinding();
-      if (selection.adapter === 'pi') selected.push(selection);
-    }
     const agents = [...new Map(selected.map(binding => [JSON.stringify(binding), binding])).values()];
     const signature = JSON.stringify({nodes: runnable.map(node => node.key), agents});
     if (!force && this.state.preflight?.ok && signature === this.lastPreflightSignature &&
         Date.now() - this.lastPreflight < 10 * 60_000) return this.state.preflight;
-    const configuration = JSON.stringify([this.state.agentBindings, this.state.pausedScopes, this.compiled.digest]);
+    const configuration = JSON.stringify([this.state.agentDefaults, this.state.agentBindings, this.state.pausedScopes, this.compiled.digest]);
     const r = await withModelAdmission(() => null,
       () => preflight(this.project.dir, this.broker, {network, model, browser, agents}),
       (_dependency, signal) => this.broker.modelRequests.acquire(signal));
-    if (configuration !== JSON.stringify([this.state.agentBindings, this.state.pausedScopes, this.compiled.digest])) {
+    if (configuration !== JSON.stringify([this.state.agentDefaults, this.state.agentBindings, this.state.pausedScopes, this.compiled.digest])) {
       throw new ControlError(409, 'agent_configuration_changed', '体检期间工位配置或暂停范围已变化，请按当前配置重新体检');
     }
     this.lastPreflightSignature = signature;
@@ -1031,31 +1076,60 @@ export class Factory {
     return token;
   }
 
-  pull(count: number, filter: { category?: string; query?: string; includeRepos?: boolean } = {}) {
+  pull(count: number, filter: { category?: string; query?: string; includeRepos?: boolean; candidateIds?: readonly string[] } = {}) {
     if (!this.runtime.nodes.has('candidates/route')) throw new ControlError(409, 'candidate_pack_unavailable', '当前项目未启用策展候选包；请从本项目流水线入口投料');
     const publishedHosts = new Set(loadPublished().map((p) => p.domain.replace(/^www\./, "")));
+    const external = new Map(this.externalIntake?.candidates.map(candidate => [candidate.entryId, candidate]));
     const q = filter.query?.toLowerCase();
-    const pick = this.catalog.filter((c) => !this.taken.has(c.id) && !publishedHosts.has(this.hostOf(c.canonicalUrl))
+    const cohort = filter.candidateIds ? new Set(filter.candidateIds) : undefined;
+    const pick = this.catalog.filter((c) => !this.taken.has(c.id) &&
+      (!cohort || cohort.has(c.id)) &&
+      (external.has(c.id) ? external.get(c.id)!.disposition === 'continue' : !publishedHosts.has(this.hostOf(c.canonicalUrl)))
       && (!filter.category || c.category === filter.category || (c.subcategories ?? []).includes(filter.category))
       && (filter.includeRepos || !/^https?:\/\/(www\.)?(github\.com|gitlab\.com|npmjs\.com|www\.npmjs\.com)\//i.test(canonical(c.canonicalUrl)??c.canonicalUrl))
       && (!q || `${c.name} ${c.canonicalUrl} ${c.descriptionZh ?? ""} ${(c.tags ?? []).join(" ")}`.toLowerCase().includes(q)));
     // Spread the pick over the list so one run is not 20 sites from the same letter.
-    const step = Math.max(1, Math.floor(pick.length / Math.max(1, count)));
+    if (this.externalIntake) pick.sort((a, b) => {
+      const priority = (id: string) => {const candidate = external.get(id); return candidate ? 100 + continuationPriority(candidate) : 0;};
+      return priority(b.id) - priority(a.id);
+    });
+    const step = this.externalIntake ? 1 : Math.max(1, Math.floor(pick.length / Math.max(1, count)));
     const chosen: CatalogEntry[] = [];
     for (let i = 0; i < pick.length && chosen.length < count; i += step) chosen.push(pick[i]);
     if (!chosen.length) return [];
+    // Validate immutable attachments before changing stock or claiming identities.
+    const prepared = chosen.map(candidate => ({candidate,
+      research: this.externalIntake && external.has(candidate.id) ?
+        externalResearchFor(this.externalIntake, external.get(candidate.id)!) : undefined}));
     if (!this.runtime.running) this.runtime.start(filter.category ? `${filter.category} × ${chosen.length}` : `候选 × ${chosen.length}`);
     const out: TokenRun[] = [];
-    for (const c of chosen) {
+    for (const {candidate: c, research} of prepared) {
       this.taken.add(c.id);
       this.runtime.stockDelta("candidates/pool", -1);
       const url = canonical(c.canonicalUrl) ?? c.canonicalUrl;
       out.push(this.runtime.create("candidates/route", {
         item: c.id, url, title: c.name, source: "candidates/pool", category: c.category,
-        data: { canonical: url, host: this.hostOf(url), catalogEntry: { category: c.category, subcategories: c.subcategories, descriptionZh: c.descriptionZh } },
+        data: { canonical: url, host: this.hostOf(url), catalogEntry: { category: c.category, subcategories: c.subcategories, descriptionZh: c.descriptionZh },
+          ...(research ? {externalResearch: research} : {}) },
       }));
     }
     return out;
+  }
+
+  /** Snapshot existing research without starting a new round or rewriting history. */
+  syncExternalIntake(sourceRoot: string) {
+    if (process.env.FACTORY_READONLY === '1' || this.runtime.running && !this.runtime.paused ||
+        [...this.runtime.workers.values()].some(pool => pool.some(worker => worker.busy))) {
+      throw new ControlError(409, 'project_busy', '请等待当前工位停稳后接回已有资料，原轮次与检查点保持不变');
+    }
+    this.externalIntake = importExternalIntake({sourceRoot, projectDir: this.project.dir});
+    this.loadStock();
+    this.journal.append({kind: 'dispatch.note', tone: 'info', text:
+      `已接回 ${this.externalIntake.summary.rawObservations} 个原始候选、${this.externalIntake.summary.facts} 份事实资料；` +
+      `${this.externalIntake.summary.published} 条有 main 回执的条目排除重投，已有轮次与审核保持原样`});
+    return {intakeId: this.externalIntake.intakeId, inventorySha256: this.externalIntake.inventorySha256,
+      alreadyPresent: this.externalIntake.alreadyPresent, summary: this.externalIntake.summary,
+      warnings: this.externalIntake.warnings};
   }
 
   /** Hand-pasted URLs enter the candidate layer at 整理 and pass the pool express. */
@@ -1087,7 +1161,7 @@ export class Factory {
     const done = new Map<string, Set<string>>(Object.values(this.state.tokens).map(t=>[t.id,new Set((t.data.checkpointDone as string[])??[])]));
     const notes=new Map<string,TokenRun["notes"]>();
     const checkpointed = new Set<string>();
-    for (const e of this.journal.read(0)) {
+    for (const e of this.journal.readKinds(['token.queued', 'token.finished', 'token.data', 'token.returned', 'attempt.finished'])) {
       if (e.run === run.id && e.kind === 'token.queued') {
         const arrivals = rt.arrivals.get(e.node) ?? []; arrivals.push(e.at); rt.arrivals.set(e.node, arrivals);
       }

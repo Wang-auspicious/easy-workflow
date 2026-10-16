@@ -198,8 +198,12 @@ export async function checkAgentEndpoints(dir: string, agents: readonly StationA
 }
 
 export function checkMemoryCapacity(broker: Broker) {
-  const free=broker.freeMemMB(),ok=free>=broker.memoryFloorMB;
-  return {ok,detail:`空闲 ${free}MB，浏览器有效上限 ${broker.effectiveBrowser()}/${broker.limits.browser}${ok?'':'（低于底线，暂停领取新页面）'}`,fix:ok?undefined:`可用内存低于 ${broker.memoryFloorMB}MB；释放不用的页面或应用后重新体检，等待期间保留工作检查点`};
+  const memory = broker.memoryStatus();
+  const ok = memory.mode !== 'blocked' && memory.browserCapacity > 0;
+  const commit = memory.commitAvailableMB === null ? '系统提交余量未知，按物理内存保守调度' :
+    `系统提交余量 ${memory.commitAvailableMB}MB / 提交上限 ${memory.commitLimitMB}MB`;
+  return {ok, detail: `物理可用 ${memory.physicalAvailableMB}MB / RAM ${memory.physicalTotalMB}MB；${commit}；浏览器有效上限 ${memory.browserCapacity}/${broker.limits.browser}${memory.mode === 'pressure' ? '（内存压力模式，最多一页）' : ''}${memory.reason ? `；${memory.reason}` : ''}`,
+    fix: ok ? undefined : '等待浏览器资源恢复，或释放不用的页面和应用；HTTP 与远程模型工位可继续，不把分页空间当作物理 RAM'};
 }
 
 export async function checkDnsProxy(url = 'https://github.com/', timeoutMs = 6000) {
@@ -209,6 +213,7 @@ export async function checkDnsProxy(url = 'https://github.com/', timeoutMs = 600
 }
 
 export async function checkBrowserCapture(broker: Broker, options: { open?: typeof openPage; timeoutMs?: number } = {}) {
+  await broker.refreshMemory();
   const resource = broker.tryAcquire('browser');
   if (!resource) return { ok: false, detail: `暂时不能验证后台截图：${broker.blocked('browser') ?? '没有浏览器名额'}`, fix: '等待页面释放或内存恢复后重新体检；没有做截图验证，不能报告截图正常' };
   const controller = new AbortController(), timeoutMs = options.timeoutMs ?? 40000;
@@ -262,6 +267,7 @@ export interface PreflightRequirements {
   signal?: AbortSignal;
 }
 export async function preflight(dir: string, broker: Broker, requirements: PreflightRequirements = {}): Promise<{ ok: boolean; checks: PreflightCheck[] }> {
+  if (requirements.browser !== false) await broker.refreshMemory();
   const agents = requirements.agents ?? (requirements.model === false ? [] : [{adapter: 'pi'} as const]);
   const checks = await Promise.all([
     ...(requirements.network === false ? [] : [check("dns", "DNS 与代理", () => checkDnsProxy()), check("web", "外网可达", () => checkExternalAccess())]),
@@ -304,7 +310,7 @@ ${rows}
 ## 环境约定
 
 - 网络：所有请求走统一出口，自动使用系统代理，按主机限速，短暂错误自动重试一次，成功的 GET 缓存 6 小时（项目文件夹 cache/http）。
-- 浏览器：自动采集默认最多 ${broker.limits.browser} 页，按空闲内存自动收缩（每页约 250MB，底线 ${broker.memoryFloorMB}MB）。
+- 浏览器：自动采集最多 ${broker.limits.browser} 页，同时检查物理 RAM 与系统提交余量；物理常规底线 ${broker.memoryFloorMB}MB，紧急底线 ${broker.memoryStatus().emergencyFloorMB}MB；物理低于常规底线时仅在已验证提交余量足够的情况下允许一页，分页空间不增加 RAM 页数预算。
 - 证书错误、需要登录、模型额度问题会亮红灯通知站长；Agent 不绕过证书、不自动登录、不填凭据。
 - 每次工位处理最多调用 10 次工具。
 

@@ -27,6 +27,7 @@ export class Journal {
       this.db.exec(`CREATE TABLE IF NOT EXISTS events (
         seq INTEGER PRIMARY KEY, at INTEGER NOT NULL, run TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL)`);
       this.db.exec("CREATE INDEX IF NOT EXISTS events_run ON events(run, seq)");
+      this.db.exec('CREATE INDEX IF NOT EXISTS events_kind ON events(kind, seq)');
     }
     this.insert = this.db.prepare("INSERT INTO events (seq, at, run, kind, body) VALUES (?, ?, ?, ?, ?)");
     const last = this.db.prepare("SELECT seq, run FROM events ORDER BY seq DESC LIMIT 1").get() as { seq: number; run: string } | undefined;
@@ -100,6 +101,17 @@ export class Journal {
       : this.db.prepare("SELECT seq, at, run, body FROM events WHERE seq > ? AND seq <= ? ORDER BY seq");
     const rows = (run ? stmt.iterate(since, through, run) : stmt.iterate(since, through)) as Iterable<{ seq: number; at: number; run: string; body: string }>;
     for (const r of rows) yield { ...JSON.parse(r.body), seq: r.seq, at: r.at, run: r.run } as Stamped;
+  }
+
+  /** Rebuild a projection without decoding unrelated, potentially large payloads. */
+  *readKinds(kinds: readonly Stamped['kind'][], since = 0, through = this.seq): Generator<Stamped> {
+    if (!kinds.length) return;
+    const selected = [...new Set(kinds)];
+    const placeholders = selected.map(() => '?').join(',');
+    const rows = this.db.prepare(
+      `SELECT seq, at, run, body FROM events WHERE seq > ? AND seq <= ? AND kind IN (${placeholders}) ORDER BY seq`
+    ).iterate(since, through, ...selected) as Iterable<{seq: number; at: number; run: string; body: string}>;
+    for (const row of rows) yield {...JSON.parse(row.body), seq: row.seq, at: row.at, run: row.run} as Stamped;
   }
 
   lastSequence(run: string, through = this.seq): number {

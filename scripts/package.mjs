@@ -5,7 +5,12 @@ import { execFileSync } from 'node:child_process';
 import { buildDesktop, output, root, safeRemove } from './build.mjs';
 
 const zipOnly = process.argv.includes('--zip-only');
-const target = path.join(root, 'release', `EasyWorkflow-${process.platform}-${process.arch}`);
+const packageName = process.argv.find(argument => argument.startsWith('--name='))?.slice(7)
+  ?? `EasyWorkflow-${process.platform}-${process.arch}`;
+if (!/^EasyWorkflow-[a-zA-Z0-9_-]+$/.test(packageName)) {
+  throw new Error('Package name must start with EasyWorkflow- and contain only letters, digits, hyphens or underscores.');
+}
+const target = path.join(root, 'release', packageName);
 if (!zipOnly) {
 if (!process.argv.includes('--no-build')) await buildDesktop();
 const require = createRequire(import.meta.url);

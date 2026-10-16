@@ -1,6 +1,7 @@
-// The fixed right column (Spec §10.2): always the main dispatcher. Resizable, collapses to an
-// avatar. Above the input sits the attachment strip — evidence, nodes and items selected
-// anywhere in the app arrive here like files attached to an agent chat.
+// 右侧栏（Spec §10.2）：固定是主调度，但内部再分成两栏——
+//   左：群组栏（RoomRail）。流程上真正需要对话的地方，点谁展开谁的往来。
+//   右：当前群组。主调度那一格还是原来的转录；其他群展示该群的工位往来。
+// 输入框属于整个面板（消息只发给主调度），所以它活在两栏下面，切群不丢草稿。
 //
 // 顶部原来那块（批次卡片 / 注意力提示 / 运行记录）已去掉：批次控制在工作区工具条上，
 // 工位的提示与去向已经作为对话行出现在转录里，不再重复一份。
@@ -12,6 +13,10 @@ import { actions } from "../api.ts";
 import { CorrectionPopover } from "../board/Correction.tsx";
 import { Transcript } from "./Transcript.tsx";
 import { Avatar } from "./Avatar.tsx";
+import { RoomRail, useRooms } from "./RoomRail.tsx";
+import { RoomLog } from "./RoomLog.tsx";
+import { GroupAvatar } from "./GroupAvatar.tsx";
+import { ROOT_ROOM } from "../../../shared/rooms.ts";
 import { dispatcherState, DISPATCHER_HUE } from "./transcript.ts";
 import { useNow } from "../util/useNow.ts";
 import "./activity.css";
@@ -40,9 +45,15 @@ const COMMANDS: Command[] = [
   { cmd: "/clear", title: "清空输入与附件", hint: "不发送任何内容", run: "clear" },
 ];
 
+/** Older profiles saved a single-column width; keep both new columns readable. */
+export function chatPanelWidth(width: number, roomsOpen: boolean): number {
+  return Math.max(roomsOpen ? 560 : 320, Math.min(720, Number.isFinite(width) ? width : 320));
+}
+
 export function Chat() {
   const open = useStore((s) => s.chatOpen);
   const width = useStore((s) => s.chatWidth);
+  const roomsOpen = useStore((s) => s.roomRailOpen);
   const unread = useStore((s) => s.unread);
   const [drag, setDrag] = useState(false);
   const composer = useRef<HTMLTextAreaElement>(null);
@@ -71,8 +82,8 @@ export function Chat() {
   const startResize = (e: React.PointerEvent) => {
     e.preventDefault();
     setDrag(true);
-    const x0 = e.clientX, w0 = width;
-    const move = (ev: PointerEvent) => setState({ chatWidth: Math.max(320, Math.min(720, w0 - (ev.clientX - x0))) });
+    const x0 = e.clientX, w0 = chatPanelWidth(width, roomsOpen);
+    const move = (ev: PointerEvent) => setState({ chatWidth: chatPanelWidth(w0 - (ev.clientX - x0), roomsOpen) });
     const up = () => { setDrag(false); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
@@ -94,12 +105,32 @@ export function Chat() {
       <div style={{ display: open ? "contents" : "none" }}>
         <div className={`chat-resize ${drag ? "is-drag" : ""}`} onPointerDown={startResize} />
         <ChatHead />
-        <Log />
+        <div className="chat-rooms">
+          <RoomRail />
+          <ChatPane />
+        </div>
         <Composer inputRef={composer} />
       </div>
       <CorrectionPopover />
     </aside>
   );
+}
+
+/** 当前群组那一格：主调度走原来的转录，其他群走该群的工位往来。 */
+function ChatPane() {
+  const rooms = useRooms();
+  const selected = useStore((s) => s.chatRoom);
+  const entries = useStore((s) => s.fs.conversation);
+  const live = useStore((s) => s.live);
+  const dispatcher = useStore((s) => s.dispatcher);
+  const room = rooms.find((r) => r.id === selected) ?? rooms[0]!;
+  // 选中的群可能因流程补丁或新观测而改名：退回主调度，不显示空白。
+  useEffect(() => {
+    if (!rooms.some((r) => r.id === selected)) setState({ chatRoom: ROOT_ROOM });
+  }, [rooms, selected]);
+  return room.kind === "root"
+    ? <RootLog entries={entries} live={live} dispatcher={dispatcher} />
+    : <section className="chat-pane"><RoomLog room={room} rooms={rooms} /></section>;
 }
 
 /** 主调度的小人：走的是和对话行里同一套动作判定，收起来时也能看出他在干什么。 */
@@ -117,27 +148,35 @@ function ChatHead() {
   const model = useStore((s) => s.model);
   const connected = useStore((s) => s.connected);
   const dispatcher = useStore((s) => s.dispatcher);
+  const rooms = useRooms();
+  const selected = useStore((s) => s.chatRoom);
+  const room = rooms.find((r) => r.id === selected) ?? rooms[0]!;
   return (
     <div className="chat-head">
       <div className="chat-avatar-wrap">
-        <DispatcherAvatar size={24} />
+        {room.kind === "root"
+          ? <DispatcherAvatar size={24} />
+          : <GroupAvatar size={26} members={room.members.slice(0, 4).map((m) => ({ key: m.key, hue: 250, state: "idle" as const, title: m.name }))} />}
         <i className={`chat-online-dot ${connected ? "" : "is-offline"}`} />
       </div>
       <div className="who">
-        <b>主调度 · Easy Workflow</b>
-        <span>{replay ? "回放中 · 只读" : !connected ? "正在重连工厂…" : dispatcher.status === "recovering" ? "正在恢复当前任务…" : live ? "正在处理 · 可补充要求" : model || "当前工作区 · 网站入库"}</span>
+        <b>{room.kind === "root" ? "主调度 · Easy Workflow" : room.name}</b>
+        <span>{room.kind === "root"
+          ? (replay ? "回放中 · 只读" : !connected ? "正在重连工厂…" : dispatcher.status === "recovering" ? "正在恢复当前任务…" : live ? "正在处理 · 可补充要求" : model || "当前工作区 · 网站入库")
+          : room.subtitle}</span>
       </div>
       <span className="grow" />
+      {room.kind !== "root" && <button className="chat-back" onClick={() => setState({ chatRoom: ROOT_ROOM, unread: 0 })} data-tip="回到主调度对话">回总台</button>}
       <button className="icon-btn" onClick={() => setState({ chatOpen: false })} data-tip="收起到右侧，只留头像  Ctrl \"><PanelRightClose size={16} /></button>
     </div>
   );
 }
 
-function Log() {
-  useStore((s) => s.version);
-  const entries = useStore((s) => s.fs.conversation);
-  const live = useStore((s) => s.live);
-  const dispatcher = useStore((s) => s.dispatcher);
+/** 主调度那一格：还是原来那份转录，滚动跟随行为不变。 */
+function RootLog({ entries, live, dispatcher }: {
+  entries: Parameters<typeof Transcript>[0]["entries"]; live: Parameters<typeof Transcript>[0]["live"];
+  dispatcher: Parameters<typeof Transcript>[0]["dispatcher"];
+}) {
   const patches = useStore((s) => s.fs.patches);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -148,23 +187,57 @@ function Log() {
   useLayoutEffect(followBottom, [entries.length, live, dispatcher, followBottom]);
   const onScroll = () => { const el = ref.current!; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; };
   return (
-    <div className="chat-log" ref={ref} onScroll={onScroll}>
-      {!entries.length && !live.id && <Empty />}
-      <Transcript entries={entries} live={live} dispatcher={dispatcher} onResize={followBottom} />
-      <ChatRecovery />
-      {live.id && !live.message && dispatcher.status !== "recovering" && <div className="pi-waiting"><Loader2 size={12} className="spin-i" />主调度正在处理，可继续补充要求…</div>}
-      {patches.filter((p) => p.status === "proposed").map((p) => (
-        <div key={p.id} className="patch-card">
-          <div><b>规格补丁 {p.id}</b> <span className="muted">待你确认</span></div>
-          <div>{p.summary}</div>
-          <div className="row">
-            <button className="btn btn--sm btn--primary" onClick={() => void actions.patch(p.id, true).catch(() => {})}>接受</button>
-            <button className="btn btn--sm" onClick={() => void actions.patch(p.id, false).catch(() => {})}>拒绝</button>
-          </div>
-        </div>
-      ))}
-    </div>
+    <section className="chat-pane" aria-label="与主调度的对话">
+      <div className="chat-log" ref={ref} onScroll={onScroll}>
+        {!entries.length && !live.id && <Empty />}
+        <Transcript entries={entries} live={live} dispatcher={dispatcher} onResize={followBottom} />
+        <ChatRecovery />
+        {live.id && !live.message && dispatcher.status !== "recovering" && <div className="pi-waiting"><Loader2 size={12} className="spin-i" />主调度正在处理，可继续补充要求…</div>}
+        {patches.filter(patch => patch.status === 'proposed').map(patch => <PatchCard key={patch.id} patch={patch} />)}
+      </div>
+    </section>
   );
+}
+
+function PatchCard({patch}: {patch: {id: string; summary: string}}) {
+  useStore(state => state.version);
+  const connected = useStore(state => state.connected);
+  const replay = useStore(state => Boolean(state.replay));
+  const status = useStore(state => state.fs.run.status);
+  const active = useStore(state => Object.values(state.fs.nodes).some(node => node.active.length > 0));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const flight = useRef(false);
+  const readOnly = !connected || replay;
+  const structureBlocked = status === 'running' || status === 'paused' || active;
+  const decide = async (accept: boolean) => {
+    const state = getState();
+    if (flight.current || !state.connected || state.replay) return;
+    if (accept && (['running', 'paused'].includes(state.fs.run.status) ||
+      Object.values(state.fs.nodes).some(node => node.active.length > 0))) return;
+    flight.current = true;
+    setBusy(true);
+    setError('');
+    try {
+      await actions.patch(patch.id, accept);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '补丁操作失败，请核对状态后重试。');
+    } finally {
+      flight.current = false;
+      setBusy(false);
+    }
+  };
+  return <div className="patch-card">
+    <div><b>规格补丁 {patch.id}</b> <span className="muted">待你确认</span></div>
+    <div>{patch.summary}</div>
+    {(readOnly || structureBlocked) && <p className="muted">{replay ? '回放为只读。' : !connected
+      ? '连接恢复后可处理补丁。' : '结束当前轮次并等待在途工位回收后，可接受结构变更。'}</p>}
+    {error && <p role="alert">{error}</p>}
+    <div className="row">
+      <button className="btn btn--sm btn--primary" disabled={busy || readOnly || structureBlocked} onClick={() => void decide(true)}>{busy ? '正在处理…' : '接受'}</button>
+      <button className="btn btn--sm" disabled={busy || readOnly} onClick={() => void decide(false)}>拒绝</button>
+    </div>
+  </div>;
 }
 
 function ChatRecovery() {

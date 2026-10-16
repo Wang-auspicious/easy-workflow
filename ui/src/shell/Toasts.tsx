@@ -17,7 +17,7 @@ export function Toasts() {
   const last = list[list.length - 1];
   if (!last) return null;
   return (
-    <div className="toast" key={last.id}>
+    <div className="toast" key={last.id} role="status" aria-live="polite">
       <span>{last.text}</span>
       {last.action && <button className="btn btn--sm" onClick={() => { last.action!.run(); toasts = toasts.filter((x) => x.id !== last.id); emit(); }}>{last.action.label}</button>}
     </div>

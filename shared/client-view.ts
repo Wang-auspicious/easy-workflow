@@ -121,7 +121,6 @@ export function uiEvent(event: Stamped): UiEvent {
     case 'case.noted':
     case 'context.noted':
     case 'chat.checkpoint':
-    case 'channel.emitted':
     case 'channel.delivery':
     case 'operation.recorded':
     case 'source.configured':

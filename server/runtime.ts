@@ -263,15 +263,27 @@ export class Runtime {
     return runId;
   }
 
-  pause() { if (!this.running || this.paused) return; this.paused = true; this.journal.append({ kind: "run.paused", runId: this.journal.run }); }
+  pause() {
+    this.requireStorage();
+    if (!this.running || this.paused) return;
+    this.commitTransition(() => {
+      this.journal.append({kind: 'run.paused', runId: this.journal.run});
+      this.paused = true;
+    });
+  }
   resume() {
     this.requireStorage();
     if (!this.running || !this.paused) return;
-    this.paused = false;
-    const now = Date.now();
-    for (const pool of this.workers.values()) for (const w of pool) if (!w.busy) w.idleSince = now;
-    this.backlogSince.clear();
-    this.journal.append({ kind: "run.resumed", runId: this.journal.run }); this.schedule();
+    this.commitTransition(() => {
+      this.journal.append({kind: 'run.resumed', runId: this.journal.run});
+      this.paused = false;
+      const now = Date.now();
+      for (const pool of this.workers.values()) for (const worker of pool) {
+        if (!worker.busy) worker.idleSince = now;
+      }
+      this.backlogSince.clear();
+      this.journal.afterCommit(() => this.schedule());
+    });
   }
 
   /** Manual end only (Spec §10.12): crashes and network loss never end a run. */
@@ -500,15 +512,22 @@ export class Runtime {
 
   create(entry: string, item: { item: string; url: string; title?: string; source: string; category?: string; data?: Record<string, unknown> }): TokenRun {
     this.requireStorage();
+    const node = this.nodes.get(entry);
+    if (!node) throw new ControlError(404, 'station_not_found', '投料入口工位不存在');
     const t: TokenRun = {
       id: `t-${short()}`, item: item.item, url: item.url, title: item.title, source: item.source, entry,
       data: { ...(item.data ?? {}) }, closure: this.closureOf(entry), done: new Set(), dead: new Set(), edgeLive: new Map(),
       inflight: new Set(), queuedAt: new Map(), failures: new Map(), rounds: {}, epoch: 0, finished: false, notes: new Map(),
     };
-    this.tokens.set(t.id, t);
-    this.journal.append({ kind: "token.created", token: t.id, line: this.nodes.get(entry)!.line, item: item.item, url: item.url, title: item.title, source: item.source, category: item.category });
-    if (item.data && Object.keys(item.data).length) this.journal.append({ kind: "token.data", token: t.id, patch: item.data });
-    this.enqueue(t, entry, item.source);
+    this.commitTransition(() => {
+      this.tokens.set(t.id, t);
+      this.journal.append({kind: 'token.created', token: t.id, line: node.line,
+        item: item.item, url: item.url, title: item.title, source: item.source, category: item.category});
+      if (item.data && Object.keys(item.data).length) {
+        this.journal.append({kind: 'token.data', token: t.id, patch: item.data});
+      }
+      this.enqueue(t, entry, item.source);
+    });
     return t;
   }
 
@@ -772,6 +791,13 @@ export class Runtime {
           if (count !== undefined) tokenUsage[field] = (tokenUsage[field] ?? 0) + count;
         }
       }
+      // The dedicated decision scope already contributed these receipts to its
+      // result. Rebuilding chat-model totals must neither erase nor duplicate it.
+      const decisions = res.metrics?.decisionUsage;
+      if (decisions?.reported) {
+        tokenUsage.input += decisions.input;
+        tokenUsage.output += decisions.output;
+      }
       if (recorded.length) {
         const usage: Usage = {input: 0, output: 0, cost: 0};
         for (const response of recorded) for (const field of ['input', 'output', 'cost', 'cacheRead', 'cacheWrite'] as const) {
@@ -780,7 +806,7 @@ export class Runtime {
         res.usage = usage;
       }
       res.metrics = {...res.metrics, modelResponses,
-        tokenUsage: modelResponses.some(response => response.tokenUsage) ? tokenUsage : res.metrics?.tokenUsage,
+        tokenUsage: modelResponses.some(response => response.tokenUsage) || decisions?.reported ? tokenUsage : res.metrics?.tokenUsage,
         costReported: modelResponses.some(response => response.costReported),
         costComplete: res.metrics?.costComplete !== false && modelResponses.every(response => response.costComplete),
         usageReported: res.metrics?.usageReported || modelResponses.some(response => response.usageReported),

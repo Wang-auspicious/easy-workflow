@@ -27,7 +27,7 @@ test("video artifacts survive process, copy, assembly and final reviewer as one 
       copy:{ name:"Fixture",takeawayZh:"浏览作品与设计细节",noteZh:"我们".padEnd(125,"看"),descriptionZh:"作品展示。",descriptionEn:"Work showcase.",rationale:{identity:"从首页作品开始浏览"},alt:{identity:"页面中蓝色的作品区域"},reasons:[{statement:"呈现原创作品",evidenceUrl:"https://fixture.test"}],reply:"" },
       facts:Object.fromEntries(["author","organization","repository","license","pricing"].map(f=>[f,fact("unknown")])),catalogV3:{primaryCategory:"single-site-showcase",subcategory:"portfolio",facets:Object.fromEntries(ALL_AXES.map(a=>[a,[]]))},
     };
-    const ctx = {token:{id:"video-token",url:d.canonical,data:d},attempt:"process",progress:()=>{},addEvidence:(e:unknown)=>e} as unknown as StationContext;
+    const ctx = {token:{id:"video-token",url:d.canonical,data:d},attempt:"process",signal:new AbortController().signal,progress:()=>{},addEvidence:(e:unknown)=>e} as unknown as StationContext;
     const svc={store,workDir:root,publishDir:path.join(root,"published"),inFlight:()=>new Set<string>()};
     const result=await TOOLS["curation.process"](ctx,svc);
     assert.equal(result.ok,true); assert.equal((result.data?.images as any[])?.length,1);

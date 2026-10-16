@@ -179,6 +179,20 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
     const kind = e.kind ?? "flow";
     const key = `${from}->${to}${kind === "flow" ? "" : `:${kind}`}`;
     if (!byKey.has(from) || !byKey.has(to)) { issues.push({ at: key, message: `edge end not found` }); return; }
+    if (!['flow', 'return', 'channel'].includes(kind)) {
+      issues.push({at: key, message: 'invalid edge kind'});
+      return;
+    }
+    if (kind === 'return') {
+      const declaration = byKey.get(from)!.returnTo?.find(value => `${byKey.get(from)!.line}/${value.station}` === to);
+      if (!declaration) issues.push({at: key, message: 'return edges must declare a bounded station.returnTo policy'});
+      // The declaration below supplies one authoritative edge and its budget.
+      return;
+    }
+    if (kind === 'flow' && edges.some(edge => edge.key === key)) {
+      issues.push({at: key, message: 'duplicate flow edge; combine its conditions into one named predicate'});
+      return;
+    }
     if (e.when && !conditions[e.when]) issues.push({ at: key, message: `unknown condition "${e.when}"` });
     edges.push({ key, from, to, kind, when: e.when, label: e.label });
   };
@@ -187,7 +201,13 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
   for (const n of nodes) for (const r of n.returnTo ?? []) {
     const to = `${n.line}/${r.station}`;
     if (!byKey.has(to)) { issues.push({ at: n.key, message: `return target ${to} not found` }); continue; }
-    if (!(r.maxRounds > 0)) issues.push({ at: n.key, message: "return edge needs maxRounds > 0" });
+    if (!Number.isSafeInteger(r.maxRounds) || r.maxRounds <= 0) {
+      issues.push({at: n.key, message: 'return edge needs a positive finite integer maxRounds'});
+    }
+    if (edges.some(edge => edge.kind === 'return' && edge.from === n.key && edge.to === to)) {
+      issues.push({at: n.key, message: 'duplicate return policy for the same station'});
+      continue;
+    }
     edges.push({ key: `${n.key}->${to}:return`, from: n.key, to, kind: "return", maxRounds: r.maxRounds, label: `退回 ≤${r.maxRounds} 轮` });
   }
   const channels = packs.flatMap((p) => p.channels);
@@ -213,11 +233,22 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
   for (const n of nodes) dfs(n.key);
   for (const e of flow) {
     const a = byKey.get(e.from)!, b = byKey.get(e.to)!;
-    const accepts = b.input.split("|");
-    if (b.input !== "*" && a.output !== "*" && !accepts.includes(a.output)) issues.push({ at: e.key, message: `I/O mismatch: ${a.output} → ${b.input}` });
+    const accepts = b.input.split('|').map(value => value.trim());
+    const outputs = a.output.split('|').map(value => value.trim());
+    if (!accepts.includes('*') && !outputs.includes('*') && outputs.some(value => !accepts.includes(value))) {
+      issues.push({at: e.key, message: `I/O mismatch: ${a.output} → ${b.input}`});
+    }
   }
   for (const n of nodes) {
     const runnable = n.kind !== "source" && n.kind !== "store";
+    if ([n.input, n.output].some(contract => contract.split('|').some(value => !value.trim()))) {
+      issues.push({at: n.key, message: 'I/O contract names cannot be empty'});
+    }
+    if (n.accept.some(value => typeof value !== 'string' || !value.trim())) {
+      issues.push({at: n.key, message: 'acceptance conditions must be non-empty text'});
+    }
+    if (!['auto', 'fixed'].includes(n.workers.policy)) issues.push({at: n.key, message: 'invalid worker policy'});
+    if (!Number.isFinite(n.estimateSeconds) || n.estimateSeconds < 0) issues.push({at: n.key, message: 'estimateSeconds must be finite and non-negative'});
     if (runnable && !n.accept.length && lines.find((l) => l.id === n.line)?.wired) issues.push({ at: n.key, message: "runnable station without acceptance conditions" });
     if (runnable && n.workers.min > n.workers.max) issues.push({ at: n.key, message: "workers.min > workers.max" });
     if (!["none", "browser", "model", "cpu", "http"].includes(n.resource)) issues.push({ at: n.key, message: "invalid resource class" });

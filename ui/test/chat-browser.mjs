@@ -13,6 +13,8 @@ const out = path.resolve("var/verification/chat-recovery");
 await fs.mkdir(out, { recursive: true });
 const posts = [], errors = [];
 let failNextChat = false;
+let failNextQuota = false;
+let failNextCatalog = false;
 try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   page.on("pageerror", error => errors.push(error.message));
@@ -30,6 +32,25 @@ try {
     const url = new URL(request.url());
     const body = request.postDataJSON();
     posts.push({ path: url.pathname, body });
+    if (url.pathname === '/api/settings') {
+      if (failNextQuota) {failNextQuota = false; await route.fulfill({status: 400, json: {error: '配额未保存，fixture 拒绝'}}); return;}
+      const settings = await page.evaluate(values => ({...window.chatFixture.getState().settings, ...values}), body);
+      await route.fulfill({json: {ok: true, settings}});
+      return;
+    }
+    if (url.pathname === '/api/tools/workflow_templates') {
+      if (failNextCatalog) {failNextCatalog = false; await route.fulfill({status: 503, json: {error: '模板暂不可用'}}); return;}
+      await route.fulfill({json: {ok: true, result: {templates: [], installed: []}}});
+      return;
+    }
+    if (url.pathname === '/api/tools/source_list') {
+      await route.fulfill({json: {ok: true, result: {sources: [], targets: []}}});
+      return;
+    }
+    if (url.pathname === '/api/tools/choose_preview_page') {
+      await route.fulfill({json: {ok: false, summary: '当前条目无法从所选工位恢复'}});
+      return;
+    }
     if (url.pathname === "/api/chat" && failNextChat) { failNextChat = false; await route.abort("failed"); return; }
     if (url.pathname === "/api/browser") { await route.fulfill({ json: await page.evaluate(() => window.chatFixture.getState().browser) }); return; }
     await route.fulfill({ json: { ok: true, queued: true, result: { cleared: false, resumed: false, message: "检查完成，当前原因仍需处理。" } } });
@@ -257,6 +278,86 @@ try {
   await page.getByRole('option').filter({ hasText: '/status' }).click();
   await page.waitForFunction(() => !document.querySelector('.composer-feedback'));
   assert.equal(await input.inputValue(), '这是一条还没发送的草稿', 'a command can run without consuming the draft or its attachments');
+  await page.evaluate(() => {
+    const {getState, setState} = window.chatFixture;
+    const current = getState();
+    setState({fs: {...current.fs, conversation: [...current.fs.conversation, {
+      id: 'native-final', turn: 'native-turn', message: {
+        role: 'assistant', api: 'native-client', provider: 'unreported', model: 'fixture-native-model',
+        content: [{type: 'text', text: '原生主调度已保留实际工具回执。'}], timestamp: Date.now(), stopReason: 'stop',
+        native: {adapter: 'codex', usageReported: false, costReported: false},
+      },
+    }]}, version: current.version + 1});
+  });
+  await page.getByText('原生主调度已保留实际工具回执。', {exact: true}).waitFor();
+  // Approval controls must never change a live factory from historical replay.
+  await page.evaluate(() => {
+    const {getState, setState} = window.chatFixture;
+    setState({fs: {...getState().fs, patches: [{id: 'fixture-patch', summary: '新增工位', status: 'proposed', at: Date.now()}]}});
+  });
+  const patch = page.locator('.patch-card');
+  assert.equal(await patch.getByRole('button', {name: '接受', exact: true}).isDisabled(), true, 'running workflows cannot install a patch');
+  assert.equal(await patch.getByRole('button', {name: '拒绝', exact: true}).isEnabled(), true);
+  await page.evaluate(() => window.chatFixture.setState({replay: {run: 'history', at: 1}}));
+  assert.equal(await patch.getByRole('button', {name: '拒绝', exact: true}).isDisabled(), true, 'replay cannot reject a live patch');
+  await page.evaluate(() => {
+    const {getState, setState} = window.chatFixture;
+    setState({replay: null, fs: {...getState().fs, run: {...getState().fs.run, status: 'ended'}, nodes: {}}});
+  });
+  await patch.getByRole('button', {name: '接受', exact: true}).click();
+  assert.deepEqual(posts.at(-1), {path: '/api/patch', body: {id: 'fixture-patch', accept: true}});
+
+  // Quotas retain edits after errors and only write the fields the user changed.
+  await page.evaluate(() => window.chatFixture.setState({view: 'settings', settings: {
+    browser: 2, model: 1, modelWorkers: 3, cpu: 2, http: 2, memoryFloorMB: 1024, socialPerMinute: 2, socialPerDay: 60,
+  }}));
+  const quotas = page.locator('.set-sec').filter({has: page.getByRole('heading', {name: '资源配额'})});
+  await quotas.getByLabel('CPU 重活').focus();
+  await quotas.getByLabel('CPU 重活').press('ArrowRight');
+  await page.evaluate(() => window.chatFixture.setState({settings: {...window.chatFixture.getState().settings, model: 4}}));
+  await page.waitForFunction(() => document.querySelector('input[aria-label="模型调用并发"]')?.value === '4');
+  assert.equal(await quotas.getByLabel('CPU 重活').inputValue(), '3');
+  failNextQuota = true;
+  await quotas.getByRole('button', {name: '保存', exact: true}).click();
+  await quotas.getByRole('alert').waitFor();
+  assert.equal(await quotas.getByLabel('CPU 重活').inputValue(), '3', 'failed writes preserve quota edits');
+  const savesBefore = posts.filter(post => post.path === '/api/settings').length;
+  await quotas.getByRole('button', {name: '保存', exact: true}).evaluate(button => {
+    button.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+    button.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+  });
+  await page.waitForFunction(() => window.chatFixture.getState().settings.cpu === 3);
+  assert.equal(posts.filter(post => post.path === '/api/settings').length, savesBefore + 1, 'same-frame repeat clicks write once');
+  assert.deepEqual(posts.filter(post => post.path === '/api/settings').at(-1).body, {cpu: 3}, 'saving one slider cannot overwrite another client settings');
+  await page.evaluate(() => window.chatFixture.setState({connected: false}));
+  assert.equal(await quotas.getByLabel('CPU 重活').isDisabled(), true);
+  await page.evaluate(() => window.chatFixture.setState({connected: true, replay: {run: 'history', at: 1}}));
+  assert.equal(await quotas.getByLabel('CPU 重活').isDisabled(), true);
+
+  await page.evaluate(() => window.chatFixture.setState({view: 'browser'}));
+  assert.equal(await page.getByRole('button', {name: '新建标签页', exact: true}).isDisabled(), true);
+  await page.evaluate(() => window.chatFixture.setState({replay: null}));
+  assert.equal(await page.getByRole('button', {name: '新建标签页', exact: true}).isEnabled(), true);
+  await page.evaluate(() => window.chatFixture.setState({view: 'candidates', draft: '不应被失败回执替换'}));
+  await page.getByText('指定目录或示例页后继续').click();
+  await page.getByLabel('采集页面网址').fill('https://fixture.test/catalog');
+  await page.getByRole('button', {name: '按这页继续'}).click();
+  await page.getByRole('alert').filter({hasText: '当前条目无法从所选工位恢复'}).waitFor();
+  assert.equal(await page.evaluate(() => window.chatFixture.getState().draft), '不应被失败回执替换', 'ok:false never emits a success message');
+
+  failNextCatalog = true;
+  await page.evaluate(() => window.chatFixture.setState({view: 'library'}));
+  await page.getByRole('button', {name: '重新读取模板'}).click();
+  await page.getByText('当前没有可用模板，可以安装自己的工作流包。').waitFor();
+  const inputValidation = await page.evaluate(async () => {
+    const {workflowInput} = await import('/src/views/workflows.ts');
+    const schema = {properties: {count: {type: 'integer', minimum: 1, maximum: 4}, optional: {type: 'boolean'}, enabled: {type: 'boolean'}}, required: ['count', 'enabled']};
+    const failures = ['1.5', '0', '5', ' '].map(count => {try {workflowInput(schema, {count}); return false;} catch {return true;}});
+    return {failures, omitted: workflowInput(schema, {count: '2'}), explicit: workflowInput(schema, {count: '2', optional: 'false'})};
+  });
+  assert.deepEqual(inputValidation.failures, [true, true, true, true]);
+  assert.deepEqual(inputValidation.omitted, {count: 2, enabled: false});
+  assert.deepEqual(inputValidation.explicit, {count: 2, optional: false, enabled: false});
   assert.deepEqual(errors, []);
   await fs.writeFile(path.join(out, "result.json"), JSON.stringify({ ok: true, checks: ["100-site goal accounting", "partial answer retention", "automatic recovery", "steer", "followUp", "SSE reconnect after missed end", "continue checkpoint", "stop answer", "idempotent resend", "network is not login", "recheck instead of blind clear", "activate exact tab", "narrow window", "journaled alert resolution"], requests: posts, errors }, null, 2));
   console.log("PASS: isolated chat recovery and responsive composer checks, screenshots in var/verification/chat-recovery");

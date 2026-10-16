@@ -3,10 +3,10 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fork } from 'node:child_process';
-import { createServer } from 'vite';
+import { build, createServer, preview } from 'vite';
 import { chromium } from 'playwright-core';
 
-export async function liveApp(label) {
+export async function liveApp(label, {production = false} = {}) {
   const root = path.resolve(import.meta.dirname, '../..');
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), `easy-ui-${label}-`));
   const token = 'isolated-ui-acceptance-only';
@@ -37,8 +37,20 @@ export async function liveApp(label) {
       child.on('message', message => { if (message.type === 'ready') { clearTimeout(timer); resolve(message.url); } });
     });
     const proxy = { target: backend, changeOrigin: false, headers: { authorization: `Bearer ${token}` } };
-    vite = await createServer({ configFile: path.join(root, 'ui/vite.config.ts'), logLevel: 'error', server: { host: '127.0.0.1', port: 0, strictPort: false, proxy: { '/api': proxy, '/evidence': proxy } } });
-    await vite.listen();
+    const configFile = path.join(root, 'ui/vite.config.ts');
+    if (production) {
+      const probe = path.join(directory, 'performance-probe.ts');
+      await fs.writeFile(probe, `export {getState, onEvent} from ${JSON.stringify(path.join(root, 'ui/src/store.ts').replaceAll('\\', '/'))};`);
+      const output = path.join(directory, 'ui-build');
+      await build({configFile, logLevel: 'error', build: {outDir: output, emptyOutDir: true,
+        rollupOptions: {preserveEntrySignatures: 'strict', input: {index: path.join(root, 'ui/index.html'), 'performance-probe': probe},
+          output: {entryFileNames: 'assets/[name].js'}}}});
+      vite = await preview({configFile, logLevel: 'error', build: {outDir: output},
+        preview: {host: '127.0.0.1', port: 0, strictPort: false, proxy: {'/api': proxy, '/evidence': proxy}}});
+    } else {
+      vite = await createServer({configFile, logLevel: 'error', server: {host: '127.0.0.1', port: 0, strictPort: false, hmr: false, proxy: {'/api': proxy, '/evidence': proxy}}});
+      await vite.listen();
+    }
     browser = await chromium.launch({ executablePath: process.env.CHROME_PATH ?? 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true });
     const url = `http://127.0.0.1:${vite.httpServer.address().port}`;
     const request = async (route, body) => {
@@ -47,6 +59,6 @@ export async function liveApp(label) {
       if (!response.ok || result.ok === false) throw new Error(`${route} ${response.status}: ${JSON.stringify(result)}`);
       return result;
     };
-    return { root, directory, browser, url, request, close, logs: () => output };
+    return { root, directory, browser, url, request, close, production, logs: () => output };
   } catch (error) { await close(); throw error; }
 }

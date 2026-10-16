@@ -6,7 +6,168 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createRequire } from 'node:module';
+import {externalIntakeAttachments, importExternalIntake, readExternalIntake} from '../server/external-intake.ts';
 const { copyProjectSnapshot } = createRequire(import.meta.url)('../app/project-data.cjs');
+
+function externalFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-external-intake-'));
+  const source = path.join(root, 'source');
+  const project = path.join(root, 'project');
+  const extra = 'docs/verification/extra-200-20261013';
+  const continuous = 'docs/verification/continuous-intake-20261014';
+  const write = (relative: string, value: unknown) => {
+    const file = path.join(source, relative);
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, typeof value === 'string' ? value : JSON.stringify(value));
+  };
+  write(`${extra}/selection.json`, {candidates: ['published', 'same-origin-one', 'same-origin-two', 'same-origin-one']
+    .map((id, index) => ({selectionOrdinal: index + 1, observation: {
+      id, name: id, canonicalUrl: `https://example.test/${id}`,
+    }}))});
+  const facts = '{ "entryId": "same-origin-one", "facts": {}, "original": "原字节" }\r\n';
+  const sha = (value: string | Buffer) => crypto.createHash('sha256').update(value).digest('hex');
+  write(`${extra}/facts-drafts/same-origin-one.json`, facts);
+  write(`${extra}/sources/same-origin-one/home.json`, '{ "text": "Original source body", "language": "en" }\r\n');
+  write(`${continuous}/lane-b/reviews/same-origin-one.facts-pre-review.json`, {
+    factsDraftSha256: sha(facts), verdict: 'pass-for-facts-only',
+  });
+  write(`${continuous}/lane-b/plans/same-origin-one.json`, {
+    pages: ['identity', 'breadth', 'proof'].map(role => ({role, url: `https://example.test/${role}`})),
+  });
+  write(`${extra}/sync-receipts.jsonl`, `${JSON.stringify({entryId: 'published',
+    sourceSynchronized: true, publicProjectionVerified: true, remotePushed: true,
+    gitCommit: 'a'.repeat(40), digest: 'b'.repeat(64)})}\n`);
+  return {root, source, project, extra, continuous, write, facts, sha};
+}
+
+test('external intake preserves raw bytes, exact identities and publication overlap with idempotent imports', () => {
+  const fixture = externalFixture();
+  try {
+    const first = importExternalIntake({sourceRoot: fixture.source, projectDir: fixture.project});
+    assert.equal(first.summary.rawObservations, 4);
+    assert.equal(first.summary.uniqueEntryIds, 3);
+    assert.equal(first.summary.published, 1);
+    assert.equal(first.summary.facts, 1);
+    assert.equal(first.summary.unpublishedFacts, 1);
+    assert.equal(first.summary.continuationCandidates, 2);
+    const candidate = first.candidates.find(item => item.entryId === 'same-origin-one')!;
+    assert.deepEqual(candidate.observationOrdinals, [2, 4]);
+    assert.equal(candidate.stages.facts, 'passed');
+    assert.equal(candidate.currentAttachments?.facts?.sourcePath,
+      `${fixture.extra}/facts-drafts/same-origin-one.json`);
+    assert.equal(candidate.currentAttachments?.plan?.sourcePath,
+      `${fixture.continuous}/lane-b/plans/same-origin-one.json`);
+    assert.equal(candidate.nextGap, 'capture');
+    assert.equal(candidate.stages.currentFiveKindApproval, false);
+    assert.equal(first.candidates.find(item => item.entryId === 'published')!.nextGap, 'published');
+    const attachments = externalIntakeAttachments(first, 'same-origin-one');
+    const copiedFacts = attachments.find(item => item.kind === 'facts')!;
+    assert.deepEqual(fs.readFileSync(copiedFacts.path), Buffer.from(fixture.facts));
+    assert.equal(attachments.some(item => item.kind === 'source' && item.sourcePath.includes('/sources/')), true);
+    const receiptPath = path.join(first.storageDir, 'receipts.jsonl');
+    const receipts = fs.readFileSync(receiptPath);
+    const second = importExternalIntake({sourceRoot: fixture.source, projectDir: fixture.project});
+    assert.equal(second.alreadyPresent, true);
+    assert.equal(second.inventorySha256, first.inventorySha256);
+    assert.deepEqual(fs.readFileSync(receiptPath), receipts);
+    assert.equal(readExternalIntake(fixture.project)!.inventorySha256, first.inventorySha256);
+    fs.unlinkSync(path.join(first.storageDir, 'current.json'));
+    assert.equal(readExternalIntake(fixture.project), null);
+    const recovered = importExternalIntake({sourceRoot: fixture.source, projectDir: fixture.project});
+    assert.equal(recovered.alreadyPresent, true);
+    assert.equal(readExternalIntake(fixture.project)!.inventorySha256, first.inventorySha256);
+    assert.deepEqual(fs.readFileSync(receiptPath), receipts);
+    assert.deepEqual(fs.readFileSync(path.join(fixture.source, fixture.extra, 'facts-drafts/same-origin-one.json')),
+      Buffer.from(fixture.facts));
+  } finally { fs.rmSync(fixture.root, {recursive: true, force: true}); }
+});
+
+test('external intake never promotes stale facts reviews or two screenshots and retains prior snapshots', () => {
+  const fixture = externalFixture();
+  try {
+    const first = importExternalIntake({sourceRoot: fixture.source, projectDir: fixture.project});
+    fixture.write(`${fixture.extra}/facts-drafts/same-origin-one.json`, `${fixture.facts} `);
+    fixture.write(`${fixture.continuous}/lane-b/plans/same-origin-one.before-current.json`,
+      {pages: [{role: 'identity', url: 'https://example.test/stale-page'}]});
+    fixture.write(`${fixture.continuous}/lane-b/materials/same-origin-one.precopy-before-current.json`,
+      {editorial: {descriptionZh: 'Old copy'}});
+    fixture.write(`${fixture.continuous}/lane-b/materials/same-origin-one.precopy.json`,
+      {editorial: {descriptionZh: 'Current copy'}});
+    const pages = ['identity', 'breadth'].map(role => {
+      const bytes = `${role} image bytes`;
+      fixture.write(`${fixture.extra}/captures/same-origin-one/${role}.webp`, bytes);
+      return {role, file: `${role}.webp`, shot: {sha256: fixture.sha(bytes)}, issues: []};
+    });
+    fixture.write(`${fixture.extra}/captures/same-origin-one/observation.json`, {pages});
+    fixture.write(`${fixture.continuous}/lane-b/drafts/same-origin-one.json`, {digest: 'c'.repeat(64)});
+    const second = importExternalIntake({sourceRoot: fixture.source, projectDir: fixture.project});
+    const candidate = second.candidates.find(item => item.entryId === 'same-origin-one')!;
+    assert.equal(candidate.stages.facts, 'pending');
+    assert.equal(candidate.currentAttachments?.plan?.sourcePath,
+      `${fixture.continuous}/lane-b/plans/same-origin-one.json`);
+    assert.equal(candidate.currentAttachments?.precopy?.sourcePath,
+      `${fixture.continuous}/lane-b/materials/same-origin-one.precopy.json`);
+    assert.deepEqual(candidate.stages.capturedRoles, ['identity', 'breadth']);
+    assert.equal(candidate.stages.currentFiveKindApproval, false);
+    assert.equal(candidate.nextGap, 'facts-review');
+    assert.equal(fs.existsSync(first.manifestPath), true);
+    assert.notEqual(second.inventorySha256, first.inventorySha256);
+    const attachment = externalIntakeAttachments(second, 'same-origin-one')[0];
+    fs.writeFileSync(attachment.path, 'changed imported artifact');
+    assert.throws(() => externalIntakeAttachments(second, 'same-origin-one'), /integrity failure/);
+  } finally { fs.rmSync(fixture.root, {recursive: true, force: true}); }
+});
+
+test('external intake rejects source-nested targets and does not commit a moving source snapshot', t => {
+  const fixture = externalFixture();
+  try {
+    assert.throws(() => importExternalIntake({sourceRoot: fixture.source,
+      projectDir: path.join(fixture.source, 'nested')}), /outside its source/);
+    const read = fs.readFileSync;
+    let changed = false;
+    const target = path.join(fixture.source, fixture.extra, 'selection.json');
+    t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+      const result = read(...args);
+      if (!changed && String(args[0]) === target) {
+        changed = true;
+        fixture.write(`${fixture.extra}/sources/late.json`, {newObservation: true});
+      }
+      return result;
+    });
+    assert.throws(() => importExternalIntake({sourceRoot: fixture.source,
+      projectDir: fixture.project}), /inventory changed/);
+    assert.equal(readExternalIntake(fixture.project), null);
+  } finally { t.mock.restoreAll(); fs.rmSync(fixture.root, {recursive: true, force: true}); }
+});
+
+test('external intake accepts original observation.url and keeps the latest exact capture queue status', () => {
+  const fixture = externalFixture();
+  try {
+    fixture.write(`${fixture.extra}/selection.json`, {candidates: [{selectionOrdinal: 1,
+      observation: {id: 'same-origin-one', name: 'Original URL shape',
+        url: 'https://example.test/original-entry?variant=one'}}]});
+    fixture.write(`${fixture.continuous}/lane-a/capture-status.json`, {
+      updatedAt: '2026-10-14T20:00:00Z', entries: [{entryId: 'same-origin-one',
+        status: 'plan-ready-awaiting-camera', blockers: ['Earlier queue entry']}],
+    });
+    fixture.write(`${fixture.continuous}/lane-b/capture-status.json`, {
+      updatedAt: '2026-10-14T21:00:00Z', entries: [{entryId: 'same-origin-one',
+        status: 'capture-held-private-evidence', blockers: [],
+        roles: [{role: 'proof', status: 'capture-held', reason: 'Actual stage timeout'}]},
+      {entryId: 'same-origin-two', status: 'plan-ready-awaiting-camera', blockers: []}],
+    });
+    const result = importExternalIntake({sourceRoot: fixture.source, projectDir: fixture.project});
+    assert.equal(result.candidates[0].url, 'https://example.test/original-entry?variant=one');
+    assert.equal(result.candidates[0].captureStatus, 'capture-held-private-evidence');
+    assert.deepEqual(result.candidates[0].captureBlockers, ['proof: Actual stage timeout']);
+    assert.match(result.manifestPath, /\.v3\.json$/);
+    fixture.write(`${fixture.extra}/selection.json`, {candidates: [{selectionOrdinal: 1,
+      observation: {id: 'same-origin-one', url: 'javascript:alert(1)'}}]});
+    assert.throws(() => importExternalIntake({sourceRoot: fixture.source, projectDir: fixture.project}),
+      /valid HTTP URL: same-origin-one/);
+    assert.equal(readExternalIntake(fixture.project)!.inventorySha256, result.inventorySha256);
+  } finally {fs.rmSync(fixture.root, {recursive: true, force: true});}
+});
 
 test('project migration preserves source, includes uncheckpointed WAL and refuses overwrite', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'h2-project-copy-'));

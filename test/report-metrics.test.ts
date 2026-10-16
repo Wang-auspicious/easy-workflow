@@ -8,6 +8,23 @@ import { aggregateMetrics, buildReport } from "../server/report.ts";
 import type { Factory } from "../server/factory.ts";
 import { Journal } from "../server/journal.ts";
 
+test('non-streaming decision calls remain countable without fabricated output timing or speed', () => {
+  const metrics: AttemptMetrics = {usageReported: true, costReported: false, modelTimeReported: false,
+    tokenUsage: {input: 74, output: 73}, decisionUsage: {input: 74, output: 73, requests: 1, reported: 1},
+    time: {firstTokenMs: 0, outputMs: 0, toolMs: 0, programMs: 0, modelCalls: 1, toolCalls: 0}};
+  const attempt = {id: 'decision', token: 'site', node: 'curation/scout', worker: 'w', input: '', startedAt: 1, endedAt: 479,
+    ms: 478, usage: {input: 0, output: 0, cost: 0}, steps: [], metrics};
+  const event = {kind: 'attempt.finished', attempt: attempt.id, ok: true, summary: 'ranked pages', ms: 478, queuedMs: 0,
+    metrics, seq: 1, at: 479, run: 'decision-report'} as const;
+  const result = aggregateMetrics([attempt], [event]);
+  assert.equal(result.time.modelCalls, 1);
+  assert.equal(result.time.firstTokenMs, null);
+  assert.equal(result.time.outputMs, null);
+  assert.equal(result.time.outputTokensPerSecond, null);
+  assert.equal(result.tokens.actual?.input, 74);
+  assert.equal(result.tokens.actual?.cost, null);
+});
+
 test("report aggregates recorded token/time parts, preserves estimates and isolates historical runs", () => {
   const compiled = compile([pack]), events: Stamped[] = []; let run = "";
   const emit = (at: number, e: JournalEvent) => { if (e.kind === "run.started") run = e.runId; events.push({ ...e, seq: events.length + 1, at, run } as Stamped); };

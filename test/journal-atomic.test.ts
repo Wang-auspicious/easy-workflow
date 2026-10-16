@@ -73,3 +73,23 @@ test('async transaction callbacks are rejected before their body can run', () =>
     assert.equal(invoked, false); assert.equal(journal.seq, 0);
   } finally { journal.close(); }
 });
+
+test('filtered replay preserves cross-kind order, bounds and detached historical payloads', () => {
+  const journal = new Journal(':memory:');
+  try {
+    journal.append({kind: 'run.started', runId: 'first', title: 'First'});
+    journal.append({kind: 'token.data', token: 'fixture', patch: {nested: {value: 'original'}}});
+    journal.append({kind: 'dispatch.note', tone: 'info', text: 'Unrelated large payload'.repeat(1000)});
+    journal.append({kind: 'run.ended', runId: 'first', manual: true});
+    journal.append({kind: 'run.started', runId: 'second', title: 'Second'});
+    const kinds = ['run.started', 'token.data', 'run.started'] as const;
+    assert.deepEqual([...journal.readKinds(kinds)], [...journal.read()].filter(event => kinds.includes(event.kind as typeof kinds[number])));
+    assert.deepEqual([...journal.readKinds(kinds, 1, 4)].map(event => event.seq), [2]);
+    assert.deepEqual([...journal.readKinds([])], []);
+    const first = [...journal.readKinds(['token.data'])][0];
+    if (first.kind !== 'token.data') assert.fail('Expected data');
+    (first.patch.nested as {value: string}).value = 'mutated';
+    const second = [...journal.readKinds(['token.data'])][0];
+    assert.equal(second.kind === 'token.data' && (second.patch.nested as {value: string}).value, 'original');
+  } finally { journal.close(); }
+});

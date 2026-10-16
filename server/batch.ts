@@ -143,7 +143,7 @@ export class BatchSupervisor {
     return batchSummary(f.state);
   }
 
-  configure(options: { target: number; flow?: boolean; maxInFlight?: number; intakeWindow?: number; category?: string; query?: string }) {
+  configure(options: { target: number; flow?: boolean; maxInFlight?: number; intakeWindow?: number; category?: string; query?: string; candidateIds?: string[] }) {
     const f = this.factory;
     if (!f.runtime.nodes.has('candidates/route') || !f.runtime.nodes.has('candidates/pool')) throw new ControlError(409, 'candidate_pack_unavailable', '网站批次需要策展候选包；请从当前项目的工作流入口投料');
     if (f.runtime.ending) throw new ControlError(409, 'run_ending', '正在结束上一轮，请等待报告');
@@ -156,7 +156,8 @@ export class BatchSupervisor {
     const goal: BatchGoal = { runId: f.state.run.id, target: options.target, ...admission,
       maxRecoveries: 2, mode: 'running', startedAt: f.state.batch?.runId === f.state.run.id ? f.state.batch.startedAt : Date.now(),
       modelCircuit: f.state.batch?.runId === f.state.run.id ? f.state.batch.modelCircuit : undefined,
-      category: options.category, query: options.query };
+      category: options.category, query: options.query,
+      candidateIds: options.candidateIds ? [...new Set(options.candidateIds)] : undefined };
     f.journal.append({ kind: 'batch.configured', batch: goal });
     f.runtime.resume();
     this.pump();
@@ -247,6 +248,7 @@ export class BatchSupervisor {
         return;
       }
       for (const token of recoveryOrder) {
+        if (goal.candidateIds && !goal.candidateIds.includes(token.item)) continue;
         if (token.status !== 'parked') continue;
         if (hasRecoveryPolicy(token.data, token.finishedAtNode ?? '')) continue;
         const candidate = f.state.recoveries[token.item];
@@ -318,12 +320,12 @@ export class BatchSupervisor {
         // Both feeders share this admission decision. Merely reversing their
         // journal subscriptions would starve the catalog instead of sources.
         const feed = () => {
-          let admitted = this.sourceHasNextTurn() ? f.sources?.admitManaged(1) ?? 0 : 0;
+          let admitted = !goal.candidateIds && this.sourceHasNextTurn() ? f.sources?.admitManaged(1) ?? 0 : 0;
           if (!admitted && !f.runtime.scopePaused('candidates/route') && !f.runtime.intakeHold('candidates/route')) {
-            admitted = f.pull(1, {category: goal.category, query: goal.query}).length;
+            admitted = f.pull(1, {category: goal.category, query: goal.query, candidateIds: goal.candidateIds}).length;
             catalogChecked = true;
           }
-          return admitted || f.sources?.admitManaged(1) || 0;
+          return admitted || (!goal.candidateIds ? f.sources?.admitManaged(1) : 0) || 0;
         };
         const admitted = f.recovery?.beforeFresh(feed) ?? feed();
         if (!admitted) break;

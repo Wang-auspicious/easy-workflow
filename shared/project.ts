@@ -114,6 +114,23 @@ export interface ChatMessage {
 
 export interface Transfer { seq: number; at: number; token: string; from: string; to: string; returned: boolean }
 
+/**
+ * 工位之间真实说过的一句话。群组视图按它拼出每个群里的往来。
+ * 只记事件本身，不推断语气：文案与 from/to 在这里定下来，界面不再改写。
+ * from/to 取值：工位键 · `dispatcher` · `user` · `channel:<信道 id>` · `*`（对群里所有人说）。
+ */
+export interface CommEntry {
+  id: string;
+  seq: number;
+  at: number;
+  token: string;
+  kind: "consult" | "verdict" | "return" | "channel" | "correction" | "note";
+  from: string;
+  to: string | null;
+  text: string;
+  tone?: "info" | "fork" | "warn";
+}
+
 export interface FactoryState {
   agentBindings?: Record<string, import('./types.ts').StationAgentBinding>;
   corrections?: Record<string, { id: string; token: string; node: string; at: number; seq: number; status: 'pending' | 'executed' | 'reverted' }>;
@@ -138,6 +155,8 @@ export interface FactoryState {
   resources: { used: Record<string, number>; limits: Record<string, number>; freeMemMB: number; at: number; waiting: Record<string, string>; modelRequests?: {active: number; queued: number; limit: number} };
   /** Ring of the latest edge transfers; the canvas turns new ones into particles. */
   transfers: Transfer[];
+  /** Ring of the latest inter-station messages; the group rail reads it. */
+  comms: CommEntry[];
   patches: { id: string; summary: string; status: string; at: number }[];
   reportReady: string | null;
   lockedStations: string[];
@@ -172,13 +191,23 @@ export function initialState(factory?: CompiledFactory): FactoryState {
     nodes, tokens: {}, tokenOrder: [], attempts: {}, workers: {}, evidence: {}, evidenceOrder: [], chat: [], conversation: [], activity: [], recoveries: {},
     totals: { usage: zeroUsage(), published: 0, manual: 0, failed: 0, rejected: 0, merged: 0, returned: 0, corrections: 0 },
     resources: { used: {}, limits: {}, freeMemMB: 0, at: 0, waiting: {} },
-    transfers: [], patches: [], reportReady: null, lockedStations: [],
+    transfers: [], comms: [], patches: [], reportReady: null, lockedStations: [],
     alerts: {}, modelCircuits: {}, preflight: null, cases: {}, contextNotes: {}, consults: {}, corrections: {}, pausedScopes: { lines: [], stations: [] }, agentBindings: {},
   };
 }
 
 const KEEP = 60;
 const pushCap = <T>(arr: T[], v: T, cap = KEEP) => { arr.push(v); if (arr.length > cap) arr.splice(0, arr.length - cap); };
+
+/** 群里的一句话：正文有界，避免长摘要把状态快照撑大。 */
+const COMM_TEXT = 240;
+const commText = (value: string) => {
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length > COMM_TEXT ? `${text.slice(0, COMM_TEXT)}…` : text;
+};
+const pushComm = (s: FactoryState, entry: Omit<CommEntry, "id" | "seq" | "at"> & { seq: number; at: number }) => {
+  pushCap((s.comms ??= []), { ...entry, text: commText(entry.text), id: `c-${entry.seq}` }, 240);
+};
 const remove = (arr: string[], v: string) => { const i = arr.indexOf(v); if (i >= 0) arr.splice(i, 1); };
 
 /** Resets per-run counters when a new run starts; stock carries over. */
@@ -359,6 +388,9 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
     case "review.verdict": {
       const n = node(e.node);
       if (e.verdict === "pass") n.passed++;
+      pushComm(s, { seq: e.seq, at: e.at, token: e.token, kind: "verdict", from: e.node, to: e.returnTo ?? null,
+        tone: e.verdict === "pass" ? "info" : "warn",
+        text: e.verdict === "pass" ? `通过：${e.reason}` : `${e.verdict === "escalate" ? "转人工" : "退回"}：${e.reason}` });
       break;
     }
     case "token.returned": {
@@ -370,11 +402,25 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       if (t.status !== "active") { t.status = "active"; t.finishedAt = undefined; t.finishedAtNode = undefined; }
       s.totals.returned++;
       node(e.from).returned++;
+      pushComm(s, { seq: e.seq, at: e.at, token: e.token, kind: "return", from: e.from, to: e.to, tone: "warn",
+        text: `第 ${e.round} 轮退回${e.byHuman ? "（站长要求）" : ""}：${e.reason}` });
       break;
     }
     case "token.data": {
       const t = s.tokens[e.token];
-      if (t) Object.assign(t.data, e.patch);
+      if (t) {
+        Object.assign(t.data, e.patch);
+        // The scheduler's complete checkpoint is also authoritative on replay;
+        // a successor need not emit a new return to retain its original caps.
+        const checkpoint = e.patch.runtimeCheckpoint as {version?: unknown; rounds?: unknown} | undefined;
+        const rounds = checkpoint?.version === 1 ? checkpoint.rounds : undefined;
+        if (rounds && typeof rounds === 'object' && !Array.isArray(rounds) &&
+            Object.entries(rounds).every(([key, value]) => key.length > 0 &&
+              !['__proto__', 'constructor', 'prototype'].includes(key) &&
+              typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)) {
+          t.rounds = {...rounds} as Record<string, number>;
+        }
+      }
       break;
     }
     case "token.finished": {
@@ -445,6 +491,8 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       s.totals.corrections++;
       for (const correction of Object.values(s.corrections ?? {})) if (correction.token === e.token && correction.status === 'pending') correction.status = 'executed';
       (s.corrections ??= {})[e.correction] = { id: e.correction, token: e.token, node: e.node, at: e.at, seq: e.seq, status: e.snapshot ? 'pending' : 'executed' };
+      pushComm(s, { seq: e.seq, at: e.at, token: e.token, kind: "correction", from: "user", to: e.node, tone: "warn",
+        text: `纠错：${e.reason}${e.note ? `（${e.note}）` : ""}` });
       break;
     }
     case 'correction.reverted': {
@@ -462,6 +510,7 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
     }
     case "dispatch.note":
       pushCap(s.activity, { id: `note-${e.seq}`, role: "note", text: e.text, at: e.at, tone: e.tone, node: e.node }, 100);
+      pushComm(s, { seq: e.seq, at: e.at, token: "", kind: "note", from: e.node ?? "dispatcher", to: "*", tone: e.tone ?? "info", text: e.text });
       break;
     case "chat.user":
       s.chat.push({ id: e.id, role: "user", text: e.text, at: e.at, attachments: e.attachments });
@@ -488,6 +537,8 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       s.reportReady = e.runId;
       break;
     case "channel.emitted":
+      pushComm(s, { seq: e.seq, at: e.at, token: e.token, kind: "channel", from: `channel:${e.channel}`, to: null,
+        tone: "info", text: `交付《${e.item}》` });
       break;
     case "alert.raised":
       (s.alerts ??= {})[e.alert.id] = { ...e.alert, at: e.at };
@@ -506,15 +557,22 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
       break;
     case "consult.opened":
       (s.consults ??= {})[e.consult] = { id: e.consult, token: e.token, reviewer: e.reviewer, owner: e.owner, fields: e.fields, problem: e.problem, round: e.round, openedAt: e.at };
+      pushComm(s, { seq: e.seq, at: e.at, token: e.token, kind: "consult", from: e.reviewer, to: e.owner, tone: "warn",
+        text: `第 ${e.round} 轮 · 要求改「${e.fields.join("、")}」：${e.problem}` });
       break;
     case "consult.replied": {
       const c = s.consults?.[e.consult];
       if (c) { c.reply = e.reply; c.replyOk = e.ok; }
+      pushComm(s, { seq: e.seq, at: e.at, token: e.token, kind: "consult", from: e.owner, to: c?.reviewer ?? null,
+        tone: e.ok ? "info" : "warn", text: `${e.ok ? "已按意见修改" : "未能完成"}：${e.reply}` });
       break;
     }
     case "consult.closed": {
       const c = s.consults?.[e.consult];
       if (c) { c.closedAt = e.at; c.outcome = e.outcome; c.reason = e.reason; }
+      pushComm(s, { seq: e.seq, at: e.at, token: e.token, kind: "consult", from: c?.reviewer ?? "dispatcher", to: "*",
+        tone: e.outcome === "resolved" ? "info" : "warn",
+        text: e.outcome === "resolved" ? `往来已闭环：${e.reason}` : `转站长处理：${e.reason}` });
       break;
     }
   }

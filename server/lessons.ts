@@ -153,7 +153,9 @@ export class Lessons {
   private lessonEvents() {
     const through = this.host.journal.seq;
     if (this.indexedSeq !== through) {
-      for (const event of this.host.journal.read(this.indexedSeq, undefined, through)) {
+      for (const event of this.host.journal.readKinds(['lesson.proposed', 'lesson.revised', 'lesson.validated',
+        'lesson.approved', 'lesson.rejected', 'lesson.applied', 'lesson.validation.started',
+        'lesson.validation.bound', 'lesson.validation.exposed'], this.indexedSeq, through)) {
         if (!isLesson(event)) continue;
         this.cachedLessonEvents.push(event);
         this.lessonSeq = event.seq;

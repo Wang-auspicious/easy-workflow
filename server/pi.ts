@@ -3,6 +3,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {AsyncLocalStorage} from 'node:async_hooks';
+import {channel} from 'node:diagnostics_channel';
 import { createModels, createProvider, envApiKeyAuth, normalizeContext, type Model, type Api, type CredentialStore } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
@@ -24,6 +26,62 @@ const modelFetch: typeof globalThis.fetch = (input, init) => {
   transport ??= new EnvHttpProxyAgent({ noProxy: ["localhost", "127.0.0.1", "::1", process.env.NO_PROXY ?? process.env.no_proxy ?? ""].join(",") });
   return proxyFetch(input as Parameters<typeof proxyFetch>[0], { ...init, dispatcher: transport } as Parameters<typeof proxyFetch>[1]) as unknown as Promise<Response>;
 };
+
+interface ConnectionAttempt {created: number; sent: boolean; responded: boolean}
+const connectionAttempt = new AsyncLocalStorage<ConnectionAttempt>();
+const observedRequests = new WeakMap<object, ConnectionAttempt>();
+function diagnosticRequest(value: unknown): object & {method?: string} | undefined {
+  const request = (value as {request?: unknown} | null)?.request;
+  return request && typeof request === 'object' ? request : undefined;
+}
+channel('undici:request:create').subscribe(value => {
+  const request = diagnosticRequest(value);
+  const attempt = connectionAttempt.getStore();
+  if (request && request.method !== 'CONNECT' && attempt) {
+    attempt.created++;
+    observedRequests.set(request, attempt);
+  }
+});
+for (const name of ['undici:client:sendHeaders', 'undici:request:bodySent']) {
+  channel(name).subscribe(value => {
+    const request = diagnosticRequest(value);
+    const attempt = request && observedRequests.get(request);
+    if (attempt) attempt.sent = true;
+  });
+}
+channel('undici:request:headers').subscribe(value => {
+  const request = diagnosticRequest(value);
+  const attempt = request && observedRequests.get(request);
+  if (attempt) attempt.responded = true;
+});
+
+/** One reconnect is safe only before TLS and before any application request bytes.
+ * Observation includes redirects; a prior response or write forbids replay. The
+ * caller retains its original model lease, deadline and SDK retry budget. */
+export async function fetchModelRequest(input: Parameters<typeof fetch>[0], init?: RequestInit,
+  send: typeof fetch = modelFetch): Promise<Response> {
+  if (!(typeof input === 'string' || input instanceof URL) ||
+      init?.body != null && typeof init.body !== 'string') return send(input, init);
+  let target: URL;
+  try { target = new URL(input); } catch { return send(input, init); }
+  if (target.protocol !== 'https:') return send(input, init);
+  const options = {...init, ...(init?.headers ? {headers: new Headers(init.headers)} : {})};
+  const attempt: ConnectionAttempt = {created: 0, sent: false, responded: false};
+  try {
+    return await connectionAttempt.run(attempt, () => send(target.href, options));
+  } catch (error) {
+    const cause = (error as Error)?.cause as Error & {code?: string; host?: string; port?: number};
+    if (options.signal?.aborted || !(error instanceof TypeError) || error.message !== 'fetch failed' ||
+        !(cause instanceof Error) || cause.code !== 'ECONNRESET' ||
+        cause.message !== 'Client network socket disconnected before secure TLS connection was established' ||
+        cause.host !== target.hostname.replace(/^\[|\]$/g, '') || Number(cause.port) !== Number(target.port || 443) ||
+        attempt.created !== 1 || attempt.sent || attempt.responded) throw error;
+    options.signal?.throwIfAborted();
+    // No loop and no transport reset: a second failure belongs to the existing
+    // station recovery, and unrelated in-flight sockets remain untouched.
+    return send(target.href, options);
+  }
+}
 export async function closeModelTransport() { const current = transport; transport = undefined; await current?.destroy(); }
 
 export const piDirectory = () => process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
@@ -156,7 +214,7 @@ export function models(requested?: PiModelSelection) {
       // attempts multiplied by station continuation and per-site batch retries.
       let transportDetail = '';
       const observedFetch: typeof fetch = async (input, init) => {
-        try { return await modelFetch(input, init); }
+        try { return await fetchModelRequest(input, init); }
         catch (error) {
           const e = error as {message?:string;code?:string;cause?:{code?:string;message?:string}};
           let endpoint = requestModel.provider;

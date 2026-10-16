@@ -67,6 +67,20 @@ test('insufficient memory cannot produce a green preflight while the browser poo
   broker.freeMem=()=>2048;assert.equal(checkMemoryCapacity(broker).ok,true);
 });
 
+test('memory preflight accepts the single-page pressure policy and reports RAM and commit separately', () => {
+  const broker = new Broker({browser: 8}, 1024);
+  broker.memorySnapshot = () => ({
+    physicalTotalMB: 16108, physicalAvailableMB: 900,
+    commitLimitMB: 36199, commitAvailableMB: 6883,
+    source: 'windows-performance', checkedAt: Date.now(),
+  });
+  const result = checkMemoryCapacity(broker);
+  assert.equal(result.ok, true, result.detail);
+  assert.match(result.detail, /900MB/);
+  assert.match(result.detail, /6883MB/);
+  assert.match(result.detail, /1\/8/);
+});
+
 test('a late browser preflight page is cancelled and reclaimed after the deadline', async () => {
   const broker = new Broker({ browser: 1 }, 0);
   let resolvePage!: (value: any) => void, closed = 0, navigated = 0, signal: AbortSignal | undefined;

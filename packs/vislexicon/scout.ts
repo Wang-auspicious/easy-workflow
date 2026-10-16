@@ -9,6 +9,7 @@ import { fetchRepoMeta, repoOf, repoSources, type RepoMeta } from "../../server/
 import { classifyFailure, type Failure } from "../../shared/failures.ts";
 import { VIEW, links as pageLinks, sameSite, visit, type Link } from "./capture.ts";
 import { parseHtml } from "./tools.ts";
+import {chooseSourceLinks} from './decisions.ts';
 
 export interface Dossier {
   url: string; finalUrl: string; status: number; title: string; description: string;
@@ -150,10 +151,25 @@ export async function scout(ctx: StationContext, svc: {
     const hit = sameHost.find((l) => { try { const u = new URL(l.href); return re.test(u.pathname) && !picked.some((p) => p.url === l.href); } catch { return false; } });
     if (hit) picked.push({ url: hit.href, why });
   }
+  // Keep deterministic candidates and all links in the dossier. Semantic choices
+  // change the bounded browsing order, never create URLs or certify page content.
+  const candidates = [...new Map([
+    ...picked.flatMap(page => sameHost.filter(link => link.href === page.url)),
+    ...sameHost,
+  ].map(link => [link.href, link])).values()];
+  const semantic = await chooseSourceLinks(ctx, candidates, [
+    {id: 'catalogue', instructions: 'Select this product’s own catalogue, components, templates or examples, not customer showcases.'},
+    {id: 'about', instructions: 'Select the page identifying this product’s creator, team or maintaining organization.'},
+    {id: 'pricing', instructions: 'Select this product’s pricing, plans or purchase terms, including paid tiers.'},
+    {id: 'license', instructions: 'Select this product’s license or usage permissions, not a privacy policy.'},
+    {id: 'docs', instructions: 'Select this product’s documentation or getting-started page, not a different sibling product.'},
+  ], 'curation.scout.key-pages', `${rendered?.title ?? http?.title ?? ''} ${http?.description ?? ''}`);
+  const priority = [...semantic].map(([why, url]) => ({url, why: `文字候选 ${why}`}));
+  const ordered = [...new Map([...priority, ...picked].map(page => [page.url, page])).values()];
   const repoLink = [url, finalUrl, ...allLinks.map((l) => l.href)].find((h) => /github\.com\/[^/]+\/[^/#?]+/i.test(h) && repoOf(h));
   const [files, pages, repo] = await Promise.all([
     siteFiles(origin, ctx.signal),
-    Promise.all(picked.slice(0, 6).map(async (p) => {
+    Promise.all(ordered.slice(0, 6).map(async (p) => {
       try {
         const r = await webGet(p.url, { signal: ctx.signal, timeout: 12000 });
         if (r.status >= 400) return null;

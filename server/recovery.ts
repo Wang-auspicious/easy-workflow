@@ -580,7 +580,8 @@ export class UnmanagedRecoverySupervisor {
           f.state.batch?.runId === f.state.run.id ? f.state.batch.modelCircuit : undefined;
         return plan?.state === 'waiting' && !this.delegated(token, plan.kind, plan.dependency) &&
           (!networkOnly || plan.kind === 'network') &&
-          (!this.managed(token) || f.state.batch?.mode === 'running') &&
+          (!this.managed(token) || f.state.batch?.mode === 'running' &&
+            (token.status === 'active' || !f.state.batch.candidateIds || f.state.batch.candidateIds.includes(token.item))) &&
           (!plan.policy || plan.nextAt <= now) &&
           (circuit ? circuit.state === 'open' && circuit.nextAt <= now && (!circuit.trialToken || circuit.trialToken === token.id) : plan.nextAt <= now) &&
           (!legacy || legacy.state === 'open' && legacy.nextAt <= now && (!legacy.trialToken || legacy.trialToken === token.id)) &&

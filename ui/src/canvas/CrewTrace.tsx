@@ -15,6 +15,7 @@ import { useHoverPreview, previewSet } from "../shell/HoverPreview.tsx";
 import { openCorrection } from "../board/Correction.tsx";
 import { fmt, secs } from "./Node.tsx";
 import {useDetail} from '../details.ts';
+import {recordedUsage} from './status.ts';
 
 /** 同一个工位的人共用形状，用色相区分开；撤下的人变灰。 */
 export function crewLook(node: CompiledNode, index: number, retired: boolean) {
@@ -25,6 +26,7 @@ export function crewLook(node: CompiledNode, index: number, retired: boolean) {
 export function workerState(w: WorkerState, a: AttemptState | undefined): AvatarState {
   if (w.retiredAt) return "sleep";
   if (a && a.endedAt === undefined) return "work";
+  if (a?.cancelled) return 'idle';
   if (a && a.ok === false) return "fail";
   if (a && a.ok) return "returned";
   return "idle";
@@ -68,6 +70,7 @@ export function WorkerTrace({ a, node, now }: { a: AttemptState; node: CompiledN
   const detail = useDetail<AttemptState>({kind: 'attempt', id: a.id}, a);
   const groups = groupSteps(detail.data?.steps ?? []);
   const running = a.endedAt === undefined;
+  const usage = recordedUsage([a]);
   const c = roleColors(node.role).border;
   return (
     <div className="wt" style={{ ["--tc" as string]: c }}>
@@ -92,7 +95,7 @@ export function WorkerTrace({ a, node, now }: { a: AttemptState; node: CompiledN
         {running ? <><Loader2 size={12} className="spin-i" /><span>{a.steps[a.steps.length - 1]?.text ?? "开始处理…"}</span></>
           : <>{a.cancelled ? <CircleMinus size={12} /> : a.ok ? <Check size={12} /> : <AlertTriangle size={12} />}
             <span>{a.ok ? a.summary : `${a.summary ?? "失败"}${a.error && a.error !== a.summary ? `：${a.error}` : ""}`}</span>
-            <span className="num muted">{a.usage.input ? `${fmt(a.usage.input + a.usage.output)} tok` : ""}{a.queuedMs ? ` · 排队 ${secs(a.queuedMs)}` : ""}</span></>}
+            <span className="num muted">{usage.total === null ? 'Token 未回报' : `${fmt(usage.total)} tok`}{a.queuedMs ? ` · 排队 ${secs(a.queuedMs)}` : ""}</span></>}
       </div>
     </div>
   );

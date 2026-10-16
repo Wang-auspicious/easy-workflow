@@ -7,8 +7,11 @@ import "../src/styles/base.css";
 import "../src/styles/shell.css";
 import "../src/styles/panels.css";
 import "../src/styles/studio.css";
+import '../src/styles/canvas.css';
 import '../src/views/recovery.css';
 import { Inspectors } from "../src/canvas/Inspector.tsx";
+import {Canvas} from '../src/canvas/Canvas.tsx';
+import {layoutFactory} from '../../shared/layout.ts';
 import { setState, getState, ingest, useStore } from "../src/store.ts";
 import { apply, initialState } from "../../shared/project.ts";
 import {uiState, uiEvent} from '../../shared/client-view.ts';
@@ -84,9 +87,10 @@ fs.agentDefaults = {
 };
 
 const geo: Geometry = { nodes: [], place: {}, capsules: [], capsuleOf: {}, docks: [], dockOf: {}, edges: [], returns: [], bounds: { x: 0, y: 0, w: 1200, h: 800 }, halls: [], bays: [], shelf: null };
-setState({fs: uiState(fs), factory, ready: true, connected: true, version: 1, view: 'canvas', model: "fixture-model",
+const canvasMode = new URLSearchParams(location.search).has('canvas');
+setState({fs: uiState(fs), factory, defaultLayout: layoutFactory(nodes, [], ['curation'], {}, []), ready: true, connected: true, version: 1, view: 'canvas', model: "fixture-model",
   settings: {browser: 2, model: 1, modelWorkers: 3, cpu: 2, http: 2, memoryFloorMB: 1024, socialPerMinute: 2, socialPerDay: 60},
-  inspectors: [{ key: "curation/review", kind: "node", x: 40, y: 40, pinned: true }]});
+  inspectors: canvasMode ? [] : [{ key: "curation/review", kind: "node", x: 40, y: 40, pinned: true }]});
 (window as any).inspectorFixture = {getState, setState, fullState: fs, emit: (event: Stamped) => {
   const stamped = {...event, seq: fs.seq + 1, at: Date.now(), run: fs.run.id} as Stamped;
   apply(fs, stamped);
@@ -95,7 +99,7 @@ setState({fs: uiState(fs), factory, ready: true, connected: true, version: 1, vi
 function Fixture() {
   const view = useStore(state => state.view);
   return view === 'board' ? <EvidenceBoard /> : view === 'settings' ? <Settings />
-    : view === 'candidates' ? <Candidates /> : <Inspectors geo={geo} cam={{x: 0, y: 0, k: 1}} />;
+    : view === 'candidates' ? <Candidates /> : canvasMode ? <Canvas active /> : <Inspectors geo={geo} cam={{x: 0, y: 0, k: 1}} />;
 }
 createRoot(document.getElementById("root")!).render(
   <div className="app" style={{ ["--chat-w" as string]: "0px" }}>

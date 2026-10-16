@@ -1,7 +1,8 @@
 // Talking to the factory server: boot snapshot, SSE stream, actions.
-import type { Attachment, ProjectAgentDefaults } from "../../shared/types.ts";
+import type { Attachment, CompiledFactory, ProjectAgentDefaults } from "../../shared/types.ts";
+import type {LayoutResult} from '../../shared/layout.ts';
 import type { FactoryState } from "../../shared/project.ts";
-import { getState, ingest, setState, type LayoutFile, type NodeAgentBinding } from "./store.ts";
+import { clearPendingEvents, getState, ingest, setState, type LayoutFile, type NodeAgentBinding } from "./store.ts";
 import { toast } from "./shell/Toasts.tsx";
 import { legacyReply } from "../../shared/conversation.ts";
 import { idleDispatcher, reconcileChatLive, reduceChatLive, type ChatEvent, type DispatcherStatus } from "./chat/live.ts";
@@ -9,61 +10,125 @@ import {executionIndex} from './canvas/status.ts';
 import type {UiEvent} from '../../shared/client-view.ts';
 
 export const api = {
-  async get<T>(path: string, options?: { signal?: AbortSignal }): Promise<T> { const r = await fetch(path, options); if (!r.ok) throw new Error(`${path} ${r.status}`); return r.json(); },
-  async post<T = unknown>(path: string, body: unknown): Promise<T> {
+  async get<T>(path: string, options?: { signal?: AbortSignal }): Promise<T> {
+    return readResponse<T>(await fetch(path, options));
+  },
+  async post<T = unknown>(path: string, body: unknown, options?: {signal?: AbortSignal}): Promise<T> {
     try {
-      const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error ?? `${path} ${r.status}`);
-      return data;
-    } catch (err) { toast((err as Error).message); throw err; }
+      const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: options?.signal });
+      return await readResponse<T>(r);
+    } catch (err) {
+      if (!(err instanceof DOMException && err.name === 'AbortError')) toast(err instanceof Error ? err.message : '请求失败，请重试。');
+      throw err;
+    }
   },
 };
 
+async function readResponse<T>(response: Response): Promise<T> {
+  let data: unknown;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error(response.ok ? '服务返回了无法读取的数据，请重试。' : `服务请求失败（HTTP ${response.status}），请检查连接后重试。`);
+  }
+  if (!response.ok) {
+    const message = data && typeof data === 'object' && 'error' in data && typeof data.error === 'string' ? data.error : `服务请求失败（HTTP ${response.status}）`;
+    throw new Error(`${message}（HTTP ${response.status}）`);
+  }
+  return data as T;
+}
+
 let es: EventSource | null = null;
+let bootGeneration = 0;
+let bootController: AbortController | null = null;
+let specGeneration = 0;
+
+interface FactorySnapshot {
+  factory: CompiledFactory;
+  layout: Partial<LayoutFile>;
+  defaultLayout: LayoutResult;
+  settings: Record<string, number>;
+  model: string;
+  keyPresent: boolean;
+  agentBindings?: NodeAgentBinding[];
+}
 
 export async function boot() {
-  const f = await api.get<{ factory: any; layout: Partial<LayoutFile>; defaultLayout: any; settings: Record<string, number>; model: string; keyPresent: boolean; agentBindings?: NodeAgentBinding[] }>("/api/factory");
-  const fs = await api.get<FactoryState & { dispatcher?: DispatcherStatus }>("/api/state?view=ui-v1");
-  // A window can reload while an older desktop backend is still shutting down.
-  fs.activity ??= fs.chat.filter(m=>m.role==="note");
-  fs.recoveries ??= {};
-  fs.conversation ??= fs.chat.filter(m=>m.role!=="note").map(m=>({id:m.id,turn:m.id.replace(/-r$/,""),message:m.role==="user"?{role:"user" as const,content:m.text,timestamp:m.at}:legacyReply(m.text,m.at),attachments:m.attachments}));
-  const layout = { pos: {}, open: {}, colors: {}, bots: {}, capsules: {}, ...f.layout };
-  if (layout.designVersion !== 4) {
-    // Preserve previous coordinates before adopting the requested compact layout.
-    // The old file is untouched until the next explicit layout edit; after that
-    // its coordinates remain available in previousLayout, not silently discarded.
-    layout.previousLayout = { pos: layout.pos, capsules: layout.capsules, open: layout.open, designVersion: layout.designVersion };
-    layout.pos = {}; layout.capsules = {}; layout.open = {}; layout.designVersion = 4;
+  if (getState().replay) return;
+  const generation = ++bootGeneration;
+  specGeneration++;
+  bootController?.abort();
+  const controller = new AbortController();
+  bootController = controller;
+  setState({bootError: null});
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]);
+  const initialLayoutRevision = layoutRevision;
+  try {
+    let f: FactorySnapshot | null = null;
+    let fs: (FactoryState & {dispatcher?: DispatcherStatus}) | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const readingSpec = specGeneration;
+      const factory = await api.get<FactorySnapshot>('/api/factory', {signal});
+      const state = await api.get<FactoryState & {dispatcher?: DispatcherStatus}>('/api/state?view=ui-v1', {signal});
+      if (generation !== bootGeneration || getState().replay) return;
+      if (readingSpec === specGeneration && state.digest === factory.factory.digest) {
+        f = factory;
+        fs = state;
+        break;
+      }
+    }
+    if (!f || !fs) throw new Error('工作流规格正在更新，请重新连接以读取一致的状态。');
+    clearPendingEvents();
+    // A window can reload while an older desktop backend is still shutting down.
+    fs.activity ??= fs.chat.filter(m=>m.role==="note");
+    fs.recoveries ??= {};
+    fs.conversation ??= fs.chat.filter(m=>m.role!=="note").map(m=>({id:m.id,turn:m.id.replace(/-r$/,""),message:m.role==="user"?{role:"user" as const,content:m.text,timestamp:m.at}:legacyReply(m.text,m.at),attachments:m.attachments}));
+    const layout = { pos: {}, open: {}, colors: {}, bots: {}, capsules: {}, ...f.layout };
+    if (layout.designVersion !== 4) {
+      // Preserve previous coordinates before adopting the requested compact layout.
+      // The old file is untouched until the next explicit layout edit; after that
+      // its coordinates remain available in previousLayout, not silently discarded.
+      layout.previousLayout = { pos: layout.pos, capsules: layout.capsules, open: layout.open, designVersion: layout.designVersion };
+      layout.pos = {}; layout.capsules = {}; layout.open = {}; layout.designVersion = 4;
+    }
+    setState({
+      factory: f.factory, defaultLayout: f.defaultLayout,
+      agentBindings: Object.fromEntries((f.agentBindings ?? []).map(binding => [binding.node, binding])),
+      nodeExecutions: executionIndex(fs),
+      layout: layoutDirty || layoutRevision !== initialLayoutRevision ? getState().layout : layout,
+      fs, version: getState().version + 1, settings: f.settings, model: f.model, keyPresent: f.keyPresent, ready: true,
+      dispatcher: fs.dispatcher ?? idleDispatcher(),
+      live: reconcileChatLive(getState().live, fs.dispatcher ?? idleDispatcher()),
+    });
+    connect(fs.seq);
+    void persistLayout();
+    void api.get<import("../../shared/browser.ts").BrowserState>("/api/browser", {signal}).then(browser => {
+      if (generation === bootGeneration && !getState().replay) setState({browser});
+    }).catch(() => {});
+  } catch (error) {
+    if (generation !== bootGeneration || controller.signal.aborted) return;
+    const message = signal.aborted ? '连接超时，请检查本地服务后重试。' : error instanceof Error ? error.message : '无法读取工作台，请重试。';
+    setState({bootError: message, connected: false});
+    throw new Error(message);
   }
-  setState({
-    factory: f.factory, defaultLayout: f.defaultLayout,
-    agentBindings: Object.fromEntries((f.agentBindings ?? []).map(binding => [binding.node, binding])),
-    nodeExecutions: executionIndex(fs),
-    layout,
-    fs, version: getState().version + 1, settings: f.settings, model: f.model, keyPresent: f.keyPresent, ready: true,
-    dispatcher: fs.dispatcher ?? idleDispatcher(),
-    live: reconcileChatLive(getState().live, fs.dispatcher ?? idleDispatcher()),
-  });
-  connect(fs.seq);
-  void api.get<import("../../shared/browser.ts").BrowserState>("/api/browser").then(browser => setState({browser})).catch(() => {});
 }
 
 export function connect(since: number) {
   es?.close();
-  es = new EventSource(`/api/events?since=${since}&view=ui-v1`);
-  es.onopen = () => setState({ connected: true });
-  es.onerror = () => setState({ connected: false });
-  es.onmessage = (m) => {
-    if (getState().replay) return;
+  const stream = new EventSource(`/api/events?since=${since}&view=ui-v1`);
+  es = stream;
+  stream.onopen = () => { if (es === stream) setState({ connected: true }); };
+  stream.onerror = () => { if (es === stream) setState({ connected: false }); };
+  stream.onmessage = (m) => {
+    if (es !== stream || getState().replay) return;
     const event = JSON.parse(m.data) as UiEvent;
     ingest([event]);
     if (event.kind === 'agent.binding') void refreshAgentBindings(event.node);
     if (event.kind === 'agent.defaults') void refreshSpec();
     if (event.kind === "factory.loaded" || event.kind === "spec.patched") void refreshSpec();
   };
-  es.addEventListener("live", (m) => {
+  stream.addEventListener("live", (m) => {
+    if (es !== stream || getState().replay) return;
     const e = JSON.parse((m as MessageEvent).data) as ChatEvent & { state?: import("../../shared/browser.ts").BrowserState };
     if (e.kind === "browser.state" && e.state) { setState({browser:e.state}); return; }
     if (getState().replay) return;
@@ -76,19 +141,21 @@ export function connect(since: number) {
 }
 
 export async function refreshSpec() {
+  const generation = ++specGeneration;
   try {
-    const f = await api.get<{ factory: any; defaultLayout: any; agentBindings?: NodeAgentBinding[]; agentDefaults?: ProjectAgentDefaults; model?: string; keyPresent?: boolean }>("/api/factory");
-    if (!getState().replay) setState((s) => ({ factory: f.factory, defaultLayout: f.defaultLayout,
+    const f = await api.get<{ factory: CompiledFactory; defaultLayout: LayoutResult; agentBindings?: NodeAgentBinding[]; agentDefaults?: ProjectAgentDefaults; model?: string; keyPresent?: boolean }>("/api/factory", {signal: AbortSignal.timeout(20000)});
+    if (generation === specGeneration && !getState().replay) setState((s) => ({ factory: f.factory, defaultLayout: f.defaultLayout,
       agentBindings: Object.fromEntries((f.agentBindings ?? []).map(binding => [binding.node, binding])),
       ...(f.model !== undefined ? {model: f.model} : {}),
       ...(f.keyPresent !== undefined ? {keyPresent: f.keyPresent} : {}),
       inspectors: s.inspectors.filter((i) => i.kind === "token" || f.factory.nodes.some((n: { key: string }) => n.key === i.key)),
     }));
-  } catch (err) { toast(`规格刷新失败：${(err as Error).message}`); }
+  } catch (err) { if (generation === specGeneration && !getState().replay) toast(`规格刷新失败：${(err as Error).message}`); }
 }
 
 const bindingReads = new Map<string, number>();
 async function refreshAgentBindings(node: string) {
+  const snapshotGeneration = bootGeneration;
   const generation = (bindingReads.get(node) ?? 0) + 1;
   bindingReads.set(node, generation);
   try {
@@ -98,7 +165,7 @@ async function refreshAgentBindings(node: string) {
     });
     const body = await response.json();
     if (!response.ok || !body.ok || !Array.isArray(body.result?.bindings)) return;
-    if (getState().replay || bindingReads.get(node) !== generation) return;
+    if (getState().replay || bindingReads.get(node) !== generation || snapshotGeneration !== bootGeneration) return;
     const binding = (body.result.bindings as NodeAgentBinding[]).find(binding => binding.node === node);
     setState(state => {
       const metadata = {...state.agentBindings};
@@ -109,13 +176,54 @@ async function refreshAgentBindings(node: string) {
   } catch { /* Preserve recorded execution; a later read can resolve default metadata. */ }
 }
 
-export function disconnect() { es?.close(); es = null; }
+export function disconnect() {
+  bootGeneration++;
+  specGeneration++;
+  bootController?.abort();
+  es?.close();
+  es = null;
+  setState({connected: false});
+}
 
 let layoutTimer = 0;
+let pendingLayout: LayoutFile | null = null;
+let layoutWriting = false;
+let layoutDirty = false;
+let layoutRevision = 0;
+
+async function persistLayout() {
+  if (layoutWriting || !pendingLayout || getState().replay) return;
+  layoutWriting = true;
+  try {
+    while (pendingLayout && !getState().replay) {
+      const next = pendingLayout;
+      pendingLayout = null;
+      try {
+        await api.post('/api/layout', next);
+        if (!pendingLayout && getState().layout === next) layoutDirty = false;
+      } catch {
+        toast('布局尚未保存，当前画面已保留。', {
+          label: '重试保存',
+          run: () => saveLayout(getState().layout),
+        }, 10000);
+      }
+    }
+  } finally {
+    layoutWriting = false;
+  }
+}
+
 export function saveLayout(next: LayoutFile) {
+  if (getState().replay) {
+    toast('回放期间布局只读，请退出回放后调整。');
+    return;
+  }
   setState({ layout: next });
+  layoutRevision++;
+  layoutDirty = true;
+  pendingLayout = next;
   clearTimeout(layoutTimer);
-  layoutTimer = window.setTimeout(() => void api.post("/api/layout", next), 500);
+  layoutTimer = window.setTimeout(() => void persistLayout(), 500);
 }
 
 export const actions = {

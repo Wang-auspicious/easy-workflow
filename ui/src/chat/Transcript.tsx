@@ -6,15 +6,13 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, GitFork, Info, Wrench, Loader2, Check, X, ChevronsDownUp, ChevronsUpDown, User } from "lucide-react";
-import type { CompiledFactory, Role } from "../../../shared/types.ts";
 import type { ConversationEntry } from "../../../shared/conversation.ts";
 import type { ChatMessage } from "../../../shared/project.ts";
 import { getState, setState, useStore } from "../store.ts";
-import { botFor } from "../../../shared/palette.ts";
-import { botState } from "../canvas/Node.tsx";
 import { toggleInspector } from "../canvas/Canvas.tsx";
 import { Avatar, STATE_TEXT, grokShape } from "./Avatar.tsx";
-import { buildTranscript, DISPATCHER_HUE, type AvatarState, type TranscriptItem, type TranscriptPart } from "./transcript.ts";
+import { buildTranscript, DISPATCHER_HUE, type TranscriptItem, type TranscriptPart } from "./transcript.ts";
+import { stationLook } from "./station-look.ts";
 import { USER_AVATARS, userAvatarSrc } from "./user-avatars.ts";
 import { useNow } from "../util/useNow.ts";
 import { CorrectionUndo } from '../board/CorrectionUndo.tsx';
@@ -39,7 +37,7 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
   const state = getState();
   const items = useMemo(
     () => buildTranscript({
-      entries, live, dispatcher, notes: state.fs.activity, factory: state.factory, station: stationLook(state.factory, state.layout.bots, now),
+      entries, live, dispatcher, notes: state.fs.activity, factory: state.factory, station: stationLook(state.factory, state.fs, state.layout.bots, now),
     }),
     [entries, entries.length, live, dispatcher, state.fs.activity, state.factory, state.version, now],
   );
@@ -81,19 +79,6 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
   );
 }
 
-/** 工位小人：形状与颜色取自画布上的同一只（botFor），动作取自 Node.tsx 的 botState。 */
-function stationLook(factory: CompiledFactory | null, bots: Record<string, number>, now: number) {
-  return (key: string) => {
-    const node = factory?.nodes.find((n) => n.key === key);
-    if (!node) return undefined;
-    const s = getState();
-    const n = s.fs.nodes[key];
-    const wired = factory?.lines.find((l) => l.id === node.line)?.wired;
-    const state: AvatarState = botState(n, Boolean(node.dormant) || (!wired && node.kind !== "store"), now, s.fs.resources.waiting?.[key]);
-    const look = botFor(key, node.role as Role, bots[key] !== undefined ? { seed: bots[key] } : undefined);
-    return { shape: look.shape, hue: look.hue, state };
-  };
-}
 
 const time = (t: number) => new Date(t).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 

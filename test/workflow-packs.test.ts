@@ -9,8 +9,11 @@ import { instantiateWorkflowTemplate, listWorkflowTemplates } from '../server/te
 import { installWorkflowPack, loadWorkflowPacks, readWorkflowIndex, addWorkflowLine, type WorkflowManifest, type WorkflowServices } from '../server/workflow-packs.ts';
 import { invokeWorkflowTool, describeWorkflowTool } from '../server/workflow-tools.ts';
 import { compile } from '../server/spec/compile.ts';
+import {workflowEntry} from '../server/workflow-entry.ts';
 import { station, line } from '../server/spec/dsl.ts';
 import type {StationAgentBinding, StationRecoveryPolicy} from '../shared/types.ts';
+import {withDecisionClient, type DecisionClientLike, type DecisionResponse} from '../server/decision-model.ts';
+import type {StationContext} from '../server/runtime.ts';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-packs-'));
 process.env.FACTORY_VAR = root;
@@ -41,6 +44,195 @@ function outputWriterFixture(id: string) {
     schemas: { text: textSchema, publication: { type: 'object', properties: { result: textSchema }, required: ['result'], additionalProperties: false }, artifact: { type: 'object', properties: { path: { type: 'string' }, sha256: { type: 'string' }, bytes: { type: 'number' } }, required: ['path', 'sha256', 'bytes'], additionalProperties: false } } };
   return { manifest, files };
 }
+
+function decisionFixture(id: string) {
+  const role = 'roles/decide/ROLE.md';
+  const input = {type: 'object', properties: {text: {type: 'string'},
+    nullable: {anyOf: [{type: 'string'}, {type: 'null'}]}, expectedModel: {type: 'string'}},
+    required: ['text', 'nullable'], additionalProperties: false};
+  // SystemOne is a typed inference program: its public output preserves every
+  // answer and the actual model, without synthesizing a chat/submit transcript.
+  const output = {type: 'object', properties: {answers: {type: 'object'}, model: {type: 'string', minLength: 1}},
+    required: ['answers', 'model'], additionalProperties: false};
+  const nodes = [station({id: 'decide', name: 'SystemOne structured decision', kind: 'program', role: 'process',
+    resource: 'none', input: 'decision-input', output: 'decision-result', accept: ['Return all real typed answers and the actual model.']}),
+  station({id: 'done', name: 'Published', kind: 'store', role: 'store', input: 'decision-result', output: 'decision-result'})];
+  const manifest: WorkflowManifest = {format: 1, id, name: id, version: '1', blurb: 'Typed inference fixture',
+    entry: `${id}/decide`, inputSchema: 'input', lines: [line({id, name: id, layer: 3, priority: 'mid', wired: true,
+      blurb: 'One explicit typed inference program', stations: nodes, edges: [['decide', 'done']]})],
+    links: [], channels: [], conditions: {}, resources: {browser: 0, model: 0, cpu: 0, http: 0}, schemas: {input, output},
+    bindings: {[`${id}/decide`]: {role, inputSchema: 'input', outputSchema: 'output',
+      input: {text: {path: 'input.text'}, nullable: {path: 'input.nullable', default: 'must-not-replace-null'}, expectedModel: {path: 'input.expectedModel'}},
+      outputKey: 'decision', execute: {kind: 'system-one', purpose: 'Classify only the supplied fixture facts.',
+        questions: {route: {type: 'choice', instructions: 'Choose the supported route from the supplied text.',
+          criteria: {accept: 'Evidence supports this route.', reject: 'Evidence does not support this route.'}}}, minConfidence: 0.8}}}};
+  return {manifest, files: {[role]: '# SystemOne decision program\n\nRead only the explicitly mapped input. Preserve nulls, complete typed answers, and actual model identity. Missing service or insufficient confidence must fail without publication; cancellation never falls back.'}};
+}
+
+test('SystemOne manifests are typed program contracts with bounded static questions and no connection secrets', async () => {
+  const directory = path.join(root, 'decision-contract');
+  const valid = decisionFixture('typed-contract');
+  await installWorkflowPack(directory, valid, idle);
+  const loaded = await loadWorkflowPacks(directory);
+  assert.equal(loaded.packs[0].contracts?.['typed-contract/decide'].executor, 'system-one');
+  const index = fs.readFileSync(path.join(directory, 'packs/installed.json'), 'utf8');
+  const base = valid.manifest.bindings['typed-contract/decide'].execute;
+  for (const invalid of [
+    {...base, purpose: ''}, {...base, questions: {}}, {...base, questions: {route: {type: 'chat', instructions: 'Invent a response.'}}},
+    {...base, questions: {route: {type: 'choice', instructions: 'Choose.', criteria: {}}}},
+    {...base, questions: {route: {type: 'noul', instructions: 'Decide.', criteria: {true: 'Only one side'}}}},
+    {...base, questions: {route: {type: 'score', instructions: 'Score.', criteria: []}}},
+    {...base, questions: Object.fromEntries(Array.from({length: 9}, (_, index) => [`q${index}`, {type: 'noul', instructions: 'Decide.'}]))},
+    {...base, questions: {route: {type: 'choice', instructions: 'Choose.', criteria: Object.fromEntries(Array.from({length: 17}, (_, index) => [`c${index}`, 'Meaning']))}}},
+    {...base, questions: Object.fromEntries(Array.from({length: 5}, (_, index) => [`q${index}`, {type: 'choice', instructions: 'Choose.', criteria: Object.fromEntries(Array.from({length: 16}, (_, option) => [`c${option}`, 'Meaning']))}]))},
+    {...base, minConfidence: -0.1}, {...base, minConfidence: 1.1},
+    {...base, apiKey: 'fixture-private-value'}, {...base, endpoint: 'http://private.fixture'},
+    {...base, agent: {adapter: 'pi'}},
+  ]) {
+    const request = structuredClone(valid);
+    request.manifest.bindings['typed-contract/decide'].execute = invalid as WorkflowManifest['bindings'][string]['execute'];
+    await assert.rejects(installWorkflowPack(directory, {...request, replace: true}, idle), /SystemOne|程序执行器/);
+    assert.equal(fs.readFileSync(path.join(directory, 'packs/installed.json'), 'utf8'), index);
+  }
+  const disguised = structuredClone(valid);
+  disguised.manifest.lines[0].stations[0].kind = 'agent';
+  await assert.rejects(installWorkflowPack(directory, {...disguised, replace: true}, idle), /不能伪装成聊天 Agent/);
+  assert.equal(fs.readFileSync(path.join(directory, 'packs/installed.json'), 'utf8'), index);
+  const ambiguousManual = structuredClone(valid);
+  ambiguousManual.manifest.bindings['typed-contract/decide'].manualWhen = {path: 'answers.absent'} as never;
+  await assert.rejects(installWorkflowPack(directory, {...ambiguousManual, replace: true}, idle), /人工分支必须声明明确/);
+  assert.equal(fs.readFileSync(path.join(directory, 'packs/installed.json'), 'utf8'), index);
+});
+
+test('SystemOne execution preserves mapped state and complete answers without an Agent transcript or invented fees', async () => {
+  const request = decisionFixture('typed-execution');
+  const directory = path.join(root, 'typed-execution');
+  const response: DecisionResponse = {answers: {route: {type: 'choice', choice: 'accept',
+    probabilities: {accept: 0.96, reject: 0.04}, confidence: 0.96}}, model: 'kev-fixture-actual',
+    requestId: 'fixture-typed-1', latencyMs: 12, usage: {inputTokens: 23, outputTokens: 4}};
+  let calls = 0;
+  const client: DecisionClientLike = {decide: async (input, options) => {
+    calls++;
+    assert.equal(options.signal.aborted, false);
+    assert.deepEqual(input.state, {text: '原始出处 https://fixture.test/page?path=/story/button--primary', nullable: null});
+    assert.deepEqual(input.questions, request.manifest.bindings['typed-execution/decide'].execute.kind === 'system-one'
+      ? request.manifest.bindings['typed-execution/decide'].execute.questions : {});
+    return response;
+  }};
+  await withDecisionClient(client, async () => {
+    await installWorkflowPack(directory, request, idle);
+    const loaded = await loadWorkflowPacks(directory, {services: {runAgent: async () => {throw new Error('SystemOne must not start a chat Agent');}}});
+    assert.equal(calls, 0, 'installation and loading never probe or start inference');
+    const node = compile(loaded.packs).nodes.find(node => node.key === 'typed-execution/decide')!;
+    const context = {token: {id: 'typed-fixture', item: 'typed-fixture', data: {
+      input: {text: '原始出处 https://fixture.test/page?path=/story/button--primary', nullable: null}}},
+    node, attempt: 'typed-attempt', signal: new AbortController().signal, progress: () => {}, addEvidence: (evidence: unknown) => evidence} as unknown as StationContext;
+    const result = await loaded.executor(node)!(context);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.data?.decision, {answers: response.answers, model: response.model});
+    assert.deepEqual(result.metrics?.execution, {adapter: 'system-one', model: response.model});
+    assert.equal(result.usage, undefined, 'the Factory decision scope owns usage aggregation; no duplicate charge here');
+    assert.equal(result.metrics?.time, undefined, 'the executor must not double-count the decision scope request');
+    assert.equal(calls, 1);
+    assert.equal(context.token.data.input && (context.token.data.input as {nullable: null}).nullable, null);
+  });
+});
+
+test('SystemOne null and low-confidence answers fail; strong negatives and low scores with high confidence remain valid', async () => {
+  const cases = [
+    {id: 'missing', question: {type: 'noul', instructions: 'Is this supported?'}, answer: null, ok: false},
+    {id: 'uncertain', question: {type: 'noul', instructions: 'Is this supported?'}, answer: {type: 'noul', noul: 0.48}, ok: false},
+    {id: 'negative', question: {type: 'noul', instructions: 'Is this supported?'}, answer: {type: 'noul', noul: 0.02}, ok: true},
+    {id: 'positive', question: {type: 'noul', instructions: 'Is this supported?'}, answer: {type: 'noul', noul: 0.98}, ok: true},
+    {id: 'uncertain-choice', question: {type: 'choice', instructions: 'Choose a supported route.', criteria: {accept: 'Supported', reject: 'Unsupported'}},
+      answer: {type: 'choice', choice: 'accept', probabilities: {accept: 0.55, reject: 0.45}, confidence: 0.55}, ok: false},
+    {id: 'low-score', question: {type: 'score', instructions: 'Score support.', criteria: ['Unsupported', 'The source explicitly supports the statement.']},
+      answer: {type: 'score', score: 0.1, probabilities: {'0': 0.9, '1': 0.1}, confidence: 0.96}, ok: true},
+    {id: 'uncertain-score', question: {type: 'score', instructions: 'Score support.', criteria: ['Unsupported', 'The source explicitly supports the statement.']},
+      answer: {type: 'score', score: 0.99, probabilities: {'0': 0.01, '1': 0.99}, confidence: 0.2}, ok: false},
+  ] as const;
+  for (const item of cases) {
+    const request = decisionFixture(`decision-${item.id}`);
+    const key = request.manifest.entry;
+    request.manifest.bindings[key].execute = {kind: 'system-one', purpose: 'Inspect only the supplied fixture evidence.',
+      questions: {route: structuredClone(item.question)} as Extract<WorkflowManifest['bindings'][string]['execute'], {kind: 'system-one'}>['questions'], minConfidence: 0.9};
+    if (item.id === 'uncertain') request.manifest.bindings[key].manualWhen = {path: 'answers.route.noul', equals: 0.48};
+    const directory = path.join(root, `decision-${item.id}`);
+    await installWorkflowPack(directory, request, idle);
+    const loaded = await loadWorkflowPacks(directory);
+    const node = compile(loaded.packs).nodes.find(node => node.key === key)!;
+    const result = await withDecisionClient({decide: async () => item.answer
+      ? {answers: {route: structuredClone(item.answer)}, model: 'kev-fixture', requestId: item.id, latencyMs: 1, usage: {inputTokens: 10, outputTokens: 2}} : null},
+    () => loaded.executor(node)!({token: {id: item.id, item: item.id, data: {input: {text: 'Supplied facts', nullable: null}}},
+      node, signal: new AbortController().signal, progress: () => {}, addEvidence: (evidence: unknown) => evidence} as unknown as StationContext));
+    assert.equal(result.ok, item.ok, item.id);
+    if (!item.ok) {
+      assert.equal(result.data, undefined, 'no low-confidence output can enter the graph');
+      assert.equal(result.verdict, undefined, 'an unavailable decision is never a pass');
+      assert.equal(result.finish, undefined, 'a missing decision is never a synthetic manual/publication result');
+      assert.equal(result.failure?.retryable, true);
+    }
+  }
+});
+
+test('SystemOne retains output-schema, preserve-input and review gates and propagates cancellation', async () => {
+  const base = decisionFixture('decision-gates');
+  const key = base.manifest.entry;
+  const response: DecisionResponse = {answers: {route: {type: 'choice', choice: 'accept',
+    probabilities: {accept: 0.95, reject: 0.05}, confidence: 0.95}}, model: 'kev-fixture', requestId: 'gates', latencyMs: 1, usage: {inputTokens: 10, outputTokens: 2}};
+  for (const variant of ['schema', 'preserve', 'review', 'cancel'] as const) {
+    const request = structuredClone(base);
+    if (variant === 'schema') request.manifest.schemas.output = {...request.manifest.schemas.output, required: ['answers', 'model', 'never-produced']};
+    if (variant === 'preserve') request.manifest.bindings[key].preserveInput = {model: 'expectedModel'};
+    if (variant === 'review') request.manifest.bindings[key].reviewTarget = key;
+    const directory = path.join(root, `decision-gates-${variant}`);
+    await installWorkflowPack(directory, request, idle);
+    const loaded = await loadWorkflowPacks(directory);
+    const node = compile(loaded.packs).nodes.find(node => node.key === key)!;
+    const controller = new AbortController();
+    const client: DecisionClientLike = {decide: async () => {
+      if (variant === 'cancel') controller.abort(new Error('fixture decision cancellation'));
+      return response;
+    }};
+    const context = {token: {id: variant, item: variant, data: {input: {text: 'Supplied facts', nullable: null, expectedModel: 'original-model'}}},
+      node, signal: controller.signal, progress: () => {}, addEvidence: (evidence: unknown) => evidence} as unknown as StationContext;
+    await assert.rejects(withDecisionClient(client, () => loaded.executor(node)!(context)),
+      variant === 'schema' ? /输出.*schema/ : variant === 'preserve' ? /不得改写/ : variant === 'review' ? /审查输出/ : /fixture decision cancellation/);
+  }
+});
+
+test('a SystemOne workflow with no configured service cannot reach publication', async () => {
+  const request = decisionFixture('decision-unavailable');
+  const directory = path.join(root, 'decision-unavailable');
+  await installWorkflowPack(directory, request, idle);
+  const loaded = await loadWorkflowPacks(directory);
+  const compiled = compile(loaded.packs);
+  const journal = new Journal(':memory:');
+  const state = initialState(compiled);
+  journal.subscribeProjection(event => apply(state, event));
+  const runtime = new Runtime(compiled, journal, new Broker({}, 0), loaded.conditions,
+    node => {
+      const execute = loaded.executor(node);
+      return execute ? context => withDecisionClient(null, () => execute(context)) : null;
+    });
+  runtime.roleResolver = key => loaded.role(key)!;
+  try {
+    runtime.ensureWorkers([]);
+    runtime.start('Explicit typed decision unavailable fixture');
+    const token = runtime.create(request.manifest.entry, {item: 'must-not-publish', url: '', source: 'manual',
+      data: {input: {text: 'Supplied facts', nullable: null}}});
+    await runtime.settle();
+    assert.notEqual(state.tokens[token.id].status, 'published');
+    assert.equal(token.data.decision, undefined);
+    const attempts = Object.values(state.attempts);
+    assert.equal(attempts.length, 1);
+    assert.equal(attempts[0].ok, false);
+    assert.match(attempts[0].summary ?? '', /SystemOne/);
+  } finally {
+    await runtime.close();
+    journal.close();
+  }
+});
 
 test('parallel workflow writers are rejected before replacing the installed index and on reload', async () => {
   const dir = path.join(root, 'output-collision'), request = outputWriterFixture('collision');
@@ -97,6 +289,56 @@ test('workflow recovery policies validate atomically and binding overrides affec
   const after = compile((await loadWorkflowPacks(directory)).packs);
   assert.notEqual(before.digest, after.digest, 'recovery policy is executable graph state, not layout metadata');
   assert.equal(after.nodes.find(node => node.key === 'policy-contract/left')?.recovery?.maxRetries, 2);
+});
+
+test('spec validation rejects unbounded returns and ambiguous edge identities without replacing an installed workflow', async () => {
+  const directory = path.join(root, 'bounded-graph');
+  const request = outputWriterFixture('bounded');
+  request.manifest.bindings['bounded/right'].outputKey = 'rightResult';
+  await installWorkflowPack(directory, request, idle);
+  const indexFile = path.join(directory, 'packs', 'installed.json');
+  const before = fs.readFileSync(indexFile, 'utf8');
+  for (const maxRounds of [0, -1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    const changed = structuredClone(request);
+    changed.manifest.lines[0].stations[1].returnTo = [{station: 'entry', maxRounds}];
+    await assert.rejects(installWorkflowPack(directory, {...changed, replace: true}, idle), /positive finite integer/);
+    assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
+  }
+  const unbounded = structuredClone(request);
+  unbounded.manifest.lines[0].edges.push({from: 'left', to: 'entry', kind: 'return'});
+  await assert.rejects(installWorkflowPack(directory, {...unbounded, replace: true}, idle), /bounded station.returnTo/);
+  const duplicate = structuredClone(request);
+  duplicate.manifest.lines[0].edges.push({...duplicate.manifest.lines[0].edges[0]});
+  await assert.rejects(installWorkflowPack(directory, {...duplicate, replace: true}, idle), /duplicate flow edge/);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
+  unbounded.manifest.lines[0].stations[1].returnTo = [{station: 'entry', maxRounds: 2}];
+  await installWorkflowPack(directory, {...unbounded, replace: true}, idle);
+  const compiled = compile((await loadWorkflowPacks(directory)).packs);
+  assert.equal(compiled.edges.filter(edge => edge.kind === 'return').length, 1);
+  assert.equal(compiled.edges.find(edge => edge.kind === 'return')!.maxRounds, 2);
+});
+
+test('I/O unions accept every declared output alternative and reject a downstream missing one', async () => {
+  const directory = path.join(root, 'union-graph');
+  const request = outputWriterFixture('union-contract');
+  request.manifest.bindings['union-contract/right'].outputKey = 'rightResult';
+  const [entry, left, right] = request.manifest.lines[0].stations;
+  entry.output = 'Text | Image';
+  left.input = 'Text | Image';
+  right.input = 'Text|Image|Video';
+  await installWorkflowPack(directory, request, idle);
+  const indexFile = path.join(directory, 'packs', 'installed.json');
+  const before = fs.readFileSync(indexFile, 'utf8');
+  for (const input of ['Text', 'Text|']) {
+    const changed = structuredClone(request);
+    changed.manifest.lines[0].stations[1].input = input;
+    await assert.rejects(installWorkflowPack(directory, {...changed, replace: true}, idle), /I\/O/);
+    assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
+  }
+  const changed = structuredClone(request);
+  changed.manifest.lines[0].stations[1].accept = [' '];
+  await assert.rejects(installWorkflowPack(directory, {...changed, replace: true}, idle), /acceptance conditions/);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
 });
 
 test('ordered replacement and independent token entries keep their actual data semantics', async () => {
@@ -288,6 +530,87 @@ test('install is idle-only, rejects missing contracts and keeps the last valid i
   const extra = line({ id: 'extra', name: 'Additional analysis', layer: 3, priority: 'low', blurb: 'New concrete line', wired: true, stations: [station({ id: 'count', name: 'Count text', kind: 'program', role: 'process', resource: 'none', accept: ['Return real word and character counts'] }), station({ id: 'published', name: 'Done', kind: 'store', role: 'store' })], edges: [['count', 'published']] });
   const updated = await addWorkflowLine(dir, manifest.id, { line: extra, schemas: {}, bindings: { 'extra/count': { role: 'roles/extra/count/ROLE.md', inputSchema: 'text', outputSchema: 'statistics', input: { text: { path: 'input.text' } }, outputKey: 'extraCounts', execute: { kind: 'builtin', name: 'text-statistics' } } }, files: { 'roles/extra/count/ROLE.md': '# Count input text\n\nCount real Unicode characters, whitespace separated words and paragraphs. Reject missing input instead of inventing empty results.' } }, idle);
   assert.equal(updated.lines.length, 2); assert.ok((await loadWorkflowPacks(dir)).executor(compile((await loadWorkflowPacks(dir)).packs).nodes.find(node => node.key === 'extra/count')!));
+});
+
+test('adding a line preserves existing tool and condition behavior and the installed index on rejection', async () => {
+  const directory = path.join(root, 'add-line-isolation');
+  const request = outputWriterFixture('original');
+  request.manifest.bindings['original/right'].outputKey = 'rightResult';
+  request.manifest.tools = {lookup: {kind: 'http', url: 'https://original.fixture.test/'}};
+  request.manifest.conditions = {allowed: {path: 'input.approved', op: 'equals', value: true}};
+  await installWorkflowPack(directory, request, idle);
+  const indexFile = path.join(directory, 'packs', 'installed.json');
+  const before = fs.readFileSync(indexFile, 'utf8');
+  const extra = outputWriterFixture('extra-isolated');
+  extra.manifest.bindings['extra-isolated/right'].outputKey = 'rightResult';
+  const addition = {line: extra.manifest.lines[0], bindings: extra.manifest.bindings,
+    schemas: extra.manifest.schemas, files: extra.files};
+  await assert.rejects(addWorkflowLine(directory, request.manifest.id, {...addition,
+    tools: {lookup: {kind: 'http', url: 'https://unexpected.fixture.test/'}}}, idle), /不能同时覆盖已有工具/);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
+  await assert.rejects(addWorkflowLine(directory, request.manifest.id, {...addition,
+    conditions: {allowed: {path: 'input.approved', op: 'equals', value: false}}}, idle), /不能同时覆盖已有条件/);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
+  const installed = await addWorkflowLine(directory, request.manifest.id, {...addition,
+    tools: request.manifest.tools, conditions: request.manifest.conditions}, idle);
+  assert.deepEqual(installed.tools, request.manifest.tools);
+  assert.deepEqual(installed.conditions, request.manifest.conditions);
+  assert.equal((await loadWorkflowPacks(directory)).manifests[0].lines.length, 2);
+});
+
+test('manual workflow intake rejects disabled entries, terminal inventory and channel-owned downstream lines', () => {
+  const {manifest} = outputWriterFixture('entry-check');
+  assert.equal(workflowEntry(manifest, {text: 'Real input'}), 'entry-check/entry');
+  for (const variant of ['dormant', 'unwired', 'terminal', 'missing']) {
+    const changed = structuredClone(manifest);
+    if (variant === 'dormant') changed.lines[0].stations[0].dormant = true;
+    if (variant === 'unwired') changed.lines[0].wired = false;
+    if (variant === 'terminal') changed.entry = 'entry-check/published';
+    if (variant === 'missing') changed.entry = 'entry-check/missing';
+    assert.throws(() => workflowEntry(changed, {text: 'Must not claim delivery'}), /入口|终态库存/);
+  }
+  const downstream = outputWriterFixture('downstream-entry');
+  manifest.lines.push(downstream.manifest.lines[0]);
+  Object.assign(manifest.bindings, downstream.manifest.bindings);
+  manifest.channels.push({id: 'handoff', from: {line: 'entry-check', station: 'published'},
+    to: {line: 'downstream-entry', station: 'entry'}, label: 'Requires upstream result'});
+  assert.throws(() => workflowEntry(manifest, {text: 'Bypass attempt'}, 'downstream-entry'), /信道上游/);
+});
+
+test('the first executable line in an empty pack uses its graph root rather than station array order', async () => {
+  const directory = path.join(root, 'empty-pack-entry');
+  const request = outputWriterFixture('root-order');
+  request.manifest.bindings['root-order/right'].outputKey = 'rightResult';
+  const empty = {...structuredClone(request.manifest), entry: '', lines: [], bindings: {}};
+  await installWorkflowPack(directory, {manifest: empty}, idle);
+  const originalLine = request.manifest.lines[0];
+  const inbox = station({id: 'inbox', name: 'Input buffer', role: 'store', kind: 'store', input: 'text', output: 'text'});
+  const added = {...originalLine, stations: [...originalLine.stations.slice(1), originalLine.stations[0], inbox],
+    edges: [...originalLine.edges, {from: 'inbox', to: 'entry'}]};
+  const manifest = await addWorkflowLine(directory, empty.id, {line: added, bindings: request.manifest.bindings,
+    schemas: {}, files: request.files}, idle);
+  assert.equal(manifest.entry, 'root-order/inbox');
+  assert.equal(workflowEntry(manifest, {text: 'Preserve the actual upstream buffer'}), 'root-order/inbox');
+  const loaded = await loadWorkflowPacks(directory);
+  const compiled = compile(loaded.packs);
+  const journal = new Journal(':memory:');
+  const state = initialState(compiled);
+  journal.subscribeProjection(event => apply(state, event));
+  const runtime = new Runtime(compiled, journal, new Broker({}, 0), loaded.conditions, loaded.executor);
+  runtime.roleResolver = key => loaded.role(key)!;
+  try {
+    runtime.ensureWorkers([]);
+    runtime.start('Graph entry preservation');
+    const token = runtime.create(manifest.entry, {item: 'root-order', url: '', source: 'manual',
+      data: {express: true, input: {text: 'Preserve the actual upstream buffer'}}});
+    await runtime.settle();
+    assert.equal(state.tokens[token.id].status, 'published');
+    assert.ok(token.done.has('root-order/inbox'));
+    assert.ok(token.done.has('root-order/entry'));
+  } finally {
+    await runtime.close();
+    journal.close();
+  }
 });
 
 test('external CLI, HTTP, Node and MCP adapters execute declared contracts; MCP schemas are discovered per call', async () => {

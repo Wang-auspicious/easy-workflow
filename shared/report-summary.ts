@@ -4,6 +4,7 @@ type RecordValue = Record<string, unknown>;
 const ATTEMPT_LIMIT = 6;
 const STATION_LIMIT = 8;
 const INSIGHT_LIMIT = 4;
+const MODEL_CIRCUIT_LIMIT = 6;
 const ITEM_GROUPS = ['published', 'manual', 'corrected', 'merged', 'rejected', 'parked'];
 const USAGE_FIELDS = ['input', 'output', 'cost', 'cacheRead', 'cacheWrite'];
 const COVERAGE_FIELDS = ['attempts', 'finished', 'tokenBreakdowns', 'usageReported',
@@ -70,6 +71,9 @@ function batchSummary(value: unknown): RecordValue | null | undefined {
   if (value === null) return null;
   const source = record(value);
   if (!source) return;
+  const circuits = Array.isArray(source.modelCircuits) ? source.modelCircuits : undefined;
+  const circuitCount = circuits ? Math.max(circuits.length,
+    Number.isSafeInteger(source.modelCircuitCount) ? Number(source.modelCircuitCount) : 0) : 0;
   return {
     ...fields(source, ['target', 'maxInFlight', 'intakeWindow', 'maxRecoveries', 'startedAt',
       'admitted', 'active', 'completed', 'blocked', 'remaining', 'published', 'merged',
@@ -77,6 +81,22 @@ function batchSummary(value: unknown): RecordValue | null | undefined {
     ['runId', 'mode', 'status', 'category', 'query', 'reason'], ['supplyExhausted']),
     admission: fields(source.admission, ['maxInFlightLimit', 'intakeWindowLimit'], ['mode']),
     modelCircuit: fields(source.modelCircuit, ['failures', 'nextAt'], ['state', 'trialToken', 'station']),
+    ...(circuits ? {
+      modelCircuits: circuits.slice(0, MODEL_CIRCUIT_LIMIT).map(value => {
+        const circuit = record(value);
+        const dependency = record(circuit?.dependency);
+        return {
+          ...fields(circuit, ['failures', 'nextAt', 'runEndedAt'], ['state', 'reason']),
+          ...Object.fromEntries(['runId', 'trialToken', 'station'].flatMap(key =>
+            identifier(circuit?.[key]) ? [[key, circuit[key]]] : [])),
+          dependency: dependency ? {
+            ...fields(dependency, [], ['adapter', 'provider', 'model']),
+            ...(identifier(dependency.key) ? {key: dependency.key} : {}),
+          } : undefined,
+        };
+      }),
+      ...(circuitCount > MODEL_CIRCUIT_LIMIT ? {modelCircuitCount: circuitCount} : {}),
+    } : {}),
   };
 }
 
