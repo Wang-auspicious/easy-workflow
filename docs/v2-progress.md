@@ -1,5 +1,7 @@
 # Easy Workflow v2 执行记录
 
+当前交付：按站长最新要求停止 A 追加计时优化，B/C/D/E 实现已分别提交，E 包含界面；F 未实施。B.17 与 D.10 真实模型验收尚未通过，完整 npm test 也未全绿。默认仍为 v1，真实项目未切换。最新数字和未通过项见文末；此前记录按实际时间保留。
+
 ## 2026-10-15 · A.2 启动遍历盘点（仅文档）
 
 执行依据：`docs/spec-v2-kernel.md`。阶段顺序 A → B → C → D → E → F；本次尚未修改实现或进入后续阶段。
@@ -244,3 +246,15 @@ D 的 MCP 边界另补齐答疑／讨论终结工具的同会话 schema 错误�
 最终全量回归中的资源等待失败定位到实际排序问题：两件货同毫秒创建或入场时，随机 id 或不同节点的拓扑位置会改变货的优先级。items 查询保留 SQLite 原始插入顺序（upsert 不改 rowid），时间相同时稳定排序；ready 排序先入场时间、再货顺序、最后同一货的节点拓扑顺序。未增加表、字段或开关。
 
 新增固定时钟、反向字典序 id、upsert 与关闭／重开 SQLite 的回归；原资源等待用例仅冻结 Date 强制触发同毫秒，保留等待状态、事件序号与执行次数断言。先在旧排序复现第二件提前 running，再在修复后通过。`node --test --test-concurrency=1 test/kernel-graph.test.ts test/kernel-retry.test.ts test/board.test.ts` **55/55，通过，7.230 秒**；`npm run typecheck` 与 `git diff --check` 通过。
+
+### B/C/D/E 最终全量回归记录
+
+在没有并行构建／浏览器验收的条件下，以 `5771d7b` 运行 `FACTORY_KERNEL=v1 npm test`：**780 项，743 通过、37 失败、0 跳过，736.535 秒**。逐项脱敏回执为 `v2-acceptance/BCDE-full-test-clean.json`。失败分类如下：
+
+- **35 项**为 `server/workflow-packs.ts:469` 安装暂存目录 rename 的 Windows EPERM，其中 channels 的 before hook 失败连带 25 项，recovery 1 项，workflow-packs 9 项。同类现象在 B/C/D/E 前已出现；本次未修改该安装器，不推定未经证实的系统原因。
+- **1 项**为同毫秒 FIFO，已在 `3dd597b` 修复；上述 55/55 目标套验证包含强制同毫秒、重开数据库与原资源等待断言。
+- **1 项**为 native dispatcher 测试中 launcher exit 1，未报告结构化错误。完整 `test/dispatcher-recovery.test.ts` 独立 **5/5，通过，7.647 秒**；加入临时子进程异常监视后，限定 3 次目标复测分别 **1/1，通过，4.066 / 3.856 / 3.938 秒**，未捕获异常。测试已逐字节恢复，原因仍未证实，没有猜测性产品修改。
+
+这些定向通过不替代失败的完整回归。未进行第三次全量重试，未删除、跳过或放宽测试。FIFO 修复后的 `npm run typecheck` 和 `npm run build` 再次通过，最终分发仍为 **26.7 MiB / 766 文件 / 2 个原有运行依赖包**。v1 源码桌面冒烟 **24/24 通过**，记录为 `BCDE-v1-smoke.json`；最终 `3dd597b` 的 `FACTORY_KERNEL=v2 npm run desktop:smoke -- --app=dist/desktop --standalone` **25/25 通过**，脱敏回执更新到 `E-desktop-smoke.json`。
+
+本轮实现交付范围为 B/C/D/E，均有独立阶段提交；F 未实施。新依赖为 0，package-lock 未变，内置 pack 仅追加规范列出的 rooms，节点 accept／schema／闸门及外部 VisLexicon 规则正文未改。默认仍为 v1，v2 需显式选择；真实项目未迁移或切换。验收副本已暂停并保留数据，长运行未通过项不因代码提交而改记成功。

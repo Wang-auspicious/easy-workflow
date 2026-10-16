@@ -1,6 +1,7 @@
 {
   "kernel": "v2",
-  "mode": "packaged standalone",
+  "mode": "packaged standalone desktop",
+  "sourceCommit": "3dd597b",
   "ok": true,
   "checks": [
     "bundled node ROLE.md accessible through the Agent interface",
