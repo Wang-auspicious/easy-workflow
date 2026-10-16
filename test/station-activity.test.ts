@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import {createRequire} from 'node:module';
 import { Type } from "typebox";
 import { configureAgentStations, runAgentStation } from "../server/agent-station.ts";
 import { closeModelTransport } from "../server/pi.ts";
@@ -19,6 +20,53 @@ import { pack } from "../packs/vislexicon/pack.ts";
 import { apply, initialState } from "../shared/project.ts";
 import { buildReport, stationReport } from "../server/report.ts";
 import type { Factory } from "../server/factory.ts";
+
+// Use the installed transport's Fetch denylist without changing its security policy.
+const {badPorts} = createRequire(import.meta.url)('undici/lib/web/fetch/constants.js') as {badPorts: string[]};
+const fetchForbiddenPorts = new Set(badPorts.map(Number));
+async function listenLocal(server: http.Server, port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const failed = (error: Error) => reject(error);
+    server.once('error', failed);
+    server.listen(port, '127.0.0.1', () => {server.off('error', failed); resolve();});
+  });
+}
+async function listenForFetch(server: http.Server): Promise<number> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (!server.listening) await listenLocal(server, 0);
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    if (!fetchForbiddenPorts.has(address.port)) return address.port;
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+  throw new Error('The local fixture could not allocate a Fetch-permitted ephemeral port');
+}
+
+test('local HTTP fixture rebinds a Fetch-forbidden port without bypassing the denylist', async () => {
+  let requests = 0;
+  const server = http.createServer((_request, response) => {requests++; response.end('safe local fixture');});
+  try {
+    // These are non-privileged Fetch-denied ports. Try another only when occupied.
+    for (const port of [6697, 10080, 6667, 6668, 6669, 6000]) {
+      assert.ok(fetchForbiddenPorts.has(port));
+      try {await listenLocal(server, port); break;}
+      catch (error) {if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error;}
+    }
+    assert.ok(server.listening, 'the boundary regression needs one available forbidden port');
+    const first = server.address();
+    assert.ok(first && typeof first !== 'string');
+    await assert.rejects(fetch(`http://127.0.0.1:${first.port}/`), error =>
+      (error as Error & {cause?: Error}).cause?.message === 'bad port');
+    assert.equal(requests, 0, 'Fetch still rejects the port before any HTTP request');
+    const port = await listenForFetch(server);
+    assert.ok(!fetchForbiddenPorts.has(port));
+    assert.equal(await (await fetch(`http://127.0.0.1:${port}/`)).text(), 'safe local fixture');
+    assert.equal(requests, 1);
+  } finally {
+    server.closeAllConnections();
+    if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});
 
 const gate = () => { let resolve!: () => void; const promise = new Promise<void>(ready => { resolve = ready; }); return { promise, resolve }; };
 const eventually = async (condition: () => boolean) => {
@@ -72,8 +120,7 @@ test("real SSE and HTTP tools persist overlapping activity, replay runs and reta
       send({ tool_calls: calls }); send({}, "tool_calls"); res.end("data: [DONE]\n\n");
     } catch (error) { res.destroy(error as Error); }
   });
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  origin = `http://127.0.0.1:${await listenForFetch(server)}`;
   fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ defaultProvider: "activity-fixture", defaultModel: "activity-fixture" }));
   fs.writeFileSync(path.join(dir, "auth.json"), JSON.stringify({ "activity-fixture": { type: "api_key", key: "local-activity-fixture" } }));
   fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify({ providers: { "activity-fixture": { api: "openai-completions", baseUrl: `${origin}/v1`, models: [{ id: "activity-fixture", input: ["text"] }] } } }));
