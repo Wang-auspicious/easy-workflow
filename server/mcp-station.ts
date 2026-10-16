@@ -142,7 +142,7 @@ export async function openStationMcp(tools: StationTool[], signal: AbortSignal) 
       const tool = scoped.find(t => t.name === call.name);
       if (!tool) return send(403, { error: "Tool is not available to this station" });
       if (JSON.stringify(call.arguments ?? {}) !== JSON.stringify(redactValue(call.arguments ?? {}, secrets))) return send(400, { error: "Credentials cannot be submitted as tool arguments" });
-      if (!Check(tool.parameters, call.arguments ?? {}) && !(tool.name === 'submit' && tool.validateInTool)) return send(400, { error: "Tool arguments violate the station contract" });
+      if (!Check(tool.parameters, call.arguments ?? {}) && !(['submit', 'submit_answer', 'submit_turn'].includes(tool.name) && tool.validateInTool)) return send(400, { error: "Tool arguments violate the station contract" });
       scopeSignal.throwIfAborted();
       const result = await tool.execute("station-mcp", call.arguments ?? {}, scopeSignal);
       // Only MCP content leaves the tool boundary; internal details are private.
@@ -317,7 +317,7 @@ export class ClosedStationAgent {
         try {
           const result = await withModelTool(releaseCapacity, () => tool.execute(id, args, signal), failure => {capacityFailure = failure;});
           if (['submit', 'handoff', 'submit_answer', 'submit_turn'].includes(tool.name)) this.messages.push({ role: 'assistant', content: [{ type: 'text', text: `${tool.name}: ${JSON.stringify(args)}` }] });
-          if (tool.name === 'submit' && result.isError) {
+          if (['submit', 'submit_answer', 'submit_turn'].includes(tool.name) && result.isError) {
             this.messages.push({role: 'user', content: [{type: 'text',
               text: `程序校验错误（工具结果）：${redactText(JSON.stringify(result.content), factorySecrets())}`} ]});
           }
