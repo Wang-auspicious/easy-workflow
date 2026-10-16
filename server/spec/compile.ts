@@ -214,7 +214,7 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
   for (const c of channels) {
     const from = `${c.from.line}/${c.from.station}`, to = `${c.to.line}/${c.to.station}`;
     if (!byKey.has(from) || !byKey.has(to)) { issues.push({ at: c.id, message: "channel end not found" }); continue; }
-    edges.push({ key: `${from}->${to}:channel`, from, to, kind: "channel", label: c.label });
+    edges.push({ key: `${from}->${to}:channel`, from, to, kind: "channel", label: c.label, ...(c.input ? {input: c.input} : {}) });
   }
 
   // Checks (Spec F1.4): acyclic flow, compatible I/O, acceptance on every runnable station.

@@ -56,10 +56,11 @@ export class UnmanagedRecoverySupervisor {
 
   constructor(factory: Factory) {
     this.factory = factory;
-    this.unsubscribe = factory.journal.subscribe(event => this.observe(event));
+    this.unsubscribe = factory.kernel === 'v2' ? () => {} : factory.journal.subscribe(event => this.observe(event));
   }
 
   start() {
+    if (this.factory.kernel === 'v2') return;
     if (this.started || this.closed || process.env.FACTORY_READONLY === '1') return;
     this.started = true;
     // A crashed trial already owns a task and its saved conversation. Cool down
@@ -556,6 +557,7 @@ export class UnmanagedRecoverySupervisor {
   }
 
   pump(now = Date.now(), networkOnly = false): number {
+    if (this.factory.kernel === 'v2') return 0;
     if (!this.running() || this.pumping) return 0;
     this.pumping = true;
     const f = this.factory;

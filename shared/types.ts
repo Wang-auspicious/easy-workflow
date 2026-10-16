@@ -88,7 +88,8 @@ export interface LineSpec {
   wired: boolean;
 }
 
-export interface ChannelSpec { id: string; from: { line: string; station: string }; to: { line: string; station: string }; label: string }
+export type ChannelInput = Record<string, string | {path?: string; value?: unknown}>;
+export interface ChannelSpec { id: string; from: { line: string; station: string }; to: { line: string; station: string }; label: string; input?: ChannelInput }
 
 export interface PackSpec {
   id: string;
@@ -132,6 +133,7 @@ export interface CompiledEdge {
   when?: string;
   label?: string;
   maxRounds?: number;
+  input?: ChannelInput;
 }
 
 /* ------------------------------------------------------------------ journal */

@@ -16,6 +16,7 @@ export class BatchSupervisor {
   private factory: Factory;
   constructor(factory: Factory) {
     this.factory = factory;
+    if (factory.kernel === 'v2') return;
     factory.journal.subscribe(event => {
       if (factory.importing) return;
       const circuit = factory.state.batch?.modelCircuit;
@@ -176,6 +177,7 @@ export class BatchSupervisor {
   }
 
   schedule() {
+    if (this.factory.kernel === 'v2') return;
     if (this.scheduled || this.pumping) return;
     this.scheduled = true;
     queueMicrotask(() => { this.scheduled = false; this.pump(); });
@@ -195,6 +197,7 @@ export class BatchSupervisor {
   }
 
   pump(now = Date.now()) {
+    if (this.factory.kernel === 'v2') return;
     const f = this.factory;
     let goal = f.state.batch;
     if (this.pumping || !goal || goal.runId !== f.state.run.id || goal.mode !== 'running' || !f.runtime.running || f.runtime.paused || f.runtime.ending || process.env.FACTORY_READONLY === '1') return;

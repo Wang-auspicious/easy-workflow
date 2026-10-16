@@ -17,10 +17,12 @@ export class Journal {
   private notifications: Stamped[] = [];
   private notifying = false;
   private readonly hasSnapshots: boolean;
+  readonly readOnly: boolean;
   seq = 0;
   run = "";
 
   constructor(file: string, readOnly = false) {
+    this.readOnly = readOnly;
     if (!readOnly) fs.mkdirSync(path.dirname(file), { recursive: true });
     this.db = new DatabaseSync(file, { readOnly });
     if (!readOnly) {
@@ -79,6 +81,9 @@ export class Journal {
   }
 
   get inTransaction(): boolean { return this.transaction !== null; }
+
+  /** Kernel tables share this connection and therefore Journal.atomic commits. */
+  get database(): DatabaseSync { return this.db; }
 
   /** Snapshots are replaceable caches, and must never capture an open transition. */
   writeSnapshot(name: string, seq: number, version: string, body: string): void {

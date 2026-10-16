@@ -15,6 +15,7 @@ import { runAgentStation, type AgentStationDef } from "./agent-station.ts";
 import { pack } from "../packs/vislexicon/pack.ts";
 import { TOOLS, canonical, type Services } from "../packs/vislexicon/tools.ts";
 import { agentDefs, warmStyleLib } from "../packs/vislexicon/agents.ts";
+import {Kernel} from './kernel/kernel.ts';
 import { loadCatalog, loadPublished, type CatalogEntry } from "../packs/vislexicon/env.ts";
 import { ControlError } from "./errors.ts";
 import { classifyFailure, type CandidateRecovery, type Failure } from "../shared/failures.ts";
@@ -48,7 +49,7 @@ import {projectDecisionClient, withDecisionAttempt} from './decision-model.ts';
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
 
-export interface Settings { browser: number; model: number; modelWorkers: number; cpu: number; http: number; memoryFloorMB: number; socialPerMinute: number; socialPerDay: number }
+export interface Settings { browser: number; model: number; modelWorkers: number; cpu: number; http: number; memoryFloorMB: number; socialPerMinute: number; socialPerDay: number; maxActiveItems: number; kernel?: 'v1' | 'v2' }
 
 interface RecoveryProjection {
   done: Map<string, Set<string>>;
@@ -103,6 +104,21 @@ export class Factory {
   private snapshotClosing?: Promise<void>;
   private snapshotsActive = false;
 
+  get kernel(): 'v1' | 'v2' {
+    return this.runtime instanceof Kernel ? 'v2' : this.runtime ? 'v1'
+      : process.env.FACTORY_KERNEL === 'v1' ? 'v1'
+      : process.env.FACTORY_KERNEL === 'v2' || this.settings.kernel === 'v2' ? 'v2' : 'v1';
+  }
+
+  private createRuntime(compiled: CompiledFactory, conditions: Runtime['conditions'], executors: Runtime['executors']): Runtime {
+    if (this.kernel === 'v2') {
+      const kernel = new Kernel(compiled, this.journal, this.broker, conditions, executors);
+      kernel.maxActiveItems = this.settings.maxActiveItems;
+      return kernel;
+    }
+    return new Runtime(compiled, this.journal, this.broker, conditions, executors);
+  }
+
   constructor(projectDirectory = VAR, options: {projectionOnly?: boolean} = {}) {
     const readOnly = process.env.FACTORY_READONLY === "1";
     const initializeProject = !readOnly && !options.projectionOnly;
@@ -124,11 +140,20 @@ export class Factory {
     }
     // Browser pages were capped at three before Spec §30.6; lift old saved caps once to the new default.
     if (!saved.browserCapV2 && (saved.browser ?? 0) <= 3) delete saved.browser;
-    this.settings = { browser: 8, model: 8, modelWorkers: saved.modelWorkers, cpu: 4, http: 6, memoryFloorMB: 1024, socialPerMinute: 6, socialPerDay: 300, ...saved };
+    this.settings = { browser: 8, model: 8, modelWorkers: saved.modelWorkers, cpu: 4, http: 6, memoryFloorMB: 1024, socialPerMinute: 6, socialPerDay: 300, maxActiveItems: 12, ...saved };
+    if (!Number.isSafeInteger(this.settings.maxActiveItems) || this.settings.maxActiveItems < 1) {
+      this.settings.maxActiveItems = 12;
+    }
     this.patches = this.readJson(path.join(this.project.dir, 'patches.json'), []);
   }
 
   private readJson<T>(file: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; } catch { return fallback; } }
+
+  /** Offline migration reads the same projection without starting any consumers. */
+  async projectState() {
+    await this.prepareProjection();
+    return {compiled: this.compiled, state: this.state};
+  }
 
   private async prepareProjection() {
     const started = performance.now();
@@ -351,7 +376,7 @@ export class Factory {
         },
       };
     };
-    this.runtime = new Runtime(this.compiled, this.journal, this.broker, this.workflowPacks!.conditions, executors);
+    this.runtime = this.createRuntime(this.compiled, this.workflowPacks!.conditions, executors);
     this.runtime.roleResolver = key => this.workflowPacks?.role(key) ?? readRole(key);
     this.modelCircuits = new ModelCircuits(this);
     this.batch = new BatchSupervisor(this);
@@ -359,8 +384,9 @@ export class Factory {
     this.runtime.onTick = () => this.maintainRuntime();
     this.wireRecovery();
     if (process.env.FACTORY_READONLY === "1") {
+      if (this.runtime instanceof Kernel) this.runtime.recover(this.state);
       this.catalog = this.runtime.nodes.has('candidates/pool') ? loadCatalog() : [];
-      this.channels!.start();
+      if (this.kernel === 'v1') this.channels!.start();
       this.sources.start();
       console.log(`BOOT_STAGE factory ${Math.round(performance.now() - started)}`);
       return;
@@ -372,24 +398,26 @@ export class Factory {
     try { this.lessons.write(); } catch (error) { this.lessonIssue(error); }
     if (this.runtime.nodes.has('curation/style')) void warmStyleLib();
     this.loadStock();
-    this.recoverLegacyFailures();
-    for(const c of Object.values(this.state.recoveries))if(c.failure?.tag==="tool_error") {
+    if (this.kernel === 'v1') this.recoverLegacyFailures();
+    for(const c of Object.values(this.state.recoveries))if(this.kernel === 'v1' && c.failure?.tag==="tool_error") {
       const failure=classifyFailure(c.failure.message,{url:c.url});
       if(failure.tag!=="tool_error")this.journal.append({kind:"candidate.disposition",candidate:{...c,failure}});
     }
     this.reconcileFailureAlerts();
-    this.batch.restoreModelCircuit();
-    this.broker.modelHold = Object.values(this.state.alerts).find(a => a.kind === 'model' && !a.dependency)?.message ?? null;
+    if (this.kernel === 'v1') {
+      this.batch.restoreModelCircuit();
+      this.broker.modelHold = Object.values(this.state.alerts).find(a => a.kind === 'model' && !a.dependency)?.message ?? null;
+    }
     this.restore();
-    this.modelCircuits.restore();
+    if (this.kernel === 'v1') this.modelCircuits.restore();
     this.reconcileManualStock();
     this.reconcileBusinessStock();
-    this.channels!.start();
+    if (this.kernel === 'v1') this.channels!.start();
     this.publicationOutbox?.start();
-    this.recovery.start();
+    if (this.kernel === 'v1') this.recovery.start();
     this.sources.start();
     this.runtime.tick();
-    this.batch.schedule();
+    if (this.kernel === 'v1') this.batch.schedule();
     console.log(`BOOT_STAGE factory ${Math.round(performance.now() - started)}`);
   }
 
@@ -449,7 +477,7 @@ export class Factory {
     this.workflowPacks = loaded; this.compiled = compiled;
     this.project = synchronizeProjectPacks(this.project.dir, loaded.packs.map(entry => entry.id));
     this.rebuildCompiledProjection();
-    this.runtime = new Runtime(compiled, this.journal, this.broker, loaded.conditions, previous.executors);
+    this.runtime = this.createRuntime(compiled, loaded.conditions, previous.executors);
     this.runtime.roleResolver = key => loaded.role(key) ?? readRole(key);
     this.runtime.onTick = () => this.maintainRuntime();
     this.wireRecovery(); this.restore(); this.loadStock(); this.reconcileManualStock(); this.runtime.tick();
@@ -632,7 +660,7 @@ export class Factory {
   }
 
   private maintainRuntime() {
-    this.resumeVerifiedCandidates(); this.batch.pump();
+    if (this.kernel === 'v1') { this.resumeVerifiedCandidates(); this.batch.pump(); }
     if (this.compiled.lines.some(line => line.id === 'atlas-feed' && line.wired)) flushAtlas(this.services);
     this.reconcileBusinessStock();
   }
@@ -906,7 +934,7 @@ export class Factory {
   }
 
   private wireRecovery() {
-    this.runtime.onRecovery = (token, failure) => this.recordRecovery(token, failure);
+    if (this.kernel === 'v1') this.runtime.onRecovery = (token, failure) => this.recordRecovery(token, failure);
     this.runtime.onAlert = (token, node, failure, dependency) => {
       const kind: Alert["kind"] | undefined = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" || failure.tag === "model_transport" ? "model" : failure.tag === "auth_required" ? "auth" : undefined;
       if (!kind) return;
@@ -915,13 +943,14 @@ export class Factory {
       this.raiseAlert({ id: kind === 'model' && dependency ? `${id}:${dependency.key}` : id,
         dependency: kind === 'model' ? dependency : undefined,
         level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: kind === 'model' ? undefined : failure.url ?? token.url });
+      if (this.kernel === 'v2') return;
       if (kind === 'model' && dependency) this.modelCircuits.failed(dependency, token.id, node.key, failure);
       if (failure.tag === 'model_transport') {
         if (!dependency) this.batch.modelFailed();
         this.recovery?.modelFailed();
       }
     };
-    this.runtime.onPark = token => this.recordRecovery(token, {tag:"run_ended",category:"system",message:"本轮结束，工作尚未完成",url:token.url,retryable:true});
+    if (this.kernel === 'v1') this.runtime.onPark = token => this.recordRecovery(token, {tag:"run_ended",category:"system",message:"本轮结束，工作尚未完成",url:token.url,retryable:true});
   }
 
   private recordRecovery(token:Pick<TokenRun,"id"|"item"|"url"|"title"|"source">,failure:Failure) {
@@ -1367,6 +1396,10 @@ export class Factory {
 
   private restore() {
     const rt = this.runtime;
+    if (rt instanceof Kernel) {
+      rt.recover(this.state);
+      return;
+    }
     rt.locked = new Set(this.state.lockedStations);
     rt.pausedLines = new Set(this.state.pausedScopes?.lines ?? []);
     rt.pausedStations = new Set(this.state.pausedScopes?.stations ?? []);
@@ -1475,11 +1508,15 @@ export class Factory {
   /* -------------------------------------------------------------- settings / layout / patches */
 
   saveSettings(next: Partial<Settings>) {
+    if (next.kernel !== undefined && next.kernel !== this.kernel && this.runtime?.running) {
+      throw new ControlError(409, 'run_active', '结束本轮后再选择下次启动使用的内核');
+    }
     this.settings = { ...this.settings, ...next };
     fs.writeFileSync(path.join(this.project.dir, 'settings.json'), JSON.stringify({ ...this.settings, browserCapV2: true }, null, 2));
     Object.assign(this.broker.limits, { browser: this.settings.browser, model: this.settings.model, modelWorkers: this.settings.modelWorkers, cpu: this.settings.cpu, http: this.settings.http });
     this.broker.modelRequests.notifyCapacityChanged();
     this.broker.memoryFloorMB = this.settings.memoryFloorMB;
+    if (this.runtime instanceof Kernel) this.runtime.maxActiveItems = this.settings.maxActiveItems;
     this.runtime.schedule();
   }
 
@@ -1521,18 +1558,21 @@ export class Factory {
       for (const pool of previous.workers.values()) for (const w of pool) this.journal.append({ kind: "worker.retired", node: w.node, worker: w.id, reason: "规格新版本生效，重新配员" });
       this.compiled = trial;
       this.rebuildCompiledProjection();
-      this.runtime = new Runtime(trial, this.journal, this.broker, this.workflowPacks?.conditions ?? pack.conditions, previous.executors);
+      this.runtime = this.createRuntime(trial, this.workflowPacks?.conditions ?? pack.conditions, previous.executors);
       this.runtime.roleResolver = previous.roleResolver;
       this.runtime.onTick = () => this.maintainRuntime();
       this.wireRecovery();
       this.runtime.stock = previous.stock;
-      this.runtime.tokens = previous.tokens;
-      for (const t of this.runtime.tokens.values()) t.closure = this.runtime.closureOf(t.entry);
+      if (this.runtime instanceof Kernel) this.runtime.recover(this.state);
+      else {
+        this.runtime.tokens = previous.tokens;
+        for (const t of this.runtime.tokens.values()) t.closure = this.runtime.closureOf(t.entry);
+      }
       this.runtime.locked = new Set([...previous.locked].filter((key) => this.runtime.nodes.has(key)));
       this.runtime.pausedLines = new Set(previous.pausedLines); this.runtime.pausedStations = new Set(previous.pausedStations);
       this.lastPreflight = 0;
       this.journal.append({ kind: "factory.loaded", digest: trial.digest, specVersion: trial.specVersion });
-      this.runtime.ensureWorkers([]);
+      if (this.kernel === 'v1') this.runtime.ensureWorkers([]);
       this.runtime.tick();
     }
     return true;

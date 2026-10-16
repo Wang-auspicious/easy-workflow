@@ -142,7 +142,7 @@ const server = http.createServer(async (req, res) => {
       const agentDefaults = factory.getAgentDefaults();
       const modelStatus = factory.dispatcherModelStatus();
       const pi = modelStatus.adapter === 'pi' ? modelStatus : null;
-      return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: modelStatus.id === 'native-default' ? modelStatus.name : modelStatus.id, modelStatus, pi, keyPresent: pi?.ready ?? false, patches: factory.patches, agentDefaults, agentBindings: factory.agentBindings().bindings });
+      return send(res, 200, { factory: c, kernel: factory.kernel, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: modelStatus.id === 'native-default' ? modelStatus.name : modelStatus.id, modelStatus, pi, keyPresent: pi?.ready ?? false, patches: factory.patches, agentDefaults, agentBindings: factory.agentBindings().bindings });
     }
     const view = url.searchParams.get('view');
     if (['/api/state', '/api/events'].includes(p) && view !== null && view !== 'raw' && view !== 'ui-v1') {

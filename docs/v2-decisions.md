@@ -24,3 +24,8 @@
 - 2026-10-16 · A · 上述构建范围得到站长回复“允许构建层打包并继续（推荐）” · 使用现有构建工具打包后端静态入口，验证相对路径和动态加载行为 · 减少已测得的小文件读取耗时，仍须通过原完整回归与三次启动验收。
 - 2026-10-16 · A · 分发资源完整性检查发现 site-style.mjs 引用的 style-contract.mjs 不在原复制清单 · 在已授权构建脚本中补充该文件的原样复制，构建后校验源与副本 SHA-256 · 保持已批准的资源保真要求，不编辑原规则或副本规则正文，不变更校验行为；不得将缺失规则时的较短启动计时当作成功。
 - 2026-10-16 · A · 构建打包后首轮仍未达 5 秒，诊断确认 boot 样式预热间接导入 Playwright 并推迟 listen 回调 · 提出取消主动预热、保留样式节点原首次加载路径，等待站长决定 · 该启动调用调整超出已授权构建范围且影响 G1，按 §0.4 停止；不修改 ready 时机或校验行为。
+- 2026-10-16 · A→B/C/D/E · 站长明确要求不要死扣启动时间，先把 B/C/D/E 全部做完 · 停止 A 追加优化，按阶段实现与提交后续功能；长运行验收如实单列，不再作为开发前置停点 · 最新用户指令优先于原 A 阶段门槛；保留全部实测，不修改数字或伪称已通过。
+- 2026-10-16 · E · 原文将界面留给 Claude，但站长本次要求执行者把 BCDE 全做完 · 在完成后端后接手 E 指定的界面部分，遵循现有样式；已在对话中说明 · 完成交付范围，不增加未规定的界面重设计。
+- 2026-10-16 · B · B.6 只说明 published/manual，现有 channel 的目标还有带 flow 下游的 inbox/pool 中转 store · v2 对这些中转节点记 done 并继续 B.6；无下游非 published store 停为 manual_store · B.13 的新货能够接替原 ChannelSupervisor 的库存消费，避免重复消费者或跨线永远停住。
+- 2026-10-16 · B · TokenState 未保存独立 entry/run 字段 · 迁移优先合法 runtimeCheckpoint.entry，其次 recoveryRoot/首个 attempt.node；run 从 token.created 所在 journal run 取值，已有 retriedBy 的旧记录不重复迁移 · 保留原任务身份及历史轮次，dry-run 不写表、快照或业务文件。
+- 2026-10-16 · B · 旧 run_batch API 使用 v1 入场目标，v2 不再写 batch.configured · v2 将目标全部持久排队，由 maxActiveItems 和资源限额分批执行，pause/resume 映射内核；configure 的 maxInFlight 兼容为 maxActiveItems · 保持入口可用，移除第二套入场与恢复调度。

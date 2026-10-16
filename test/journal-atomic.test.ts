@@ -4,10 +4,106 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import {spawnSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
+import {fileURLToPath} from 'node:url';
 import { Journal } from '../server/journal.ts';
 import {restoreSnapshots, saveSnapshots, snapshotVersion, type Snapshottable} from '../server/snapshots.ts';
 import {apply, deserializeSnapshot, deserializeState, initialState, serializeSnapshot, serializeState, validateState} from '../shared/project.ts';
 import type {JournalEvent, Stamped} from '../shared/types.ts';
+
+test('kernel migration dry-run preserves database bytes and committed migration is idempotent', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-kernel-migrate-'));
+  const file = path.join(directory, 'journal.db');
+  const journal = new Journal(file);
+  journal.append({kind: 'run.started', runId: 'migration-fixture', title: 'Migration fixture'});
+  journal.append({kind: 'token.created', token: 'active-fixture', item: 'active', url: 'https://fixture.test/',
+    source: 'fixture', line: 'curation'});
+  journal.append({kind: 'token.data', token: 'active-fixture', patch: {runtimeCheckpoint: {
+    version: 1, entry: 'curation/reader', done: ['curation/reader'], rounds: {'curation/reader': 2}, notes: [],
+  }}});
+  journal.append({kind: 'token.created', token: 'manual-fixture', item: 'manual', url: 'https://fixture.test/manual',
+    source: 'fixture', line: 'curation'});
+  journal.append({kind: 'token.data', token: 'manual-fixture', patch: {recoveryRoot: 'curation/reader'}});
+  journal.append({kind: 'token.finished', token: 'manual-fixture', node: 'curation/manual', status: 'manual', reason: 'Owner needs to inspect'});
+  journal.close();
+  const hash = () => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const script = fileURLToPath(new URL('../scripts/kernel-migrate.ts', import.meta.url));
+  const execute = (dryRun: boolean) => {
+    const result = spawnSync(process.execPath, [script, '--project', directory, ...(dryRun ? ['--dry-run'] : [])], {
+      encoding: 'utf8', timeout: 60_000, windowsHide: true,
+      env: {...process.env, FACTORY_PREFLIGHT: '0', FACTORY_DISCOVERY: '0'},
+    });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  try {
+    const before = hash();
+    execute(true);
+    assert.equal(hash(), before, 'dry-run must not create kernel tables or snapshots');
+    execute(false);
+    const db = new DatabaseSync(file, {readOnly: true});
+    const rows = db.prepare('SELECT id, status, body FROM items ORDER BY id').all() as {id: string; status: string; body: string}[];
+    assert.equal(rows.length, 2);
+    const active = JSON.parse(rows[0].body);
+    assert.equal(active.nodes['curation/reader'].status, 'done');
+    assert.equal(active.nodes['curation/reader'].rounds, 2);
+    assert.equal(rows[1].status, 'parked');
+    assert.equal(JSON.parse(rows[1].body).parked.reason, 'Owner needs to inspect');
+    const written = rows.map(row => row.body);
+    db.close();
+    execute(false);
+    const again = new DatabaseSync(file, {readOnly: true});
+    assert.deepEqual(again.prepare('SELECT body FROM items ORDER BY id').all().map(row => row.body), written);
+    again.close();
+  } finally {
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
+
+test('Factory selects v2 without worker or legacy supervisor events and preserves the status API', async () => {
+  const {Factory} = await import('../server/factory.ts');
+  const {FactoryControl} = await import('../server/control.ts');
+  const {Kernel} = await import('../server/kernel/kernel.ts');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-kernel-factory-'));
+  const keys = ['FACTORY_KERNEL', 'FACTORY_PREFLIGHT', 'FACTORY_START_PAUSED', 'FACTORY_READONLY'] as const;
+  const saved = keys.map(key => [key, process.env[key]] as const);
+  Object.assign(process.env, {FACTORY_KERNEL: 'v2', FACTORY_PREFLIGHT: '0', FACTORY_START_PAUSED: '1', FACTORY_READONLY: '0'});
+  let factory: InstanceType<typeof Factory> | undefined;
+  try {
+    factory = new Factory(directory);
+    await factory.boot();
+    assert.ok(factory.runtime instanceof Kernel);
+    assert.equal(factory.runtime.maxActiveItems, 12);
+    const control = new FactoryControl(factory);
+    const status = await control.execute('status', {});
+    assert.equal(status.result.kernel, 'v2');
+    factory.runtime.executors = () => async () => ({ok: true, summary: 'Fixture gate', data: {gate: 'pass'}});
+    factory.runtime.start('v2 factory fixture');
+    const token = factory.runtime.create('curation/gate', {item: 'fixture', url: 'https://fixture.test/', source: 'fixture'});
+    await factory.runtime.settle();
+    assert.equal(factory.runtime.store.get(token.id)?.status, 'published');
+    assert.equal(factory.state.tokens[token.id].status, 'published');
+    assert.ok([...factory.journal.read()].every(event => !/^(worker\.|measurement\.|consult\.|batch\.configured)/.test(event.kind)));
+    await assert.rejects(() => control.execute('allocation_plan', {action: 'status'}), error =>
+      error instanceof Error && 'status' in error && error.status === 410);
+  } finally {
+    if (factory) {
+      factory.recovery?.close();
+      factory.channels?.close();
+      await factory.sources?.close();
+      await factory.runtime?.close();
+      factory.publicationOutbox?.close();
+      factory.docs?.flush();
+      factory.lessons?.close();
+      await factory.closeSnapshots();
+      factory.journal.close();
+    }
+    for (const [key, value] of saved) value === undefined ? delete process.env[key] : process.env[key] = value;
+    assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
+    fs.rmSync(directory, {recursive: true, force: true});
+  }
+});
 
 test('journal rollback preserves durable rows, sequence, run and all subscriber visibility', () => {
   const journal = new Journal(':memory:');

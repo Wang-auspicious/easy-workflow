@@ -119,3 +119,34 @@ rg -n 'journal\.(read|readKinds|runs)|\.history\(' server
 进一步独立诊断发现 `Factory.boot → warmStyleLib → common.mjs → Playwright` 绕过 browser.ts 的按需加载。与正式连接资料配置相同的诊断里，listen=2489.5 ms、style完成=2932.0 ms、ready发送=2946.2 ms；ready 前案卷回填回调为 0。没有复现首轮 1746 ms 差额，不能将其全部归因；但确认该动态链会推迟 listen 回调。生成产物的诊断改动均已按原字节恢复。
 
 **等待站长决定（§0.4）**：请求只取消 Factory.boot 主动预热，样式节点继续首次使用时按原路径 await 加载校验库。具体边界与验证见 `v2-acceptance/A-style-load-followup.md`。本项尚未实施，完整 npm test 和源码 smoke 仍未获得最终通过，A 未通过、B 未开始。
+
+## 2026-10-16 · 站长调整执行顺序：先完成 B/C/D/E
+
+站长明确要求：**“我不是让你死扣这个时间……先把后面 BCDE 全做完……这三四秒倒是无所谓的”**。据此停止 A 的追加性能优化，取消以 A 的 5 秒结果阻塞后续开发。A 的失败实测保留，不伪标通过；样式主动预热提案不再继续实施。
+
+现在按 B → C → D → E 完成功能、定向验证和分阶段提交，真实模型长运行验收单独记录，未完成者明确标注。按本次“BCDE 全做完”的新指令接手 E 的必要界面接入（保留现有视觉，不额外重设计）。默认内核暂保留 v1，v2 通过显式开关在项目副本验证，不切换真实项目。
+
+### B.11 / B.14 接入盘点
+
+命令：`rg -n "ctx\.token\." server packs`；`rg -n "runtime\.\w+" server ui`。
+
+执行器直接读取的 TokenRun 字段：`data`、`id`、`item`、`source`、`title`、`url`。适配器仍完整提供 B.11 指定的 done/dead/inflight/rounds/epoch/notes 和 closure 等上下文字段。
+
+外部 runtime 成员去重：`atomicTransition`、`checkpoint`、`close`、`closureOf`、`correct`、`create`、`decideMeasurement`、`descendants`、`end`、`ending`、`ensureWorkers`、`executors`、`fork`、`intakeHold`、`lineTakt`、`locked`、`maxActiveItems`、`measurementProposal`、`nodes`、`occupiesAdmission`、`onAlert`、`onPark`、`onRecovery`、`onTick`、`outFlow`、`parkRecovery`、`pause`、`paused`、`pausedLines`、`pausedStations`、`queues`、`readyFrontier`、`recover`、`restoreCheckpoint`、`restoreFlow`、`resume`、`resumeFrontier`、`retire`、`roleResolver`、`runnable`、`running`、`sampleItems`、`schedule`、`scopePaused`、`selectedModelDependency`、`setScopePaused`、`setWorkerLock`、`settle`、`start`、`stationNumbers`、`stock`、`stockDelta`、`tick`、`toManual`、`tokens`、`ts`、`undoCorrection`、`workers`。
+
+额外辅助（B.14 表外）按最小兼容处理：保留纯图查询；token/queue 为兼容视图，显式 checkpoint 将变更回写 items；v2 停用旧 Batch/Recovery 调度和旧 Channel 消费，由 Kernel 独立完成入场、重试和跨线投递，避免直接写 v1 视图形成第二套状态。旧功能入口逐一验证并保留 v1 分支。
+
+### B 实现与定向验证
+
+已增加 `server/kernel/{item,store,scheduler,retry,kernel}.ts`，同一 journal.db 中维护 items/attempts。Factory 三处构造通过显式 v2 选择；默认 v1 不变。v2 无 worker/measurement/consult/batch.configured 事件，跨线按稳定货 id 幂等创建，旧消费者与恢复监督器在 v2 禁用。设置 maxActiveItems 默认 12，迁移 CLI 支持只读 dry-run 和重复执行保留已有记录。
+
+| 命令／场景 | 结果 |
+|---|---|
+| `node --test --test-concurrency=1 test/kernel-graph.test.ts test/kernel-retry.test.ts` | **32/32，通过，3.075 秒**；含真实 v1/v2 策展图 8 组合、退回／fix／人工撤销、FIFO／资源、迟到结果丢弃、跨线幂等、重试全表及单模型试探 |
+| `node --test --test-name-pattern='v2 ' test/runtime-restart.test.ts` | **4/4，通过，8.643 秒**；两个真实 SIGKILL operation receipt 边界、独立 SQLite 读者事务可见性、故障回滚 |
+| `node --test --test-name-pattern='kernel migration' test/journal-atomic.test.ts` | **1/1，通过，21.31 秒**；dry-run 主数据库字节不变、checkpoint／manual 原因保留、重复迁移不覆盖 |
+| `node --test --test-name-pattern='Factory selects v2' test/journal-atomic.test.ts` | **1/1，通过，4.49 秒**；实际 Factory 启动、status API、完成投影、禁旧事件及 410 |
+| `npm run typecheck` | 通过，含服务端与 UI |
+| `npm run build` | 通过；**26.5 MiB / 760 文件 / 2 个原有运行依赖包** |
+
+完整 npm test 留待本次 B/C/D/E 功能固定后统一验证；分发 v2 桌面冒烟正在执行。真实模型 30 站与 60 秒状态记录尚未执行，**不把上述 fixture 结果冒充 B.17 通过**。按站长最新顺序要求进入 C 实现，默认切换与真实项目切换均未进行。
