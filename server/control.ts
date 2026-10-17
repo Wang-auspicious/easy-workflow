@@ -176,6 +176,22 @@ function definitions(f: Factory): Tool[] {
         const token=f.runtime.create(`${p.line}/inbox`,{item:p.item,url:p.url,source:'manual',data:{...data,canonical:p.url,express:true}});
         return ok({token:token.id,item:token.item,line:p.line},'资料已进入独立流水线');
       }},
+      { name: 'channels', label: '跨线信道投递', description: 'Read durable cross-line hand-offs (for example a confirmed component source queued into components/inbox) with their target, status, attempts and reason; action=retry re-queues one failed or stuck delivery without repeating the parent line. A delivery stays pending until a round is running.', parameters: object({ action: choice('state', 'retry'), id: Type.Optional(name()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })) }),
+        execute: async (_id, p) => {
+          const supervisor = f.channels;
+          if (!supervisor) throw new ControlError(409, 'channels_unavailable', '当前内核没有跨线信道投递');
+          if (p.action === 'retry') {
+            if (!p.id) throw new ControlError(400, 'missing_delivery', '需要投递 id');
+            return ok(supervisor.retry(p.id), `已重新排队投递 ${p.id}`);
+          }
+          const deliveries = supervisor.status();
+          const open = deliveries.filter(d => !['acknowledged'].includes(d.status));
+          return ok({ running: f.runtime.running, paused: f.runtime.paused, total: deliveries.length,
+            byStatus: deliveries.reduce((counts, d) => ({ ...counts, [d.status]: (counts[d.status] ?? 0) + 1 }), {} as Record<string, number>),
+            deliveries: open.slice(0, p.limit ?? 50).map(d => ({ id: d.id, channel: d.channel, item: d.item, url: d.url, target: d.target,
+              status: d.status, attempts: d.attempts, targetToken: d.targetToken, reason: d.reason })) },
+            `跨线投递：待处理 ${open.length}，已完成 ${deliveries.length - open.length}`);
+        } },
       { name: 'workflow_templates', label: '工作流与模板', description: 'List runnable workflow templates and installed project packs with their declared input schemas.', parameters: object({}), execute: async () => ok({ templates: listWorkflowTemplates(), installed: f.workflowPacks?.manifests ?? [] }, '读取可运行工作流模板') },
       {name: 'workflow_authoring', label: '自主建线指南', description: 'Read the autonomous authoring protocol, real executor catalog, scoped tools and an optional complete template source (manifest and ROLE files). Adapt it to the user goal; then save, trial and activate.',
         parameters: object({template: Type.Optional(object({templateId: name(), id: name(), name: name()}))}),
@@ -741,6 +757,7 @@ export class FactoryControl {
   mutates(tool: string, input: unknown) {
     const args = (input ?? {}) as { action?: string; values?: unknown };
     return !READS.has(tool) && !(['run_batch', 'allocation_plan'].includes(tool) && args.action === 'status')
+      && !(tool === 'channels' && args.action !== 'retry')
       && !(tool === 'external_intake' && args.action === 'status')
       && !(tool === 'publication_batches' && args.action === 'status')
       && !(tool === 'settings' && !args.values)

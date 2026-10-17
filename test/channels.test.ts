@@ -997,3 +997,31 @@ test('source HTTP collection shares capacity and releases it after cancellation'
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+test('the control surface reports a queued cross-line hand-off and keeps the read path read-only', async () => {
+  const factory = await boot();
+  try {
+    const { FactoryControl } = await import('../server/control.ts');
+    const source = parent(factory);
+    emit(factory, source.id);
+    await settle(factory);
+    const control = new FactoryControl(factory);
+    const state = await control.execute('channels', { action: 'state' }, 'dispatcher');
+    assert.equal(state.result.total, 1);
+    assert.equal(state.result.running, false, 'no round is running, so the hand-off stays queued');
+    assert.deepEqual(state.result.deliveries.map((delivery: { target: string; status: string }) => [delivery.target, delivery.status]), [['child/inbox', 'pending']]);
+    assert.equal(state.result.byStatus.pending, 1);
+    const readOnly = process.env.FACTORY_READONLY;
+    process.env.FACTORY_READONLY = '1';
+    try {
+      const read = await control.execute('channels', { action: 'state' }, 'dispatcher');
+      assert.equal(read.result.total, 1, 'a state read is not a mutation');
+      assert.equal(read.seq, state.seq, 'reading deliveries does not append a journal event');
+    } finally {
+      if (readOnly === undefined) delete process.env.FACTORY_READONLY; else process.env.FACTORY_READONLY = readOnly;
+    }
+    const retried = await control.execute('channels', { action: 'retry', id: state.result.deliveries[0].id }, 'dispatcher');
+    assert.equal(retried.result.status, 'pending');
+    assert.equal(children(factory).length, 0, 'retrying without a running round cannot create the child out of band');
+  } finally { await close(factory); }
+});

@@ -45,6 +45,7 @@
 | 换模型 / 改工位或主调度配置 | `agent_defaults` / `set_agent_defaults` / `agent_bindings` / `set_agent_binding` |
 | 接受或拒绝补丁 / 经验 | `decide_patch` / `decide_lesson` |
 | 安装或修改内置线、用户安装包 | `workflow_template` / `workflow_install` / `workflow_line` / `propose_patch` |
+| 看跨线交接是否卡住（组件源已确认却没开工） | `channels` |
 | 原地续接旧内核已保存的预算交接（每工位最多2次） | `resume_handoff` |
 
 截图修复要把目标传给程序：`correct` 的 `captureTarget:{role,url,locate}` 才是实际取景参数，普通 note 只是备注。url 与 locate 必须来自当前审查或实际读过的页面；不能猜新地址。`manual_review({token})` 返回当前小摘要；只有需要完整事实才加 `detail:true`。运行中不重复 correct；已发布就停止重跑。固定清单结果用 `manual_review({tokens:[...],waitMs:30000})`，数量由工具汇总，不能按记忆口算。预算交接用 `resume_handoff`；截图返工轮数与明确授权的纠错次数分别记录，不能靠换工位绕过上限。
