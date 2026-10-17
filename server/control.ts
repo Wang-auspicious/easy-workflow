@@ -70,11 +70,14 @@ function resolveToken(state: Factory["state"], query: string) {
   return latest;
 }
 
+/** The dispatcher holds the owner's authority; station agents stay scoped to their station. */
+const isOwner = (actor?: string) => actor === 'user' || actor === 'dispatcher';
+
 export const ROLE_AUTHORING = {
-  guide: "自主建新线先 workflow_authoring 读模板与契约，逐岗位编写完整 ROLE.md；workflow_draft 校验、workflow_trial 真实试跑、workflow_activate 启用。修改既有内置职责或用户安装包仍须交站长决定。",
+  guide: "自主建新线先 workflow_authoring 读模板与契约，逐岗位编写完整 ROLE.md；workflow_draft 校验、workflow_trial 真实试跑、workflow_activate 启用。主调度与站长同级，可自行修改既有内置职责与用户安装包；改动前保存草稿并真实试跑。",
   examples: ["curation/reader", "curation/facts", "curation/scout"],
   sections: ["岗位为何存在：产物给谁、做错的后果", "铁律", "你会拿到什么（输入、案卷、env_* 工具）", "工序（照做）", "判断规则与真实案例", "错误怎么处理（nextAction / owner）", "自检清单", "提交契约", "不该做的事", "拿不准时怎么办"],
-  requirements: ["逐份按岗位写清具体职责，不用无关模板冒充。", "长期规则进 ROLE.md，版本和本轮进度进 CONTEXT.md。", "程序工位每项行为必须有真实执行器和试跑证据；新增可执行节点同时交付 executor 和 ROLE。", "自主新线和自建线修订须通过同版本隔离试跑；既有生产线补丁仍由站长决定。"],
+  requirements: ["逐份按岗位写清具体职责，不用无关模板冒充。", "长期规则进 ROLE.md，版本和本轮进度进 CONTEXT.md。", "程序工位每项行为必须有真实执行器和试跑证据；新增可执行节点同时交付 executor 和 ROLE。", "自主新线、既有生产线与自建线修订都须通过同版本隔离试跑；主调度与站长同级，可自行决定补丁。"],
 };
 
 function definitions(f: Factory): Tool[] {
@@ -84,7 +87,7 @@ function definitions(f: Factory): Tool[] {
     const idleState = () => ({ running: f.runtime.running, paused: f.runtime.paused, ending: f.runtime.ending, inflight: [...f.runtime.workers.values()].flat().filter(w => w.busy).length });
     const guard = () => ({ ...idleState(), assertIdle: () => assertWorkflowIdle(idleState()) });
     const structuralUser = (actor?: string) => {
-      if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '安装和变更工作流须由用户在界面确认；调度员可以提交完整包供审阅');
+      if (!isOwner(actor)) throw new ControlError(403, 'owner_decision_required', '安装和变更工作流须由站长或主调度确认；工位 Agent 只能提交完整包供审阅');
       assertWorkflowIdle(guard());
     };
     const dictionary = () => Type.Record(Type.String(), Type.Unknown());
@@ -98,10 +101,10 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'set_agent_defaults', label: '设置项目 Agent 默认配置',
-        description: 'User-only project station and dispatcher defaults. Omitted sections stay unchanged. Pi model changes apply on the next model request; in-flight requests finish unchanged. Station harness changes apply on the next attempt. Dispatcher harness and native model changes apply to the next conversation; recovery preserves the captured harness.',
+        description: 'Owner-level (station owner or dispatcher) project station and dispatcher defaults. Omitted sections stay unchanged. Pi model changes apply on the next model request; in-flight requests finish unchanged. Station harness changes apply on the next attempt. Dispatcher harness and native model changes apply to the next conversation; recovery preserves the captured harness.',
         parameters: Type.Object({station: Type.Optional(agentBinding()), dispatcher: Type.Optional(agentBinding())}, {additionalProperties: false, minProperties: 1}),
         execute: async (_id, parameters, actor) => {
-          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '项目模型与主调度模型由用户选择，Agent 不能自行更换');
+          if (!isOwner(actor)) throw new ControlError(403, 'owner_decision_required', '项目模型与主调度模型由站长或主调度选择，工位 Agent 不能自行更换');
           return ok(f.setAgentDefaults(parameters), '已保存项目 Agent 默认配置，下次执行生效');
         },
       },
@@ -113,10 +116,10 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'set_agent_binding', label: '设置工位 Agent',
-        description: 'User-only per-station adapter selection, including while running. Pi model changes apply to the next model request and preserve the station conversation; in-flight requests finish unchanged. Harness changes apply to the next attempt. A null binding restores the workflow or saved project default. A station may choose its own connected Pi model through its scoped station_model tool. Credentials and tool scope remain host-managed.',
+        description: 'Owner-level (station owner or dispatcher) per-station adapter selection, including while running. Pi model changes apply to the next model request and preserve the station conversation; in-flight requests finish unchanged. Harness changes apply to the next attempt. A null binding restores the workflow or saved project default. A station may choose its own connected Pi model through its scoped station_model tool. Credentials and tool scope remain host-managed.',
         parameters: object({node: name(), binding: Type.Union([Type.Null(), agentBinding()])}),
         execute: async (_id, parameters, actor) => {
-          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '全局控制接口不能代替其他工位改配置；节点可用 station_model 调整自己的 Pi 模型');
+          if (!isOwner(actor)) throw new ControlError(403, 'owner_decision_required', '工位配置由站长或主调度更换；工位 Agent 可用自己的 station_model 调整自己的 Pi 模型');
           return ok(f.setAgentBinding(parameters.node, parameters.binding), parameters.binding ? '已保存工位配置；Pi 模型从下一次请求生效，运行底座从下次尝试生效' : '已恢复继承；Pi 模型从下一次请求生效');
         },
       },
@@ -128,7 +131,7 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'source_configure', label: '配置持续来源',
-        description: 'User-only source configuration. Defaults to disabled. RSS/JSON use bounded shared HTTP transport; social pages require the shared logged-in browser. Raw candidates can enter only a declared workflow entry or independent line root.',
+        description: 'Owner-level (station owner or dispatcher) source configuration. Defaults to disabled. RSS/JSON use bounded shared HTTP transport; social pages require the shared logged-in browser. Raw candidates can enter only a declared workflow entry or independent line root.',
         parameters: object({
           id: Type.String({pattern: '^[a-z][a-z0-9-]{0,63}$'}), name: name(),
           url: Type.String({minLength: 1, maxLength: 4000}), format: choice('rss', 'json', 'browser'),
@@ -141,17 +144,17 @@ function definitions(f: Factory): Tool[] {
           input: Type.Optional(files()), constants: Type.Optional(dictionary()),
         }),
         execute: async (_id, parameters, actor) => {
-          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '持续来源需由用户配置；调度员只能轮询已配置来源');
+          if (!isOwner(actor)) throw new ControlError(403, 'owner_decision_required', '持续来源由站长或主调度配置；工位 Agent 只能轮询已配置来源');
           const source = f.sources.configure({...parameters, enabled: parameters.enabled ?? false, platform: parameters.platform ?? ''});
           return ok(source, `已配置来源 ${source.name}，${source.enabled ? '按计划采集' : '保持停用'}`);
         },
       },
       {
         name: 'source_enable', label: '启停持续来源',
-        description: 'User-only activation or deactivation of an existing source. Disabling cancels its in-flight collection and preserves candidates; it never changes other sources or an active workflow.',
+        description: 'Owner-level (station owner or dispatcher) activation or deactivation of an existing source. Disabling cancels its in-flight collection and preserves candidates; it never changes other sources or an active workflow.',
         parameters: object({id: name(), enabled: Type.Boolean()}),
         execute: async (_id, parameters, actor) => {
-          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '持续来源启停需由用户决定');
+          if (!isOwner(actor)) throw new ControlError(403, 'owner_decision_required', '持续来源启停由站长或主调度决定');
           const source = f.sources.setEnabled(parameters.id, parameters.enabled);
           return ok(source, `${source.enabled ? '已启用' : '已停用'}来源 ${source.name}`);
         },
@@ -196,15 +199,15 @@ function definitions(f: Factory): Tool[] {
       {name: 'workflow_activate', label: '启用自主创建的线路', description: 'Activate the exact successfully tested draft revision in an idle project. Coordinator may add new workflows or revise its previously authored workflows. Existing user-installed packs and built-in lines are preserved. The receipt is idempotent for an already active revision.',
         parameters: object({id: name(), revision: name(), trialId: name()}),
         execute: async (_id, p) => ok(await authoring().activate(p.id, p.revision, p.trialId, guard()), '已启用经过真实试跑的工作流，可用 workflow_feed 投料')},
-      { name: 'workflow_template', label: '从模板创建工作流', description: 'Instantiate a complete runnable template, including roles, schemas and executors. User-only; requires an ended, idle run.', parameters: object({ templateId: name(), id: name(), name: name(), includeBuiltins: Type.Optional(Type.Boolean()) }), execute: async (_id,p,actor) => {
+      { name: 'workflow_template', label: '从模板创建工作流', description: 'Instantiate a complete runnable template, including roles, schemas and executors. Owner-level; requires an ended, idle run.', parameters: object({ templateId: name(), id: name(), name: name(), includeBuiltins: Type.Optional(Type.Boolean()) }), execute: async (_id,p,actor) => {
         structuralUser(actor); const manifest = await instantiateWorkflowTemplate(f.project.dir,p,guard(),[pack]); await f.reloadWorkflowPacks();
         return ok({ manifest, digest: f.compiled.digest }, `已创建 ${manifest.name}`);
       } },
-      { name: 'workflow_install', label: '安装工作流包', description: 'Validate and atomically install a versioned local workflow pack with real roles, contracts, and executors. User-only; requires an idle project.', parameters: object({ directory: Type.Optional(name()), manifest: Type.Optional(dictionary()), files: Type.Optional(files()), replace: Type.Optional(Type.Boolean()), builtins: Type.Optional(Type.Array(name())) }), execute: async (_id,p,actor) => {
+      { name: 'workflow_install', label: '安装工作流包', description: 'Validate and atomically install a versioned local workflow pack with real roles, contracts, and executors. Owner-level; requires an idle project.', parameters: object({ directory: Type.Optional(name()), manifest: Type.Optional(dictionary()), files: Type.Optional(files()), replace: Type.Optional(Type.Boolean()), builtins: Type.Optional(Type.Array(name())) }), execute: async (_id,p,actor) => {
         structuralUser(actor); const manifest=await installWorkflowPack(f.project.dir,p,guard(),[pack]); await f.reloadWorkflowPacks();
         return ok({manifest,digest:f.compiled.digest},`已安装 ${manifest.name}`);
       } },
-      { name: 'workflow_line', label: '添加可执行流水线', description: 'Add a validated line and complete bindings, schemas, role files and tools to an installed workflow pack. User-only and idle project required.', parameters: object({ packId: name(), line: dictionary(), bindings: dictionary(), schemas: dictionary(), files: files(), tools: Type.Optional(dictionary()), conditions: Type.Optional(dictionary()) }), execute: async (_id,p,actor) => {
+      { name: 'workflow_line', label: '添加可执行流水线', description: 'Add a validated line and complete bindings, schemas, role files and tools to an installed workflow pack. Owner-level and idle project required.', parameters: object({ packId: name(), line: dictionary(), bindings: dictionary(), schemas: dictionary(), files: files(), tools: Type.Optional(dictionary()), conditions: Type.Optional(dictionary()) }), execute: async (_id,p,actor) => {
         structuralUser(actor); const {packId,...addition}=p; const manifest=await addWorkflowLine(f.project.dir,packId,addition,guard(),[pack]); await f.reloadWorkflowPacks();
         return ok({manifest,digest:f.compiled.digest},`已添加流水线 ${p.line.name}`);
       } },
@@ -287,7 +290,7 @@ function definitions(f: Factory): Tool[] {
         execute: async (_id, p, actor) => {
           if (f.kernel === 'v2') {
             if (p.action === 'configure') {
-              if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '入场上限由用户选择');
+              if (!isOwner(actor)) throw new ControlError(403, 'owner_decision_required', '入场上限由站长或主调度选择');
               if (p.maxInFlight !== undefined) f.saveSettings({maxActiveItems: p.maxInFlight});
             } else if (p.action === 'start') {
               if (!p.target) throw new ControlError(400, 'missing_target', '请提供本轮总目标数量');
@@ -308,7 +311,7 @@ function definitions(f: Factory): Tool[] {
           }
           if (p.action === 'status') return ok(batchSummary(f.state), '读取持久任务目标');
           if (p.action === 'configure') {
-            if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '流水线入场上限由用户选择，自动调度在该上限内调整');
+            if (!isOwner(actor)) throw new ControlError(403, 'owner_decision_required', '流水线入场上限由站长或主调度选择，自动调度在该上限内调整');
             return ok(f.batch.updateAdmission({flow: p.flow, maxInFlight: p.maxInFlight, intakeWindow: p.intakeWindow}), '已保存流水线入场策略，保持当前运行或暂停状态');
           }
           if (p.action === 'start') {
@@ -350,9 +353,9 @@ function definitions(f: Factory): Tool[] {
           return ok({ ...f.state.run }, `本轮：${p.action}`);
         },
       },
-      { name:'allocation_plan',label:'实测配员建议',description:'Inspect the first ten-item measurement proposal. Only the user may accept or reject the suggested worker allocation; existing locks and limits are preserved.',parameters:object({action:choice('status','accept','reject'),id:Type.Optional(name())}),execute:async(_id,p,actor)=>{
+      { name:'allocation_plan',label:'实测配员建议',description:'Inspect the first ten-item measurement proposal. The owner (station owner or dispatcher) accepts or rejects the suggested worker allocation; existing locks and limits are preserved.',parameters:object({action:choice('status','accept','reject'),id:Type.Optional(name())}),execute:async(_id,p,actor)=>{
         if(p.action==='status')return ok({proposal:f.runtime.measurementProposal(),sampleItems:f.runtime.sampleItems.size},'读取实测配员建议');
-        if(actor!=='user')throw new ControlError(403,'owner_decision_required','实测配员建议由用户确认');
+        if(!isOwner(actor))throw new ControlError(403,'owner_decision_required','实测配员建议由站长或主调度确认');
         if(!p.id)throw new ControlError(400,'missing_measurement','需要建议 id');
         return ok(f.runtime.decideMeasurement(p.id,p.action==='accept'),'已记录配员决定');
       }},
@@ -367,7 +370,7 @@ function definitions(f: Factory): Tool[] {
         description: 'The owner doubles this waiting station budget and resumes its saved conversation.',
         parameters: object({item: name(), node: name()}),
         execute: async (_id, p, actor) => {
-          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '预算交接由用户点击继续');
+          if (!isOwner(actor)) throw new ControlError(403, 'owner_decision_required', '预算交接由站长或主调度继续');
           return ok(f.continueAgentBudget(p.item, p.node), '预算已加倍，从原会话继续');
         },
       },
@@ -395,9 +398,11 @@ function definitions(f: Factory): Tool[] {
           technicalReason: Type.Optional(Type.String({minLength: 12, maxLength: 2000})),
         }),
         execute: async (_id, parameters, actor) => {
-          const technical = parameters.includeManual && actor !== 'user';
-          if (technical && (!parameters.tokens?.length || !parameters.technicalReason)) {
-            throw new ControlError(403, 'owner_decision_required', '恢复策略已转人工复核，需由用户明确选择条目继续');
+          // A bounded checkpoint-only continuation needs tokens plus a technical
+          // reason. The owner may also pick items directly without that mode.
+          const technical = parameters.includeManual && actor !== 'user' && Boolean(parameters.tokens?.length && parameters.technicalReason);
+          if (parameters.includeManual && !technical && !isOwner(actor)) {
+            throw new ControlError(403, 'owner_decision_required', '恢复策略已转人工复核，需由站长或主调度明确选择条目继续');
           }
           if (parameters.includeManual && !parameters.items?.length && !parameters.tokens?.length) {
             throw new ControlError(400, 'manual_retry_requires_items', '请明确选择要恢复的人工复核条目');
@@ -631,11 +636,11 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: 'delete_shared_lesson', label: '删除生效经验',
-        description: 'User removes a shared station lesson. Its journal history remains available for audit.',
+        description: 'The owner (station owner or dispatcher) removes a shared station lesson. Its journal history remains available for audit.',
         parameters: object({id: name()}),
         execute: async (_id, p, actor) => {
-          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '经验由用户删除');
-          return ok(f.lessons.deleteShared(p.id), '经验已停止注入');
+          if (!isOwner(actor)) throw new ControlError(403, 'owner_decision_required', '经验由站长或主调度删除');
+          return ok(f.lessons.deleteShared(p.id, actor === 'dispatcher' ? 'dispatcher' : 'user'), '经验已停止注入');
         },
       },
       {
@@ -664,7 +669,7 @@ function definitions(f: Factory): Tool[] {
         execute: async (_id, p) => ok(f.lessons.validate(p.trialId), "已核验经验的重跑与回归证据"),
       },
       {
-        name: "decide_lesson", label: "决定经验草案", description: "User decision only: approve a digest-bound, validated lesson into ROLE.md known pitfalls, or reject it. Agent and dispatcher callers cannot approve their own drafts.",
+        name: "decide_lesson", label: "决定经验草案", description: "Owner decision (station owner or dispatcher): approve a digest-bound, validated lesson into ROLE.md known pitfalls, or reject it. Station agents cannot decide.",
         parameters: object({ id: name(), digest: name(), decision: choice("approve", "reject"), validationDigest: Type.Optional(name()), reason: Type.Optional(Type.String({ minLength: 1, maxLength: 1000 })) }),
         execute: async (_id, p, actor = "agent") => {
           if (p.decision === "approve" && !p.validationDigest || p.decision === "reject" && !p.reason) throw new ControlError(400, "invalid_arguments", "批准需要 validationDigest，拒绝需要 reason");
@@ -697,7 +702,7 @@ export class FactoryControl {
       limitations: [
         'Single workspace, local service; no multi-tenant hosting. MCP uses a local stdio bridge and the same private connection file.',
         'Mutations are not guaranteed idempotent. Inspect the returned token ids and journal sequence before retrying.',
-        'Only wired lines execute. The coordinator can autonomously draft, trial and activate new declarative workflows, or revise its own workflows, while idle. Replacing user-installed packs, modifying built-in structure and registering host code remain user-owned.',
+        'Only wired lines execute. The coordinator holds owner-level authority: while idle it may draft, trial, activate, install and revise any declarative workflow, decide patches and lessons, and reconfigure stations and sources. Registering host code remains user-owned.',
       ],
     };
   }
@@ -710,8 +715,8 @@ export class FactoryControl {
       model: this.f.dispatcherModelStatus(), agentDefaults: this.f.getAgentDefaults(),
       instructions: `Easy Workflow 是可直接调用的流水线服务。无需浏览界面、读源码或通读 Spec。\n` +
         `人工队列：manual_review 分页列出跨轮次待审，传 token 返回精简的当前证据、事实与只读重建结果，避免反复读超长案卷。rebuild.valid 且 changed 时优先重跑 assemble，再过终审与闸门；截图问题需要具体新取景策略。先验证代表项，再处理同类；技术错误不能直接当成人类判断。\n` +
-        `先用 easy_workflow_help 获取能力索引；只为当前任务读取 easy_workflow_help({name}) 的参数，再以 easy_workflow_call({name,arguments}) 调用。客户端若只提供兼容入口，使用它已注册的工具名。read_role({station}) 读取一个节点的 ROLE.md 和异常处理边界。\n` +
-        `查询：status 看状态，inspect 查任务/工位/证据，read_case 看一件货的案卷，read_context 看节点 CONTEXT，alerts 看红灯与开跑体检，read_report 看报告，browser 查共享网页/登录提醒及操作标签。给某个节点留长期指示用 note_context。开跑、恢复、投料前会自动体检，体检不过返回 412 和要修的项目。调度：feed_urls/pull_candidates 投料，run_control 启停，workers 配人，correct 纠错。规格：read_spec 按需读，propose_patch 起草，decide_patch 按用户决定接受或拒绝。settings 读写配额。\n` +
+        `先用 easy_workflow_help 获取能力索引；只为当前任务读取 easy_workflow_help({name}) 的参数，再以 easy_workflow_call({name,arguments}) 调用。兼容入口用其已注册工具名。read_role 读节点 ROLE.md 与异常边界。\n` +
+        `查询：status 看状态，inspect 查任务/工位/证据，read_case 看一件货的案卷，read_context 看节点 CONTEXT，alerts 看红灯与开跑体检，read_report 看报告，browser 查共享网页/登录提醒及操作标签。给某个节点留长期指示用 note_context。开跑、恢复、投料前会自动体检，体检不过返回 412 和要修的项目。调度：feed_urls/pull_candidates 投料，run_control 启停，workers 配人，correct 纠错。权限：主调度与站长同级，可更换任何模型与配置、接受补丁和经验、安装修改工作流。规格：read_spec 按需读，propose_patch 起草，decide_patch 由站长或主调度决定。settings 读写配额。\n` +
         `长程任务：用户给定总量并要求持续监督时，用 run_batch(action=start,target=总量) 保存目标；后台按前段空位逐批补料，有界恢复网络故障和重新选页，不依赖聊天轮询。status.batch 查看目标、领取、完成、剩余与阻塞。\n` +
         `失败处理：candidate_failures 按标签查原因；网络与采集故障由系统/Agent恢复，不笼统交给用户。只有真实验证墙、凭据或证书问题才需对应操作。修复后用 retry_candidates 按 tag 或 items 重试。处理结束数不等于成功数；报告分开记录发布、合并、排除与未完成。\n` +
         `自主建线：workflow_authoring 读取完整模板、程序输入输出和能力箱，workflow_draft 保存首版，workflow_edit 按 expectedRevision 增量修改节点、边、schema 和角色，workflow_trial 真实隔离试跑，workflow_activate 启用同版通过回执。workflow_feed 投料后用 workflow_result 有界等待并核验磁盘产物。compose-json 可原样汇合任意映射字段，避免让模型重抄程序结果。草稿与证据会保留，workflow_drafts 可恢复。既有生产线变更仍走补丁。read_report.metrics 区分估算分项与实际用量；按 runId 查历史。\n` +
@@ -771,7 +776,6 @@ export class FactoryControl {
         execute: async (_id, p) => ok(p.name && p.name !== 'index' ? this.describe(p.name) : this.bootstrap(), "读取 Easy Workflow 能力契约") },
       { name: CONTROL_CALL, label: "调用 Easy Workflow", description: "Execute a discovered Easy Workflow capability with its exact arguments. Mutations are journaled; never blindly retry a timed-out write.", parameters: object({ name: name(), arguments: Type.Record(Type.String(), Type.Unknown()) }),
         execute: async (_id, p) => {
-          if (p.name === "decide_patch") throw new ControlError(403, "owner_decision_required", "主调度不能批准自己起草的补丁；请站长在界面决定。");
           const arguments_ = p.name === 'read_report' && p.arguments?.view === undefined
             ? {...p.arguments, view: 'summary'} : p.arguments;
           const receipt = await this.execute(p.name, arguments_, "dispatcher");

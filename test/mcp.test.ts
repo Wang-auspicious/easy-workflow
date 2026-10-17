@@ -97,7 +97,7 @@ test("stdio MCP reaches the existing authenticated control registry without cred
     assert.equal(bootstrap.product, "Easy Workflow");
     assert.ok(bootstrap.instructions.length < 1500);
     assert.match(bootstrap.roleAuthoring.guide, /workflow_draft.*workflow_trial.*workflow_activate/);
-    assert.match(bootstrap.roleAuthoring.guide, /既有内置职责或用户安装包.*站长/);
+    assert.match(bootstrap.roleAuthoring.guide, /主调度与站长同级.*用户安装包/);
     const schema = await rpc("tools/call", { name: "h2_help", arguments: { name: "read_spec" } });
     assert.equal(JSON.parse(schema.result.content[0].text).inputSchema.additionalProperties, false);
     const spec = await rpc("tools/call", { name: "easy_workflow_call", arguments: { name: "read_spec", arguments: {} } });
@@ -105,8 +105,9 @@ test("stdio MCP reaches the existing authenticated control registry without cred
     const bad = await rpc("tools/call", { name: "h2_call", arguments: { name: "feed_urls", arguments: { urls: "bad" } } });
     assert.equal(bad.result.isError, true);
     const before = authorized;
-    const forbidden = await rpc("tools/call", { name: "h2_call", arguments: { name: "decide_patch", arguments: { id: "any", accept: true } } });
-    assert.equal(forbidden.result.isError, true); assert.equal(authorized, before);
+    const unknown = await rpc("tools/call", { name: "h2_call", arguments: { name: "decide_patch", arguments: { id: "any", accept: true } } });
+    assert.equal(unknown.result.isError, true, "real validation still rejects an unknown patch");
+    assert.equal(authorized, before + 1, "owner-level calls reach the service instead of being blocked in the bridge");
     assert.ok(authorized >= 4); assert.ok(!transcript.includes(secret)); assert.ok(!errors.includes(secret));
   } finally {
     child.stdin.end(); child.kill(); lines.close();

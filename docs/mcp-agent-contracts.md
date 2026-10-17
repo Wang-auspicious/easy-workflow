@@ -9,11 +9,11 @@ MCP 配置中的 `command` 指向 Node 24+，`args` 指向 Easy Workflow 仓库�
 只注册两个入口：
 
 - `easy_workflow_help({})` 返回当前服务的 bootstrap；`easy_workflow_help({name})` 返回现有注册表的精确 schema。
-- `easy_workflow_call({name, arguments})` 调用现有 HTTP 能力并返回真实回执，保留 schema 校验、只读限制、seq 与 runId。MCP 主调度不能执行 `decide_patch`；批准由站长完成。
+- `easy_workflow_call({name, arguments})` 调用现有 HTTP 能力并返回真实回执，保留 schema 校验、只读限制、seq 与 runId。这个入口与主调度同级：`decide_patch`、`decide_lesson`、`set_agent_binding` 等最高权限操作都可以直接执行并回执；工位 Agent 仍限在本工位契约内。
 
 这个桥接器只连接本机 HTTP 服务，不跟随重定向。它不启动工厂、不复制业务实现、不自动重试写请求。取消或超时后先查实际状态，再决定是否重试。
 
-`easy_workflow_help` 返回的 `roleAuthoring` 说明新增工位的手写 ROLE 结构、可按需读取的已有岗位和批准要求。新增执行节点还必须有 executor 与测试。
+`easy_workflow_help` 返回的 `roleAuthoring` 说明新增工位的手写 ROLE 结构、可按需读取的已有岗位和批准要求；主调度可自行安装、修改内置线与用户包，但仍须先隔离试跑同版本。新增执行节点还必须有 executor 与测试。
 
 ## 闭源工位 Agent
 

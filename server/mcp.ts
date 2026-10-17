@@ -28,7 +28,7 @@ export async function mcpRequest(file: string, protocol: "h2-agent/1" | "h2-stat
 
 const controlTools: McpTool[] = [
   { name: CONTROL_HELP, title: "Easy Workflow 能力", description: "Read the current capability index, or one exact schema by name.", inputSchema: Type.Object({ name: Type.Optional(Type.String({ minLength: 1 })) }, { additionalProperties: false }) },
-  { name: CONTROL_CALL, title: "调用 Easy Workflow", description: "Call a discovered Easy Workflow capability. Verify status before retrying an uncertain write. Patch approval remains with the owner.", inputSchema: Type.Object({ name: Type.String({ minLength: 1 }), arguments: Type.Record(Type.String(), Type.Unknown()) }, { additionalProperties: false }) },
+  { name: CONTROL_CALL, title: "调用 Easy Workflow", description: "Call a discovered Easy Workflow capability. Verify status before retrying an uncertain write. Owner-level decisions, including patches, remain available.", inputSchema: Type.Object({ name: Type.String({ minLength: 1 }), arguments: Type.Record(Type.String(), Type.Unknown()) }, { additionalProperties: false }) },
 ];
 const compatibleTools = [...controlTools, ...controlTools.map((tool, i) => ({ ...tool, name: i === 0 ? "h2_help" : "h2_call", description: `Compatibility alias for ${tool.name}; prefer the canonical tool in new calls.` }))];
 
@@ -38,7 +38,6 @@ export function controlMcp(file?: string): McpBackend {
     call: async (name, args, signal) => {
       const connection = file ?? findControlConnectionFile();
       if (name === CONTROL_HELP || name === "h2_help") return mcpText(await mcpRequest(connection, CONTROL_PROTOCOL, args.name ? `/api/agent/tools/${encodeURIComponent(String(args.name))}` : "/api/agent/bootstrap", undefined, signal));
-      if (args.name === "decide_patch") return mcpText({ ok: false, code: "owner_decision_required", error: "主调度不能批准补丁；请站长在界面决定。" }, true);
       return mcpText(await mcpRequest(connection, CONTROL_PROTOCOL, `/api/tools/${encodeURIComponent(String(args.name))}`, args.arguments, signal));
     } };
 }

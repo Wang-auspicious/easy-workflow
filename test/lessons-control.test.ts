@@ -182,24 +182,25 @@ test("lesson wiring: legacy boot, atomic Runtime scheduling, actor boundaries an
       } finally { off(); }
     });
 
-    await t.test("control actor reaches revisions and only explicit user decisions can reject or approve", async () => {
+    await t.test("control actor reaches revisions and only the owner can reject or approve", async () => {
       const revised = await control.execute("revise_lesson", { id: draft.id, digest: draft.digest, suggestion: "网络入口恢复后再核对直接事实来源。" }, "dispatcher");
       draft = revised.result;
       const change = [...factory.journal.read()].findLast((event) => event.kind === "lesson.revised");
       assert.equal(change?.kind === "lesson.revised" && change.by, "dispatcher");
-      for (const actor of ["agent", "dispatcher"] as const) {
-        await assert.rejects(() => control.execute("decide_lesson", { id: draft.id, digest: draft.digest, decision: "reject", reason: "must remain a draft" }, actor), /只有站长/);
-        await assert.rejects(() => control.execute("decide_lesson", { id: draft.id, digest: draft.digest, decision: "approve", validationDigest: "missing" }, actor), /只有站长/);
-      }
+      await assert.rejects(() => control.execute("decide_lesson", { id: draft.id, digest: draft.digest, decision: "reject", reason: "must remain a draft" }, "agent"), /只有站长/);
+      await assert.rejects(() => control.execute("decide_lesson", { id: draft.id, digest: draft.digest, decision: "approve", validationDigest: "missing" }, "agent"), /只有站长/);
+      // The dispatcher holds the user's decision gate. The digest check still
+      // rejects a stale approval instead of writing into the role handbook.
+      await assert.rejects(() => control.execute("decide_lesson", { id: draft.id, digest: draft.digest, decision: "approve", validationDigest: "missing" }, "dispatcher"), /缺少当前草案/);
       await assert.rejects(() => control.execute("decide_lesson", { id: draft.id, digest: draft.digest, decision: "approve", validationDigest: "missing" }, "user"), /缺少当前草案/);
     });
 
     await closeFactory(factory); f = undefined;
     server = await startServer();
-    await t.test("HTTP agent tools cannot spoof the actor; the user decision route uses the same digest gate", async () => {
-      const args = { id: draft.id, digest: draft.digest, decision: "reject", reason: "fixture user rejected" };
-      assert.equal((await server!.call("/api/tools/decide_lesson", args)).status, 403);
-      assert.equal((await server!.call("/api/tools/decide_lesson", { ...args, actor: "user" })).status, 400);
+    await t.test("HTTP agent tools cannot spoof the actor and keep the same digest gate", async () => {
+      const args = { id: draft.id, digest: draft.digest, decision: "reject", reason: "fixture owner rejected" };
+      assert.equal((await server!.call("/api/tools/decide_lesson", { ...args, actor: "user" })).status, 400, "the request body cannot spoof the actor");
+      assert.equal((await server!.call("/api/tools/decide_lesson", { ...args, digest: "stale" })).status, 409, "the dispatcher route uses the same digest gate");
       assert.equal((await server!.call("/api/lessons/decision", { ...args, decision: "approve", validationDigest: "not-validated" })).status, 409);
       const response = await server!.call("/api/lessons/decision", args);
       assert.equal(response.status, 200);

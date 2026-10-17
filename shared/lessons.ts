@@ -67,16 +67,16 @@ export interface LessonValidation {
 
 export type LessonEvent =
   | {kind: 'lesson.shared'; lesson: SharedLesson}
-  | {kind: 'lesson.deleted'; id: string; actor: 'user'}
+  | {kind: 'lesson.deleted'; id: string; actor: 'user' | 'dispatcher'}
   | { kind: "lesson.proposed"; draft: LessonDraft }
   | { kind: "lesson.revised"; draft: LessonDraft; by: "agent" | "dispatcher" | "user" }
   | { kind: "lesson.validation.started"; trial: LessonTrial }
   | { kind: "lesson.validation.bound"; trialId: string; token: string; item: string }
   | { kind: "lesson.validation.exposed"; trialId: string; digest: string; token: string; attempt: string; station: string }
   | { kind: "lesson.validated"; validation: LessonValidation }
-  | { kind: "lesson.approved"; lessonId: string; digest: string; validationDigest: string; actor: "user"; roleRevision: string; roleResultDigest: string; addition: string }
+  | { kind: "lesson.approved"; lessonId: string; digest: string; validationDigest: string; actor: "user" | "dispatcher"; roleRevision: string; roleResultDigest: string; addition: string }
   | { kind: "lesson.applied"; lessonId: string; digest: string; roleResultDigest: string }
-  | { kind: "lesson.rejected"; lessonId: string; digest: string; actor: "user"; reason: string };
+  | { kind: "lesson.rejected"; lessonId: string; digest: string; actor: "user" | "dispatcher"; reason: string };
 
 /** Cross-item advice is separate from approved ROLE edits, on the same journal. */
 export interface SharedLesson {

@@ -133,7 +133,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && p === "/api/agent/bootstrap") return send(res, 200, control.bootstrap());
     if (req.method === "GET" && p.startsWith("/api/agent/tools/")) return send(res, 200, control.describe(decodeURIComponent(p.slice("/api/agent/tools/".length))));
     if (req.method === "GET" && ["/api/tools", "/api/capabilities", "/.well-known/agent.json"].includes(p)) return send(res, 200, control.manifest());
-    if (req.method === "POST" && p.startsWith("/api/tools/")) return send(res, 200, await control.execute(decodeURIComponent(p.slice("/api/tools/".length)), await body(req)));
+    // This is the coordinator/MCP surface: it holds owner-level authority, while
+    // station agents stay scoped to their own contracts.
+    if (req.method === "POST" && p.startsWith("/api/tools/")) return send(res, 200, await control.execute(decodeURIComponent(p.slice("/api/tools/".length)), await body(req), "dispatcher"));
     const readRoute = p.startsWith("/evidence/") || p.startsWith("/api/report/") || p.startsWith("/api/agent/") || ["/api/factory", "/api/state", "/api/events", "/api/journal", "/api/runs", "/api/tools", "/api/capabilities", "/.well-known/agent.json"].includes(p);
     if (readRoute && req.method !== "GET") throw new ControlError(405, "method_not_allowed", "此资源只支持 GET");
     if (p.startsWith("/evidence/")) { const file = factory.store.resolve(p); if (!file) { res.writeHead(404); res.end(); return; } serveFile(res, file, req); return; }

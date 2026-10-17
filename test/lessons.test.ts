@@ -378,7 +378,7 @@ test("candidate trial context follows the exact bound token and attempt when ide
   } finally { f.close(); }
 });
 
-test("only a user can approve a digest-bound validated lesson; append is exact, durable and idempotent", () => {
+test("station agents cannot approve a digest-bound validated lesson; the owner append is exact, durable and idempotent", () => {
   const f = fixture();
   try {
     const draft = f.seed(), trial = f.trial(draft);
@@ -388,7 +388,7 @@ test("only a user can approve a digest-bound validated lesson; append is exact, 
     assert.equal(validation.regressions.length, 2);
     assert.deepEqual(validation.regressions.find((s) => s.item === "known-b")?.changedFields, ["editorial.noteZh"]);
     assert.equal(f.lessons.get(draft.id).status, "validated");
-    for (const actor of ["agent", "dispatcher"] as const) assert.throws(() => f.lessons.approve(draft.id, { digest: draft.digest, validationDigest: validation.evidenceDigest }, actor), /只有站长/);
+    assert.throws(() => f.lessons.approve(draft.id, { digest: draft.digest, validationDigest: validation.evidenceDigest }, "agent"), /只有站长/);
     assert.throws(() => f.lessons.approve(draft.id, { digest: draft.digest, validationDigest: "stale" }, "user"), /缺少当前草案/);
     const result = f.lessons.approve(draft.id, { digest: draft.digest, validationDigest: validation.evidenceDigest }, "user");
     assert.equal(result.status, "applied");
@@ -402,6 +402,20 @@ test("only a user can approve a digest-bound validated lesson; append is exact, 
     assert.equal(fs.readFileSync(f.roleFile, "utf8"), appended);
     assert.doesNotMatch(f.lessons.pendingContext(station), new RegExp(draft.id));
     assert.throws(() => f.lessons.revise(draft.id, { digest: draft.digest, suggestion: "try replacing the approved rule" }, "agent"), /只能修订/);
+  } finally { f.close(); }
+});
+
+test("the dispatcher decides lessons with the owner's authority and the audit trail records the real actor", () => {
+  const f = fixture();
+  try {
+    const draft = f.seed(), trial = f.trial(draft);
+    f.rerun(trial.id);
+    const validation = f.lessons.validate(trial.id);
+    assert.throws(() => f.lessons.approve(draft.id, { digest: draft.digest, validationDigest: validation.evidenceDigest }, "agent"), /只有站长/);
+    const applied = f.lessons.approve(draft.id, { digest: draft.digest, validationDigest: validation.evidenceDigest }, "dispatcher");
+    assert.equal(applied.status, "applied");
+    const decision = [...f.journal.read()].findLast((event) => event.kind === "lesson.approved");
+    assert.equal(decision?.kind === "lesson.approved" && decision.actor, "dispatcher", "the real deciding actor is recorded");
   } finally { f.close(); }
 });
 

@@ -124,6 +124,8 @@ function nativeDispatcherFixture(source: string, adapter: 'launcher' | 'claude-c
       if (name === 'status') return {ok: true, result: {writes: writes.length}, summary: 'Local state'};
       if (name === 'read_report') return {ok: true, tool: name,
         result: {activity: {intervals: [{text: 'private long report '.repeat(40000)}]}}, summary: 'Report', seq: journal.seq};
+      // Owner-level decisions reach the service; the real patch gate still rejects them.
+      if (name === 'decide_patch') throw new Error('补丁不存在或已处理');
       assert.equal(name, 'fixture_write');
       writes.push(input.value!);
       if (input.value === 'uncertain') throw new Error('connection interrupted after local write');
@@ -157,7 +159,7 @@ assert.match(JSON.stringify(second), /second/);
 const uncertain = await call('env_call', {name: 'fixture_write', arguments: {value: 'uncertain'}});
 if (count) assert.match(JSON.stringify(uncertain), /核对/);
 const approval = await call('env_call', {name: 'decide_patch', arguments: {id: 'never-approved', accept: true}});
-assert.match(JSON.stringify(approval), /站长|核对/);
+assert.match(JSON.stringify(approval), /补丁不存在|核对/);
 const report = await call('env_call', {name: 'read_report', arguments: {}});
 assert.ok(Buffer.byteLength(JSON.stringify(report)) < 32 * 1024);
 if (count) assert.match(raw, /first|second/);

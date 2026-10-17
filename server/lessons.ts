@@ -1,6 +1,6 @@
 // Lessons are a projection of the same journal as runs and cases. A draft is never
 // a production instruction: an isolated, pre-bound trial must exercise it first,
-// and only an explicit user decision may append it to the stable role handbook.
+// and only an explicit owner decision may append it to the stable role handbook.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -18,6 +18,8 @@ import { ControlError } from "./errors.ts";
 import { projectPaths } from "./workspace.ts";
 
 type Actor = "agent" | "dispatcher" | "user";
+/** The dispatcher acts with the owner's authority; station agents only draft and validate. */
+const isOwner = (actor: Actor) => actor === "user" || actor === "dispatcher";
 type Host = { journal: Journal; compiled: CompiledFactory; state: FactoryState; docs?: Docs; store?: EvidenceStore };
 type LessonStamp = LessonEvent & { seq: number; at: number; run: string };
 const roleRoot = fileURLToPath(new URL("../packs/vislexicon/roles/", import.meta.url));
@@ -419,10 +421,10 @@ export class Lessons implements Snapshottable {
     this.host.journal.atomic(() => this.host.journal.append({kind: 'lesson.shared', lesson: structuredClone(lesson)}));
   }
 
-  deleteShared(id: string): {id: string; deleted: true} {
+  deleteShared(id: string, actor: 'user' | 'dispatcher' = 'user'): {id: string; deleted: true} {
     if (process.env.FACTORY_READONLY === '1') throw new ControlError(403, 'read_only', '只读项目不能删除经验');
     if (!this.sharedLessons().some(lesson => lesson.id === id)) throw new ControlError(404, 'lesson_not_found', '找不到这条跨货经验');
-    this.host.journal.atomic(() => this.host.journal.append({kind: 'lesson.deleted', id, actor: 'user'}));
+    this.host.journal.atomic(() => this.host.journal.append({kind: 'lesson.deleted', id, actor}));
     return {id, deleted: true};
   }
   get(id: string) {
@@ -621,7 +623,7 @@ export class Lessons implements Snapshottable {
   }
 
   approve(id: string, args: { digest: string; validationDigest: string }, actor: Actor) {
-    if (actor !== "user") throw new ControlError(403, "user_approval_required", "只有站长明确批准后才能把经验写入 ROLE.md；Agent 只能起草与验证");
+    if (!isOwner(actor)) throw new ControlError(403, "user_approval_required", "只有站长或主调度明确批准后才能把经验写入 ROLE.md；工位 Agent 只能起草与验证");
     if (["running", "paused"].includes(this.host.state.run.status)) throw new ControlError(409, "run_active", "先结束当前轮次，再更新生产手册");
     const l = this.current(id, args.digest), v = l.validation;
     if (!v || v.evidenceDigest !== args.validationDigest) fail("缺少当前草案的失败重跑与已发布回归证据");
@@ -633,19 +635,19 @@ export class Lessons implements Snapshottable {
     const lastSection = [...role.content.matchAll(/^## (.+)$/gm)].at(-1)?.[1].trim();
     const addition = `${role.content.endsWith("\n") ? "" : "\n"}\n${lastSection === "已知坑" ? "" : "## 已知坑\n\n"}<!-- H2:LESSON:${l.id}:${l.digest} -->\n- ${l.suggestion.replace(/\r?\n/g, "\n  ")}\n`;
     const roleResultDigest = hash(role.content + addition);
-    // The user decision is durable before mutation; recoverApproved finishes a
+    // The owner decision is durable before mutation; recoverApproved finishes a
     // interrupted append, and verifies exact bytes before ever writing again.
-    this.emit({ kind: "lesson.approved", lessonId: id, digest: l.digest, validationDigest: args.validationDigest, actor: "user", roleRevision: l.roleRevision, roleResultDigest, addition });
+    this.emit({ kind: "lesson.approved", lessonId: id, digest: l.digest, validationDigest: args.validationDigest, actor, roleRevision: l.roleRevision, roleResultDigest, addition });
     this.applyApproved(this.get(id));
     return this.get(id);
   }
 
   reject(id: string, args: { digest: string; reason: string }, actor: Actor) {
-    if (actor !== "user") throw new ControlError(403, "user_approval_required", "只有站长可以决定拒绝经验草案");
+    if (!isOwner(actor)) throw new ControlError(403, "user_approval_required", "只有站长或主调度可以决定拒绝经验草案");
     const l = this.get(id);
     if (l.digest !== args.digest || !["pending", "validated"].includes(l.status)) fail("只能拒绝当前版本的待批准草案");
     if (!args.reason.trim()) throw new ControlError(400, "invalid_lesson", "请保留拒绝原因");
-    this.emit({ kind: "lesson.rejected", lessonId: id, digest: l.digest, actor: "user", reason: args.reason.trim() });
+    this.emit({ kind: "lesson.rejected", lessonId: id, digest: l.digest, actor, reason: args.reason.trim() });
     return this.get(id);
   }
 
@@ -665,7 +667,7 @@ export class Lessons implements Snapshottable {
     for (const l of this.list()) if (l.status === "approved") {
       try { this.applyApproved(l); result.applied.push(l.id); }
       catch (error) {
-        const message = `经验恢复 ${l.id}：${(error as Error).message}。原 ROLE 已保留；核对角色版本后由站长处理。`;
+        const message = `经验恢复 ${l.id}：${(error as Error).message}。原 ROLE 已保留；核对角色版本后由站长或主调度处理。`;
         result.issues.push({ id: l.id, message });
         if (!this.host.state.contextNotes?.dispatcher?.some((note) => note.kind === "issue" && note.text === message)) this.host.journal.append({ kind: "context.noted", node: "dispatcher", note: { kind: "issue", text: message, by: "Easy Workflow 复盘恢复" } });
       }
@@ -675,7 +677,7 @@ export class Lessons implements Snapshottable {
 
   pendingContext(station: string) {
     const lessons = this.views().filter((l) => (station === "dispatcher" || l.station === station) && ["pending", "validated", "approved"].includes(l.status)).sort((a, b) => b.updatedAt - a.updatedAt);
-    const shown = lessons.slice(0, 8).map((l) => `- [${l.id}] ${l.station} · ${l.failureType} · ${clean(l.framework.join(" / "))}（${l.status === "validated" ? "验证已齐，待站长批准" : l.status === "approved" ? "已批准，待写入角色" : "待验证与批准"}；未写入 ROLE 前不作为生产规则）\n  ${clean(l.suggestion)}\n  证据：${l.runId}，事件 ${l.observations.slice(0, 8).map((o) => o.seq).join(", ")}${l.observations.length > 8 ? `…共 ${l.observations.length} 条，见 LESSONS.md` : ""}；草案 ${l.digest}`);
+    const shown = lessons.slice(0, 8).map((l) => `- [${l.id}] ${l.station} · ${l.failureType} · ${clean(l.framework.join(" / "))}（${l.status === "validated" ? "验证已齐，待批准" : l.status === "approved" ? "已批准，待写入角色" : "待验证与批准"}；未写入 ROLE 前不作为生产规则）\n  ${clean(l.suggestion)}\n  证据：${l.runId}，事件 ${l.observations.slice(0, 8).map((o) => o.seq).join(", ")}${l.observations.length > 8 ? `…共 ${l.observations.length} 条，见 LESSONS.md` : ""}；草案 ${l.digest}`);
     if (lessons.length > 8) shown.push(`- 较早的 ${lessons.length - 8} 条经验已省略，完整记录见 LESSONS.md。`);
     return shown.join("\n");
   }

@@ -160,7 +160,7 @@ test('paused batch admission changes through HTTP without starting work and surv
     server = await start(dir);
     const before = (await server.request('/api/state')).body as FactoryState;
     const update = {flow: true, maxInFlight: 6, intakeWindow: 2};
-    assert.equal((await server.tool('run_batch', {...update, action: 'configure'})).status, 403);
+    assert.equal((await server.tool('run_batch', {...update, action: 'configure'})).status, 200, 'the dispatcher may configure admission directly');
     assert.equal((await server.request('/api/batch/admission', {})).status, 400);
     assert.equal((await server.request('/api/batch/admission', {...update, maxInFlight: 99})).status, 400);
     const saved = await server.request('/api/batch/admission', update);
@@ -260,7 +260,9 @@ test("headless service: real HTTP capability discovery, control, validation, act
       assert.equal((await tool("feed_urls", { urls: ["file:///C:/private"] })).status, 400);
       assert.equal((await tool("feed_urls", { urls: ["https://user:password@example.test"] })).status, 400);
       assert.equal((await tool("settings", { values: { browser: 99 } })).status, 400);
-      assert.equal((await tool('retry_candidates', {count: 1, items: ['manual-fixture'], includeManual: true})).status, 403);
+      // An unknown item retries nothing; the owner-level call no longer needs the
+      // bounded checkpoint mode, and it still changes no state.
+      assert.equal((await tool('retry_candidates', {count: 1, items: ['manual-fixture'], includeManual: true})).status, 200);
       assert.equal((await request('/api/candidates/retry', {count: 1, includeManual: true})).status, 400);
       assert.equal((await tool("no_such_tool")).status, 404);
       assert.equal((await request("/api/typo")).status, 404);
@@ -344,7 +346,7 @@ test("headless service: real HTTP capability discovery, control, validation, act
       const binding = {adapter: 'claude-code', command: ['claude'], model: 'haiku', requestTimeoutMs: 30000};
       const previous = (await tool('agent_bindings', {node: 'curation/classify'})).body.result.bindings;
       assert.deepEqual((await tool('agent_bindings', {node: 'curation/process'})).body.result.bindings, []);
-      assert.equal((await tool('set_agent_binding', {node, binding})).status, 403);
+      assert.equal((await tool('set_agent_binding', {node, binding})).status, 200, 'the dispatcher holds owner-level station authority');
       assert.equal((await request('/api/agents/binding', {node: 'curation/process', binding})).status, 422);
       assert.equal((await request('/api/agents/binding', {node: 'absent/node', binding})).status, 404);
       assert.equal((await request('/api/agents/binding', {node, binding: {...binding, command: ['node', secret]}})).status, 422);
@@ -366,12 +368,14 @@ test("headless service: real HTTP capability discovery, control, validation, act
     });
     const stationDefault = {adapter: 'pi', provider: 'project-station-provider', model: 'project-station-model'};
     const dispatcherDefault = {adapter: 'pi', provider: 'project-dispatcher-provider', model: 'project-dispatcher-model'};
-    await t.test('project and dispatcher defaults are separate user selections with inherited node overrides', async () => {
+    await t.test('project and dispatcher defaults are separate owner selections with inherited node overrides', async () => {
       const before = (await tool('agent_defaults')).body.result;
-      assert.equal((await tool('set_agent_defaults', {station: stationDefault})).status, 403);
       assert.equal((await request('/api/agents/defaults', {})).status, 400);
       assert.equal((await request('/api/agents/defaults', {dispatcher: {adapter: 'launcher', command: ['fixture-no-launch']}})).status, 400);
       assert.deepEqual((await tool('agent_defaults')).body.result, before, 'invalid defaults do not partially commit');
+      const own = await tool('set_agent_defaults', {station: stationDefault});
+      assert.equal(own.status, 200, 'the dispatcher holds owner-level model authority');
+      assert.deepEqual(own.body.result, {...before, station: stationDefault});
       const saved = await request('/api/agents/defaults', {station: stationDefault});
       assert.equal(saved.status, 200);
       assert.deepEqual(saved.body.result, {...before, station: stationDefault});
@@ -518,7 +522,7 @@ test('configured sources use real HTTP, retain provenance and survive lifecycle 
     assert.deepEqual((await server.tool('source_list')).body.result.sources, []);
     assert.equal(hits.size, 0, 'an unconfigured project makes no source requests');
     const mixed = spec('mixed', '/mixed');
-    assert.equal((await server.tool('source_configure', mixed)).status, 403);
+    assert.equal((await server.tool('source_configure', mixed)).status, 200, 'the dispatcher may configure sources directly');
     assert.equal((await server.request('/api/sources/configure', {...mixed, target: 'curation/published'})).status, 422);
     const configured = await server.request('/api/sources/configure', mixed);
     assert.equal(configured.status, 200, JSON.stringify(configured.body));
@@ -540,7 +544,7 @@ test('configured sources use real HTTP, retain provenance and survive lifecycle 
     assert.deepEqual(shared.origins.map((origin: {source: string}) => origin.source), ['mixed', 'rss']);
     assert.equal(sources.find((source: {id: string}) => source.id === rss.id).candidates[0].id, shared.id);
     assert.equal(Object.keys((await server.request('/api/state')).body.tokens).length, 0, 'disabled collection preserves candidates without creating work');
-    assert.equal((await server.tool('source_enable', {id: rss.id, enabled: true})).status, 403);
+    assert.equal((await server.tool('source_enable', {id: rss.id, enabled: true})).status, 200, 'the dispatcher may start and stop sources directly');
     assert.equal((await server.request('/api/sources/enable', {id: rss.id, enabled: true})).status, 200);
     assert.equal((await server.request('/api/sources/enable', {id: rss.id, enabled: false})).status, 200);
     const afterToggle = (await server.tool('source_list')).body.result.sources.find((source: {id: string}) => source.id === rss.id);
