@@ -52,12 +52,15 @@ export const DISPATCHER_HUE = 256;
 /** 工位小人的外观与动作由调用方给出：外观取自画布同一只（botFor），动作取自 Node.tsx 的 botState。 */
 export interface StationLook { shape: BotShape | GrokShapeName; hue: number; state: AvatarState }
 
-/** 工具中文名，与 vendor/pi-web-ui/tools/index.js 的渲染器保持一致。 */
+/** Human-readable names for the current capability registry. */
 const TOOL_LABEL: Record<string, string> = {
   status: "查看运行状态", inspect: "查看详情", run_control: "控制运行", feed_urls: "投料",
   pull_candidates: "取候选", workers: "调整工位", correct: "纠错", propose_patch: "起草规格补丁",
   settings: "工作设置", journal: "读取过程", report: "读取报告", read_report: "读取报告", candidates: "查询候选",
   undo_correction: '撤销纠错', workflow_templates: '查看工作流模板', workflow_feed: '提交工作流任务', business_feed: '提交业务任务', allocation_plan: '实测配员建议',
+  workflow_authoring: '自主建线指南', workflow_drafts: '读取工作流草稿', workflow_draft: '创建或修订线路',
+  workflow_edit: '增量修改线路草稿', workflow_trial: '真实隔离试跑', workflow_activate: '启用自主创建的线路',
+  workflow_result: '等待并核验实际产物',
 };
 
 export function correctionReceipt(name: string, args: Record<string, unknown>, output: string): string | undefined {

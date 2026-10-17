@@ -27,7 +27,7 @@ export type WorkflowDecisionQuestion =
   | {type: 'noul'; instructions: string; criteria?: {true: string; false: string}}
   | {type: 'score'; instructions: string; criteria: string[]};
 export type WorkflowExecution =
-  | { kind: 'builtin'; name: 'normalize-text' | 'text-statistics' | 'keywords' | 'aggregate' | 'page-text' | 'prepare-source' | 'route' | 'publish-json' }
+  | { kind: 'builtin'; name: 'normalize-text' | 'text-statistics' | 'keywords' | 'aggregate' | 'compose-json' | 'page-text' | 'prepare-source' | 'route' | 'publish-json' }
   | { kind: 'agent'; instructions: string; tools?: string[]; timeoutMs?: number; agent?: StationAgentBinding }
   | {kind: 'system-one'; purpose: string; questions: Record<string, WorkflowDecisionQuestion>; minConfidence?: number}
   | { kind: 'node'; module: string; export?: string }
@@ -249,7 +249,7 @@ function materialize(manifest: WorkflowManifest, directory: string, projectDir: 
         if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || tool.method && !['GET', 'POST'].includes(tool.method)) bad(`${key} 的 HTTP 工具必须声明无内嵌凭据的 HTTP(S) 地址和 GET/POST 方法`);
       } else if (typeof tool.command !== 'string' || !tool.command.trim() || tool.args && (!Array.isArray(tool.args) || tool.args.some(arg => typeof arg !== 'string')) || tool.kind === 'mcp' && !tool.tool) bad(`${key} 的进程工具命令、参数或 MCP 工具名无效`);
       code += JSON.stringify(tool);
-    } else if (binding.execute.kind !== 'agent' && binding.execute.kind !== 'system-one' && (binding.execute.kind !== 'builtin' || !['normalize-text', 'text-statistics', 'keywords', 'aggregate', 'page-text', 'prepare-source', 'route', 'publish-json'].includes(binding.execute.name))) bad(`${key} 没有已实现的执行器`);
+    } else if (binding.execute.kind !== 'agent' && binding.execute.kind !== 'system-one' && (binding.execute.kind !== 'builtin' || !['normalize-text', 'text-statistics', 'keywords', 'aggregate', 'compose-json', 'page-text', 'prepare-source', 'route', 'publish-json'].includes(binding.execute.name))) bad(`${key} 没有已实现的执行器`);
     const declaredRecovery = manifest.lines.flatMap(line => line.stations.map(station => ({line: line.id, station})))
       .find(value => `${value.line}/${value.station.id}` === key)?.station.recovery;
     const revision = digest(content + code + JSON.stringify([binding, declaredRecovery,
@@ -392,6 +392,7 @@ async function builtin(name: Extract<WorkflowExecution, { kind: 'builtin' }>['na
     return { keywords: [...counts].sort(([a, x], [b, y]) => y - x || a.localeCompare(b)).slice(0, 12).map(([word, count]) => ({ word, count })) };
   }
   if (name === 'aggregate') return { text: input.text, statistics: input.statistics, keywords: input.keywords.keywords };
+  if (name === 'compose-json') return structuredClone(input);
   if (name === 'route') { const text = String(input.value).trim(); let url: URL | undefined; try { url = new URL(text); } catch {} return { kind: url && ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? 'link' : text.length >= 20 ? 'text' : 'unknown', value: text }; }
   if (name === 'page-text') {
     if (!services.callCapability) throw new Error('共享 page_text 能力未接入，不能把未采集内容当作成功');

@@ -15,7 +15,7 @@
 
 ## 你手里的能力
 
-能力通过 `easy_workflow_help` 按需查看，用 `easy_workflow_call` 调用，不需要扫描源码。旧会话中的 `h2_help` / `h2_call` 仍可兼容。常用的：
+能力通过本次实际注册的 `easy_workflow_help` 按需查看，用 `easy_workflow_call` 调用，不需要扫描源码。不要根据旧会话猜测工具别名。常用的：
 
 | 想做的事 | 能力 |
 |---|---|
@@ -34,9 +34,9 @@
 | 共享浏览器的页数、登录提醒、标签操作 | `browser` |
 | 六条业务线的输入、产物与自动交接 | `business_lines` / `business_feed` |
 | 学会建线，取得完整可改的模板与能力箱 | `workflow_authoring` |
-| 保存或恢复建线工作，查看并修正校验错误 | `workflow_draft` / `workflow_drafts` |
+| 保存或恢复建线工作，增量修正节点、连线与契约 | `workflow_draft` / `workflow_edit` / `workflow_drafts` |
 | 隔离试跑并验证输出，启用成功版本 | `workflow_trial` / `workflow_activate` |
-| 给自己创建的线投料 | `workflow_feed` |
+| 给自己创建的线投料、等待并核验磁盘产物 | `workflow_feed` / `workflow_result` |
 
 ## 自主创造线路
 
@@ -45,9 +45,9 @@
 1. 先读 `business_lines` 和 `workflow_templates`，判断已有业务线能否完成目标。图鉴反哺由组件发布自动触发；科研绘图要真实数值或可复现代码；图像处理要明确变换；Skill 和 PPT 保存原件，不能谎称生成了新原件。
 2. 需要新线就读 `workflow_authoring`。从最接近的模板取得完整 manifest 和角色文件，按目标修改，可组合串行、并行汇合、条件分流、独立审查、有界返工、跨线信道和人工分支。程序与 Agent 如实分开。
 3. 每个岗位写清输入、职责、可用工具、产物 schema、验收与失败去向。并行岗位用不同 outputKey；发布节点显式要求审查通过。未知事实留缺口，不制造数据；不可依赖一个未注册的工具名。
-4. 调用 `workflow_draft` 保存完整草稿。返回错误就据错误修改，更新时携带刚读到的 expectedRevision。不要在没有试跑证据时宣称线路能用。
-5. 调用 `workflow_trial` 传入有代表性的真实样本和输出断言。检查 passed、每件货、uncovered 工位和实际产物。应覆盖主要分支与异常路径；如果失败，读具体原因、修草稿并重跑。有限修复后仍缺输入或能力，就说明具体缺口并保留草稿。
-6. 用通过的 trialId 和同一 revision 调用 `workflow_activate`，然后 `workflow_feed` 执行正式任务。无需让用户重复确认已经要求你创建的线路。项目还在运行时先保存草稿和试跑，等轮次结束再启用；不要擅自结束用户正在运行的任务。
+4. 调用 `workflow_draft` 保存首版完整草稿。之后用 `workflow_edit` 只修改有问题的节点、连线、输入映射、schema 或角色，携带刚读到的 expectedRevision。不必反复重写整份清单；每次修改都会重新完整校验。纯字段汇合优先使用 `compose-json`，不让模型重抄程序结果。
+5. 调用 `workflow_trial` 传入有代表性的真实样本和输出断言。expect.values 使用 `{"report.count":3,"review.verdict":"pass"}` 这样的点分路径；对象是精确比较，不是局部匹配。检查 passed、checks 中的 expected/actual、failures、uncovered 和产物。写错断言就修路径，绝不能删掉用户要求的字段条件、降低目标或用 published 状态代替质量验证。有限修复后仍缺输入或能力，就说明具体缺口并保留草稿。
+6. 用通过的 trialId 和同一 revision 调用 `workflow_activate`，然后 `workflow_feed` 执行正式任务。用 `workflow_result(token, waitMs)` 等待并核对实际文件、字节和 SHA-256；只有 readyForDelivery=true 才能报告交付。无需让用户重复确认已经要求你创建的线路。项目还在运行时先保存草稿和试跑，等轮次结束再启用；不要擅自结束用户正在运行的任务。
 7. 重启后用 `workflow_drafts` 找回工作；写请求超时先查安装状态和回执。试跑产物在独立目录，正式项目发布要另行核实。后续改进自己创建的线，也必须重新保存、试跑再启用；旧安装版本会保留。
 
 ## 开跑之前
@@ -89,7 +89,7 @@
 
 - 发现某个工位反复犯同一种错（比如阅读员总把安装页当演示页），用 `note_context` 给它留一条指示，写清例子和正确做法。它下次工作时就会读到。
 - 值得长期保留的经验，起草进 LESSONS.md 的待批准条目，交站长批准后写进对应 ROLE.md 的"已知坑"。
-- 以后新增节点时，按现有 ROLE.md 的写法起草它的职责手册：为什么有这个岗位、铁律、拿到什么、能力箱、工序、判断规则与真实案例、出错怎么办、自检清单、提交。交站长批准。
+- 自主创建的节点由你编写职责手册并纳入草稿：岗位目的、输入、能力箱、工序、验收、错误处理与提交格式。依照已有建线授权自行校验、试跑和启用；对既有内置线或用户安装包职责的长期改动，仍交站长决定。
 
 ## 回答的方式
 
