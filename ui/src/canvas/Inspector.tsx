@@ -66,13 +66,14 @@ function Card({ insp, idx, geo, cam }: { insp: Inspector; idx: number; geo: Geom
   const ref = useRef<HTMLDivElement>(null);
   const dragCleanup = useRef<(() => void) | null>(null);
   useEffect(() => () => dragCleanup.current?.(), []);
-  const [bounds, setBounds] = useState({ width: 0, height: 0, cardHeight: 0 });
+  const [bounds, setBounds] = useState({width: 0, height: 0, cardWidth: 0, cardHeight: 0});
   useLayoutEffect(() => {
     const element = ref.current, parent = element?.parentElement;
     if (!element || !parent) return;
     const measure = () => {
-      const next = { width: parent.clientWidth, height: parent.clientHeight, cardHeight: element.offsetHeight };
-      setBounds((old) => old.width === next.width && old.height === next.height && old.cardHeight === next.cardHeight ? old : next);
+      const next = {width: parent.clientWidth, height: parent.clientHeight, cardWidth: element.offsetWidth, cardHeight: element.offsetHeight};
+      setBounds(old => old.width === next.width && old.height === next.height &&
+        old.cardWidth === next.cardWidth && old.cardHeight === next.cardHeight ? old : next);
     };
     const observer = new ResizeObserver(measure); observer.observe(parent); observer.observe(element); measure();
     return () => observer.disconnect();
@@ -84,7 +85,7 @@ function Card({ insp, idx, geo, cam }: { insp: Inspector; idx: number; geo: Geom
     if (p) { left = cam.x + (p.x + p.w) * cam.k + 16; top = cam.y + p.y * cam.k - 24; }
     else { left = 120 + idx * 30; top = 90 + idx * 30; }
     const parent = bounds.width ? bounds : undefined;
-    const w = insp.kind === "node" ? 440 : 520;
+    const w = bounds.cardWidth || (insp.kind === 'node' ? 380 : 520);
     if (parent) {
       if (left + w > parent.width - 12 && p) left = Math.max(12, cam.x + p.x * cam.k - w - 16);
       left = Math.max(12, Math.min(parent.width - w - 12, left));

@@ -168,7 +168,8 @@ export function roomSummaries(rooms: readonly RoomSpec[], ctx: RoomContext, seen
     const speakers = memberActors(room, ctx).filter((actor) => actor.kind !== "user");
     const running = speakers.filter((actor) => actor.state === "work" || actor.state === "wait").length;
     // A station's own progress notes are not conversation: they neither preview nor count as unread.
-    const lines = buildRoomLines(room, rooms, ctx).filter((line) => line.kind !== "note");
+    const lines = buildRoomLines(room, rooms, ctx).filter(line =>
+      line.kind !== 'note' || Boolean(line.label && line.label !== '进展'));
     const last = lines[lines.length - 1];
     const since = seen[room.id] ?? 0;
     const unread = room.kind === "root" ? 0 : lines.filter((line) => line.at > since).length;

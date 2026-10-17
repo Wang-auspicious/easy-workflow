@@ -19,6 +19,7 @@ import { apply, initialState, type TokenState } from "../../shared/project.ts";
 import { legacyReply } from "../../shared/conversation.ts";
 import { botFor } from "../../shared/palette.ts";
 import type { CompiledFactory, CompiledNode, Stamped } from "../../shared/types.ts";
+import '../src/styles/materials.css';
 
 const fs = initialState();
 const now = Date.now();
@@ -86,7 +87,7 @@ fs.alerts = {
   auth: { id: "auth", at: now - 100, kind: "auth", level: "red", item: "account", tab: "login-tab", url: "https://account.example.test/", message: "素材账户：需要登录才能查看私有文件" },
 };
 fs.recoveries["angular-ui"] = { item: "angular-ui", token: "token-2", title: "Angular UI", source: "fixture", url: "https://angular-ui.example.test/", disposition: "retry", at: now, attempts: 1, failure: { tag: "network_connection", category: "network", owner: "system", retryable: true, message: "公开入口连接中断，已保留先前成果" } };
-setState({ fs, factory, ready: true, connected: true, chatOpen: true, chatWidth: 420, model: "fixture-model", version: 1,
+setState({ fs, factory, ready: true, connected: true, chatOpen: true, chatList: true, chatWidth: 420, model: "fixture-model", version: 1,
   live: { id: "fixture-turn", text: "", tools: [] },
   dispatcher: { turn: "fixture-turn", status: "recovering", busy: true, attempt: 2, maxAttempts: 4, nextRetryAt: now + 40000, message: "连接超时，已保存上下文；稍后继续当前任务。", error: error.errorMessage, recoverable: true, updatedAt: now },
   browser: { tabs: [{ id: "login-tab", title: "素材账户", url: "https://account.example.test/login", owner: "agent", loading: false, attention: "登录后查看私有文件", attentionKind: "auth" }], active: "login-tab", bookmarks: [], history: [], retentionDays: 30, mode: "headless" },

@@ -162,11 +162,14 @@ export function RoomList() {
   const factory = useStore((s) => s.factory);
   const fs = useStore((s) => s.fs);
   const bots = useStore((s) => s.layout.bots);
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
+  const events = useStore(state => state.kernelEvents);
   const rootUnread = useStore((s) => s.unread);
   const now = useNow(5000);
   const dispatcher = useDispatcherActor();
   const [showQuiet, setShowQuiet] = useState(false);
-  const ctx: RoomContext = useMemo(() => ({ factory, state: fs, look: stationLook(factory, fs, bots, now), now }), [factory, fs, bots, now]);
+  const ctx: RoomContext = useMemo(() => ({factory, state: fs, look: stationLook(factory, fs, bots, now), now,
+    ...(kernel === 'v2' ? {kernelEvents: events} : {})}), [factory, fs, bots, now, kernel, events]);
   const summaries = useMemo(() => roomSummaries(rooms, ctx, seen).filter((s) => s.room.kind !== "root"), [rooms, ctx, seen]);
   const talking = summaries.filter((s) => s.count > 0).sort((a, b) => b.previewAt - a.previewAt);
   const quiet = summaries.filter((s) => s.count === 0);
@@ -182,7 +185,7 @@ export function RoomList() {
       : room.members.slice(0, 4).map((m) => ({ key: m.key, hue: 250, state: "sleep" as AvatarState }));
     const last = summary.preview.replace(/^[^：]{1,12}：/, "");
     return (
-      <button key={room.id} className="talk-row" onClick={() => open(room.id)}>
+      <button key={room.id} className="talk-row" data-room={room.id} data-room-kind={room.kind} onClick={() => open(room.id)}>
         <span className="talk-av"><GroupAvatar size={40} members={stack} />{summary.running > 0 && <i className="talk-live" aria-label="有工位在跑" />}</span>
         <span className="talk-main">
           <span className="talk-top"><b>{roomTitle(room, lineName)}</b><time className="num">{clock(summary.previewAt, now)}</time></span>
@@ -196,7 +199,7 @@ export function RoomList() {
   };
   return (
     <div className="talk-list" role="list">
-      <button className="talk-row" onClick={() => open(ROOT_ROOM)}>
+      <button className="talk-row" data-room={ROOT_ROOM} data-room-kind="root" onClick={() => open(ROOT_ROOM)}>
         <span className="talk-av"><Avatar shape={dispatcher.shape} hue={dispatcher.hue} state={dispatcher.state} size={40} title="主调度" /></span>
         <span className="talk-main">
           <span className="talk-top"><b>主调度</b><time className="num">{lastRoot ? clock(lastRoot.message.timestamp ?? 0, now) : ""}</time></span>

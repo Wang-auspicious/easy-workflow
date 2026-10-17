@@ -1,5 +1,6 @@
 // Station identity first, execution metadata second, comparable workload metrics below.
 import { memo } from "react";
+import { ArrowUpRight } from 'lucide-react';
 import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
 import type { CompiledNode, EvidenceRef } from "../../../shared/types.ts";
 import { type NodeState } from "../../../shared/project.ts";
@@ -14,6 +15,7 @@ import { useNow } from "../util/useNow.ts";
 import { bottleneck, trailOf } from "./stats.ts";
 import { nodeCountPresentation } from './node-counts.ts';
 import { nodeExecutionPresentation, stationStatus } from './status.ts';
+import {waitingNames} from '../kernel.ts';
 
 export const fmt = (n: number) => (n >= 10000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : n.toLocaleString("en-US"));
 export const secs = (ms: number) => (ms >= 60000 ? `${(ms / 60000).toFixed(1)}m` : ms >= 10000 ? `${Math.round(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`);
@@ -54,6 +56,9 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const displayName = node.name;
   const c = roleColors(node.role, colorOverride !== undefined ? { h: colorOverride } : undefined);
   const status = stationStatus(node, s.fs, s.replay?.at ?? now, dormant, recoveryTokens);
+  const waits = Object.entries(waitingNames).map(([key, label]) => ({key, label,
+    count: kernelNumbers?.waiting[key as keyof typeof waitingNames] ?? 0})).filter(wait => wait.count > 0);
+  const waitingSummary = waits.map(wait => `等${wait.label} ${fmt(wait.count)} 件`).join(' · ');
   const strip = dormant ? [] : (n?.strip ?? []).map((id) => s.fs.evidence[id]).filter(Boolean) as EvidenceRef[];
   const visualEvidence = strip.filter((ev) => ev.kind === "image" || ev.kind === "video");
   const workers = n?.workers.length ?? 0;
@@ -65,7 +70,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const keyboardProps = {
     tabIndex: 0,
     role: 'button',
-    'aria-label': `${displayName}：${status.label}，查看工位详情`,
+    'aria-label': `${displayName}：${status.label}${waitingSummary ? `，${waitingSummary}` : ''}，查看工位详情`,
     'aria-expanded': open,
     onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => {
       if (event.target !== event.currentTarget || !['Enter', ' '].includes(event.key)) return;
@@ -100,14 +105,18 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         <StationIcon role={node.role} size={14} />
         <div className="node-heading">
           <span className="node-name" title={node.name}>{displayName}</span>
-          <span className={`node-type ${usesModel ? "node-model" : ""}`} title={execution}>{shape === "source" ? "来源接入" : shape === "store" ? "任务库存" : execution}</span>
+          <span className={`node-type ${usesModel ? "node-model" : ""}`} data-tip={execution} data-tip-side="top">{shape === "source" ? "来源接入" : shape === "store" ? "任务库存" : execution}</span>
         </div>
         {light}
       </div>
       <div className="node-footer">
         {shape === "store" ? <><span className="node-stock num">{fmt(n?.stock ?? 0)}{Boolean(n?.plus) && <span className="node-plus">本轮 +{fmt(n?.plus ?? 0)}</span>}</span>{node.id === "manual" && (n?.stock ?? 0) > 0 && <button className="node-review" onClick={event => {event.stopPropagation(); setState({view: "review"});}}>去审核</button>}</> : <>
-        <span className={`node-doing ${working ? 'is-active' : failedLast && !queue ? 'is-warn' : ''}`} title={doing}>{doing}</span>
+        {waits.length ? <span className="node-waits" data-tip={waitingSummary} aria-label={waitingSummary}>
+          {waits.slice(0, 2).map(wait => <span key={wait.key} className={`node-wait node-wait--${wait.key}`} data-waiting={wait.key}>等{wait.label} {fmt(wait.count)}</span>)}
+          {waits.length > 2 && <span>+{waits.length - 2}</span>}
+        </span> : <span className={`node-doing ${working ? 'is-active' : failedLast && !queue ? 'is-warn' : ''}`} title={doing}>{doing}</span>}
         {visualEvidence.length > 0 && <Strip items={visualEvidence.slice(-2)} />}
+        {!visualEvidence.length && <ArrowUpRight className="node-open-hint" size={16} aria-hidden="true" />}
         </>}
       </div>
     </div>

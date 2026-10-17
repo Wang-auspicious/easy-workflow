@@ -22,7 +22,7 @@ import {BoardStore} from '../../server/board.ts';
 
 const root = path.resolve(import.meta.dirname, "../..");
 const v2 = process.argv.includes('--v2');
-const out = path.join(root, v2 ? 'docs/v2-acceptance/E' : 'var/verification/rooms');
+const out = path.join(root, v2 ? 'var/verification/rooms-v2' : 'var/verification/rooms');
 await fs.mkdir(out, { recursive: true });
 
 /* ---------------------------------------------------------------- 1. 真实运行，产出真实往来 */
@@ -170,23 +170,27 @@ async function serve(directory) {
 
 async function verifyV2(page, seeded, errors) {
   await page.waitForFunction(() => document.querySelector('.kernel-summary')?.textContent?.includes('已发布 1'));
-  assert.equal(await page.locator('.room-rail .room-item').count(), 6);
-  const names = await page.locator('.room-item-name').allInnerTexts();
+  await page.getByRole('button', {name: '所有对话', exact: true}).click();
+  assert.ok(await page.locator('[data-room="field:shots.*"] .talk-sub').innerText().then(text => !text.includes('围绕这一字段')), 'v2 discussion previews include real field events');
+  const quiet = page.getByRole('button', {name: /还有.*个群暂时没有往来/});
+  if (await quiet.count()) await quiet.click();
+  assert.equal(await page.locator('.talk-row').count(), 6);
+  const names = await page.locator('.talk-top b').allInnerTexts();
   for (const label of ['主调度', '分类', '三屏', '风格', '事实', '文案']) assert.ok(names.some(name => name.includes(label)), label);
   assert.ok(await page.locator('.kernel-attention').count() >= 2);
   assert.equal(await page.locator('.allocation-shortcut,.allocation-proposal').count(), 0);
   await page.screenshot({path: path.join(out, 'summary-attention.png')});
-  await page.locator('.room-item').filter({has: page.locator('.room-item-name').filter({hasText: '三屏'})}).click();
-  await page.getByText('特写没有完整展示组件主体，请保留页面路径并补充证据。', {exact: true}).waitFor();
-  assert.ok((await page.locator('.rlog-verb').allInnerTexts()).includes('答复'));
-  assert.equal(await page.getByText('已保存选中页面的主体证据（UI fixture）', {exact: true}).count(), 0, 'claims are not conversation rows');
+  await page.locator('[data-room="field:shots.*"]').click();
+  await page.locator('.bub').filter({hasText: '特写没有完整展示组件主体，请保留页面路径并补充证据。'}).waitFor();
+  assert.ok((await page.locator('.bub-verb').allInnerTexts()).includes('答复'));
+  assert.equal(await page.locator('.bub').filter({hasText: '已保存选中页面的主体证据（UI fixture）'}).count(), 0, 'claims are not conversation rows');
   const toggle = page.getByRole('checkbox', {name: '显示进展'});
   assert.equal(await toggle.isChecked(), false);
-  assert.equal(await page.getByText('正在核对选中页面与像素统计（UI fixture 进展）', {exact: true}).count(), 0);
+  assert.equal(await page.locator('.bub').filter({hasText: '正在核对选中页面与像素统计（UI fixture 进展）'}).count(), 0);
   await page.screenshot({path: path.join(out, 'shots-challenge.png')});
   await page.screenshot({path: path.join(out, 'progress-off.png')});
   await toggle.check();
-  await page.getByText('正在核对选中页面与像素统计（UI fixture 进展）', {exact: true}).waitFor();
+  await page.locator('.bub').filter({hasText: '正在核对选中页面与像素统计（UI fixture 进展）'}).waitFor();
   await page.screenshot({path: path.join(out, 'progress-on.png')});
   await page.reload();
   await page.locator('.rail-conn.is-on').waitFor();
@@ -203,6 +207,7 @@ async function verifyV2(page, seeded, errors) {
     const {toggleInspector} = await import('/src/canvas/Canvas.tsx');
     toggleInspector('curation/proof');
   });
+  await page.locator('[data-inspector="curation/proof"]').getByRole('tab', {name: '说明', exact: true}).click();
   await page.locator('.kernel-lesson').waitFor();
   assert.equal(await page.getByRole('button', {name: '加一个人', exact: true}).count(), 0);
   assert.equal(await page.getByRole('button', {name: '撤一个', exact: true}).count(), 0);
@@ -259,18 +264,31 @@ try {
   await page.addInitScript(() => { localStorage.setItem("pf.chatOpen", "true"); localStorage.setItem("pf.chatWidth", "320"); });
   await page.goto(server.url);
   await page.locator(".rail-conn.is-on").waitFor();
-  await page.locator(".room-rail-list .room-item").first().waitFor();
+  await page.locator('.chat-head').waitFor();
 
   if (v2) {
     await verifyV2(page, seeded, errors);
   } else {
 
-  const rail = page.locator(".room-rail");
-  const items = rail.locator(".room-item");
-  const names = await rail.locator(".room-item-name").allInnerTexts();
+  assert.ok(await page.locator('.chat-pane').evaluate(el => el.getBoundingClientRect().width >= 320), 'saved sidebar widths keep the conversation readable');
+  assert.equal(await page.locator('.chat-pane .pi-conversation').count(), 1);
+  await page.locator('.composer textarea').fill('切换群组时保留主调度草稿');
+  await page.screenshot({path: path.join(out, '01-rail-root.png')});
+  const showList = async () => {
+    await page.getByRole('button', {name: '所有对话', exact: true}).click();
+    await page.locator('.talk-list').waitFor();
+  };
+  await showList();
+  const trafficIds = await page.locator('.talk-row:not([data-room-kind="root"])').evaluateAll(rows => rows.map(row => row.dataset.room));
+  const showQuiet = async () => {
+    const more = page.getByRole('button', {name: /还有.*个群暂时没有往来/});
+    if (await more.count()) await more.click();
+  };
+  await showQuiet();
+  const rail = page.locator('.talk-list');
+  const items = rail.locator('.talk-row');
+  const names = await rail.locator('.talk-top b').allInnerTexts();
   const count = await items.count();
-  assert.ok(await page.locator('.chat-pane').evaluate(el => el.getBoundingClientRect().width >= 320),
-    '旧版保存的 320px 单栏宽度不能把新双栏正文挤成竖排');
   assert.ok(count > 10, `群组栏应该列出流程上真实需要对话的地方，实际 ${count}`);
 
   // 群组是从流程推出来的：工序、返工环、跨段三类都要在。
@@ -278,33 +296,36 @@ try {
   for (const expected of ["读懂与判定", "核验与发布", "组件源确认", "组件实例发布"]) {
     assert.ok(text.includes(expected), `缺少推导出来的群组：${expected}\n实际：${text}`);
   }
-  const lanes = { part: await rail.locator(".room-kind--part").count(), loop: await rail.locator(".room-kind--loop").count(), bridge: await rail.locator(".room-kind--bridge").count() };
+  const lanes = {part: await rail.locator('[data-room-kind="part"]').count(), loop: await rail.locator('[data-room-kind="loop"]').count(), bridge: await rail.locator('[data-room-kind="bridge"]').count()};
   assert.ok(lanes.loop > 0, "返工环必须出现");
   assert.ok(lanes.bridge >= 2, "跨段移交必须出现");
   assert.ok(lanes.part >= 8, `每一段工序都要有自己的群，实际 ${lanes.part}`);
 
-  // 主调度那一格：转录宿主和输入框都还在，切群不会把总台弄没。
-  assert.ok(await page.locator(".chat-pane .pi-conversation").count() === 1, "总台的转录宿主还在");
-  assert.ok(await page.locator(".composer textarea").count() === 1, "输入框属于整个面板，切群也还在");
-  await page.screenshot({ path: path.join(out, "01-rail-root.png") });
-
-  // 打开一个跨段群：看它是不是只有这两个工位，以及往来是不是真实事件。
-  const bridge = rail.locator(".room-item", { has: page.locator(".room-kind--bridge") }).first();
+  const rooms = await page.evaluate(async () => {
+    const {deriveRooms} = await import('/src/chat/rooms.ts');
+    const {getState} = await import('/src/store.ts');
+    const state = getState();
+    return deriveRooms(state.factory, Object.values(state.fs.consults ?? {}).map(c => ({reviewer: c.reviewer, owner: c.owner})));
+  });
+  const bridge = rail.locator('[data-room-kind="bridge"]').first();
+  const bridgeId = await bridge.getAttribute('data-room');
+  const bridgeRoom = rooms.find(room => room.id === bridgeId);
   await bridge.click();
-  await page.locator(".room-head").waitFor();
-  const members = await page.locator(".room-head-members .room-chip").allInnerTexts();
-  assert.equal(members.length, 2, `跨段群应当是两个负责人，实际 ${members.join("、")}`);
-  const peer = await page.locator(".room-head-peer").innerText();
-  assert.ok(peer.length > 0, "跨段群要标出对面那条线");
+  await page.locator('.room-intro').waitFor();
+  assert.equal(bridgeRoom.members.length, 2);
+  const memberText = await page.locator('.room-intro').innerText();
+  for (const member of bridgeRoom.members) assert.ok(memberText.includes(member.name));
   await page.screenshot({ path: path.join(out, "02-bridge-room.png") });
 
   // 打开一个工序群：成员是这一段工序里所有工位，程序工位如实标注。
-  const partRoom = rail.locator(".room-item", { has: page.locator(".room-kind--part") }).first();
-  await partRoom.click();
-  await page.locator(".room-head").waitFor();
-  assert.ok((await page.locator(".room-head-members .room-chip").count()) >= 2, "工序群要列出这一段的所有工位");
-  assert.ok((await page.locator(".room-head-members .room-chip--program").count()) > 0, "程序工位不能被伪装成 Agent");
-  assert.ok((await page.locator(".room-head-members .room-chip--agent, .room-head-members .room-chip--review").count()) > 0, "群里的 Agent 要能看出来");
+  await showList();
+  await showQuiet();
+  const partRoom = rooms.find(room => room.kind === 'part' && room.members.some(member => member.kind === 'program') && room.members.some(member => ['agent', 'review'].includes(member.kind)));
+  assert.ok(partRoom, 'the roster retains program and Agent identities');
+  await rail.locator(`[data-room="${partRoom.id}"]`).click();
+  await page.locator('.room-intro').waitFor();
+  const partText = await page.locator('.room-intro').innerText();
+  for (const member of partRoom.members) assert.ok(partText.includes(member.name), `missing participant ${member.name}`);
   await page.screenshot({ path: path.join(out, "03-part-room.png") });
 
   // 真实往来：退回 / 咨询 / 判定 / 纠错至少各有一条落在某个群里。
@@ -329,33 +350,33 @@ try {
   assert.equal(projection.unique, projection.lines, `同一条往来不能在多个群里重复出现：${JSON.stringify(projection)}`);
   assert.ok(projection.lines > 0 && projection.lines <= projection.comms, `群里的行应当来自真实往来：${JSON.stringify(projection)}`);
 
-  const routed = await page.evaluate(() => [...document.querySelectorAll(".room-rail .room-item")].map((item) => ({
-    id: item.getAttribute("aria-current") === null ? item.textContent ?? "" : "",
-    name: item.querySelector(".room-item-name")?.textContent ?? "",
-    preview: item.querySelector(".room-item-sub")?.textContent ?? "",
+  await showList();
+  const routed = await page.evaluate(() => [...document.querySelectorAll('.talk-list .talk-row')].map((item) => ({
+    id: item.dataset.room,
+    name: item.querySelector('.talk-top b')?.textContent ?? '',
+    preview: item.querySelector('.talk-sub > span')?.textContent ?? '',
   })));
-  const withTraffic = routed.filter((room) => room.preview && room.preview !== "还没有往来" && room.name !== "主调度");
+  const withTraffic = routed.filter(room => trafficIds.includes(room.id));
   assert.ok(withTraffic.length >= 3, `往来应当落在多个群里：${JSON.stringify(routed)}`);
   assert.ok(withTraffic.some((room) => /纠错|交付|退回|复查|要求改|闭环/.test(room.preview)), `群组预览要显示真实说过的话：${JSON.stringify(withTraffic)}`);
   assert.ok(withTraffic.some((room) => room.preview.includes("交付")), `跨线交付要落到跨段群里：${JSON.stringify(withTraffic)}`);
 
   // 点开有往来的那个群：行必须是真实事件，而且要能看出说了什么。
-  const hotIndex = await page.evaluate(() => [...document.querySelectorAll(".room-rail .room-item")]
-    .findIndex((item) => (item.querySelector(".room-item-sub")?.textContent ?? "") !== "还没有往来" && !item.classList.contains("room-item--root")));
-  assert.ok(hotIndex > 0, "至少有一个群已经有往来");
-  await rail.locator(".room-item").nth(hotIndex).click();
-  await page.locator(".room-head").waitFor();
-  const verbs = await page.locator(".rlog-verb").allInnerTexts();
+  assert.ok(withTraffic.length > 0, 'at least one room has real traffic');
+  await rail.locator(`[data-room="${withTraffic[0].id}"]`).click();
+  await page.locator('.room-intro').waitFor();
+  const verbs = await page.locator('.bub-verb').allInnerTexts();
   assert.ok(verbs.length > 0, "有往来的群里必须有行");
   assert.ok(verbs.some((v) => ["提出修改", "退回", "判定", "交付", "纠错"].includes(v)), `群里的行要说清楚是什么往来：${verbs.join("、")}`);
   await page.screenshot({ path: path.join(out, "05-room-traffic.png") });
 
-  // 收起群组栏：只留头像，主调度对话不受影响。
-  await rail.getByRole("button", { name: "收起群组栏" }).click();
-  await page.locator(".room-rail.is-narrow").waitFor();
-  assert.equal(await page.locator(".room-rail.is-narrow .room-item-name").count(), 0, "收起后不该还有名字");
-  assert.ok((await page.locator(".room-rail.is-narrow .gstack, .room-rail.is-narrow .gavatar").count()) >= 10, "收起后每个群仍然有一只头像");
+  await page.getByRole('button', {name: '收起对话', exact: true}).click();
+  await page.locator('.chat.is-collapsed').waitFor();
+  assert.equal(await page.locator('.composer textarea').isVisible(), false);
   await page.screenshot({ path: path.join(out, "04-rail-narrow.png") });
+  await page.keyboard.press('Control+k');
+  await page.locator('.composer textarea').waitFor();
+  assert.equal(await page.locator('.composer textarea').inputValue(), '切换群组时保留主调度草稿');
 
   assert.deepEqual(errors, [], "界面不应有未捕获错误");
   console.log(JSON.stringify({

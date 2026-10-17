@@ -56,7 +56,8 @@ try {
     await route.fulfill({ json: { ok: true, queued: true, result: { cleared: false, resumed: false, message: "检查完成，当前原因仍需处理。" } } });
   });
   await page.goto(`http://127.0.0.1:${address.port}/test/chat-fixture.html`);
-  await page.getByText("正在自动恢复", { exact: true }).waitFor();
+  await page.locator('.talk-row').filter({has: page.getByText('主调度', {exact: true})}).click();
+  await page.locator('.chat-status').filter({hasText: '正在自动恢复'}).waitFor();
   // 顶部那块（批次卡片 / 注意力提示 / 运行记录）已经去掉：批次控制在工作区工具条上，
   // 工位提示作为对话行出现，不再重复一份。
   assert.equal(await page.locator(".batch-outcome").count(), 0);
@@ -74,15 +75,12 @@ try {
   assert.match(await page.locator(".tr-tool--done .tr-tool-body").innerText(), /调用参数.*返回结果.*blocked/s);
   assert.equal(await page.locator(".tr-row--user").count(), 1);
   assert.equal(await page.locator(".tr-row--dispatcher").count(), 4);
-  assert.equal(await page.locator(".tr-row--station").count(), 2, "工位记录也要出现在对话里，带自己的小人");
-  await page.getByText("候选已按来源分流，采集限额还有 6 个位置", { exact: true }).waitFor();
+  assert.equal(await page.locator('.tr-row--station').count(), 0, 'station broadcasts belong in their own rooms, not the dispatcher conversation');
   // 小人：形状取自 Grok Bot 的曲线数据，动作用状态类；主调度此刻在恢复，应该是 wait。
-  assert.equal(await page.locator(".tr .gavatar").count(), 6, "每条由 Agent 发出的消息一只小人");
+  assert.equal(await page.locator(".tr .gavatar").count(), 4, "每条由 Agent 发出的消息一只小人");
   assert.equal(await page.locator(".tr-av-pick img").count(), 1, "你自己的消息用你选的头像图");
   assert.equal(await page.locator(".chat-head .gavatar").count(), 1, "栏头的头像与对话里的是同一套");
   assert.equal(await page.locator(".tr-row--dispatcher .gavatar--wait").count(), 4);
-  assert.equal(await page.locator(".tr-row--station .gavatar--work").count(), 1, "在跑的工位小人要动起来");
-  assert.equal(await page.locator(".tr-row--station .gavatar--fail").count(), 1, "刚失败的工位小人显示失败状态");
   // 思考只占一小块，自己在里面滚；报错的工具卡片不自动展开。
   const think = await page.locator(".tr-think-body").first().evaluate((el) => ({ overflow: getComputedStyle(el).overflowY, max: getComputedStyle(el).maxHeight }));
   assert.equal(think.overflow, "auto");
@@ -102,9 +100,9 @@ try {
   await page.locator(".tr-av-menu button", { hasText: "Dijkstra" }).click();
   assert.match(await page.locator(".tr-av-pick img").getAttribute("src"), /dijkstra\.svg$/);
   assert.equal(await page.locator(".tr-av-menu").count(), 0);
-  const shapeLength = await page.locator(".tr-row--station .gavatar path").first().getAttribute("d");
+  const shapeLength = await page.locator(".tr-row--dispatcher .gavatar path").first().getAttribute("d");
   assert.ok((shapeLength ?? "").length > 100, "小人形状是真实的曲线数据，不是占位图");
-  const avatarBox = await page.locator(".tr-row--station .gavatar").first().boundingBox();
+  const avatarBox = await page.locator(".tr-row--dispatcher .gavatar").first().boundingBox();
   assert.ok(avatarBox && avatarBox.width >= 30 && avatarBox.height >= 30, "小人要真的占位，不能被压扁");
   await page.screenshot({ path: path.join(out, "transcript-1440.png") });
 
@@ -143,19 +141,19 @@ try {
   await page.keyboard.press("Control+k");
   await page.waitForFunction(() => document.activeElement?.tagName === "TEXTAREA");
   assert.equal(await page.evaluate(() => document.activeElement?.tagName), "TEXTAREA", "Ctrl+K 要把光标送进输入框");
-  await page.locator('.chat-head button[data-tip^="收起到右侧"]').click();
+  await page.getByRole('button', {name: '收起对话', exact: true}).click();
   await page.locator('.chat.is-collapsed').waitFor();
   await page.keyboard.press("Control+k");
   await page.waitForFunction(() => !document.querySelector('.chat.is-collapsed') && document.activeElement?.tagName === "TEXTAREA", undefined, { timeout: 1500 });
   assert.equal(await input.inputValue(), "", "收起后快捷键重新展开并聚焦，不产生消息");
 
   await page.evaluate(() => window.fixtureEvents.onerror({}));
-  await page.getByText("正在重新连接工厂", { exact: true }).waitFor();
+  await page.getByText('正在重新连接，已有回答都在', {exact: true}).waitFor();
   await input.fill("断线时保留草稿");
   assert.equal(await page.getByRole("button", { name: "安排后续跟进", exact: true }).isDisabled(), true);
   await page.evaluate(() => { window.fixtureEvents.onopen({}); window.fixtureEvents.live({ ...window.chatFixture.getState().dispatcher, kind: "chat.status", status: "interrupted", busy: false, nextRetryAt: undefined, message: "连接已恢复，可继续检查点。" }); });
-  await page.getByRole("button", { name: "继续当前任务", exact: true }).click();
-  await page.waitForFunction(() => !document.querySelector(".chat-recovery .btn")?.disabled);
+  await page.locator('.chat-status').getByRole('button', {name: '继续', exact: true}).click();
+  await page.waitForFunction(() => !document.querySelector('.chat-status-act')?.disabled);
   assert.equal(posts.at(-1).path, "/api/chat/continue");
   assert.equal(await input.inputValue(), "断线时保留草稿");
 
@@ -175,31 +173,35 @@ try {
   await page.getByText(/消息未确认送达/).waitFor();
   const firstAttempt = posts.at(-1);
   assert.equal(await input.inputValue(), firstAttempt.body.text);
-  await page.locator('.chat-head button[data-tip^="收起到右侧"]').click();
+  await page.getByRole('button', {name: '收起对话', exact: true}).click();
   await page.locator('.chat.is-collapsed').waitFor();
   await page.keyboard.press("Control+k");
   await page.waitForFunction(() => document.activeElement?.tagName === "TEXTAREA");
   assert.equal(await input.inputValue(), firstAttempt.body.text, "收起对话保留未确认消息及其重试身份");
+  await page.getByRole('button', {name: '所有对话', exact: true}).click();
+  await page.keyboard.press('Control+k');
+  assert.equal(await input.inputValue(), firstAttempt.body.text, 'switching conversations preserves the pending message');
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
   await page.waitForFunction(() => !document.querySelector(".composer textarea").value && !document.querySelector(".composer-feedback"));
   assert.equal(posts.at(-1).body.requestId, firstAttempt.body.requestId);
 
-  await page.getByRole("button", { name: "1 件需要你操作", exact: true }).click();
-  assert.equal(await page.locator(".rail-alert .rail-badge").count(), 0, "system diagnostics do not inflate the human-action badge");
-  const systemAlert = page.locator(".alert-item.is-recovery");
+  await page.getByRole('button', {name: '需要你处理的事', exact: true}).click();
+  assert.equal(await page.locator('.rail-alert .rail-badge').innerText(), '1', 'only the login task counts as a human action');
+  const systemAlert = page.locator('.alert-group');
+  await systemAlert.locator('summary').click();
   assert.match(await systemAlert.innerText(), /连接中断/);
   assert.ok(!(await systemAlert.innerText()).includes("请登录"));
   assert.equal(await page.getByRole("button", { name: "我已处理", exact: true }).count(), 0);
   await systemAlert.getByRole("button", { name: "重新检查", exact: true }).click();
-  await page.waitForFunction(() => !document.querySelector(".alert-actions button")?.disabled);
+  await page.waitForFunction(() => !document.querySelector('.alert-group .alert-link')?.disabled);
   assert.deepEqual(posts.at(-1), { path: "/api/tools/alerts", body: { action: "recheck", id: "network" } });
   await page.screenshot({ path: path.join(out, "alerts-1440.png") });
-  await page.locator(".alert-item:not(.is-recovery)").getByRole("button", { name: "打开对应页面" }).click();
+  await page.locator('.alert-row').getByRole('button', {name: '打开页面'}).click();
   await page.waitForFunction(() => !document.querySelector(".alert-pop"));
   assert.deepEqual(posts.at(-1).body, { action: "activate", id: "login-tab" });
 
   await page.setViewportSize({ width: 1040, height: 768 });
-  await page.getByRole("button", { name: "1 件需要你操作", exact: true }).click();
+  await page.getByRole('button', {name: '需要你处理的事', exact: true}).click();
   await page.screenshot({ path: path.join(out, "alerts-1040.png") });
   const pop = await page.locator(".alert-pop").boundingBox();
   assert.ok(pop.x >= 0 && pop.x + pop.width <= 1040 && pop.y >= 0 && pop.y + pop.height <= 768, "alert controls remain inside the window");
@@ -207,9 +209,9 @@ try {
     const state = window.chatFixture.getState();
     window.fixtureEvents.onmessage({ data: JSON.stringify({ kind: "alert.cleared", id: "auth", reason: "fixture access verified", seq: state.fs.seq + 1, at: Date.now(), run: state.fs.run.id }) });
   });
-  await page.getByRole("button", { name: "1 件待系统检查", exact: true }).waitFor();
+  await page.locator('.rail-alert.is-recovery').waitFor();
   assert.equal((await page.title()).startsWith("● "), false, "a journaled resolution updates the human-action indicator immediately");
-  assert.equal(await page.locator(".alert-item:not(.is-recovery)").count(), 0);
+  assert.equal(await page.locator('.alert-row').count(), 0);
 
   // Composer stays compact at every supported sidebar width. Test actual boxes,
   // not CSS text, while retaining the real send/recovery actions above.

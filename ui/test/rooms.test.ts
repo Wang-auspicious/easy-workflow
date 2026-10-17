@@ -5,7 +5,7 @@ import test from "node:test";
 import { compile } from "../../server/spec/compile.ts";
 import { pack } from "../../packs/vislexicon/pack.ts";
 import { deriveRooms, ROOT_ROOM, speakersOf, talks } from "../../shared/rooms.ts";
-import { buildRoomLines, routeComm, type RoomContext } from "../src/chat/rooms.ts";
+import { buildRoomLines, roomSummaries, routeComm, type RoomContext } from "../src/chat/rooms.ts";
 import { apply, initialState, type FactoryState } from "../../shared/project.ts";
 import type { Stamped } from "../../shared/types.ts";
 import {kernelRooms, kernelRoomLines, mergeKernelEvents} from '../src/kernel.ts';
@@ -50,6 +50,11 @@ test('v2 groups follow the five declared fields and keep progress separate from 
   const visible = kernelRoomLines(shots, ctx, merged, true);
   assert.ok(visible.some(line => line.label === '进展' && line.text === 'Checking the selected page.'));
   assert.ok(!kernelRoomLines(rooms.find(room => room.id === 'field:facts.*')!, ctx, merged, true).length);
+  const summary = roomSummaries(rooms, {...ctx, kernelEvents: merged, showProgress: true}, {})
+    .find(summary => summary.room.id === shots.id)!;
+  assert.equal(summary.count, 1, 'field challenges remain visible in the conversation list');
+  assert.equal(summary.unread, 1, 'progress and automatic claims never inflate unread conversation');
+  assert.ok(summary.preview.includes(post.body));
   const noisy: Stamped[] = Array.from({length: 3000}, (_, index) => ({...at(index + 10, index + 200),
     kind: 'attempt.progress', attempt: 'review-attempt', text: `Progress ${index}`}));
   const retained = mergeKernelEvents(merged, noisy);

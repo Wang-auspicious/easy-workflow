@@ -61,17 +61,20 @@ export function Chat() {
   const [drag, setDrag] = useState(false);
   const composer = useRef<HTMLTextAreaElement>(null);
   const pendingFocus = useRef(false);
+  const resizeCleanup = useRef<(() => void) | null>(null);
+  useEffect(() => () => resizeCleanup.current?.(), []);
   useLayoutEffect(() => {
-    if (open && pendingFocus.current && composer.current) {
+    if (open && !list && isRoot && pendingFocus.current && composer.current) {
       composer.current.focus(); pendingFocus.current = false;
     }
-  }, [open]);
+  }, [open, list, isRoot]);
   useEffect(() => {
     const focus = () => {
       pendingFocus.current = true;
-      const wasOpen = getState().chatOpen;
-      setState({ chatOpen: true, unread: 0 });
-      if (wasOpen && composer.current) { composer.current.focus(); pendingFocus.current = false; }
+      const current = getState();
+      const wasVisible = current.chatOpen && !current.chatList && current.chatRoom === ROOT_ROOM;
+      setState({ chatOpen: true, chatList: false, chatRoom: ROOT_ROOM, unread: 0 });
+      if (wasVisible && composer.current) { composer.current.focus(); pendingFocus.current = false; }
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key.toLowerCase() === "k" && (event.ctrlKey || event.metaKey)) {
@@ -83,34 +86,60 @@ export function Chat() {
     return () => { window.removeEventListener("easy:focus-composer", focus); window.removeEventListener("keydown", onKey); };
   }, []);
   const startResize = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
     e.preventDefault();
+    resizeCleanup.current?.();
     setDrag(true);
     const x0 = e.clientX, w0 = chatPanelWidth(width, roomsOpen);
     const move = (ev: PointerEvent) => setState({ chatWidth: chatPanelWidth(w0 - (ev.clientX - x0), roomsOpen) });
-    const up = () => { setDrag(false); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+    const cleanup = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+      window.removeEventListener('blur', up);
+      resizeCleanup.current = null;
+    };
+    const up = () => {
+      setDrag(false);
+      cleanup();
+    };
+    resizeCleanup.current = cleanup;
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+    window.addEventListener('pointercancel', up);
+    window.addEventListener('blur', up);
   };
   return (
     <aside className={`chat${open ? "" : " is-collapsed"}`}>
       {!open && <>
         <div className="chat-head" />
         <div className="chat-collapsed">
-          <button className="chat-avatar-btn" onClick={() => setState({ chatOpen: true, unread: 0 })} data-tip="展开主调度  Ctrl \" data-tip-side="right">
+          <button className="chat-avatar-btn" aria-label="展开主调度" onClick={() => setState({ chatOpen: true, chatList: false, chatRoom: ROOT_ROOM, unread: 0 })} data-tip="展开主调度  Ctrl K" data-tip-side="right">
             <DispatcherAvatar size={26} />
             {unread > 0 && <i className="chat-unread" />}
           </button>
-          <button className="icon-btn" onClick={() => setState({ chatOpen: true, unread: 0 })} data-tip="展开" data-tip-side="right"><PanelRightOpen size={16} /></button>
+          <button className="icon-btn" aria-label="展开对话" onClick={() => setState({ chatOpen: true, unread: 0 })} data-tip="展开对话" data-tip-side="right"><PanelRightOpen size={16} /></button>
         </div>
       </>}
       {/* Collapsing is a view change. Keep the pending request ID and send mode
           alive so reopening cannot resend an unconfirmed operation as new. */}
       <div style={{ display: open ? "contents" : "none" }}>
-        <div className={`chat-resize ${drag ? "is-drag" : ""}`} onPointerDown={startResize} />
+        <div className={`chat-resize ${drag ? "is-drag" : ""}`} onPointerDown={startResize}
+          role="separator" aria-label="调整对话宽度" aria-orientation="vertical" tabIndex={open ? 0 : -1}
+          aria-valuemin={340} aria-valuemax={720} aria-valuenow={chatPanelWidth(width)}
+          onKeyDown={event => {
+            if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+            event.preventDefault();
+            const next = event.key === 'Home' ? 340 : event.key === 'End' ? 720
+              : chatPanelWidth(width) + (event.key === 'ArrowLeft' ? 24 : -24);
+            setState({chatWidth: chatPanelWidth(next)});
+          }} />
         <ChatHead />
         <KernelSummary />
         {list ? <RoomList /> : <ChatPane />}
-        {!list && isRoot && <Composer inputRef={composer} />}
+        <div style={{display: !list && isRoot ? 'contents' : 'none'}}>
+          <Composer inputRef={composer} visible={open && !list && isRoot} />
+        </div>
       </div>
       <CorrectionPopover />
     </aside>
@@ -153,7 +182,7 @@ function ChatHead() {
   const rooms = useRooms();
   const selected = useStore((s) => s.chatRoom);
   const room = rooms.find((r) => r.id === selected) ?? rooms[0]!;
-  const close = <button className="icon-btn" onClick={() => setState({ chatOpen: false })} data-tip="收起  Ctrl \"><PanelRightClose size={16} /></button>;
+  const close = <button className="icon-btn" aria-label="收起对话" onClick={() => setState({ chatOpen: false })} data-tip="收起对话  Ctrl \"><PanelRightClose size={16} /></button>;
   if (list) return (
     <div className="chat-head chat-head--list">
       <b className="chat-title">对话</b>
@@ -305,7 +334,7 @@ export function AttChip({ a, onRemove }: { a: Attachment; onRemove?: () => void 
   );
 }
 
-function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement | null> }) {
+function Composer({inputRef, visible}: {inputRef: React.RefObject<HTMLTextAreaElement | null>; visible: boolean}) {
   const atts = useStore((s) => s.attachments);
   const draft = useStore((s) => s.draft);
   const history = useStore((s) => s.history);
@@ -323,13 +352,24 @@ function Composer({ inputRef }: { inputRef: React.RefObject<HTMLTextAreaElement 
   const [walk, setWalk] = useState<number | null>(null);
   const pendingSend = useRef<{ requestId: string; text: string; attachments: string } | null>(null);
   const ta = inputRef;
-  useEffect(() => { if (draft && ta.current) ta.current.focus(); }, [draft]);
+  useEffect(() => {if (draft && visible && ta.current) ta.current.focus();}, [draft, visible]);
   useLayoutEffect(() => {
     const el = ta.current;
-    if (!el) return;
-    el.style.height = "0px";
-    el.style.height = `${Math.min(180, el.scrollHeight)}px`;
-  }, [draft]);
+    if (!el || !visible) return;
+    // The sidebar animates from its collapsed width. Measure again as it opens,
+    // otherwise a placeholder measured at 20px wide leaves an empty 180px box.
+    let width = -1;
+    const measure = () => {
+      if (el.clientWidth === width) return;
+      width = el.clientWidth;
+      el.style.height = '0px';
+      el.style.height = `${Math.min(180, el.scrollHeight)}px`;
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [draft, visible]);
   const typedCommand = draft.startsWith("/") && !draft.includes(" ") && !draft.includes("\n");
   const matches = typedCommand
     ? COMMANDS.filter((c) => c.cmd.startsWith(draft.toLowerCase()) || c.title.includes(draft.slice(1)))

@@ -135,8 +135,89 @@ try {
   releaseFactory();
   await page.waitForTimeout(150);
   assert.equal(await page.evaluate(async () => (await import('/src/store.ts')).getState().replay.run), 'old');
+
+  // Real keyboard/pointer gestures on the current shell, with isolated API data.
+  await page.evaluate(async () => (await import('/src/store.ts')).setState({
+    replay: null, view: 'canvas', chatOpen: false, chatList: true, connected: true,
+  }));
+  const card = page.locator('.node[data-node="fixture/step"]');
+  await card.focus();
+  await page.keyboard.press('Enter');
+  await page.locator('.inspector').waitFor();
+  const footprint = await card.evaluate(element => ({width: element.offsetWidth, height: element.offsetHeight}));
+  assert.deepEqual(footprint, {width: 240, height: 112});
+  const layers = page.getByRole('button', {name: '图层', exact: true});
+  await layers.click();
+  await page.getByRole('menu', {name: '画布图层'}).waitFor();
+  await page.keyboard.press('ArrowDown');
+  assert.equal(await page.getByRole('menuitemradio', {name: /Spec/}).evaluate(element => element === document.activeElement), true);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.getByRole('menu').count(), 0);
+  assert.equal(await page.locator('.inspector').count(), 1, 'Escape closes only the topmost layer menu');
+  assert.equal(await layers.evaluate(element => element === document.activeElement), true);
+  await layers.click();
+  await page.getByRole('menuitemradio', {name: /信道/}).click();
+  assert.equal(await layers.getAttribute('aria-expanded'), 'false');
+  await layers.click();
+  await page.getByRole('menuitemradio', {name: /流水线/}).click();
+  await layers.click();
+  await page.locator('.canvas-title').click();
+  assert.equal(await page.getByRole('menu').count(), 0, 'outside click dismisses the menu');
+
+  const expand = page.getByRole('button', {name: '展开主调度', exact: true});
+  await expand.focus();
+  await page.getByRole('tooltip').waitFor();
+  const tipBox = await page.getByRole('tooltip').boundingBox();
+  assert.ok(tipBox.x >= 8 && tipBox.x + tipBox.width <= 1352 && tipBox.y >= 8, 'right-rail keyboard tooltip stays inside the window');
+  assert.ok(await expand.getAttribute('aria-describedby'));
+  await page.keyboard.press('Escape');
+  assert.equal(await page.getByRole('tooltip').count(), 0);
+  await expand.hover();
+  await page.getByRole('tooltip').waitFor();
+  await page.mouse.move(500, 850);
+  assert.equal(await page.getByRole('tooltip').count(), 0, 'pointer exit clears the tooltip');
+
+  await page.keyboard.press('Control+k');
+  const input = page.locator('.composer textarea');
+  await input.waitFor();
+  assert.equal(await input.evaluate(element => element === document.activeElement), true, 'Ctrl+K opens the dispatcher from the conversation list');
+  await page.waitForFunction(() => document.querySelector('.composer textarea').offsetHeight <= 60);
+  await input.fill('保留这份草稿');
+  await page.getByRole('button', {name: '所有对话', exact: true}).click();
+  await page.locator('.talk-list').waitFor();
+  await page.keyboard.press('Control+k');
+  await input.waitFor();
+  assert.equal(await input.inputValue(), '保留这份草稿');
+  assert.equal(await input.evaluate(element => element === document.activeElement), true);
+  const resize = page.getByRole('separator', {name: '调整对话宽度'});
+  await resize.focus();
+  const width = Number(await resize.getAttribute('aria-valuenow'));
+  await page.keyboard.press('ArrowLeft');
+  assert.equal(Number(await resize.getAttribute('aria-valuenow')), width + 24);
+  await page.keyboard.press('ArrowRight');
+  const resizeBox = await resize.boundingBox();
+  await page.mouse.move(resizeBox.x + resizeBox.width / 2, 400);
+  await page.mouse.down();
+  await page.mouse.move(resizeBox.x - 28, 400);
+  assert.equal(await page.locator('.app').evaluate(element => getComputedStyle(element).transitionDuration), '0s', 'drag resizing directly tracks the pointer');
+  await page.mouse.up();
+  assert.equal(await page.locator('.chat-resize.is-drag').count(), 0);
+  await page.getByRole('button', {name: '收起对话', exact: true}).click();
+  await page.getByRole('button', {name: '工作视图', exact: true}).focus();
+  await page.setViewportSize({width: 1100, height: 700});
+  await page.keyboard.press('Enter');
+  const controlBottom = await page.locator('.controls').evaluate(element => {
+    const box = element.getBoundingClientRect();
+    return {bottom: box.bottom, scroll: document.querySelector('.cv').scrollTop};
+  });
+  assert.ok(controlBottom.bottom > 650 && controlBottom.bottom <= 700 && controlBottom.scroll === 0, 'focused controls never scroll the canvas chrome out of view on resize');
+  await page.setViewportSize({width: 1360, height: 900});
+  await page.keyboard.press('Control+k');
+  await page.screenshot({path: path.join(out, 'keyboard-and-surfaces.png')});
+  await page.emulateMedia({reducedMotion: 'reduce'});
+  assert.ok(await card.evaluate(element => parseFloat(getComputedStyle(element).transitionDuration) < .001), 'reduced-motion removes the material transitions');
   assert.deepEqual(errors, []);
-  const checks = ['visible startup failure and retry', 'serialized layout writes', 'failed save retains draft and retries', 'replay is read-only', 'obsolete stream ignored', 'boot cannot replace a newly saved layout', 'boot cannot replace newer spec metadata', 'boot cannot replace replay'];
+  const checks = ['visible startup failure and retry', 'serialized layout writes', 'failed save retains draft and retries', 'replay is read-only', 'obsolete stream ignored', 'boot cannot replace a newly saved layout', 'boot cannot replace newer spec metadata', 'boot cannot replace replay', 'uniform keyboard-accessible cards', 'layer-menu keyboard and outside dismissal', 'tooltip focus, dismissal and viewport bounds', 'Ctrl+K opens dispatcher and preserves drafts', 'keyboard and direct pointer resizing', 'reduced-motion materials'];
   await fs.writeFile(path.join(out, 'result.json'), JSON.stringify({checks, errors}, null, 2));
   console.log(JSON.stringify({checks, errors}));
 } finally {

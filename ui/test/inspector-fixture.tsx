@@ -21,6 +21,7 @@ import {Candidates} from '../src/views/Candidates.tsx';
 import { botFor } from "../../shared/palette.ts";
 import type { CompiledFactory, CompiledNode, Stamped } from "../../shared/types.ts";
 import type { Geometry } from "../src/canvas/geometry.ts";
+import '../src/styles/materials.css';
 
 const now = Date.now();
 const station = (key: string, name: string, role: CompiledNode["role"], kind: CompiledNode["kind"]): CompiledNode => ({

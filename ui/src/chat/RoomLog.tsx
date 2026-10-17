@@ -44,8 +44,10 @@ export function RoomLog({ room, rooms }: { room: RoomSpec; rooms: readonly RoomS
     return buildRoomLines(room, rooms, ctx);
   }, [room, rooms, factory, fs, bots, now, kernel, events, showProgress]);
   // A station announcing its own progress is not a conversation; it stays one tap away.
-  const notes = all.filter((line) => line.kind === "note").length;
-  const lines = showNotes ? all : all.filter((line) => line.kind !== "note");
+  // v2 field posts are represented as note rows too, but challenges and answers
+  // are actual conversation. Its progress toggle already filters announcements.
+  const notes = kernel === 'v2' ? 0 : all.filter(line => line.kind === 'note').length;
+  const lines = kernel === 'v2' || showNotes ? all : all.filter(line => line.kind !== 'note');
 
   useLayoutEffect(() => {
     const el = host.current!;
@@ -119,8 +121,8 @@ export function RoomRow({ line, first = true }: { line: RoomLine; first?: boolea
           {line.to && <span className="bub-to">对 {line.to.name}</span>}
           <time className="num">{time(line.at)}</time>
         </header>}
-        <div className={`bub bub--${line.kind}${line.tone === "warn" ? " is-warn" : ""}`}>
-          {line.kind !== "note" && <span className="bub-verb">{line.label ?? VERB[line.kind]}</span>}
+        <div className={`bub bub--${line.label && line.label !== '进展' ? 'conversation' : line.kind}${line.tone === "warn" ? " is-warn" : ""}`}>
+          {(line.kind !== 'note' || line.label) && <span className="bub-verb">{line.label ?? VERB[line.kind]}</span>}
           {line.text.replace(/^\[[^\]]{1,24}\]\s*/, "")}
           {item && <span className="bub-item">{item}</span>}
           {line.note && <span className="bub-item">{({open: '待处理', resolved: '已解决', rejected: '已拒绝', superseded: '已替代', judged: '已裁决', parked: '待处理'} as Record<string, string>)[line.note] ?? line.note}</span>}

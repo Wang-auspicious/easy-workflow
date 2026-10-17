@@ -22,7 +22,7 @@
 .tr-state--returned { background: color-mix(in oklab, var(--ok) 14%, #fff); color: color-mix(in oklab, var(--ok) 75%, #123); }
 
 /* 用户消息：一个浅底盒子，仍然在同一列里，不单独换边。 */
-.tr-row--user .tr-text markdown-block, .tr-row--user .tr-text .markdown { display: block; background: var(--panel-3); border: 1px solid var(--line); border-radius: 12px; padding: 9px 12px; }
+.tr-row--user .tr-text > markdown-block, .tr-row--user .tr-text > .markdown { display: block; background: linear-gradient(155deg, #f3f7ff, #eaf1fc); color: #3c567a; border: 1px solid #dce7f7; border-radius: 12px; padding: 10px 13px; box-shadow: inset 0 1px 0 #fff, 0 2px 4px #23395405; }
 
 /* 工具条：一次收起/展开所有工具卡片 */
 .tr-bar { display: flex; align-items: center; gap: 8px; font-size: 11px; padding: 0 2px 2px; }
@@ -58,8 +58,10 @@
 @keyframes tr-shimmer { 0% { background-position: 120% 0 } 100% { background-position: -20% 0 } }
 
 .tr-tool-wrap { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.tr-tool { border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
-.tr-tool > summary { display: flex; align-items: center; gap: 7px; padding: 7px 10px; font-size: 12px; cursor: pointer; list-style: none; color: var(--ink-2); }
+.tr-tool { border: 1px solid var(--line-2); border-radius: 11px; background: var(--surface, #fff); box-shadow: inset 0 1px 0 #fff, 0 2px 4px #23395405; transition: border-color 150ms, box-shadow 150ms; }
+.tr-tool:hover { border-color: #c0d0e6; box-shadow: var(--shadow-1); }
+.tr-tool[open] { border-color: #c6d6eb; }
+.tr-tool > summary { display: flex; align-items: center; gap: 7px; padding: 9px 11px; font-size: 12px; cursor: pointer; list-style: none; color: var(--ink-2); border-radius: inherit; }
 .tr-tool > summary::-webkit-details-marker { display: none; }
 .tr-tool > summary:hover { color: var(--ink); }
 .tr-tool-status { display: inline-flex; color: var(--ok); }

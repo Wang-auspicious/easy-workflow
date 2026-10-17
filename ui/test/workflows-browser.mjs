@@ -34,7 +34,7 @@ try {
       (await import('/src/canvas/Canvas.tsx')).toggleInspector('curation/reader', 'node');
     });
     const inspector = page.locator('[data-inspector="curation/reader"]');
-    await inspector.getByRole('button', {name: '规格', exact: true}).click();
+    await inspector.getByRole('tab', {name: '说明', exact: true}).click();
     const settings = inspector.getByRole('region', {name: '工位 Agent 配置'});
     await settings.getByLabel('执行适配器').waitFor();
     assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'inherit');
@@ -54,13 +54,13 @@ try {
     const expected = {adapter: 'launcher', command: ['node', 'fixture-launcher.mjs'], model: 'isolated-requested-model'};
     assert.deepEqual((await app.request('/api/state')).agentBindings['curation/reader'], expected);
     await page.locator('[data-node="curation/reader"] .node-type').filter({hasText: 'launcher · isolated-requested-model（配置）'}).waitFor();
-    await inspector.locator('.spec-view').evaluate(element => { element.scrollTop = 0; });
+    await inspector.locator('.about').evaluate(element => { element.scrollTop = 0; });
     await page.screenshot({path: path.join(out, 'agent-binding-live.png')});
     await page.reload();
     await page.locator('.rail-conn.is-on').waitFor();
     await page.locator('[data-tip^="画布 · 流水线"]').click();
     await page.evaluate(async () => (await import('/src/canvas/Canvas.tsx')).toggleInspector('curation/reader', 'node'));
-    await inspector.getByRole('button', {name: '规格', exact: true}).click();
+    await inspector.getByRole('tab', {name: '说明', exact: true}).click();
     await settings.getByLabel('Agent 请求模型').waitFor();
     assert.equal(await settings.getByLabel('执行适配器').inputValue(), 'launcher');
     assert.equal(await settings.getByLabel('Agent 请求模型').inputValue(), expected.model);
@@ -91,8 +91,8 @@ try {
   await page.locator('[data-tip^="画布 · 流水线"]').click();
   await page.evaluate(async node => (await import('/src/canvas/Canvas.tsx')).toggleInspector(node, 'node'), pack.entry);
   const programInspector = page.locator(`[data-inspector="${pack.entry}"]`);
-  await programInspector.getByRole('button', {name: '规格', exact: true}).click();
-  await programInspector.getByText('程序执行，不使用 Agent 模型。').waitFor();
+  await programInspector.getByRole('tab', {name: '说明', exact: true}).click();
+  await programInspector.locator('.insp-title .muted').filter({hasText: '程序执行'}).waitFor();
   assert.equal(await programInspector.getByLabel('执行适配器').count(), 0);
   await page.evaluate(async () => (await import('/src/store.ts')).setState({inspectors: []}));
   await page.locator('[data-tip="流水线库"]').click();

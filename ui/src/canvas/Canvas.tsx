@@ -73,7 +73,7 @@ export function Canvas({ active }: { active: boolean }) {
     const b = geoRef.current.bounds;
     fitMode.current = true;
     workMode.current = false;
-    const padX = 20, padTop = 62, padBottom = 58;
+    const padX = 20, padTop = 112, padBottom = 64;
     const k = Math.max(MIN_K, Math.min(1.1, (box.width - padX * 2) / b.w, (box.height - padTop - padBottom) / b.h));
     const target = { k, x: (box.width - b.w * k) / 2 - b.x * k, y: padTop + (box.height - padTop - padBottom - b.h * k) / 2 - b.y * k };
     if (animate) animateTo(target); else setCam(target);
@@ -89,9 +89,16 @@ export function Canvas({ active }: { active: boolean }) {
     if (area && !Object.keys(s.layout.pos).length && !s.selected.length) {
       fitMode.current = false;
       workMode.current = true;
-      // The whole working line fits the screen; the HUD keeps 96px above, controls 56px below.
-      const k = Math.max(0.5, Math.min(1.1, (box.width - 40) / area.w, (box.height - 152) / area.h));
-      const target = { k, x: (box.width - area.w * k) / 2 - area.x * k, y: 96 + (box.height - 152 - area.h * k) / 2 - area.y * k };
+      // Keep station titles readable on laptops. The overview remains available
+      // through F; a working view can pan instead of shrinking text to 8px.
+      const k = Math.max(0.8, Math.min(1.1, (box.width - 40) / area.w, (box.height - 168) / area.h));
+      const activeKey = g.nodes.find(({node}) => s.fs.nodes[node.key]?.active.length)?.node.key;
+      const anchor = g.place[activeKey ?? 'curation/classify'];
+      const x = area.w * k <= box.width - 40 || !anchor
+        ? (box.width - area.w * k) / 2 - area.x * k
+        : Math.max(box.width - 20 - (area.x + area.w) * k,
+          Math.min(20 - area.x * k, box.width / 2 - (anchor.x + anchor.w / 2) * k));
+      const target = {k, x, y: 112 + Math.max(0, (box.height - 168 - area.h * k) / 2) - area.y * k};
       if (animate) animateTo(target, 320); else setCam(target);
       return;
     }

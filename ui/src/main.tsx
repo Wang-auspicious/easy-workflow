@@ -7,6 +7,7 @@ import "./styles/panels.css";
 import "./styles/studio.css";
 import { App } from "./App.tsx";
 import { boot } from "./api.ts";
+import './styles/materials.css';
 
 createRoot(document.getElementById("root")!).render(<App />);
 boot().catch((err) => {

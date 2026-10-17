@@ -80,7 +80,7 @@ export const Hud = memo(function Hud() {
     <>
       <div className="hud-wrap">
         <div className="hud">
-          <div className="canvas-title"><span>工作区</span><i>/</i><b>{isIdle ? '工作流待运行' : run.title || '工作流运行'}</b><span className="hud-badge" data-tip={progress.detail}>{progress.label}</span></div>
+          <div className="canvas-title"><span>工作区</span><i>/</i><b>{isIdle ? '工作流待运行' : run.title || '工作流运行'}</b><span className={`hud-badge hud-badge--${progress.light}`} data-tip={progress.detail}>{progress.label}</span></div>
           {!replay && (
             <div className="hud-actions">
               <button className="btn" disabled={!connected || ending} onClick={() => setPull((p) => !p)}><PackagePlus size={15} />投料</button>
@@ -102,8 +102,9 @@ export const Hud = memo(function Hud() {
           </select>
           <button className="run-metrics num" onClick={() => setOpen((o) => !o)} data-tip={progress.detail}>
             <span className={`light light--${progress.light}`} />
-            <span className="hud-done">已发布 <b>{counts.published}/{counts.total}</b></span>{counts.active>0&&<span>在途 {counts.active}</span>}{counts.parked>0&&<span className="has-failures">待重试 {counts.parked}</span>}{counts.manual>0&&<button className="hud-review" onClick={(e)=>{e.stopPropagation();setState({view:"review"});}} data-tip="打开待人工审核">待人工 {counts.manual} ›</button>}{counts.failed>0&&<span className="has-failures">失败 {counts.failed}</span>}<span className="metric-dot">·</span><span className="hud-clock">{displayTime}</span><span className="metric-dot">·</span><span data-tip={`模型用量 ${usage.reported}/${usage.samples} 次有报告，未报告的用量不视为零。`}>{usage.partial ? '已报 ' : ''}{displayTok} tok</span><ChevronDown size={12} />
+            <span className="hud-done">已发布 <b>{counts.published}/{counts.total}</b></span>{counts.active>0&&<span>在途 {counts.active}</span>}{counts.parked>0&&<span className="has-failures">待重试 {counts.parked}</span>}{counts.failed>0&&<span className="has-failures">失败 {counts.failed}</span>}<span className="metric-dot">·</span><span className="hud-clock">{displayTime}</span><span className="metric-dot">·</span><span data-tip={`模型用量 ${usage.reported}/${usage.samples} 次有报告，未报告的用量不视为零。`}>{usage.partial ? '已报 ' : ''}{displayTok} tok</span><ChevronDown size={12} />
           </button>
+          {counts.manual > 0 && <button className="hud-review" onClick={() => setState({view: 'review'})} data-tip="打开待人工审核">待人工 {counts.manual} ›</button>}
           {selected.length > 0 && <button className="inspect-selection" onClick={() => toggleInspector(selected[0])}>查看所选</button>}
           <AllocationShortcut />
           {memoryGuard && <span className="chip" title={memoryGuard.detail}>{memoryGuard.label}</span>}
