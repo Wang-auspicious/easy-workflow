@@ -86,11 +86,12 @@ export function Canvas({ active }: { active: boolean }) {
     if (!box) return;
     const g = geoRef.current, s = getState();
     const area = s.defaultLayout?.workArea;
-    if (area && !Object.keys(s.layout.pos).length && !s.selected.length && !g.nodes.some(({ node }) => s.fs.nodes[node.key]?.active.length)) {
+    if (area && !Object.keys(s.layout.pos).length && !s.selected.length) {
       fitMode.current = false;
       workMode.current = true;
-      const k = Math.max(0.76, Math.min(1.08, (box.width - 56) / area.w, (box.height - 156) / area.h));
-      const target = { k, x: (box.width - area.w * k) / 2 - area.x * k, y: 106 + (box.height - 156 - area.h * k) / 2 - area.y * k };
+      // The whole working line fits the screen; the HUD keeps 96px above, controls 56px below.
+      const k = Math.max(0.5, Math.min(1.1, (box.width - 40) / area.w, (box.height - 152) / area.h));
+      const target = { k, x: (box.width - area.w * k) / 2 - area.x * k, y: 96 + (box.height - 152 - area.h * k) / 2 - area.y * k };
       if (animate) animateTo(target, 320); else setCam(target);
       return;
     }

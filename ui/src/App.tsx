@@ -9,6 +9,7 @@ import { EvidenceBoard } from "./board/EvidenceBoard.tsx";
 import { Library } from "./views/Library.tsx";
 import { Runs } from "./views/Runs.tsx";
 import { Candidates } from "./views/Candidates.tsx";
+import { Review } from "./views/Review.tsx";
 import { BrowserView } from "./views/BrowserView.tsx";
 import { Settings } from "./views/Settings.tsx";
 import { Report } from "./report/Report.tsx";
@@ -47,6 +48,7 @@ export function App() {
             {view === "library" && <Library />}
             {view === "runs" && <Runs />}
             {view === "candidates" && <Candidates />}
+            {view === "review" && <Review />}
             {view === "browser" && <BrowserView />}
             {view === "settings" && <Settings />}
             {view === "report" && <Report />}

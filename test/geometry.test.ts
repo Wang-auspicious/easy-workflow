@@ -91,10 +91,14 @@ test("the factory composes a dense working area with a short vertical review bra
   // shrinking every station to satisfy a fixed full-factory width.
   assert.ok(Object.values(g.bounds).every(Number.isFinite));
   for (const { node, place } of g.nodes) if (node.kind !== "source") {
-    assert.ok(place.w >= 240 && place.h >= 170, `${node.key} must fit its title, metrics and status`);
+    assert.ok(place.w >= 120 && place.h >= 42, `${node.key} must fit its title and live counts`);
   }
+  // The whole working line, sources to publication, fits one screen at a readable scale.
+  // At a 1240×650 canvas the fitted cards stay at least 118px wide, so names remain legible.
+  const fit = Math.min(1240 / def.workArea!.w, 650 / def.workArea!.h);
+  assert.ok(176 * fit >= 118, `work area ${def.workArea!.w}×${def.workArea!.h} shrinks cards to ${Math.round(176 * fit)}px`);
   const review = g.place["curation/kind-join"], arbiter = g.place["curation/arbiter"];
-  assert.equal(review.x, arbiter.x);
+  assert.equal(review.x + review.w / 2, arbiter.x + arbiter.w / 2, "the join sits centred above its arbiter");
   const branch = g.edges.find((e) => e.edge.from === "curation/kind-join" && e.edge.to === "curation/arbiter")!;
   assert.equal(branch.fromPort.dir, "down");
   assert.equal(branch.toPort.dir, "up");
@@ -123,7 +127,7 @@ test("adjacent-column branches keep one straight stem instead of jogging midway"
 
 test("every real flow, channel and return keeps visible endpoints and avoids unrelated cards", () => {
   const f = compile([pack]), def = layoutFactory(f.nodes, f.edges, f.ui.order, f.ui.hints, f.ui.collapsed);
-  const freeX = Math.max(...Object.values(def.pos).map((p) => p.x + p.w)) + 180;
+  const freeX = Math.max(...[...Object.values(def.pos), ...Object.values(def.capsules)].map((p) => p.x + p.w)) + 180;
   // Keep the moved capsule outside the candidate column; overlapping an endpoint
   // with another card has no collision-free route and is tested as attachment only.
   const freeLeft = Math.min(...Object.values(def.pos).map((p) => p.x)) - def.capsules.components.w - 80;
@@ -181,7 +185,7 @@ test("an empty compiled graph has finite canvas bounds", () => {
 test("logical phase bounds still contain their stations in the compact layout", () => {
   const f = compile([pack]), def = layoutFactory(f.nodes, f.edges, f.ui.order, f.ui.hints, f.ui.collapsed);
   const bays = def.bays!;
-  assert.deepEqual(bays.slice(0, 6).map((b) => b.name), ["来源接入", "候选与分流", "读懂与判定", "资源采集", "核验与著录", "终审与发布"]);
+  assert.deepEqual(bays.slice(0, 5).map((b) => b.name), ["来源接入", "候选与分流", "读懂与判定", "取证与风格", "核验与发布"]);
   for (const b of bays) for (const k of b.stations) {
     const p = def.pos[k] ?? def.capsules[b.line];
     assert.ok(p.x >= b.x && p.x + p.w <= b.x + b.w && p.y >= b.y && p.y + p.h <= b.y + b.h, `${k} sits inside bay ${b.name}`);
@@ -210,8 +214,13 @@ test("intake is compact and all business branches enter one aligned column", () 
   assert.deepEqual(f.nodes.filter((n) => n.line === "candidates").map((n) => n.id), ["tidy", "pool", "route"]);
   const branches = g.edges.filter((e) => e.from === "candidates/route");
   assert.ok(branches.length >= 4);
-  assert.equal(new Set(branches.map((e) => g.place[e.to].x)).size, 1);
-  assert.ok(branches.every((e) => !e.quiet), "branch destinations must not be hidden as channels");
+  // Folded business lines stack in one column below the working line; their hand-offs
+  // show on hover so they never cross the bands of the open line.
+  const folded = branches.filter((e) => e.to.startsWith("capsule:"));
+  assert.ok(folded.length >= 3);
+  assert.equal(new Set(folded.map((e) => g.place[e.to].x)).size, 1);
+  assert.ok(folded.every((e) => e.quiet), "hand-offs to folded lines stay quiet");
+  assert.ok(branches.some((e) => e.to === "curation/dedupe" && !e.quiet), "the open line keeps a visible entry");
   for (let i = 0; i < g.bays.length; i++) for (let j = i + 1; j < g.bays.length; j++) {
     const a = g.bays[i], b = g.bays[j];
     assert.ok(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y, `parts ${a.name} and ${b.name} overlap`);

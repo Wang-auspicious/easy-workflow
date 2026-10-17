@@ -2,7 +2,7 @@
 // the user's layout file (drags, opened capsules). Layout never touches the spec.
 import type { CompiledEdge, CompiledFactory, CompiledNode } from "../../../shared/types.ts";
 import {
-  GEO, decorationsOf, layoutFactory, ports, routeEdge, sizeOf, wrapGaps,
+  GEO, alignBands, decorationsOf, layoutFactory, ports, routeEdge, sizeOf, wrapGaps,
   type BayBox, type DockBox, type EdgeRoute, type HallBox, type LayoutResult, type Placed,
 } from "../../../shared/layout.ts";
 import type { LayoutFile } from "../store.ts";
@@ -126,8 +126,9 @@ export function geometry(f: CompiledFactory, def: LayoutResult, layout: LayoutFi
       group.sort((a, b) => end === "from" ? a.b.y - b.b.y : a.a.y - b.a.y);
       group.forEach((d, i) => {
         const box = end === "from" ? d.a : d.b;
-        const gap = Math.min(32, (box.h - 64) / Math.max(1, group.length - 1));
-        socketY.set(d, { ...socketY.get(d), [end === "from" ? "fromY" : "toY"]: box.y + box.h / 2 + (i - (group.length - 1) / 2) * gap });
+        // Compact cards: sockets spread up to 14px apart and stay on whole pixels.
+        const gap = Math.max(0, Math.min(14, (box.h - 16) / Math.max(1, group.length - 1)));
+        socketY.set(d, { ...socketY.get(d), [end === "from" ? "fromY" : "toY"]: Math.round(box.y + box.h / 2 + (i - (group.length - 1) / 2) * gap) });
       });
     }
   }
@@ -175,8 +176,8 @@ export function geometry(f: CompiledFactory, def: LayoutResult, layout: LayoutFi
     const item = { edge: e, members: d.members, from: d.from, to: d.to, ...route };
     if (e.kind === "return") { returns.push(item); continue; }
     // Quiet changes visual emphasis only: cross-line edges still have visible endpoints.
-    const branch = f.nodes.find((n) => n.key === e.from)?.layer === 2;
-    const quiet = !branch && (d.from.startsWith("capsule:") || d.to.startsWith("capsule:") || Boolean(f.ui.hints[f.nodes.find((n) => n.key === e.from)?.line ?? ""]?.side?.includes(e.key)));
+    // Hand-offs to folded lines show on hover only, so they never cross the working line.
+    const quiet = (d.from.startsWith("capsule:") || d.to.startsWith("capsule:") || Boolean(f.ui.hints[f.nodes.find((n) => n.key === e.from)?.line ?? ""]?.side?.includes(e.key)));
     edges.push({ ...item, quiet, wrap: d.crossed.length > 0 });
   }
 
@@ -192,6 +193,13 @@ export function geometry(f: CompiledFactory, def: LayoutResult, layout: LayoutFi
   return {
     nodes, place, capsules, capsuleOf, docks, dockOf, edges, returns,
     bounds: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
-    halls, bays: (def.bays ?? []).map((b) => ({ ...b, ...partBounds(b.stations.map((k) => place[visible(k)]).filter(Boolean)) })), shelf: capsules.length ? def.shelf ?? null : null,
+    halls, bays: alignedBays((def.bays ?? []).map((b) => ({ ...b, ...partBounds(b.stations.map((k) => place[visible(k)]).filter(Boolean)) })), capsuleOf), shelf: capsules.length ? def.shelf ?? null : null,
   };
+}
+
+/** Frames of the open lines keep one table grid after drags; folded-line frames stay as they are. */
+function alignedBays(bays: BayBox[], capsuleOf: Record<string, string>): BayBox[] {
+  const open = bays.filter((b) => !b.stations.some((k) => capsuleOf[k]));
+  alignBands(open);
+  return bays;
 }

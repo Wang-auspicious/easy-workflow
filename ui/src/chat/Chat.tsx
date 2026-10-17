@@ -6,14 +6,14 @@
 // 顶部原来那块（批次卡片 / 注意力提示 / 运行记录）已去掉：批次控制在工作区工具条上，
 // 工位的提示与去向已经作为对话行出现在转录里，不再重复一份。
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowUp, Square, PanelRightClose, PanelRightOpen, X, Image as ImageIcon, Box, Package, ScrollText, RotateCw, Info, Loader2, Slash } from "lucide-react";
+import { ArrowUp, Square, PanelRightClose, PanelRightOpen, X, Image as ImageIcon, Box, Package, ScrollText, RotateCw, Info, Loader2, Slash, ChevronLeft } from "lucide-react";
 import type { Attachment } from "../../../shared/types.ts";
 import { detach, getState, setState, useStore } from "../store.ts";
 import { actions } from "../api.ts";
 import { CorrectionPopover } from "../board/Correction.tsx";
 import { Transcript } from "./Transcript.tsx";
 import { Avatar } from "./Avatar.tsx";
-import { RoomRail, useRooms } from "./RoomRail.tsx";
+import { RoomList, useRooms } from "./RoomRail.tsx";
 import { RoomLog } from "./RoomLog.tsx";
 import { GroupAvatar } from "./GroupAvatar.tsx";
 import { ROOT_ROOM } from "../../../shared/rooms.ts";
@@ -46,8 +46,8 @@ const COMMANDS: Command[] = [
 ];
 
 /** Older profiles saved a single-column width; keep both new columns readable. */
-export function chatPanelWidth(width: number, roomsOpen: boolean): number {
-  return Math.max(roomsOpen ? 560 : 320, Math.min(720, Number.isFinite(width) ? width : 320));
+export function chatPanelWidth(width: number, _roomsOpen?: boolean): number {
+  return Math.max(340, Math.min(720, Number.isFinite(width) ? width : 380));
 }
 
 export function Chat() {
@@ -55,6 +55,8 @@ export function Chat() {
   const width = useStore((s) => s.chatWidth);
   const roomsOpen = useStore((s) => s.roomRailOpen);
   const unread = useStore((s) => s.unread);
+  const list = useStore((s) => s.chatList);
+  const isRoot = useStore((s) => s.chatRoom === ROOT_ROOM);
   const [drag, setDrag] = useState(false);
   const composer = useRef<HTMLTextAreaElement>(null);
   const pendingFocus = useRef(false);
@@ -105,11 +107,8 @@ export function Chat() {
       <div style={{ display: open ? "contents" : "none" }}>
         <div className={`chat-resize ${drag ? "is-drag" : ""}`} onPointerDown={startResize} />
         <ChatHead />
-        <div className="chat-rooms">
-          <RoomRail />
-          <ChatPane />
-        </div>
-        <Composer inputRef={composer} />
+        {list ? <RoomList /> : <ChatPane />}
+        {!list && isRoot && <Composer inputRef={composer} />}
       </div>
       <CorrectionPopover />
     </aside>
@@ -148,26 +147,36 @@ function ChatHead() {
   const model = useStore((s) => s.model);
   const connected = useStore((s) => s.connected);
   const dispatcher = useStore((s) => s.dispatcher);
+  const list = useStore((s) => s.chatList);
   const rooms = useRooms();
   const selected = useStore((s) => s.chatRoom);
   const room = rooms.find((r) => r.id === selected) ?? rooms[0]!;
+  const close = <button className="icon-btn" onClick={() => setState({ chatOpen: false })} data-tip="收起  Ctrl \"><PanelRightClose size={16} /></button>;
+  if (list) return (
+    <div className="chat-head chat-head--list">
+      <b className="chat-title">对话</b>
+      <span className="grow" />
+      {close}
+    </div>
+  );
+  const sub = room.kind === "root"
+    ? (replay ? "回放中 · 只读" : !connected ? "正在重连…" : dispatcher.status === "recovering" ? "正在恢复…" : live ? "正在处理" : model || "在线")
+    : room.subtitle;
   return (
-    <div className="chat-head">
-      <div className="chat-avatar-wrap">
-        {room.kind === "root"
-          ? <DispatcherAvatar size={24} />
-          : <GroupAvatar size={26} members={room.members.slice(0, 4).map((m) => ({ key: m.key, hue: 250, state: "idle" as const, title: m.name }))} />}
-        <i className={`chat-online-dot ${connected ? "" : "is-offline"}`} />
-      </div>
-      <div className="who">
-        <b>{room.kind === "root" ? "主调度 · Easy Workflow" : room.name}</b>
-        <span>{room.kind === "root"
-          ? (replay ? "回放中 · 只读" : !connected ? "正在重连工厂…" : dispatcher.status === "recovering" ? "正在恢复当前任务…" : live ? "正在处理 · 可补充要求" : model || "当前工作区 · 网站入库")
-          : room.subtitle}</span>
+    <div className="chat-head chat-head--talk">
+      <button className="chat-round" onClick={() => setState({ chatList: true })} aria-label="所有对话" data-tip="所有对话"><ChevronLeft size={17} /></button>
+      <span className="grow" />
+      <div className="chat-pill" title={sub}>
+        <span className="chat-avatar-wrap">
+          {room.kind === "root"
+            ? <DispatcherAvatar size={22} />
+            : <GroupAvatar size={22} members={room.members.slice(0, 4).map((m) => ({ key: m.key, hue: 250, state: "idle" as const, title: m.name }))} />}
+          <i className={`chat-online-dot ${connected ? "" : "is-offline"}`} />
+        </span>
+        <b>{room.kind === "root" ? "主调度" : room.name}</b>
       </div>
       <span className="grow" />
-      {room.kind !== "root" && <button className="chat-back" onClick={() => setState({ chatRoom: ROOT_ROOM, unread: 0 })} data-tip="回到主调度对话">回总台</button>}
-      <button className="icon-btn" onClick={() => setState({ chatOpen: false })} data-tip="收起到右侧，只留头像  Ctrl \"><PanelRightClose size={16} /></button>
+      {close}
     </div>
   );
 }
@@ -247,19 +256,19 @@ function ChatRecovery() {
   const [busy, setBusy] = useState(false);
   const now = useNow();
   if (replay) return null;
-  if (!connected) return <div className="chat-recovery" role="status"><Loader2 size={14} className="spin-i" /><div><b>正在重新连接工厂</b><p>已有回答保留。连接恢复后同步任务进度。</p></div></div>;
+  // One quiet line, not a card: the conversation is saved either way.
+  if (!connected) return <div className="chat-status" role="status"><Loader2 size={12} className="spin-i" />正在重新连接，已有回答都在</div>;
   if (!["recovering", "interrupted", "failed", "aborted"].includes(state.status)) return null;
   const recovering = state.status === "recovering";
   const seconds = state.nextRetryAt ? Math.max(0, Math.ceil((state.nextRetryAt - now) / 1000)) : 0;
   const resume = async () => { setBusy(true); try { await actions.continueChat(); } catch { /* API displays the reason; retain the checkpoint controls. */ } finally { setBusy(false); } };
-  return <div className="chat-recovery" role="status">
-    {recovering ? <Loader2 size={14} className="spin-i" /> : <Info size={14} />}
-    <div><b>{recovering ? "正在自动恢复" : state.status === "aborted" ? "本次回答已停止" : "当前对话已保留检查点"}</b>
-      <p>{state.message || (recovering ? "从中断处继续处理。" : "已有结果和工具记录保留，可继续当前任务。")}</p>
-      {recovering && <small>{state.maxAttempts > 0 ? `第 ${state.attempt} / ${state.maxAttempts} 次尝试` : "正在重连"}{state.nextRetryAt ? seconds ? ` · ${seconds} 秒后重试` : " · 正在准备继续" : ""}</small>}
-      {!state.busy && state.recoverable && <button className="btn btn--sm" disabled={busy} onClick={() => void resume()}><RotateCw size={12} />{busy ? "正在恢复…" : "继续当前任务"}</button>}
-      {state.error && <details><summary>技术详情</summary><pre>{state.error}</pre></details>}
-    </div>
+  const text = recovering
+    ? `正在自动恢复${seconds ? ` · ${seconds} 秒后重试` : ""}`
+    : state.status === "aborted" ? "这次回答已停止，进度已保存" : "连接中断过，进度已保存";
+  return <div className="chat-status" role="status" data-tip={[state.message, state.error].filter(Boolean).join("\n") || undefined}>
+    {recovering ? <Loader2 size={12} className="spin-i" /> : <Info size={12} />}
+    <span>{text}</span>
+    {!state.busy && state.recoverable && <button className="chat-status-act" disabled={busy} onClick={() => void resume()}><RotateCw size={11} />{busy ? "恢复中" : "继续"}</button>}
   </div>;
 }
 

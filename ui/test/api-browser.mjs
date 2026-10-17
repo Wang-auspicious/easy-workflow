@@ -14,7 +14,7 @@ const factory = compile([{id: 'api-fixture', name: '连接与保存验收', vers
     stations: [station({id: 'step', name: '处理', role: 'process', kind: 'program', resource: 'none'})], edges: []})],
   channels: [], links: [], conditions: {}, resources: {browser: 0, model: 0, http: 0, cpu: 0}, order: [], collapsed: [], hints: {}}]);
 const snapshot = initialState(factory);
-const metadata = {factory, layout: {designVersion: 4}, defaultLayout: layoutFactory(factory.nodes, [], [], {}, []), settings: {}, model: 'fixture', keyPresent: false};
+const metadata = {factory, layout: {designVersion: 6}, defaultLayout: layoutFactory(factory.nodes, [], [], {}, []), settings: {}, model: 'fixture', keyPresent: false};
 const server = await createServer({configFile: path.resolve('ui/vite.config.ts'), logLevel: 'error', server: {host: '127.0.0.1', port: 0, strictPort: false}});
 await server.listen();
 const browser = await chromium.launch({executablePath: process.env.CHROME_PATH ?? 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true});

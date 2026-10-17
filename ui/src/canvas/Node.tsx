@@ -88,28 +88,60 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
     );
   }
 
-  const numPrefix = node.num ? plainNum(node.num) : "";
   const {usesModel, label: execution} = nodeExecutionPresentation(node, actualExecution, agentBinding, replay);
+  const queue = n?.queue.length ?? 0, active = n?.active.length ?? 0;
+  // What a person wants to know at a glance: what is it doing now, and is anything stuck.
+  const working = active ? s.fs.tokens[s.fs.attempts[n!.active[0]]?.token ?? ""]?.item : undefined;
+  const paused = status.light === 'yellow' && /暂停/.test(status.label);
+  const failedLast = Boolean(n && n.lastFailAt > n.lastOkAt);
+  const doing = dormant ? '休眠' : working ? `正在处理 ${working}${active > 1 ? ` 等 ${active} 件` : ''}`
+    : queue ? `${paused ? '已暂停 · ' : ''}排队 ${fmt(queue)} 件` : paused ? '已暂停' : failedLast ? '上一件没有通过' : '空闲';
+  const light = <i className={`light light--${status.light} ${status.pulse ? 'is-pulse' : ''}`} data-tip={`${status.label}${status.detail ? `：${status.detail}` : ''}`} />;
+  const box = { left: place.x, top: place.y, width: place.w, height: place.h, ...vars, borderStyle: node.role === "channel" ? "dashed" : undefined };
+
+  if (shape === "step") {
+    // A program hand-off on the line: one row, the work it holds, nothing else.
+    return (
+      <div {...keyboardProps} className={cls} data-node={node.key} style={box} data-tip={`${node.name} · ${execution} · ${counts.detail}`}
+        onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
+        {stop >= 0 && <span className="node-stop num">{stop + 1}</span>}
+        <StationIcon role={node.role} size={13} />
+        <span className="node-name" title={node.name}>{displayName}</span>
+        <span className="node-count num">{active ? <b>处理中</b> : queue ? `排队 ${queue}` : ''}</span>
+        {light}
+      </div>
+    );
+  }
+
+  if (shape === "store") {
+    return (
+      <div {...keyboardProps} className={cls} data-node={node.key} style={box} data-tip={counts.detail}
+        onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
+        <StationIcon role={node.role} size={13} />
+        <span className="node-store-text">
+          <span className="node-name" title={node.name}>{displayName}</span>
+          <span className="node-stock num">{fmt(n?.stock ?? 0)}{Boolean(n?.plus) && <span className="node-plus">本轮 +{fmt(n?.plus ?? 0)}</span>}</span>
+        </span>
+        {node.id === 'manual' && (n?.stock ?? 0) > 0 && <button className="node-review" onClick={(e) => { e.stopPropagation(); setState({ view: 'review' }); }}>去审核</button>}
+      </div>
+    );
+  }
 
   return (
-    <div {...keyboardProps} className={cls} data-node={node.key} style={{ left: place.x, top: place.y, width: place.w, height: place.h, ...vars, borderStyle: node.role === "channel" ? "dashed" : undefined }}
+    <div {...keyboardProps} className={cls} data-node={node.key} style={box}
       onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
       {stop >= 0 && <span className="node-stop num">{stop + 1}</span>}
       <div className="node-header">
-        <StationIcon role={node.role} size={19} />
+        <StationIcon role={node.role} size={14} />
         <div className="node-heading">
           <span className="node-name" title={node.name}>{displayName}</span>
           <span className={`node-type ${usesModel ? "node-model" : ""}`} title={execution}>{execution}</span>
         </div>
-        {numPrefix && <span className="node-idx num">{numPrefix}</span>}
+        {light}
       </div>
-      {visualEvidence.length ? <Strip items={visualEvidence} /> : <div className="node-metrics num">
-        <div className="node-metric"><span>{shape === "store" ? "当前库存" : "待处理"}</span><b>{fmt(shape === "store" ? n?.stock ?? 0 : n?.queue.length ?? 0)}<small> 件</small></b></div>
-        <div className="node-metric"><span>{shape === "store" ? "本轮流入" : "进行中"}</span><b>{fmt(shape === "store" ? n?.plus ?? 0 : n?.active.length ?? 0)}<small> 件</small></b></div>
-      </div>}
       <div className="node-footer">
-        <span className="node-status" data-tip={counts.resource ? counts.detail : status.detail}><i className={`light light--${status.light} ${status.pulse ? 'is-pulse' : ''}`} />{status.label}</span>
-        <span className={`node-staff num ${!counts.resource && n?.failed ? 'has-failures' : ''}`} data-tip={`${counts.resource ? '' : `${workers} 位工人 · `}${counts.detail}`}>{counts.footer}</span>
+        <span className={`node-doing ${working ? 'is-active' : failedLast && !queue ? 'is-warn' : ''}`} title={doing}>{doing}</span>
+        {visualEvidence.length > 0 && <Strip items={visualEvidence.slice(-2)} />}
       </div>
     </div>
   );

@@ -37,7 +37,8 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
   const state = getState();
   const items = useMemo(
     () => buildTranscript({
-      entries, live, dispatcher, notes: state.fs.activity, factory: state.factory, station: stationLook(state.factory, state.fs, state.layout.bots, now),
+      // 主调度这一格只放你和主调度的对话；工位的播报在各自的群和画布上。
+      entries, live, dispatcher, notes: [], factory: state.factory, station: stationLook(state.factory, state.fs, state.layout.bots, now),
     }),
     [entries, entries.length, live, dispatcher, state.fs.activity, state.factory, state.version, now],
   );

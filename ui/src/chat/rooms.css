@@ -107,3 +107,60 @@
   .room-item-pulse { animation: none; }
   .room-rail { transition: none; }
 }
+
+/* ---------------------------------------------------------------- Grok Bot 式对话（v5）
+   列表与对话是两屏：列表一行一个对象；对话里一个气泡一句话，播报默认折叠。 */
+.chat .chat-head.chat-head--list, .chat .chat-head.chat-head--talk { height: 58px; padding: 0 14px; gap: 8px; border-bottom: 0; }
+.chat-title { font-size: 17px; font-weight: 650; letter-spacing: -0.02em; color: #111318; }
+.chat-round { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; background: #f4f4f5; color: #3a3f47; flex: none; }
+.chat-round:hover { background: #ebebed; }
+.chat-pill { display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 14px 0 8px; border-radius: 18px; background: #f4f4f5; min-width: 0; max-width: 70%; }
+.chat-pill b { font-size: 13.5px; font-weight: 600; color: #15181d; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-pill .chat-avatar-wrap { position: relative; display: grid; place-items: center; flex: none; }
+
+.talk-list { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 6px 16px; display: flex; flex-direction: column; }
+.talk-row { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 10px; border-radius: 14px; text-align: left; }
+.talk-row:hover { background: #f6f6f7; }
+.talk-av { position: relative; flex: none; display: grid; place-items: center; width: 44px; height: 44px; }
+.talk-live { position: absolute; right: 1px; bottom: 2px; width: 10px; height: 10px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 2.5px #fff; }
+.talk-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.talk-top { display: flex; align-items: baseline; gap: 8px; }
+.talk-top b { flex: 1; min-width: 0; font-size: 14.5px; font-weight: 600; color: #15181d; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.talk-top time { flex: none; font-size: 11px; color: #a7abb2; }
+.talk-sub { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.talk-sub > span { flex: 1; min-width: 0; font-size: 12.5px; color: #8b9098; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.talk-sub > span.is-warn { color: #b7791f; }
+.talk-unread { flex: none; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: #15181d; color: #fff; font-size: 10px; font-style: normal; line-height: 18px; text-align: center; font-weight: 600; }
+.talk-more { margin: 8px 10px 0; padding: 9px 0; font-size: 12px; color: #a0a5ad; text-align: left; border-top: 1px solid #f1f1f3; }
+.talk-more:hover { color: #5d636c; }
+
+.chat-status { display: flex; align-items: center; gap: 7px; margin: 10px 2px 0; padding: 0; font-size: 11.5px; color: #8b9098; }
+.chat-status span { flex: 1; }
+.chat-status-act { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 10px; border-radius: 12px; background: #15181d; color: #fff; font-size: 11px; }
+.chat-status-act:disabled { opacity: 0.5; }
+
+.room-intro { margin: 14px 4px 10px; font-size: 11.5px; line-height: 1.6; color: #9aa0a8; text-align: center; }
+.room-intro span { color: #b6bac0; font-size: 10.5px; }
+.room-notes { display: block; margin: 0 auto 6px; padding: 3px 10px; border-radius: 10px; background: #f4f4f5; color: #8b9098; font-size: 10.5px; }
+.room-notes:hover { color: #3a3f47; }
+.room-foot { justify-content: center; border-top: 0; padding: 10px 14px 14px; }
+.room-ask { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 16px; border-radius: 17px; background: #15181d; color: #fff; font-size: 12px; font-weight: 500; }
+.room-ask:hover { background: #2a2e35; }
+
+.talk { display: flex; flex-direction: column; gap: 3px; padding-bottom: 12px; }
+.bub-row { display: flex; gap: 9px; align-items: flex-start; }
+.bub-row.is-first { margin-top: 12px; }
+.bub-av { width: 30px; flex: none; }
+.bub-main { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.bub-head { display: flex; align-items: baseline; gap: 7px; padding-left: 2px; }
+.bub-who { font-size: 12.5px; font-weight: 600; color: #15181d; background: none; border: 0; padding: 0; cursor: pointer; }
+button.bub-who:hover { text-decoration: underline; text-underline-offset: 3px; }
+.bub-to { font-size: 11px; color: #9aa0a8; }
+.bub-head time { font-size: 10.5px; color: #b6bac0; }
+.bub { max-width: 100%; padding: 8px 12px; border-radius: 16px; border-top-left-radius: 6px; background: #f4f4f5; color: #1f2328; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.bub.is-warn { background: #fdf6ec; }
+.bub--note { background: transparent; color: #8b9098; padding: 2px 4px; font-size: 12px; }
+.bub-verb { display: inline-block; margin-right: 6px; font-size: 10.5px; font-weight: 600; color: #6b7280; }
+.bub.is-warn .bub-verb { color: #b7791f; }
+.bub--channel .bub-verb { color: #2f8f6f; }
+.bub-item { display: inline-block; margin-left: 6px; font-size: 10.5px; color: #9aa0a8; font-family: var(--mono); }

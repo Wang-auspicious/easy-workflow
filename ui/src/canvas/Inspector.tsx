@@ -23,7 +23,7 @@ import { toggleInspector } from "./Canvas.tsx";
 import { useNow } from "../util/useNow.ts";
 import { toast } from "../shell/Toasts.tsx";
 import { inspectPart, partTone } from "../../../shared/parts.ts";
-import { recordedUsage, stationStatus, tokenStatus } from './status.ts';
+import { nodeExecutionPresentation, recordedUsage, stationStatus, tokenStatus } from './status.ts';
 import { CrewStrip, CrewTimeline, WorkerTrace } from "./CrewTrace.tsx";
 import {useDetail, type TokenDetail} from '../details.ts';
 import {failureLabels} from '../../../shared/failures.ts';
@@ -168,76 +168,110 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
     }
     if (action === 'lock' || action === 'unlock') toast(action === 'unlock' ? '已解锁人数：恢复自动伸缩' : '已锁定人数：不再自动伸缩');
   });
+  const execution = nodeExecutionPresentation(node, s.nodeExecutions[node.key], s.agentBindings[node.key], replay).label;
   return (
-    <>
+    <div className="sheet">
       <Head onDrag={onDrag} onClose={onClose} onPin={onPin} pinned={insp.pinned}>
-        <StationIcon role={node.role} size={21} />
+        <StationIcon role={node.role} size={18} />
         <div className="insp-title">
-          <b>{node.num} {node.name}</b>
-          <span className="muted">{({ agent: "agent 工位", program: "程序工位", review: "审查员", gate: "闸门", source: "来源", store: "库" } as Record<string, string>)[node.kind]} · {node.resource === "none" ? "无资源" : node.resource}</span>
+          <b>{node.name}</b>
+          <span className="muted">{execution}</span>
         </div>
       </Head>
-      <div className="insp-stats num">
-        <Stat k="在岗" v={`${onDuty}${workers.length > onDuty ? ` / ${workers.length}` : ""}`} />
-        <Stat k="队列" v={`${n?.queue.length ?? 0}`} />
-        <Stat k="中位" v={durations.length ? secs(median(durations)) : "—"} />
-        <Stat k="P90" v={durations.length ? secs(quantile(durations, 0.9)) : "—"} />
-        <Stat k="节拍" v={durations.length && onDuty ? secs(median(durations) / onDuty) : "—"} />
-        <Stat k="已报 token" v={usage.total === null ? '—' : fmt(usage.total)} />
-      </div>
-      <div className="scope-notice" data-station-status={currentStatus.label}><i className={`light light--${currentStatus.light}`} /> {currentStatus.label} · {currentStatus.detail}</div>
-      {replay ? <div className="scope-notice">回放为只读；退出回放后可调整工位。</div>
-        : !connected ? <div className="scope-notice">连接已断开，恢复连接后可调整工位。</div> : null}
-      {runPaused && <div className="scope-notice">本轮已暂停；恢复此工位不会恢复整轮，请使用本轮的继续入口。</div>}
-      {linePaused && <div className="scope-notice">所属流水线已暂停。恢复流水线后，单独暂停的工位仍保持暂停。
-        <button className="btn btn--sm" disabled={controlsDisabled} onClick={() => void togglePause('line')}>恢复所属流水线</button>
-      </div>}
-      {controlError && <div className="scope-notice" role="alert">{controlError}</div>}
-      <div className="insp-actions">
-        {node.kind !== "store" && node.kind !== "source" && <>
-          <button className="btn btn--sm" disabled={controlsDisabled} onClick={() => void togglePause()}>{scopeBusy ? <Loader2 size={12} className="spin-i" /> : stationPaused ? <Play size={12} /> : <Pause size={12} />}{stationPaused ? '恢复此工位' : '暂停此工位'}</button>
-          <button className="btn btn--sm" disabled={controlsDisabled || onDuty >= node.workers.max} onClick={() => void changeWorkers('fork')} data-tip={`上限 ${node.workers.max}`}><GitFork size={13} />加一个人</button>
-          <button className="btn btn--sm" disabled={controlsDisabled || onDuty <= node.workers.min || !workers.some(worker => !worker.retiredAt && !worker.busy)} onClick={() => void changeWorkers('retire')}><UserMinus size={13} />撤一个</button>
-          <button className="btn btn--sm btn--ghost" disabled={controlsDisabled} onClick={() => void changeWorkers(locked ? 'unlock' : 'lock')}>{locked ? <Unlock size={13} /> : <Lock size={13} />}{locked ? "解锁人数" : "锁定人数"}</button>
-        </>}
+      <div className="sheet-bar">
+        <span className="sheet-state"><i className={`light light--${currentStatus.light}`} />{currentStatus.label}</span>
         <span className="grow" />
-        <button className="btn btn--sm btn--ghost" onClick={() => attach({ type: "node", id: node.key, label: node.name })} data-tip="把这个工位加到对话附件"><MessageSquarePlus size={13} />问主调度</button>
-      </div>
-      <div className="insp-tabs">
-        <button className={tab === "work" ? "is-on" : ""} onClick={() => setTab("work")}>工作过程</button>
-        <button className={tab === "metrics" ? "is-on" : ""} onClick={() => setTab("metrics")}>统计</button>
-        <button className={tab === "spec" ? "is-on" : ""} onClick={() => setTab("spec")}>规格</button>
-      </div>
-      {tab === "spec" ? <SpecView node={node} /> : tab === "metrics" ? <NodeMetrics attempts={attempts.filter(a=>a.startedAt>=s.fs.run.startedAt)} onSelect={id=>{setAttemptSel(id);setTab("work");}}/> : (
-        <div className="insp-body">
-          {workers.length > 0 && (
-            <CrewStrip node={node} workers={workers} attempts={attempts} current={worker?.id}
-              onPick={(id) => { setAttemptSel(null); onWorker(id); }} />
-          )}
-          {current ? <WorkerTrace a={current} node={node} now={now} /> : (
-            node.kind === "store" ? <div className="insp-empty">库存 {fmt(n?.stock ?? 0)}。这是一个存储库，不运行执行器。</div> :
-            node.dormant ? <div className="insp-empty">休眠：不占任何资源，不发任何请求。需要时让主调度激活。</div> : (
-              <div className="insp-empty">{lineWired ? "尚无处理记录。任务经过这个工位后，会在这里显示真实步骤与证据。" : "这条线尚未接入执行器，暂时不会处理任务。"}</div>
-            )
-          )}
-          <CrewTimeline notes={s.fs.activity.filter((m) => m.node === insp.key)} workers={workers} now={now} />
-          {recent.length > 0 && (
-            <div className="recent">
-              <div className="sec-title">最近处理</div>
-              {recent.map((a) => (
-                <button key={a.id} className={`recent-row ${current?.id === a.id ? "is-on" : ""}`} onClick={() => setAttemptSel(a.id)}>
-                  {a.endedAt === undefined ? <Loader2 size={12} className="spin-i" /> : a.cancelled ? <CircleMinus size={12} className="muted" /> : a.ok ? <Check size={12} className="ok-c" /> : <AlertTriangle size={12} className="bad-c" />}
-                  <span className="r-item">{s.fs.tokens[a.token]?.item}</span>
-                  <span className="r-sum muted">{a.summary ?? a.input}</span>
-                  <span className="num muted">{a.ms !== undefined ? secs(a.ms) : secs(now - a.startedAt)}</span>
-                </button>
-              ))}
-            </div>
-          )}
+        {node.kind !== "store" && node.kind !== "source" && <button className="insp-icon" disabled={controlsDisabled} onClick={() => void togglePause()} data-tip={stationPaused ? '恢复此工位' : '暂停此工位'}>{scopeBusy ? <Loader2 size={14} className="spin-i" /> : stationPaused ? <Play size={14} /> : <Pause size={14} />}</button>}
+        <button className="insp-icon" onClick={() => attach({ type: "node", id: node.key, label: node.name })} data-tip="把它带进对话问主调度"><MessageSquarePlus size={14} /></button>
+        <div className="insp-seg" role="tablist">
+          <button role="tab" aria-selected={tab !== "spec"} className={tab !== "spec" ? "is-on" : ""} onClick={() => setTab("work")}>动态</button>
+          <button role="tab" aria-selected={tab === "spec"} className={tab === "spec" ? "is-on" : ""} onClick={() => setTab("spec")}>说明</button>
         </div>
-      )}
-    </>
+      </div>
+      {linePaused && <p className="insp-note">所属流水线已暂停。<button className="insp-text-btn" disabled={controlsDisabled} onClick={() => void togglePause('line')}>恢复流水线</button></p>}
+      {controlError && <p className="insp-note is-bad" role="alert">{controlError}</p>}
+      {tab === "spec" ? <About node={node} /> : <Feed node={node} attempts={attempts} now={now} dormant={Boolean(node.dormant) || !lineWired} />}
+    </div>
   );
+}
+
+/** The station speaks: one bubble per item it handled, newest at the bottom, like a chat. */
+function Feed({ node, attempts, now, dormant }: { node: CompiledNode; attempts: AttemptState[]; now: number; dormant: boolean }) {
+  const s = getState();
+  const scroll = useRef<HTMLDivElement>(null);
+  const shown = attempts.filter((a) => !a.cancelled).slice(-40);
+  useLayoutEffect(() => { const el = scroll.current; if (el) el.scrollTop = el.scrollHeight; }, [shown.length, node.key]);
+  if (node.kind === "store") return <div className="feed feed--empty">这里存着 {fmt(s.fs.nodes[node.key]?.stock ?? 0)} 件。{node.id === 'manual' ? <button className="insp-text-btn" onClick={() => setState({ view: 'review' })}>去逐件审核</button> : null}</div>;
+  if (!shown.length) return <div className="feed feed--empty">{dormant ? "休眠中，不占资源。需要时让主调度激活。" : "还没处理过东西。有活过来时，它会在这里说它做了什么。"}</div>;
+  const time = (t: number) => new Date(t).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  const plain = (text?: string) => (text ?? "").replace(/^\[[^\]]{1,24}\]\s*/, "").replace(/\s*·?\s*Token 未回报.*$/, "").slice(0, 160);
+  return (
+    <div className="feed" ref={scroll}>
+      {shown.map((a) => {
+        const item = s.fs.tokens[a.token]?.item ?? a.token;
+        const running = a.endedAt === undefined;
+        const step = running ? plain(a.steps.at(-1)?.text) : "";
+        const tone = running ? "is-run" : a.ok ? "" : "is-warn";
+        return (
+          <button key={a.id} className={`feed-msg ${tone}`} onClick={() => toggleInspector(a.token, "token")} data-tip="打开这件货">
+            <span className="feed-meta"><b>{item}</b><time className="num">{running ? `${secs(now - a.startedAt)}` : time(a.endedAt!)}</time></span>
+            <span className="feed-text">
+              {running ? <><Loader2 size={11} className="spin-i" /> 正在处理{step ? `：${step}` : "…"}</>
+                : a.ok ? plain(a.summary) || "完成" : `没通过：${plain(a.summary ?? a.error) || "原因未记录"}`}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** What the station is for: its own role file, typeset for reading; model choice for agents. */
+function About({ node }: { node: CompiledNode }) {
+  const [role, setRole] = useState<string | null>(null);
+  useEffect(() => { let alive = true; setRole(null); void api.post<{ result: { content: string } }>("/api/tools/read_role", { station: node.key }).then((r) => { if (alive) setRole(r.result.content); }).catch(() => { if (alive) setRole(""); }); return () => { alive = false; }; }, [node.key]);
+  // Drop front matter, the title (already in the header) and the meta quote line.
+  const body = (role ?? "").replace(/^---[\s\S]*?---\s*/, "").split("\n").filter((line, i) => !(i < 3 && /^#\s/.test(line)) && !/^>\s/.test(line.trim())).join("\n").trim();
+  const factory = getState().factory;
+  const nameOf = (key: string) => factory?.nodes.find((n) => n.key === key || n.id === key)?.name ?? key;
+  return (
+    <div className="about">
+      {node.returnTo?.length ? <p className="about-flow">做得不合格时：{node.returnTo.map((r) => `退回给${nameOf(r.station)}，最多 ${r.maxRounds} 轮`).join("；")}；仍不合格就交给你审核。</p> : null}
+      {node.kind !== "store" && node.kind !== "source" && node.kind !== "program" && node.kind !== "gate" && <section><h4>用哪个模型</h4><AgentBindingSettings key={node.key} node={node} /></section>}
+      {role === null ? <p className="about-wait">正在读取说明…</p> : body ? <Markdown text={body} /> : <p className="about-wait">这个工位还没有写说明。</p>}
+    </div>
+  );
+}
+
+/** Headings, lists, tables and paragraphs — enough to read a ROLE.md comfortably. */
+function Markdown({ text }: { text: string }) {
+  const blocks: React.ReactNode[] = [];
+  let list: string[] = [], ordered = false, table: string[][] = [];
+  const inline = (t: string) => t.replace(/\*\*/g, "").replace(/`/g, "");
+  const flush = () => {
+    if (list.length) { const items = list.map((l, i) => <li key={i}>{l}</li>); blocks.push(ordered ? <ol key={blocks.length}>{items}</ol> : <ul key={blocks.length}>{items}</ul>); list = []; }
+    if (table.length) { const [head, ...rows] = table; blocks.push(<table key={blocks.length}><thead><tr>{head.map((c, i) => <th key={i}>{c}</th>)}</tr></thead><tbody>{rows.map((r, i) => <tr key={i}>{r.map((c, j) => <td key={j}>{c}</td>)}</tr>)}</tbody></table>); table = []; }
+  };
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line) { flush(); continue; }
+    if (line.startsWith("|")) {
+      if (/^\|[\s:|-]+\|?$/.test(line)) continue;
+      if (list.length) flush();
+      table.push(line.replace(/^\||\|$/g, "").split("|").map((c) => inline(c.trim())));
+      continue;
+    }
+    const bullet = /^[-*]\s+/.test(line), numbered = /^\d+[.)]\s+/.test(line);
+    if (bullet || numbered) {
+      if (table.length || (list.length && ordered !== numbered)) flush();
+      ordered = numbered; list.push(inline(line.replace(/^([-*]|\d+[.)])\s+/, ""))); continue;
+    }
+    flush();
+    if (/^#+\s/.test(line)) blocks.push(<h5 key={blocks.length}>{line.replace(/^#+\s*/, "")}</h5>);
+    else blocks.push(<p key={blocks.length}>{inline(line)}</p>);
+  }
+  flush();
+  return <div className="md">{blocks}</div>;
 }
 
 const Stat = ({ k, v }: { k: string; v: string }) => <div className="stat"><span>{k}</span><b>{v}</b></div>;

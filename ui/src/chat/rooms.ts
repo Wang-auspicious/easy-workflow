@@ -160,14 +160,15 @@ export function roomSummaries(rooms: readonly RoomSpec[], ctx: RoomContext, seen
   return rooms.map((room) => {
     const speakers = memberActors(room, ctx).filter((actor) => actor.kind !== "user");
     const running = speakers.filter((actor) => actor.state === "work" || actor.state === "wait").length;
-    const lines = buildRoomLines(room, rooms, ctx);
+    // A station's own progress notes are not conversation: they neither preview nor count as unread.
+    const lines = buildRoomLines(room, rooms, ctx).filter((line) => line.kind !== "note");
     const last = lines[lines.length - 1];
     const since = seen[room.id] ?? 0;
     const unread = room.kind === "root" ? 0 : lines.filter((line) => line.at > since).length;
     return {
       room, speakers, running, unread, count: lines.length,
       state: room.kind === "root" ? "idle" : mergeState(speakers.map((actor) => actor.state)),
-      preview: last ? `${last.actor.name}：${last.text}` : (room.kind === "root" ? "" : "还没有往来"),
+      preview: last ? `${last.actor.name}：${last.text.replace(/^\[[^\]]{1,24}\]\s*/, "")}` : (room.kind === "root" ? "" : "还没有往来"),
       previewAt: last?.at ?? 0,
       tone: last?.tone,
     };

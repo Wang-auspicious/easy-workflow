@@ -33,6 +33,7 @@ export function EvidenceBoard() {
   const [f, setF] = useState({ run: "current", kind: "", status: "", station: "", review: "", corrected: false, suspicious: false, source: "" });
   const [cursor, setCursor] = useState<{ r: number; c: number }>({ r: 0, c: 0 });
   const [light, setLight] = useState<EvidenceRef | null>(null);
+  const [openNotes, setOpenNotes] = useState<Set<string>>(() => new Set());
   const [box, setBox] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   const anchor = useRef<string | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
@@ -226,7 +227,18 @@ export function EvidenceBoard() {
                 {row.t.corrections > 0 && <span className="chip warn-chip">纠错 {row.t.corrections}</span>}
                 <button className="bd-go" onClick={(e) => { e.stopPropagation(); goCanvas(row.t); }} data-tip="在画布上看这件货的证据链  Enter"><ArrowRight size={14} /></button>
               </div>
-              {row.notes.length > 0 && <div className="bd-notes">{row.notes.map((e) => <Note key={e.id} e={e} sel={selected.has(e.id)} onClick={(ev) => click(ev, e.id)} onZoom={() => setLight(e)} />)}</div>}
+              {row.notes.length > 0 && (() => {
+                // Problems first and in full; routine station records fold into one line.
+                const flagged = row.notes.filter((e) => e.tone === "warn" || e.tone === "bad");
+                const expanded = openNotes.has(row.t.id);
+                const shown = expanded ? row.notes : flagged.slice(0, 2);
+                const rest = row.notes.length - shown.length;
+                return <div className="bd-notes">
+                  {shown.map((e) => <Note key={e.id} e={e} sel={selected.has(e.id)} onClick={(ev) => click(ev, e.id)} onZoom={() => setLight(e)} />)}
+                  {(rest > 0 || expanded) && <button className="bd-notes-more" onClick={(ev) => { ev.stopPropagation(); setOpenNotes((prev) => { const next = new Set(prev); if (next.has(row.t.id)) next.delete(row.t.id); else next.add(row.t.id); return next; }); }}>
+                    {expanded ? "收起工位记录" : `${shown.length ? "其余 " : ""}${rest} 条工位记录`}</button>}
+                </div>;
+              })()}
             </div>
           </div>
         )) : (

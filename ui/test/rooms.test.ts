@@ -33,7 +33,7 @@ test("群组从流程图上推出来：每一段工序、声明的返工环、�
   // 策展线的四段工序都有群，而不是只有会说话最多的那一段。
   const parts = rooms.filter((room) => room.kind === "part");
   assert.deepEqual(parts.filter((room) => room.line === "curation").map((room) => room.name),
-    ["读懂与判定", "资源采集", "核验与著录", "终审与发布"]);
+    ["读懂与判定", "取证与风格", "核验与发布"]);
   // 一条线全是程序工位时不产生群：候选层和来源层都不该出现。
   assert.equal(parts.filter((room) => room.line === "candidates" || room.line === "sources").length, 0);
 
@@ -58,12 +58,12 @@ test("群组从流程图上推出来：每一段工序、声明的返工环、�
 
 test("运行期真的发生的咨询会补出图上没有的群，图上已有的不重复补", () => {
   const base = deriveRooms(factory);
-  // 风格判定员（核验与著录）与组件特写摄影（资源采集）跨了工序，静态图上没有共同群。
-  const observed = deriveRooms(factory, [{ reviewer: "curation/style", owner: "curation/proof" }]);
+  // 终审员（核验与发布）与编目员（读懂与判定）跨了工序，静态图上没有共同群。
+  const observed = deriveRooms(factory, [{ reviewer: "curation/audit", owner: "curation/catalog" }]);
   assert.equal(observed.length, base.length + 1);
-  const room = observed.find((entry) => entry.id === "loop:curation/style");
+  const room = observed.find((entry) => entry.id === "loop:curation/audit");
   assert.ok(room?.observed, "观测补出来的群要标出来");
-  assert.deepEqual(room.members.map((member) => member.key), ["curation/style", "curation/proof"]);
+  assert.deepEqual(room.members.map((member) => member.key), ["curation/audit", "curation/catalog"]);
 
   // 同一段工序里的往来已经被工序群装下了，不再补一个重复的群。
   const inside = deriveRooms(factory, [{ reviewer: "curation/fact-review", owner: "curation/facts" }]);
@@ -108,24 +108,24 @@ test("真实事件落成往来：判定、退回、咨询、纠错、交付各�
 test("一条往来只落在一个群里，跨段交付落在跨段群并标出两端", () => {
   const state = build([
     { kind: "review.verdict", token: "t1", node: "curation/fact-review", verdict: "return", returnTo: "curation/facts", reason: "许可没有引用来源", ...at(1, 100) },
-    { kind: "consult.opened", consult: "k-1", token: "t1", reviewer: "curation/style", owner: "curation/proof", fields: ["shots.proof"], problem: "主体不可见", round: 1, ...at(2, 200) },
+    { kind: "consult.opened", consult: "k-1", token: "t1", reviewer: "curation/audit", owner: "curation/catalog", fields: ["facets"], problem: "主类与编目不符", round: 1, ...at(2, 200) },
     { kind: "channel.emitted", channel: "curation.component-source.confirmed", token: "t1", item: "d3-color", ...at(3, 300) },
   ]);
-  const rooms = deriveRooms(factory, [{ reviewer: "curation/style", owner: "curation/proof" }]);
+  const rooms = deriveRooms(factory, [{ reviewer: "curation/audit", owner: "curation/catalog" }]);
   const ctx = context(state);
   const lines = rooms.filter((room) => room.kind !== "root").flatMap((room) => buildRoomLines(room, rooms, ctx));
   assert.equal(new Set(lines.map((line) => line.id)).size, lines.length, "同一条往来不能在多个群里重复");
 
   // 同类工序内部的退回留在这一段工序里，不让它掉进别的群。
-  const within = rooms.find((room) => room.name === "核验与著录")!;
+  const within = rooms.find((room) => room.name === "核验与发布")!;
   assert.deepEqual(buildRoomLines(within, rooms, ctx).map((line) => line.text), ["退回：许可没有引用来源"]);
 
   // 跨工序的咨询落进它们自己那个群，而不是随便进一方的工序群。
-  const crossing = rooms.find((room) => room.id === "loop:curation/style")!;
+  const crossing = rooms.find((room) => room.id === "loop:curation/audit")!;
   const crossingLines = buildRoomLines(crossing, rooms, ctx);
   assert.equal(crossingLines.length, 1);
-  assert.equal(crossingLines[0]!.actor.key, "curation/style");
-  assert.equal(crossingLines[0]!.to?.key, "curation/proof");
+  assert.equal(crossingLines[0]!.actor.key, "curation/audit");
+  assert.equal(crossingLines[0]!.to?.key, "curation/catalog");
 
   // 交付只有信道 id：两端由这个群自己的人给出，不编一个不存在的说话人。
   const bridge = rooms.find((room) => room.kind === "bridge" && room.signal.includes("curation.component-source.confirmed"))!;

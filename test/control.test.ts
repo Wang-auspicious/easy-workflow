@@ -220,10 +220,10 @@ test("headless service: real HTTP capability discovery, control, validation, act
       assert.ok(bootstrap.body.instructions.length < 1500);
       assert.ok(!JSON.stringify(bootstrap.body).includes(secret));
       assert.ok(bootstrap.body.tools.every((x: any) => !x.inputSchema));
-      const part = bootstrap.body.parts.find((p: any) => p.name === "资源采集");
+      const part = bootstrap.body.parts.find((p: any) => p.name === "取证与风格");
       assert.ok(part);
       const detail = await tool("inspect", { part: part.id });
-      assert.equal(detail.body.result.totals.stations, 7);
+      assert.equal(detail.body.result.totals.stations, 8);
       assert.equal(detail.body.result.totals.inFlight, 0);
       assert.deepEqual(detail.body.result.recent, []);
       assert.equal((await request("/api/agent/tools/feed_urls")).body.inputSchema.type, "object");

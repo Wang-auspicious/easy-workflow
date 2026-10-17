@@ -1,7 +1,7 @@
 // 右侧栏现在分成"群组栏 + 当前群组"：左边一列是流程上真实需要对话的地方，
 // 点谁就展开谁的往来。群组不是写死的：deriveRooms 把编译好的图走一遍，
 // 找返工环、判断会合点、同一段工序和跨段移交（shared/rooms.ts）。
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useStore, setState } from "../store.ts";
 import { ChevronsLeft, ChevronsRight, Radio } from "lucide-react";
 import { ROOT_ROOM, deriveRooms, type RoomSpec } from "../../../shared/rooms.ts";
@@ -136,4 +136,82 @@ export function RoomRail() {
       {open && total > 0 && <div className="room-rail-foot"><Radio size={11} />{total} 条新往来</div>}
     </nav>
   );
+}
+
+const clock = (t: number, now: number) => {
+  if (!t) return "";
+  const d = new Date(t), today = new Date(now);
+  return d.toDateString() === today.toDateString()
+    ? d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+    : `${d.getMonth() + 1}/${d.getDate()}`;
+};
+
+/**
+ * Grok Bot 式的对话列表：一行一个对象，头像、名字、时间、最后一句。主调度永远在最上面，
+ * 其余按最近一次往来排序；还没说过话的群收进末尾，一行带过。
+ */
+export function RoomList() {
+  const rooms = useRooms();
+  const seen = useStore((s) => s.roomSeen);
+  const factory = useStore((s) => s.factory);
+  const fs = useStore((s) => s.fs);
+  const bots = useStore((s) => s.layout.bots);
+  const rootUnread = useStore((s) => s.unread);
+  const now = useNow(5000);
+  const dispatcher = useDispatcherActor();
+  const [showQuiet, setShowQuiet] = useState(false);
+  const ctx: RoomContext = useMemo(() => ({ factory, state: fs, look: stationLook(factory, fs, bots, now), now }), [factory, fs, bots, now]);
+  const summaries = useMemo(() => roomSummaries(rooms, ctx, seen).filter((s) => s.room.kind !== "root"), [rooms, ctx, seen]);
+  const talking = summaries.filter((s) => s.count > 0).sort((a, b) => b.previewAt - a.previewAt);
+  const quiet = summaries.filter((s) => s.count === 0);
+  const lastRoot = [...fs.conversation].reverse().find((e) => e.message.role === "assistant" || e.message.role === "user");
+  const rootPreview = lastRoot ? textOf(lastRoot.message) : "布置任务、问进度、让它调度所有工位";
+  const lineName = (id: string | null) => factory?.lines.find((l) => l.id === id)?.name ?? id ?? "";
+  const open = (id: string) => setState((s) => ({
+    chatRoom: id, chatList: false, roomSeen: { ...s.roomSeen, [id]: Date.now() }, ...(id === ROOT_ROOM ? { unread: 0 } : {}),
+  }));
+  const row = (summary: RoomSummary) => {
+    const { room } = summary;
+    const stack = summary.speakers.length ? summary.speakers.map(stackOf)
+      : room.members.slice(0, 4).map((m) => ({ key: m.key, hue: 250, state: "sleep" as AvatarState }));
+    const last = summary.preview.replace(/^[^：]{1,12}：/, "");
+    return (
+      <button key={room.id} className="talk-row" onClick={() => open(room.id)}>
+        <span className="talk-av"><GroupAvatar size={40} members={stack} />{summary.running > 0 && <i className="talk-live" aria-label="有工位在跑" />}</span>
+        <span className="talk-main">
+          <span className="talk-top"><b>{roomTitle(room, lineName)}</b><time className="num">{clock(summary.previewAt, now)}</time></span>
+          <span className="talk-sub">
+            <span className={summary.tone === "warn" ? "is-warn" : ""}>{summary.count ? last : room.subtitle}</span>
+            {summary.unread > 0 && <i className="talk-unread num">{summary.unread > 99 ? "99+" : summary.unread}</i>}
+          </span>
+        </span>
+      </button>
+    );
+  };
+  return (
+    <div className="talk-list" role="list">
+      <button className="talk-row" onClick={() => open(ROOT_ROOM)}>
+        <span className="talk-av"><Avatar shape={dispatcher.shape} hue={dispatcher.hue} state={dispatcher.state} size={40} title="主调度" /></span>
+        <span className="talk-main">
+          <span className="talk-top"><b>主调度</b><time className="num">{lastRoot ? clock(lastRoot.message.timestamp ?? 0, now) : ""}</time></span>
+          <span className="talk-sub"><span>{rootPreview}</span>{rootUnread > 0 && <i className="talk-unread num">{rootUnread}</i>}</span>
+        </span>
+      </button>
+      {talking.map(row)}
+      {quiet.length > 0 && <>
+        <button className="talk-more" onClick={() => setShowQuiet(!showQuiet)}>{showQuiet ? "收起" : `还有 ${quiet.length} 个群暂时没有往来`}</button>
+        {showQuiet && quiet.map(row)}
+      </>}
+    </div>
+  );
+}
+
+function textOf(message: { content?: unknown }): string {
+  const c = message.content;
+  if (typeof c === "string") return c.replace(/\s+/g, " ").slice(0, 80);
+  if (Array.isArray(c)) {
+    const t = c.map((p) => (p && typeof p === "object" && "text" in p ? String((p as { text: unknown }).text) : "")).join(" ");
+    return t.replace(/\s+/g, " ").slice(0, 80);
+  }
+  return "";
 }

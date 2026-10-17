@@ -84,12 +84,12 @@ export async function boot() {
     fs.recoveries ??= {};
     fs.conversation ??= fs.chat.filter(m=>m.role!=="note").map(m=>({id:m.id,turn:m.id.replace(/-r$/,""),message:m.role==="user"?{role:"user" as const,content:m.text,timestamp:m.at}:legacyReply(m.text,m.at),attachments:m.attachments}));
     const layout = { pos: {}, open: {}, colors: {}, bots: {}, capsules: {}, ...f.layout };
-    if (layout.designVersion !== 4) {
+    if (layout.designVersion !== 6) {
       // Preserve previous coordinates before adopting the requested compact layout.
       // The old file is untouched until the next explicit layout edit; after that
       // its coordinates remain available in previousLayout, not silently discarded.
       layout.previousLayout = { pos: layout.pos, capsules: layout.capsules, open: layout.open, designVersion: layout.designVersion };
-      layout.pos = {}; layout.capsules = {}; layout.open = {}; layout.designVersion = 4;
+      layout.pos = {}; layout.capsules = {}; layout.open = {}; layout.designVersion = 6;
     }
     setState({
       factory: f.factory, defaultLayout: f.defaultLayout,

@@ -6,7 +6,7 @@ const tones: Record<string, string> = { 来源接入: "#638ebd", 候选与分流
 export const partTone = (name: string) => tones[name] ?? "#7e8cae";
 export function partBounds(places: Placed[]): Placed {
   if (!places.length) return { x: 0, y: 0, w: 1, h: 1 };
-  const x = Math.min(...places.map((p) => p.x)) - 22, y = Math.min(...places.map((p) => p.y)) - 52;
+  const x = Math.min(...places.map((p) => p.x)) - 22, y = Math.min(...places.map((p) => p.y)) - 42;
   return { x, y, w: Math.max(...places.map((p) => p.x + p.w)) - x + 22, h: Math.max(...places.map((p) => p.y + p.h)) - y + 22 };
 }
 

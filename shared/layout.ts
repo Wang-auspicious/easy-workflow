@@ -30,8 +30,8 @@ export const GEO = {
   hallPadBottom: 20,
   hallGap: 30,
   maxCols: 99,
-  capsuleW: 236,
-  capsuleH: 76,
+  capsuleW: 196,
+  capsuleH: 60,
   capsuleGap: 28,
   shelfHead: 0,
   shelfPad: 12,
@@ -41,9 +41,9 @@ export const GEO = {
   statusGap: 5,
   statusH: 26,
   /** Source chips inside the source dock. */
-  chipW: 170,
-  chipH: 38,
-  chipGap: 8,
+  chipW: 134,
+  chipH: 32,
+  chipGap: 6,
   dockPad: 10,
   dockHead: 30,
   /** Distance between ports that share one side of a card. */
@@ -68,14 +68,23 @@ export function shapeOf(n: Pick<CompiledNode, "kind" | "role" | "resource">): No
 export function sizeOf(n: Pick<CompiledNode, "kind" | "role" | "resource"> & { name?: string }): { w: number; h: number } {
   switch (shapeOf(n)) {
     case "source": return { w: GEO.chipW, h: GEO.chipH };
-    case "store": return { w: 280, h: 228 };
-    case "step": return { w: 280, h: 228 };
-    default: return { w: 280, h: 228 };
+    case "store": return { w: 170, h: 60 };
+    case "step": return { w: 132, h: 46 };
+    default: return { w: CARD.w, h: CARD.h };
   }
 }
 
+/** The compact station card: a whole production line must fit one screen. */
+export const CARD = { w: 176, h: 82 };
+
 export interface PhaseHint { name: string; stations: string[] }
-export interface LineHint { mode: "stack" | "layered"; wrap?: number; side?: string[]; phases?: PhaseHint[]; grid?: Record<string, [number, number]>; focus?: string[] }
+export interface LineHint {
+  mode: "stack" | "layered"; wrap?: number; side?: string[]; phases?: PhaseHint[];
+  grid?: Record<string, [number, number]>;
+  /** Width and height of one grid cell; fractional cells place narrow steps. */
+  cell?: [number, number];
+  focus?: string[];
+}
 
 export interface Pt { x: number; y: number }
 export interface Placed { x: number; y: number; w: number; h: number }
@@ -293,7 +302,7 @@ export function layoutFactory(
 function gridPlan(nodes: CompiledNode[], edges: CompiledEdge[], order: string[], hints: Record<string, LineHint>, collapsed: string[]): LayoutResult {
   const pos: Record<string, Placed> = {}, lines: LayoutResult["lines"] = {}, capsules: Record<string, Placed> = {};
   const bays: BayBox[] = [], halls: HallBox[] = [], docks: DockBox[] = [];
-  const dx = 318, dy = 288;
+  const cellOf = (line: string): [number, number] => hints[line]?.cell ?? [318, 288];
   const ids = [...new Set(nodes.map((n) => n.line))].sort((a, b) => order.indexOf(a) - order.indexOf(b));
   const extent = (ps: Placed[]): Placed => {
     if (!ps.length) return { x: 0, y: 0, w: 1, h: 1 };
@@ -307,15 +316,23 @@ function gridPlan(nodes: CompiledNode[], edges: CompiledEdge[], order: string[],
     if (ns[0].layer === 1) {
       const targetKey = edges.find((e) => ns.some((n) => n.key === e.from) && e.kind === "flow")?.to;
       const target = nodes.find((n) => n.key === targetKey);
-      const cell = target ? hints[target.line]?.grid?.[target.id] : undefined;
+      // A pack may pin the dock itself (`grid.dock`), aligning it with the bands below.
+      const pinned = hints[id]?.grid?.dock;
+      const cell = pinned ?? (target ? hints[target.line]?.grid?.[target.id] : undefined);
+      const [dx, dy] = target ? cellOf(target.line) : cellOf(id);
       const h = GEO.dockHead + ns.length * (GEO.chipH + GEO.chipGap) + 2;
-      const d = { id: `dock:${id}`, line: id, members: ns.map((n) => n.key), x: (cell?.[0] ?? -2) * dx - (GEO.chipW + 20) - 80, y: (cell?.[1] ?? 0) * dy + (228 - h) / 2, w: GEO.chipW + 20, h };
+      const d = { id: `dock:${id}`, line: id, members: ns.map((n) => n.key), x: Math.round((cell?.[0] ?? -2) * dx - (pinned ? 0 : GEO.chipW + 20 + 36)), y: Math.round((cell?.[1] ?? 0) * dy), w: GEO.chipW + 20, h };
       docks.push(d);
       ns.forEach((n, i) => { pos[n.key] = { x: d.x + 10, y: d.y + GEO.dockHead + i * (GEO.chipH + GEO.chipGap), ...sizeOf(n) }; });
     } else if (ns[0].layer === 2) {
-      ns.forEach((n) => { const cell = hint?.grid?.[n.id]; pos[n.key] = { x: (cell?.[0] ?? candidates.indexOf(n) - candidates.length) * dx, y: (cell?.[1] ?? 0) * dy, ...sizeOf(n) }; });
+      const [dx, dy] = cellOf(id);
+      ns.forEach((n) => {
+        const cell = hint?.grid?.[n.id], size = sizeOf(n);
+        pos[n.key] = { x: Math.round((cell?.[0] ?? candidates.indexOf(n) - candidates.length) * dx), y: Math.round((cell?.[1] ?? 0) * dy + (CARD.h - size.h) / 2), ...size };
+      });
     } else {
       const baseY = nextY;
+      const [dx, dy] = cellOf(id);
       const used = new Set(Object.values(hint?.grid ?? {}).map((p) => p.join(":")));
       let extra = Math.max(0, ...Object.values(hint?.grid ?? {}).map((p) => p[1])) + (hint?.grid ? 1 : 0);
       ns.forEach((n, i) => {
@@ -326,10 +343,15 @@ function gridPlan(nodes: CompiledNode[], edges: CompiledEdge[], order: string[],
           while (used.has(`${col}:${row}`)) row++;
           used.add(`${col}:${row}`);
         }
-        pos[n.key] = { x: col * dx, y: baseY + row * dy, ...sizeOf(n) };
+        const size = sizeOf(n);
+        pos[n.key] = { x: Math.round(col * dx), y: Math.round(baseY + row * dy + (CARD.h - size.h) / 2), ...size };
       });
       nextY = Math.max(...ns.map((n) => pos[n.key].y + pos[n.key].h)) + 140;
-      if (!workArea && hint?.focus) workArea = extent(hint.focus.map((key) => pos[key.includes("/") ? key : `${id}/${key}`]).filter(Boolean));
+      if (!workArea && hint?.focus) {
+        // Include the bay frames and their labels, which sit outside the cards.
+        const area = extent(hint.focus.map((key) => pos[key.includes("/") ? key : `${id}/${key}`]).filter(Boolean));
+        workArea = { x: area.x - 28, y: area.y - 56, w: area.w + 56, h: area.h + 76 };
+      }
     }
     const box = extent(ns.map((n) => pos[n.key]));
     lines[id] = { ...box, layer: ns[0].layer };
@@ -340,14 +362,40 @@ function gridPlan(nodes: CompiledNode[], edges: CompiledEdge[], order: string[],
       bays.push({ ...partBounds(dock ? [dock] : keys.map((key) => pos[key])), id: `${id}:${phase.name}`, hall: id, line: id, name: phase.name, index: bays.length, row: 0, stations: keys });
     }
   }
+  alignBands(bays);
+  // Folded lines stack in a column right of the open line, so their hand-offs leave
+  // through the free margin instead of crossing the bands.
+  const placedOpen = Object.values(pos);
+  const foldX = placedOpen.length ? Math.max(...placedOpen.map((p) => p.x + p.w)) + 110 : 0;
   ids.filter((id) => collapsed.includes(id)).forEach((id, i) => {
     // All business entries branch into one vertical column. Their own nodes
     // may expand to the right; the inlet column never folds into a bottom shelf.
-    const p = { x: 0, y: nextY + i * 220, w: GEO.capsuleW, h: GEO.capsuleH };
+    const p = { x: foldX, y: i * (GEO.capsuleH + 84), w: GEO.capsuleW, h: GEO.capsuleH };
     capsules[id] = p; lines[id] = { ...p, layer: 3 };
     bays.push({ ...partBounds([p]), id: `${id}:line`, hall: id, line: id, name: id, index: bays.length, row: 0, stations: nodes.filter((n) => n.line === id).map((n) => n.key) });
   });
   return { pos, via: {}, gaps: [], lines, capsules, bays, docks, halls, rows: [], layers: [], shelf: null, workArea };
+}
+
+/** Frames read as one table: frames sharing a band get the same top and bottom, every
+ * band starts at the same left edge and ends at the same right edge. */
+export function alignBands(bays: BayBox[]) {
+  if (!bays.length) return;
+  const left = Math.min(...bays.map((b) => b.x)), right = Math.max(...bays.map((b) => b.x + b.w));
+  const bands: BayBox[][] = [];
+  for (const bay of [...bays].sort((a, b) => a.y - b.y)) {
+    const band = bands.find((group) => group.some((other) => bay.y < other.y + other.h && other.y < bay.y + bay.h));
+    if (band) band.push(bay); else bands.push([bay]);
+  }
+  for (const band of bands) {
+    const top = Math.min(...band.map((b) => b.y)), bottom = Math.max(...band.map((b) => b.y + b.h));
+    band.sort((a, b) => a.x - b.x);
+    band.forEach((bay, i) => {
+      bay.y = top; bay.h = bottom - top;
+      if (i === 0) { bay.w += bay.x - left; bay.x = left; }
+      if (i === band.length - 1) bay.w = right - bay.x;
+    });
+  }
 }
 
 function floorPlan(
@@ -580,7 +628,9 @@ function corridor(start: Pt, end: Pt, all: Placed[]): Pt[] | null {
   for (const x of xs) options.push([start, { x, y: start.y }, { x, y: end.y }, end]);
   for (const y of ys) options.push([start, { x: start.x, y }, { x: end.x, y }, end]);
   for (const y of ys) for (const x1 of [start.x, ...xs]) for (const x2 of [end.x, ...xs]) options.push([start, { x: x1, y: start.y }, { x: x1, y }, { x: x2, y }, { x: x2, y: end.y }, end]);
-  const valid = options.map(simplify).filter((ps) => ps.slice(1).every((p, i) => clearSegment(ps[i], p, boxes)));
+  // Nearby cards shape the candidate lanes, but a lane must clear every card: an outer
+  // lane can otherwise run straight through a card that sits beyond the search window.
+  const valid = options.map(simplify).filter((ps) => ps.slice(1).every((p, i) => clearSegment(ps[i], p, all)));
   const cost = (ps: Pt[]) => ps.slice(1).reduce((s, p, i) => s + distance(ps[i], p), 0) + (ps.length - 2) * 60;
   valid.sort((a, b) => cost(a) - cost(b));
   return valid[0] ?? null;
@@ -637,7 +687,7 @@ export function routeEdge(a: Placed, b: Placed, obstacles: Placed[], opts: Route
     for (const dir of sides) for (const lift of [40, 76, 120, 200]) {
       const p0 = at(a, dir), p1 = at(b, dir), vertical = dir === "left" || dir === "right";
       const lane = dir === "left" ? Math.min(a.x, b.x) - lift : dir === "right" ? Math.max(a.x + a.w, b.x + b.w) + lift : dir === "up" ? Math.min(a.y, b.y) - lift : Math.max(a.y + a.h, b.y + b.h) + lift;
-      const path = softPath(vertical ? [p0, { x: lane, y: p0.y }, { x: lane, y: p1.y }, p1] : [p0, { x: p0.x, y: lane }, { x: p1.x, y: lane }, p1], 14);
+      const path = softPath(vertical ? [p0, { x: lane, y: p0.y }, { x: lane, y: p1.y }, p1] : [p0, { x: p0.x, y: lane }, { x: p1.x, y: lane }, p1], 6);
       if (!insideAny(path.sample(), [...boxes, a, b])) return done(path, p0, p1);
     }
     // Obstructed return routes use the same collision-aware router as normal flow.
@@ -663,11 +713,11 @@ export function routeEdge(a: Placed, b: Placed, obstacles: Placed[], opts: Route
   // Prefer one uninterrupted middle lane. A length-only comparison rewards four
   // tiny rounded bends over two clean turns and creates a pointless mid-lane jog.
   const ordered = v0.y && v1.y ? [candidates[1], candidates[0], ...candidates.slice(2)] : candidates;
-  const paths = ordered.map((ps) => softPath(ps, 18)).filter((p) => !insideAny(p.sample(), blocked));
+  const paths = ordered.map((ps) => softPath(ps, 6)).filter((p) => !insideAny(p.sample(), blocked));
   if (paths.length) return done(paths[0], p0, p1);
   const detour = corridor(out, inn, blocked);
-  if (detour) return done(softPath([p0, ...detour, p1], 16), p0, p1);
+  if (detour) return done(softPath([p0, ...detour, p1], 6), p0, p1);
   // Overlapping user-dragged cards have no collision-free solution. Endpoints
   // remain attached and recover a clear route as soon as the cards separate.
-  return done(softPath(candidates[0], 12), p0, p1);
+  return done(softPath(candidates[0], 6), p0, p1);
 }

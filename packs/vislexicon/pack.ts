@@ -286,33 +286,48 @@ export const pack: Pack = {
   hints: {
     sources: {
       mode: "stack",
+      // Visual only: the dock's left edge lines up with the first station of the bands below.
+      cell: [196, 100],
+      grid: { dock: [-1.03, 0] },
       phases: [
         { name: "来源接入", stations: ["watch", "github", "x", "xhs", "douyin", "bilibili"] },
       ],
     },
     candidates: {
       mode: "layered",
-      grid: { tidy: [-2.25, 0], pool: [-2.25, 1], route: [-1.25, 1] },
+      // Visual only. The candidate inlet stacks under the source dock's right edge.
+      cell: [196, 100],
+      grid: { tidy: [0.097, 0], pool: [0, 1], route: [0.097, 2] },
       phases: [
         { name: "候选与分流", stations: ["tidy", "pool", "route"] },
       ],
     },
     curation: {
       mode: "layered",
+      // Visual only (outside the compiled digest). Three bands that read like lines of
+      // text: understand → capture & style → verify & publish. The whole line fits one
+      // screen; narrow program steps take fractional cells.
+      cell: [196, 100],
       grid: {
-        dedupe: [0, 1], scout: [1, 1], reader: [2, 0], classify: [2, 1], "classify-review": [2, 2], "kind-join": [3, 1.5], arbiter: [3, 2.5], catalog: [4, 1],
-        plan: [5.5, 1], identity: [6.5, 1], record: [7.5, 0], breadth: [7.5, 2], proof: [8.5, 2], process: [8.5, 1], "shot-review": [9.5, 1],
-        facts: [11, 3], "fact-review": [12, 3], style: [11, 1], copy: [13, 2], "copy-review": [14, 2],
-        assemble: [15.5, 2], audit: [16.5, 2], gate: [17.5, 2], published: [18.5, 1.5], manual: [18.5, 2.5],
+        dedupe: [1.17, 1], scout: [2.02, 1], reader: [2.87, 0], classify: [2.87, 1], "classify-review": [2.87, 2],
+        "kind-join": [4.033, 1], arbiter: [3.92, 2], catalog: [4.97, 1],
+        plan: [-1.03, 4.55], identity: [-0.18, 4.55], record: [0.92, 3.55], breadth: [0.92, 5.55], proof: [1.97, 5.55],
+        process: [3.02, 4.55], "shot-review": [4.07, 4.55], style: [5.12, 4.55],
+        facts: [-1.03, 7.1], "fact-review": [0, 7.1], copy: [1.033, 7.1], "copy-review": [2.065, 7.1],
+        assemble: [3.098, 7.1], audit: [4.13, 7.1], gate: [5.163, 7.1], published: [5.98, 7.1], manual: [5.98, 8.1],
       },
-      focus: ["scout", "reader", "classify", "classify-review", "kind-join", "arbiter", "catalog", "plan", "identity", "breadth", "proof", "process", "shot-review"],
+      focus: [
+        "sources/watch", "sources/bilibili", "candidates/tidy", "candidates/route",
+        "dedupe", "scout", "reader", "classify", "classify-review", "kind-join", "arbiter", "catalog",
+        "plan", "identity", "record", "breadth", "proof", "process", "shot-review", "style",
+        "facts", "fact-review", "copy", "copy-review", "assemble", "audit", "gate", "published", "manual",
+      ],
       wrap: 99,
       side: ["curation/arbiter->curation/manual"],
       phases: [
         { name: "读懂与判定", stations: ["dedupe", "scout", "reader", "classify", "classify-review", "kind-join", "arbiter", "catalog"] },
-        { name: "资源采集", stations: ["plan", "identity", "breadth", "proof", "record", "process", "shot-review"] },
-        { name: "核验与著录", stations: ["facts", "fact-review", "style", "copy", "copy-review"] },
-        { name: "终审与发布", stations: ["assemble", "audit", "gate", "published", "manual"] },
+        { name: "取证与风格", stations: ["plan", "identity", "breadth", "proof", "record", "process", "shot-review", "style"] },
+        { name: "核验与发布", stations: ["facts", "fact-review", "copy", "copy-review", "assemble", "audit", "gate", "published", "manual"] },
       ],
     },
   },

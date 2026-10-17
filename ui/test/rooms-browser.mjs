@@ -130,7 +130,7 @@ try {
 
   // 群组是从流程推出来的：工序、返工环、跨段三类都要在。
   const text = names.join("\n");
-  for (const expected of ["读懂与判定", "核验与著录", "组件源确认", "组件实例发布"]) {
+  for (const expected of ["读懂与判定", "核验与发布", "组件源确认", "组件实例发布"]) {
     assert.ok(text.includes(expected), `缺少推导出来的群组：${expected}\n实际：${text}`);
   }
   const lanes = { part: await rail.locator(".room-kind--part").count(), loop: await rail.locator(".room-kind--loop").count(), bridge: await rail.locator(".room-kind--bridge").count() };

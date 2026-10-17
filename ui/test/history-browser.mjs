@@ -57,7 +57,7 @@ try {
   page.on('requestfailed', request => { if (request.url().includes('/api/report/') || request.url().includes('/api/journal')) failures.push(request.url()); });
   await page.route('**/api/**', async route => {
     const url = new URL(route.request().url());
-    if (url.pathname === '/api/factory') return route.fulfill({ json: { factory, layout: { designVersion: 4 }, defaultLayout: layoutFactory(factory.nodes, factory.edges, factory.ui.order, {}, []), settings: {}, model: 'fixture', keyPresent: false } });
+    if (url.pathname === '/api/factory') return route.fulfill({ json: { factory, layout: { designVersion: 6 }, defaultLayout: layoutFactory(factory.nodes, factory.edges, factory.ui.order, {}, []), settings: {}, model: 'fixture', keyPresent: false } });
     if (url.pathname === '/api/state') return route.fulfill({ json: initialState(factory) });
     if (url.pathname === '/api/runs') return route.fulfill({ json: [{ run, first: startedAt, last: startedAt + 6500, events: events.length, report: true }] });
     if (url.pathname.startsWith('/api/report/')) {

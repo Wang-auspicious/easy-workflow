@@ -11,7 +11,7 @@ import {executionIndex, recordNodeExecution, runtimeRecoveryIndex, type NodeExec
 import {applyUiEvent, isUiState, type UiEvent} from '../../shared/client-view.ts';
 export type { LiveChat } from "./chat/live.ts";
 
-export type View = "canvas" | "board" | "candidates" | "library" | "runs" | "browser" | "settings" | "report";
+export type View = "canvas" | "board" | "review" | "candidates" | "library" | "runs" | "browser" | "settings" | "report";
 export type Layer = "pipeline" | "gantt" | "spec" | "channels";
 
 export interface LayoutFile {
@@ -61,6 +61,8 @@ export interface Store {
   chatRoom: string;
   /** 群组栏是否展开；收起时只留一列头像。 */
   roomRailOpen: boolean;
+  /** Grok Bot style: the conversation list replaces the open conversation. */
+  chatList: boolean;
   /** 每个群看到哪一刻，用来算未读。 */
   roomSeen: Record<string, number>;
   live: LiveChat;
@@ -100,7 +102,7 @@ let state: Store = {
   fs: initialState(), version: 0, nodeRev: {}, agentBindings: {}, nodeExecutions: {}, nodeRecoveries: {},
   view: (LS("view") as View) ?? "canvas", layer: "pipeline", reportRun: null,
   attachments: [], chatOpen: (LS("chatOpen") as boolean) ?? false, chatWidth: (LS("chatWidth") as number) ?? 320, unread: 0,
-  chatRoom: (LS("chatRoom") as string) ?? "root", roomRailOpen: (LS("roomRailOpen") as boolean) ?? true, roomSeen: (LS("roomSeen") as Record<string, number>) ?? {},
+  chatRoom: (LS("chatRoom") as string) ?? "root", roomRailOpen: (LS("roomRailOpen") as boolean) ?? true, chatList: false, roomSeen: (LS("roomSeen") as Record<string, number>) ?? {},
   live: emptyLive(), dispatcher: idleDispatcher(),
   browser: emptyBrowser(),
   inspectors: [], selected: [], follow: false, trail: null, flashes: {}, settings: {}, model: "", keyPresent: false, replay: null, focus: null, draft: "", boardFocus: null,
