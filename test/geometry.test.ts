@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { compile } from "../server/spec/compile.ts";
 import { pack } from "../packs/vislexicon/pack.ts";
-import { decorationsOf, layoutFactory, ports, routeEdge, type LayoutResult, type Placed, type Pt } from "../shared/layout.ts";
+import { CARD, decorationsOf, layoutFactory, ports, routeEdge, type LayoutResult, type Placed, type Pt } from "../shared/layout.ts";
 import type { CompiledEdge, CompiledFactory, CompiledNode } from "../shared/types.ts";
 import { geometry } from "../ui/src/canvas/geometry.ts";
 
@@ -96,7 +96,13 @@ test("the factory composes a dense working area with a short vertical review bra
   // The whole working line, sources to publication, fits one screen at a readable scale.
   // At a 1240×650 canvas the fitted cards stay at least 118px wide, so names remain legible.
   const fit = Math.min(1240 / def.workArea!.w, 650 / def.workArea!.h);
-  assert.ok(176 * fit >= 118, `work area ${def.workArea!.w}×${def.workArea!.h} shrinks cards to ${Math.round(176 * fit)}px`);
+  assert.ok(CARD.w * fit >= 118, `work area ${def.workArea!.w}×${def.workArea!.h} shrinks cards to ${Math.round(CARD.w * fit)}px`);
+  for (const {node, place} of g.nodes) assert.deepEqual({w: place.w, h: place.h}, CARD, `${node.key} shares the same card footprint`);
+  for (let i = 0; i < g.nodes.length; i++) for (const other of g.nodes.slice(i + 1)) {
+    const current = g.nodes[i];
+    const a = current.place, b = other.place;
+    assert.ok(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y, `${current.node.key} overlaps ${other.node.key}`);
+  }
   const review = g.place["curation/kind-join"], arbiter = g.place["curation/arbiter"];
   assert.equal(review.x + review.w / 2, arbiter.x + arbiter.w / 2, "the join sits centred above its arbiter");
   const branch = g.edges.find((e) => e.edge.from === "curation/kind-join" && e.edge.to === "curation/arbiter")!;

@@ -303,8 +303,8 @@ export const pack: Pack = {
     sources: {
       mode: "stack",
       // Visual only: the dock's left edge lines up with the first station of the bands below.
-      cell: [196, 100],
-      grid: { dock: [-1.03, 0] },
+      cell: [258, 132],
+      grid: { dock: [0, 0] },
       phases: [
         { name: "来源接入", stations: ["watch", "github", "x", "xhs", "douyin", "bilibili"] },
       ],
@@ -312,8 +312,8 @@ export const pack: Pack = {
     candidates: {
       mode: "layered",
       // Visual only. The candidate inlet stacks under the source dock's right edge.
-      cell: [196, 100],
-      grid: { tidy: [0.097, 0], pool: [0, 1], route: [0.097, 2] },
+      cell: [258, 132],
+      grid: { tidy: [2.15, 0], pool: [2.15, 1], route: [2.15, 2] },
       phases: [
         { name: "候选与分流", stations: ["tidy", "pool", "route"] },
       ],
@@ -322,15 +322,15 @@ export const pack: Pack = {
       mode: "layered",
       // Visual only (outside the compiled digest). Three bands that read like lines of
       // text: understand → capture & style → verify & publish. The whole line fits one
-      // screen; narrow program steps take fractional cells.
-      cell: [196, 100],
+      // screen; every source, program, Agent and store has the same card size.
+      cell: [258, 132],
       grid: {
-        dedupe: [1.17, 1], scout: [2.02, 1], reader: [2.87, 0], classify: [2.87, 1], "classify-review": [2.87, 2],
-        "kind-join": [4.033, 1], arbiter: [3.92, 2], catalog: [4.97, 1],
-        plan: [-1.03, 4.55], identity: [-0.18, 4.55], record: [0.92, 3.55], breadth: [0.92, 5.55], proof: [1.97, 5.55],
-        process: [3.02, 4.55], "shot-review": [4.07, 4.55], style: [5.12, 4.55],
-        facts: [-1.03, 7.1], "fact-review": [0, 7.1], copy: [1.033, 7.1], "copy-review": [2.065, 7.1],
-        assemble: [3.098, 7.1], audit: [4.13, 7.1], gate: [5.163, 7.1], published: [5.98, 7.1], manual: [5.98, 8.1],
+        dedupe: [3.3, 1], scout: [4.3, 1], reader: [5.3, 0], classify: [5.3, 1], "classify-review": [5.3, 2],
+        "kind-join": [6.3, 1], arbiter: [6.3, 2], catalog: [7.3, 1],
+        plan: [0, 4.5], identity: [1.2, 4.5], record: [2.4, 3.5], breadth: [2.4, 5.5], proof: [3.6, 5.5],
+        process: [4.9, 4.5], "shot-review": [6.1, 4.5], style: [7.3, 4.5],
+        facts: [0, 7], "fact-review": [1.043, 7], copy: [2.086, 7], "copy-review": [3.129, 7],
+        assemble: [4.171, 7], audit: [5.214, 7], gate: [6.257, 7], published: [7.3, 7], manual: [7.3, 8],
       },
       focus: [
         "sources/watch", "sources/bilibili", "candidates/tidy", "candidates/route",

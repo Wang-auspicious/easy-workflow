@@ -61,7 +61,7 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const slow = shape !== "store" && shape !== "source" && bottleneck(s.fs, s.factory!, node.line)?.key === node.key;
   const stop = trail ? trailOf(s.fs, trail).indexOf(node.key) : -1;
   const vars = { ["--c" as string]: c.border, ["--c-strong" as string]: c.strong, ["--fill" as string]: c.fill, ["--fill-h" as string]: c.fillHover, ["--ink-c" as string]: c.ink, ["--soft" as string]: c.soft, ["--glow" as string]: c.glow };
-  const cls = `node node--${shape} ${dormant ? "is-dormant" : ""} ${selected ? "is-selected" : ""} ${open ? "is-open" : ""} ${dim ? "is-dim" : ""} ${n?.active.length ? "is-busy" : ""} ${slow ? "is-slow" : ""} ${trail ? (stop >= 0 ? "is-trail" : "is-off-trail") : ""}`;
+  const cls = `node node--uniform node--${shape} ${dormant ? "is-dormant" : ""} ${selected ? "is-selected" : ""} ${open ? "is-open" : ""} ${dim ? "is-dim" : ""} ${n?.active.length ? "is-busy" : ""} ${slow ? "is-slow" : ""} ${trail ? (stop >= 0 ? "is-trail" : "is-off-trail") : ""}`;
   const keyboardProps = {
     tabIndex: 0,
     role: 'button',
@@ -79,17 +79,6 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
     },
   };
 
-  if (shape === "source") {
-    return (
-      <div {...keyboardProps} className={cls} data-node={node.key} style={{ left: place.x, top: place.y, width: place.w, height: place.h, ...vars }}
-        data-tip={`${node.name}：${node.blurb ?? ""}${dormant ? "（休眠）" : ""}`} onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
-        <StationIcon role={node.role} size={15} />
-        <span className="node-name">{displayName}</span>
-        <span className="node-src-sub" data-tip={counts.detail}>{dormant ? '休眠 · ' : ''}{kernel === 'v2' && kernelNumbers ? `就绪 ${kernelNumbers.ready} · 完成 ${kernelNumbers.done}` : `库存 ${fmt(n?.stock ?? 0)}`}</span>
-      </div>
-    );
-  }
-
   const {usesModel, label: execution} = nodeExecutionPresentation(node, actualExecution, agentBinding, replay);
   const queue = (kernel === 'v2' ? kernelNumbers?.ready : undefined) ?? n?.queue.length ?? 0;
   const active = (kernel === 'v2' ? kernelNumbers?.running : undefined) ?? n?.active.length ?? 0;
@@ -102,33 +91,6 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const light = <i className={`light light--${status.light} ${status.pulse ? 'is-pulse' : ''}`} data-tip={`${status.label}${status.detail ? `：${status.detail}` : ''}`} />;
   const box = { left: place.x, top: place.y, width: place.w, height: place.h, ...vars, borderStyle: node.role === "channel" ? "dashed" : undefined };
 
-  if (shape === "step") {
-    // A program hand-off on the line: one row, the work it holds, nothing else.
-    return (
-      <div {...keyboardProps} className={cls} data-node={node.key} style={box} data-tip={`${node.name} · ${execution} · ${counts.detail}`}
-        onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
-        {stop >= 0 && <span className="node-stop num">{stop + 1}</span>}
-        <StationIcon role={node.role} size={13} />
-        <span className="node-name" title={node.name}>{displayName}</span>
-        <span className="node-count num">{active ? <b>处理中</b> : queue ? `排队 ${queue}` : ''}</span>
-        {light}
-      </div>
-    );
-  }
-
-  if (shape === "store") {
-    return (
-      <div {...keyboardProps} className={cls} data-node={node.key} style={box} data-tip={counts.detail}
-        onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
-        <StationIcon role={node.role} size={13} />
-        <span className="node-store-text">
-          <span className="node-name" title={node.name}>{displayName}</span>
-          <span className="node-stock num">{fmt(n?.stock ?? 0)}{Boolean(n?.plus) && <span className="node-plus">本轮 +{fmt(n?.plus ?? 0)}</span>}</span>
-        </span>
-        {node.id === 'manual' && (n?.stock ?? 0) > 0 && <button className="node-review" onClick={(e) => { e.stopPropagation(); setState({ view: 'review' }); }}>去审核</button>}
-      </div>
-    );
-  }
 
   return (
     <div {...keyboardProps} className={cls} data-node={node.key} style={box}
@@ -138,13 +100,15 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         <StationIcon role={node.role} size={14} />
         <div className="node-heading">
           <span className="node-name" title={node.name}>{displayName}</span>
-          <span className={`node-type ${usesModel ? "node-model" : ""}`} title={execution}>{execution}</span>
+          <span className={`node-type ${usesModel ? "node-model" : ""}`} title={execution}>{shape === "source" ? "来源接入" : shape === "store" ? "任务库存" : execution}</span>
         </div>
         {light}
       </div>
       <div className="node-footer">
+        {shape === "store" ? <><span className="node-stock num">{fmt(n?.stock ?? 0)}{Boolean(n?.plus) && <span className="node-plus">本轮 +{fmt(n?.plus ?? 0)}</span>}</span>{node.id === "manual" && (n?.stock ?? 0) > 0 && <button className="node-review" onClick={event => {event.stopPropagation(); setState({view: "review"});}}>去审核</button>}</> : <>
         <span className={`node-doing ${working ? 'is-active' : failedLast && !queue ? 'is-warn' : ''}`} title={doing}>{doing}</span>
         {visualEvidence.length > 0 && <Strip items={visualEvidence.slice(-2)} />}
+        </>}
       </div>
     </div>
   );

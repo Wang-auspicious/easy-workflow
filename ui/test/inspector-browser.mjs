@@ -74,6 +74,10 @@ try {
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     calls.push(url.pathname);
+    if (url.pathname === '/api/board') {
+      await route.fulfill({json: {posts: [], rooms: []}});
+      return;
+    }
     if (url.pathname === '/api/pull') {
       pullWrites.push(route.request().postDataJSON());
       await new Promise(resolve => { releasePull = resolve; });
@@ -188,6 +192,52 @@ try {
   await page.locator(".insp-title b").waitFor();
   assert.match(await page.locator(".insp-title b").innerText(), /截图审查员/);
 
+  if (process.argv.includes('--message-open')) {
+    for (const kernel of ['v1', 'v2']) {
+      await page.goto(`http://127.0.0.1:${address.port}/test/inspector-fixture.html`);
+      await page.evaluate(kernel => {
+        const fixture = window.inspectorFixture;
+        fixture.setState({kernel});
+        for (const token of ['t1', 't2']) fixture.emit({kind: 'token.data', token,
+          patch: {title: {value: 'Structured task title'}, kind: 'component-source',
+            facts: {pricing: {value: 'free', sources: []}, license: {value: 'MIT', sources: []}},
+            style: {applicable: true, styles: [{id: 'minimal'}]},
+            copy: {takeawayZh: {value: 'A traceable result'}, descriptionZh: 'Original evidence retained'}}});
+      }, kernel);
+      for (let index = 0; index < 2; index++) {
+        await page.locator('.feed-msg').nth(index).click();
+        await page.locator('.inspector--token .chain-facts').waitFor();
+        assert.match(await page.locator('.inspector--token .chain-facts').innerText(), /free.*MIT/);
+        assert.match(await page.locator('.inspector--token .insp-title').innerText(), /Structured task title/);
+        assert.equal(await page.locator('.inspector--node .feed-msg').count(), 2, 'the station stays mounted after clicking its conversation');
+        assert.equal(await page.locator('.inspector-error').count(), 0);
+        await page.locator('.inspector--token').getByRole('button', {name: '关闭详情', exact: true}).click();
+      }
+      await page.evaluate(() => {
+        const fixture = window.inspectorFixture;
+        for (const token of ['t1', 't2']) fixture.emit({kind: 'token.data', token,
+          patch: {facts: {price: 'paid', license: 'Apache-2.0'}, style: {applicable: true, styles: {unexpected: true}}, copy: null}});
+      });
+      await page.locator('.feed-msg').first().click();
+      await page.locator('.inspector--token .chain-facts').waitFor();
+      assert.match(await page.locator('.inspector--token .chain-facts').innerText(), /paid.*Apache-2.0/);
+      await page.screenshot({path: path.join(out, `message-open-${kernel}.png`)});
+      assert.deepEqual(errors, [], 'structured facts and legacy values must never blank the workspace');
+      // The local boundary also contains a future malformed record outside token.data.
+      await page.evaluate(() => {
+        const fixture = window.inspectorFixture, state = fixture.getState();
+        const open = state.inspectors.find(item => item.kind === 'token');
+        state.fs.tokens[open.key].url = {broken: true};
+        fixture.setState({version: state.version + 1});
+      });
+      await page.locator('.inspector-error').waitFor();
+      assert.equal(await page.locator('.inspector--node .feed-msg').count(), 2);
+      await page.locator('.inspector-error').getByRole('button', {name: '关闭详情', exact: true}).click();
+      assert.equal(await page.locator('.inspector-error').count(), 0);
+      assert.equal(await page.locator('.inspector--node').count(), 1);
+    }
+    console.log('PASS: all station messages open structured/legacy task details on v1/v2; local errors remain closable');
+  } else {
   // Inspectors must remain read-only during replay/disconnection, including staff controls.
   const addWorker = page.getByRole('button', {name: '加一个人', exact: true});
   const lockWorkers = page.getByRole('button', {name: '锁定人数', exact: true});
@@ -682,6 +732,7 @@ try {
   assert.equal(await page.locator('.inspector').count(), 0, 'a removed station cannot crash its stale inspector');
   assert.deepEqual(errors, [], `页面不能有运行时错误：${errors.join(" | ")}`);
   console.log(`PASS: isolated station card checks, screenshot in ${path.relative(process.cwd(), out)}`);
+  }
 } catch (error) {
   if (page) {
     await page.screenshot({path: path.join(out, 'failure.png')});

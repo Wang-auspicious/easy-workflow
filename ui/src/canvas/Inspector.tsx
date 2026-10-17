@@ -2,7 +2,7 @@
 // workers and, for the chosen worker, its work as a narrated trace — like a Claude Code
 // sub-agent view: input, thoughts, folded tool steps with their evidence, current activity.
 // A token card shows that item's evidence chain from URL to publication.
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Component, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { previewSet, useHoverPreview } from "../shell/HoverPreview.tsx";
 import { Pin, PinOff, X, GitFork, UserMinus, Lock, Unlock, MessageSquarePlus, ChevronRight, CircleMinus, Check, AlertTriangle, Loader2, ExternalLink, Play, Pause } from "lucide-react";
 import type { CompiledNode, EvidenceRef, StationAgentBinding } from "../../../shared/types.ts";
@@ -33,7 +33,33 @@ export function Inspectors({ geo, cam }: { geo: Geometry; cam: Camera }) {
   const list = useStore((s) => s.inspectors);
   const factory = useStore(state => state.factory);
   return <>{list.filter(item => item.kind !== 'node' || factory?.nodes.some(node => node.key === item.key))
-    .map((i, idx) => <Card key={i.key} insp={i} idx={idx} geo={geo} cam={cam} />)}</>;
+    .map((i, idx) => <InspectorBoundary key={`${i.kind}:${i.key}`} insp={i}><Card insp={i} idx={idx} geo={geo} cam={cam} /></InspectorBoundary>)}</>;
+}
+
+/** A malformed historical record must never unmount the workspace. */
+class InspectorBoundary extends Component<{insp: Inspector; children: ReactNode}, {failed: boolean}> {
+  state = {failed: false};
+  static getDerivedStateFromError() {return {failed: true};}
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return <div className="inspector inspector-error" role="alert" style={{left: 24, top: 120}}>
+      <div className="insp-head"><b>这条详情暂时无法显示</b><span className="grow" />
+        <button className="icon-btn" aria-label="关闭详情" onClick={() => setState({inspectors: getState().inspectors.filter(item => item.key !== this.props.insp.key)})}><X size={15} /></button></div>
+      <p>画布与其他工位仍可使用，任务数据没有改动。</p>
+      <button className="btn btn--sm" onClick={() => this.setState({failed: false})}>重新打开详情</button>
+    </div>;
+  }
+}
+
+const recordValue = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+
+/** Facts use {value, sources}; older runs stored a string. Neither shape is JSX. */
+function displayText(value: unknown, depth = 0): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (depth < 3 && recordValue(value)) return displayText(recordValue(value)!.value, depth + 1);
+  return '';
 }
 
 function Card({ insp, idx, geo, cam }: { insp: Inspector; idx: number; geo: Geometry; cam: Camera }) {
@@ -625,7 +651,14 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
   } : undefined, Boolean(t));
   if (!t) return null;
   const currentStatus = tokenStatus(t, s.fs, s.replay?.at ?? now);
-  const d = {...detail.data?.data, ...t.data} as Record<string, any>;
+  const d: Record<string, unknown> = {...detail.data?.data, ...t.data};
+  for (const key of ['facts', 'style', 'copy']) {
+    const full = recordValue(detail.data?.data?.[key]), summary = recordValue(t.data[key]);
+    if (full && summary) d[key] = {...full, ...summary};
+  }
+  const facts = recordValue(d.facts), style = recordValue(d.style), copy = recordValue(d.copy);
+  const pricing = displayText(facts?.pricing ?? facts?.price), license = displayText(facts?.license);
+  const styles = Array.isArray(style?.styles) ? style.styles.map(value => displayText(recordValue(value)?.id ?? value)).filter(Boolean) : [];
   const steps: { node: string; a: AttemptState; ev: EvidenceRef[] }[] = [];
   for (const id of t.attempts) {
     const a = s.fs.attempts[id];
@@ -638,7 +671,7 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
     <>
       <Head onDrag={onDrag} onClose={onClose} onPin={onPin} pinned={insp.pinned}>
         <div className="insp-title">
-          <b>{d.title || t.title || t.item}</b>
+          <b>{displayText(d.title) || t.title || t.item}</b>
           <span className="muted">{t.url.replace(/^https?:\/\//, "")}</span>
         </div>
         <span className={`chip st-${t.status}`} title={currentStatus.detail}>{currentStatus.label}</span>
@@ -647,13 +680,13 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
       {detail.loading && <div className="scope-notice muted" role="status">正在读取完整任务详情；当前状态来自实时摘要。</div>}
       {detail.error && <div className="scope-notice" role="alert">完整任务详情读取失败：{detail.error} <button className="btn btn--sm" onClick={detail.retry}>重新读取</button></div>}
       <div className="chain-facts">
-        {d.kind && <span className="chip">分类 {d.kind}{d.kindAgreed ? " ✓" : d.kindAgreed === false ? " · 仲裁" : ""}</span>}
-        {d.mode && <span className="chip">{d.mode === "video" ? "录屏路线" : "三张图"}</span>}
-        {d.style?.applicable && <span className="chip">风格 {(d.style.styles ?? []).map((x: any) => x.id).join(" · ") || "无合适的词"}</span>}
-        {d.facts && <span className="chip">{d.facts.price} · {d.facts.license}</span>}
+        {displayText(d.kind) && <span className="chip">分类 {displayText(d.kind)}{d.kindAgreed ? " ✓" : d.kindAgreed === false ? " · 仲裁" : ""}</span>}
+        {displayText(d.mode) && <span className="chip">{d.mode === "video" ? "录屏路线" : "三张图"}</span>}
+        {style?.applicable === true && <span className="chip">风格 {styles.join(' · ') || '无合适的词'}</span>}
+        {(pricing || license) && <span className="chip">{[pricing, license].filter(Boolean).join(' · ')}</span>}
         {Object.entries(t.rounds).map(([k, r]) => <span key={k} className="chip warn-chip">退回 {name(k)?.name} ×{r}</span>)}
       </div>
-      {d.copy?.takeawayZh && <div className="chain-copy sel">「{d.copy.takeawayZh}」<span className="muted">{d.copy.descriptionZh}</span></div>}
+      {displayText(copy?.takeawayZh) && <div className="chain-copy sel">「{displayText(copy?.takeawayZh)}」<span className="muted">{displayText(copy?.descriptionZh)}</span></div>}
       {t.reason && t.status !== "active" && <div className="chain-reason">{t.reason}</div>}
       {kernel === 'v2' && <BoardChain item={t.id} />}
       <div className="chain">

@@ -312,6 +312,12 @@ test('UI summaries preserve retry and cross-line identities, scheduling, evidenc
   assert.equal(compact.tokens.parent.data.large, undefined);
   assert.deepEqual(compact.tokens.parent.data.style, {applicable: true, subjectVisible: true, styles: [{id: 'fixture-style'}]});
   assert.equal(raw.tokens.parent.data.large, 'x'.repeat(1024 * 1024));
+  emit({kind: 'token.data', token: 'parent', patch: {facts: {
+    pricing: {value: 'freemium', sources: ['full pricing evidence']},
+    license: {value: 'MIT', sources: ['full license evidence']},
+  }}});
+  assert.deepEqual(compact.tokens.parent.data.facts, {pricing: {value: 'freemium'}, license: {value: 'MIT'}});
+  assert.deepEqual((raw.tokens.parent.data.facts as {license: {sources: string[]}}).license.sources, ['full license evidence']);
   emit({kind: 'scope.paused', scope: 'line', key: 'components', paused: true, reason: 'fixture'});
   emit({kind: 'token.queued', token: 'retry', node: 'fixture/work'});
   emit({kind: 'worker.spawned', node: 'fixture/work', worker: 'worker-ui', label: 'Fixture', reason: 'fixture'});

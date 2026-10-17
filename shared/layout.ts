@@ -9,6 +9,9 @@
 import type { CompiledEdge, CompiledNode } from "./types.ts";
 import { partBounds } from "./parts.ts";
 
+/** Every station gets the same readable footprint, regardless of executor type. */
+export const CARD = {w: 240, h: 112};
+
 export const GEO = {
   /** Horizontal space between rank columns: room for curves, port fans and branch labels. */
   colGap: 72,
@@ -30,8 +33,8 @@ export const GEO = {
   hallPadBottom: 20,
   hallGap: 30,
   maxCols: 99,
-  capsuleW: 196,
-  capsuleH: 60,
+  capsuleW: CARD.w,
+  capsuleH: CARD.h,
   capsuleGap: 28,
   shelfHead: 0,
   shelfPad: 12,
@@ -41,9 +44,9 @@ export const GEO = {
   statusGap: 5,
   statusH: 26,
   /** Source chips inside the source dock. */
-  chipW: 134,
-  chipH: 32,
-  chipGap: 6,
+  chipW: CARD.w,
+  chipH: CARD.h,
+  chipGap: 18,
   dockPad: 10,
   dockHead: 30,
   /** Distance between ports that share one side of a card. */
@@ -51,7 +54,7 @@ export const GEO = {
 };
 
 /** Chips per row inside a source dock. */
-const DOCK_COLS = 1;
+const DOCK_COLS = 2;
 /** Width of the shelf's own label, left of the capsules. */
 export const SHELF_LABEL = 156;
 
@@ -66,16 +69,8 @@ export function shapeOf(n: Pick<CompiledNode, "kind" | "role" | "resource">): No
 }
 
 export function sizeOf(n: Pick<CompiledNode, "kind" | "role" | "resource"> & { name?: string }): { w: number; h: number } {
-  switch (shapeOf(n)) {
-    case "source": return { w: GEO.chipW, h: GEO.chipH };
-    case "store": return { w: 170, h: 60 };
-    case "step": return { w: 132, h: 46 };
-    default: return { w: CARD.w, h: CARD.h };
-  }
+  return {...CARD};
 }
-
-/** The compact station card: a whole production line must fit one screen. */
-export const CARD = { w: 176, h: 82 };
 
 export interface PhaseHint { name: string; stations: string[] }
 export interface LineHint {
@@ -320,10 +315,11 @@ function gridPlan(nodes: CompiledNode[], edges: CompiledEdge[], order: string[],
       const pinned = hints[id]?.grid?.dock;
       const cell = pinned ?? (target ? hints[target.line]?.grid?.[target.id] : undefined);
       const [dx, dy] = target ? cellOf(target.line) : cellOf(id);
-      const h = GEO.dockHead + ns.length * (GEO.chipH + GEO.chipGap) + 2;
-      const d = { id: `dock:${id}`, line: id, members: ns.map((n) => n.key), x: Math.round((cell?.[0] ?? -2) * dx - (pinned ? 0 : GEO.chipW + 20 + 36)), y: Math.round((cell?.[1] ?? 0) * dy), w: GEO.chipW + 20, h };
+      const columns = Math.min(DOCK_COLS, ns.length), rows = Math.ceil(ns.length / columns);
+      const w = (columns - 1) * dx + CARD.w, h = (rows - 1) * dy + CARD.h;
+      const d = { id: `dock:${id}`, line: id, members: ns.map((n) => n.key), x: Math.round((cell?.[0] ?? -2) * dx - (pinned ? 0 : w + 36)), y: Math.round((cell?.[1] ?? 0) * dy), w, h };
       docks.push(d);
-      ns.forEach((n, i) => { pos[n.key] = { x: d.x + 10, y: d.y + GEO.dockHead + i * (GEO.chipH + GEO.chipGap), ...sizeOf(n) }; });
+      ns.forEach((n, i) => { pos[n.key] = {x: d.x + (i % columns) * dx, y: d.y + Math.floor(i / columns) * dy, ...sizeOf(n)}; });
     } else if (ns[0].layer === 2) {
       const [dx, dy] = cellOf(id);
       ns.forEach((n) => {

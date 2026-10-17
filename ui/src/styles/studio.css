@@ -433,3 +433,23 @@
   .node.is-busy::after { display: none; }
   .edge-flash { opacity: 0.5; filter: none; }
 }
+
+/* Uniform stations: source, program, Agent, gate and inventory share one footprint. */
+.node.node--uniform { display: flex; flex-direction: column; align-items: stretch; gap: 0; padding: 0; border: 1px solid #dfe3ea; border-radius: 9px; background: linear-gradient(180deg, #fff, #fcfdff); box-shadow: 0 1px 0 #fff inset, 0 2px 5px #172b4510, 0 5px 12px #172b4508; }
+.node.node--uniform .node-header { flex: 1; min-height: 0; align-items: flex-start; gap: 10px; padding: 16px 14px 8px; }
+.node.node--uniform .station-icon { width: 34px; height: 34px; border-radius: 8px; flex: none; }
+.node.node--uniform .station-icon svg { width: 18px; height: 18px; }
+.node.node--uniform .node-heading { gap: 3px; padding-top: 0; }
+.node.node--uniform .node-name { font-size: 17px; line-height: 1.35; font-weight: 620; color: #171a1f; letter-spacing: -0.02em; }
+.node.node--uniform .node-type { display: block; font-size: 12px; line-height: 1.35; color: #7d8592; }
+.node.node--uniform .node-footer { flex: none; height: 32px; padding: 0 14px 8px 58px; gap: 8px; border: 0; }
+.node.node--uniform .node-doing { font-size: 12.5px; }
+.node.node--uniform .thumb { width: 36px; height: 24px; }
+.node.node--uniform.node--store .node-footer { padding-left: 58px; }
+.node.node--uniform .node-stock { display: flex; align-items: baseline; flex: 1; gap: 6px; font-size: 22px; font-weight: 650 !important; color: #273142; }
+.node.node--uniform .node-plus { margin: 0; font-size: 11px; font-weight: 500; color: #35967b; }
+.node.node--uniform.is-dormant { opacity: .8; }
+.node.node--uniform.is-selected, .node.node--uniform.is-open, .node.node--uniform.is-trail { border-color: #7ba5f0; box-shadow: 0 0 0 2px #3274ea13, 0 4px 16px #20365912; }
+.dock-head { display: none; }
+.inspector-error { padding: 12px; max-width: calc(100% - 48px); }
+.inspector-error p { color: var(--ink-2); padding: 4px 10px; line-height: 1.6; }

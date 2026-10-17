@@ -44,7 +44,7 @@ function tokenData(data: Record<string, unknown>) {
   }
   const nested = {
     style: ['applicable', 'subjectVisible', 'styles'],
-    facts: ['price', 'license'],
+    facts: ['price', 'pricing', 'license'],
     copy: ['takeawayZh', 'descriptionZh'],
   };
   for (const [key, keys] of Object.entries(nested)) {
@@ -56,6 +56,12 @@ function tokenData(data: Record<string, unknown>) {
       continue;
     }
     const fields = pick(value, keys);
+    if (key === 'facts') {
+      for (const field of keys) {
+        const fact = object(fields[field]);
+        if (fact) fields[field] = pick(fact, ['value']);
+      }
+    }
     if (key === 'style' && Array.isArray(fields.styles)) {
       fields.styles = fields.styles.map(style => pick(style, ['id']));
     }
