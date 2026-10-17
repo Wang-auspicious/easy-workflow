@@ -1,7 +1,7 @@
 // One callable capability registry for the dispatcher, HTTP clients and dashboard.
 import { Type } from "typebox";
 import { Check, Errors } from "typebox/value";
-import { elapsed, median, quantile, latestRunTokens } from "../shared/project.ts";
+import { elapsed, median, quantile, latestRunTokens, manualOwner } from "../shared/project.ts";
 import type { Factory } from "./factory.ts";
 import { ControlError } from "./errors.ts";
 import { KIND_ZH } from "../packs/vislexicon/env.ts";
@@ -20,6 +20,8 @@ import {proofCheckpointSha256, supplementProof} from './capture-supplement.ts';
 import {applyEntryUrlDecision} from './entry-url-decision.ts';
 import {WorkflowAuthoring} from './workflow-authoring.ts';
 import {businessCatalog, businessInput} from '../packs/vislexicon/intake.ts';
+import {manualReview} from './manual-review.ts';
+import {sameSite} from '../packs/vislexicon/capture.ts';
 
 const name = () => Type.String({ minLength: 1, maxLength: 200 });
 const choice = (...values: string[]) => Type.Union(values.map((x) => Type.Literal(x)));
@@ -355,6 +357,12 @@ function definitions(f: Factory): Tool[] {
         return ok(f.runtime.decideMeasurement(p.id,p.action==='accept'),'已记录配员决定');
       }},
       {
+        name: 'resume_handoff', label: '续接待审工位会话',
+        description: 'For legacy v1 manual work with a saved budget handoff, resume the same paid station conversation. At most 2 continuations per token/station, each capped at 128000 tokens and 30 minutes. Preserves evidence and correction counts; never approves or publishes by itself. Run must be resumed separately. Do not use correct for a budget handoff.',
+        parameters: object({token: name(), node: name()}),
+        execute: async (_id, p) => ok(f.resumeAgentHandoff(p.token, p.node), '已续接原工位会话'),
+      },
+      {
         name: 'continue_budget', label: '继续交接会话',
         description: 'The owner doubles this waiting station budget and resumes its saved conversation.',
         parameters: object({item: name(), node: name()}),
@@ -377,24 +385,44 @@ function definitions(f: Factory): Tool[] {
       {
         name: 'retry_candidates',
         label: '按标签批量重试',
-        description: 'Explicitly retry retained candidates after resolving their cause. Prefer exact token ids; legacy item ids are accepted only when unambiguous across workflows. Removed invalid URLs cannot be retried. includeManual requires a user request with explicit tokens or unambiguous items and preserves the original checkpoint.',
+        description: 'Retry retained candidates after resolving their cause. Prefer exact token ids. includeManual keeps the original checkpoint and correction counts. Agents may resume explicitly selected technical failures with technicalReason describing the actual fix, at most twice per failed station across successor tasks. Human decisions and auth still require the user. Never use this to repeat an unchanged quality failure.',
         parameters: object({
           tag: Type.Optional(name()),
           items: Type.Optional(Type.Array(name(), {minItems: 1, maxItems: 200})),
           tokens: Type.Optional(Type.Array(name(), {minItems: 1, maxItems: 200})),
           count: Type.Integer({minimum: 1, maximum: 200}),
           includeManual: Type.Optional(Type.Boolean()),
+          technicalReason: Type.Optional(Type.String({minLength: 12, maxLength: 2000})),
         }),
         execute: async (_id, parameters, actor) => {
-          if (parameters.includeManual && actor !== 'user') {
+          const technical = parameters.includeManual && actor !== 'user';
+          if (technical && (!parameters.tokens?.length || !parameters.technicalReason)) {
             throw new ControlError(403, 'owner_decision_required', '恢复策略已转人工复核，需由用户明确选择条目继续');
           }
           if (parameters.includeManual && !parameters.items?.length && !parameters.tokens?.length) {
             throw new ControlError(400, 'manual_retry_requires_items', '请明确选择要恢复的人工复核条目');
           }
           const selected = f.candidatesForRetry(parameters);
+          const resumes = new Map<string, {station: string; count: number}>();
+          if (technical) for (const candidate of selected) {
+            const previous = f.state.tokens[candidate.token];
+            if (!previous || !candidate.failure || candidate.failure.owner === 'user' || candidate.failure.category === 'auth' || manualOwner(previous) === 'human') {
+              throw new ControlError(403, 'owner_decision_required', '此条目需要用户判断或登录接管，不能作为技术恢复');
+            }
+            const station = (candidate.disposition === 'manual' ? candidate.recoveryStation : previous.finishedAtNode) ?? '';
+            const count = (previous.data.technicalResumes as Record<string, {count: number}> | undefined)?.[station]?.count ?? 0;
+            if (count >= 2) throw new ControlError(409, 'technical_resume_limit', '该工位已有2次技术修复续接，保留具体阻塞，不能无限重试');
+            resumes.set(previous.id, {station, count: count + 1});
+          }
           if (selected.length && !f.runtime.running) await f.ensureReady();
-          const tasks = f.retryCandidates(parameters);
+          const tasks = f.retryCandidates({...parameters, ...(technical ? {checkpointOnly: true, onClaim: token => {
+            const resume = resumes.get(String(token.data.retryOf));
+            if (!resume) throw new ControlError(409, 'technical_resume_target_changed', '原检查点与选择不一致');
+            const patch = {technicalResumes: {...token.data.technicalResumes as object, [resume.station]: {...resume, reason: parameters.technicalReason}}};
+            Object.assign(token.data, patch);
+            f.journal.append({kind: 'token.data', token: token.id, patch});
+            f.runtime.checkpoint(token);
+          }} : {})});
           return ok({count: tasks.length, tokens: tasks.map(token => ({id: token.id, item: token.item})), runId: f.state.run.id},
             `已取出 ${tasks.length} 件重试`);
         },
@@ -433,17 +461,35 @@ function definitions(f: Factory): Tool[] {
         },
       },
       {
-        name: "correct", label: "纠错退回", description: "Send a token back to the station that produced a piece of evidence (or a named station) with a reason. Use evidence ids from attachments when given.",
-        parameters: Type.Object({ evidence: Type.Optional(Type.String()), token: Type.Optional(Type.String()), station: Type.Optional(Type.String()), reason: Type.String(), note: Type.Optional(Type.String()) }),
-        execute: async (_id, p) => {
+        name: "correct", label: "纠错退回", description: "Send unfinished work back to a station. Active/completed work is skipped unless revisit=true for an explicitly requested revision; ordinary queue cleanup must omit revisit. For screenshot repairs use captureTarget with an observed URL and exact visible target text. position=above frames content before the anchor, below after it, center around it. dismissOverlay names a presentation popup to close via its real close button (never auth). Prose note alone does not execute framing or clicks. reason is required. Manual corrections are capped at 3 per station; automatic history stays intact.",
+        parameters: Type.Object({ evidence: Type.Optional(Type.String()), token: Type.Optional(Type.String()), station: Type.Optional(Type.String()), reason: Type.String(), note: Type.Optional(Type.String()), revisit: Type.Optional(Type.Boolean()),
+          captureTarget: Type.Optional(object({role: choice('breadth', 'proof'), url: Type.String({minLength: 1, maxLength: 4000}), locate: Type.String({minLength: 2, maxLength: 1000}), selector: Type.Optional(Type.String({minLength: 1, maxLength: 600})), position: Type.Optional(choice('below', 'above', 'center')), dismissOverlay: Type.Optional(Type.String({minLength: 2, maxLength: 150})),
+            interaction: Type.Optional(Type.Union([object({kind: Type.Literal('open-preview'), index: Type.Integer({minimum: 0, maximum: 49})}), object({kind: Type.Literal('open-dialog'), label: Type.String({minLength: 2, maxLength: 120})})]))})) }),
+        execute: async (_id, p, actor) => {
           const ev = p.evidence ? f.state.evidence[p.evidence] : undefined;
           const token = ev?.token ?? p.token;
           const station = p.station ?? ev?.station;
           if (!token || !station) throw new ControlError(400, "missing_target", "需要证据 id，或 token + station");
+          const current = f.state.tokens[token];
           const target = f.runtime.tokens.get(token), node = f.runtime.nodes.get(station);
+          if (actor !== 'user' && current && target && node && f.runtime.runnable(node) && target.closure.has(station) && ['active', 'published', 'merged', 'rejected'].includes(current.status) && !p.revisit) {
+            return ok({ok: true, skipped: true, token, status: current.status, gate: current.data.gate}, '任务已在途或完成，保留当前结果，未重复纠错');
+          }
+          if (p.captureTarget) {
+            if (station !== `curation/${p.captureTarget.role}`) throw new ControlError(400, 'capture_station_mismatch', '取景角色与纠错工位不一致');
+            let valid = false;
+            try {
+              const url = new URL(p.captureTarget.url);
+              const host = typeof current?.data.host === 'string' ? current.data.host : new URL(current?.url ?? '').hostname.replace(/^www\./, '');
+              valid = ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && sameSite(url.href, host) &&
+                p.captureTarget.locate.trim().length >= 2 && (!p.captureTarget.interaction || p.captureTarget.role === 'proof');
+            } catch { /* Reject before changing state or consuming a repair. */ }
+            if (!valid) throw new ControlError(400, 'invalid_capture_target', '取景目标必须使用该任务同站的真实 HTTP(S) 页面及可命中的定位文本；预览交互仅用于 proof。当前状态和返工次数未改变。请从 browser.read 原样复制 URL，不要改写域名。');
+          }
           // Let Runtime preserve its target rejection; invalid commands must not probe a model.
           if (!f.runtime.running && target && node && f.runtime.runnable(node) && target.closure.has(station)) await f.ensureReady();
-          const r = f.runtime.correct({ token, node: station, evidence: p.evidence }, p.reason, p.note);
+          const note = p.captureTarget ? JSON.stringify({captureTarget: p.captureTarget, note: p.note}) : p.note;
+          const r = f.runtime.correct({ token, node: station, evidence: p.evidence }, p.reason, note);
           return ok(r, `${f.state.tokens[token]?.item ?? token} → ${nodeName(station)}：${r.message}`);
         },
       },
@@ -491,6 +537,9 @@ function definitions(f: Factory): Tool[] {
           }, `查看 ${t.item}`);
         },
       },
+      {name: 'manual_review', label: '待人工队列诊断', description: 'Read a compact manual queue across all runs, or one exact token with current media, provenance, repair targets and a read-only rebuild/validation using the current programs. Prefer this over huge inspect/read_case responses for triage. Does not approve, mutate or rerun anything. Repair one representative, verify actual outcome, then process similar items. A technical failure is not itself a human judgment.',
+        parameters: object({token: Type.Optional(name()), tokens: Type.Optional(Type.Array(name(), {minItems: 1, maxItems: 100})), detail: Type.Optional(Type.Boolean()), waitMs: Type.Optional(Type.Integer({minimum: 0, maximum: 30_000})), offset: Type.Optional(Type.Integer({minimum: 0})), limit: Type.Optional(Type.Integer({minimum: 1, maximum: 20}))}),
+        execute: async (_id, p) => ok(await manualReview(f, p), '读取待审诊断；按真实原因恢复并重新审查')},
       {
         name: "propose_patch", label: "起草规格补丁", description: "Draft a spec patch (shown to the owner for accept/reject). ops: set {station, field, value} | add-station {line, station:{id,name,role,kind}, after} | remove-station {station} | add-edge/remove-edge {from,to}.",
         parameters: Type.Object({ summary: name(), ops: Type.Array(patchOp, { minItems: 1, maxItems: 100 }) }),
@@ -501,9 +550,18 @@ function definitions(f: Factory): Tool[] {
         parameters: object({}), execute: async () => ok({ factory: f.compiled, patches: f.patches }, "读取规格和补丁"),
       },
       {
-        name: "browser", label: "内置浏览器", description: "Shared persistent browser tabs, auth attention, bookmarks and retained history. action=state reads; open/navigate use http(s) URLs. No passwords or cookies are exposed.",
+        name: "browser", label: "内置浏览器", description: "Shared browser. state/open return real tab IDs; use tabId or active for read, never invent an ID. read returns bounded rendered landmarks, media, controls, exact CSS selectors and document positions; feed an observed selector into correct.captureTarget for regions without text. No passwords, field values or cookies are exposed.",
         parameters: object({ action: choice("state","read","open","activate","navigate","back","forward","reload","close","tab.move","bookmark.add","bookmark.update","bookmark.remove","bookmark.move","history.prune","attention.check"), id: Type.Optional(name()), url: Type.Optional(Type.String({minLength:1,maxLength:4000})), title: Type.Optional(Type.String({maxLength:60})), before: Type.Optional(name()), days: Type.Optional(Type.Integer({minimum:1,maximum:365})) }),
-        execute: async (_id,p) => { try { return ok(await browserCommand(p), p.action === "state" ? "读取浏览器状态" : "浏览器操作已完成"); } catch (error) { throw new ControlError(400,"browser_operation_failed",(error as Error).message); } },
+        execute: async (_id,p,actor) => {
+          try {
+            const value = await browserCommand(p);
+            const result = actor !== 'user' && Array.isArray(value.tabs) ? {
+              active: value.active, tabId: value.active,
+              tabs: value.tabs.map((tab: {id: string; url: string; title: string; attention?: unknown}) => ({id: tab.id, url: tab.url, title: tab.title, attention: tab.attention})),
+            } : value;
+            return ok(result, p.action === 'state' ? '读取浏览器状态' : '浏览器操作已完成');
+          } catch (error) {throw new ControlError(400, 'browser_operation_failed', (error as Error).message);}
+        },
       },
       {
         name: "decide_patch", label: "接受 / 拒绝补丁", description: "Accept or reject a proposed patch. Acceptance validates and activates it while no run is active; returns 409 otherwise. Invalid or unwired runnable stations cannot be activated.",
@@ -616,7 +674,7 @@ function definitions(f: Factory): Tool[] {
     ];
   }
 
-const READS = new Set(["agent_defaults", "agent_bindings", "source_list", "workflow_templates", "workflow_authoring", "workflow_drafts", "workflow_result", "business_lines", "status", "inspect", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
+const READS = new Set(["agent_defaults", "agent_bindings", "source_list", "workflow_templates", "workflow_authoring", "workflow_drafts", "workflow_result", "business_lines", "status", "inspect", "manual_review", "read_spec", "read_report", "candidate_failures", "read_role", "read_context", "read_case", "read_lessons"]);
 
 export class FactoryControl {
   private f: Factory;
@@ -651,6 +709,7 @@ export class FactoryControl {
       product: "Easy Workflow", protocol: CONTROL_PROTOCOL, revision, readOnly,
       model: this.f.dispatcherModelStatus(), agentDefaults: this.f.getAgentDefaults(),
       instructions: `Easy Workflow 是可直接调用的流水线服务。无需浏览界面、读源码或通读 Spec。\n` +
+        `人工队列：manual_review 分页列出跨轮次待审，传 token 返回精简的当前证据、事实与只读重建结果，避免反复读超长案卷。rebuild.valid 且 changed 时优先重跑 assemble，再过终审与闸门；截图问题需要具体新取景策略。先验证代表项，再处理同类；技术错误不能直接当成人类判断。\n` +
         `先用 easy_workflow_help 获取能力索引；只为当前任务读取 easy_workflow_help({name}) 的参数，再以 easy_workflow_call({name,arguments}) 调用。客户端若只提供兼容入口，使用它已注册的工具名。read_role({station}) 读取一个节点的 ROLE.md 和异常处理边界。\n` +
         `查询：status 看状态，inspect 查任务/工位/证据，read_case 看一件货的案卷，read_context 看节点 CONTEXT，alerts 看红灯与开跑体检，read_report 看报告，browser 查共享网页/登录提醒及操作标签。给某个节点留长期指示用 note_context。开跑、恢复、投料前会自动体检，体检不过返回 412 和要修的项目。调度：feed_urls/pull_candidates 投料，run_control 启停，workers 配人，correct 纠错。规格：read_spec 按需读，propose_patch 起草，decide_patch 按用户决定接受或拒绝。settings 读写配额。\n` +
         `长程任务：用户给定总量并要求持续监督时，用 run_batch(action=start,target=总量) 保存目标；后台按前段空位逐批补料，有界恢复网络故障和重新选页，不依赖聊天轮询。status.batch 查看目标、领取、完成、剩余与阻塞。\n` +
@@ -709,7 +768,7 @@ export class FactoryControl {
     // Canonical tools plus aliases for persisted conversations and installed clients.
     const current: Tool[] = [
       { name: CONTROL_HELP, label: "查看 Easy Workflow 能力", description: "Easy Workflow capability index; supply name to read one tool's exact schema. No UI or repository exploration needed.", parameters: object({ name: Type.Optional(name()) }),
-        execute: async (_id, p) => ok(p.name ? this.describe(p.name) : this.bootstrap(), "读取 Easy Workflow 能力契约") },
+        execute: async (_id, p) => ok(p.name && p.name !== 'index' ? this.describe(p.name) : this.bootstrap(), "读取 Easy Workflow 能力契约") },
       { name: CONTROL_CALL, label: "调用 Easy Workflow", description: "Execute a discovered Easy Workflow capability with its exact arguments. Mutations are journaled; never blindly retry a timed-out write.", parameters: object({ name: name(), arguments: Type.Record(Type.String(), Type.Unknown()) }),
         execute: async (_id, p) => {
           if (p.name === "decide_patch") throw new ControlError(403, "owner_decision_required", "主调度不能批准自己起草的补丁；请站长在界面决定。");

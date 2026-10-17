@@ -438,6 +438,37 @@ test('C contract forces a handoff at one hundred percent without spending anothe
   });
 });
 
+test('C contract keeps a validated submit when its final usage receipt crosses the budget', {timeout: 20000}, async () => {
+  await contractFixture(() => ({...submitContract(), tokens: 125}), async fixture => {
+    const result = await runAgentStation(fixture.definition, {...fixture.context, agentBudget: {maxTokens: 100, maxMs: 900000}});
+    assert.equal(result.ok, true, 'a checked, received submit must not be replaced by a late forced handoff');
+    assert.equal(result.agentContract?.ending, 'submit');
+    assert.equal(result.agentContract?.actualTokens, 125, 'actual cost remains reported without pretending it stayed under budget');
+    assert.equal(result.handoff, undefined);
+    assert.equal(fixture.requests.length, 1, 'no follow-up model call or paid retry is permitted');
+  });
+});
+
+test('a reused reviewer session receives changed screenshots without needing a direct redo note', {timeout: 20000}, async () => {
+  await contractFixture(() => submitContract(), async fixture => {
+    const file = path.join(fixture.dir, 'current-shot.ppm');
+    fs.writeFileSync(file, Buffer.concat([Buffer.from('P6\n4 6\n255\n'), Buffer.alloc(4 * 6 * 3, 50)]));
+    const definition = {...fixture.definition, input: () => ({text: 'Review the current screenshot.', images: [{file, label: 'current proof'}]})};
+    const first = await runAgentStation(definition, fixture.context);
+    assert.equal(first.ok, true);
+    fs.writeFileSync(file, Buffer.concat([Buffer.from('P6\n4 6\n255\n'), Buffer.alloc(4 * 6 * 3, 220)]));
+    const second = await runAgentStation(definition, {...fixture.context, attempt: 'new-screenshot-review',
+      token: {...fixture.context.token, data: {...fixture.context.token.data, ...first.data}}});
+    assert.equal(second.ok, true);
+    const latestUser = (fixture.requests[1].messages as {role: string; content: unknown}[]).findLast(message => message.role === 'user');
+    assert.ok(Array.isArray(latestUser?.content), 'new review inputs must carry the new pixels despite a restored session');
+    const pixels = (latestUser.content as {type: string; image_url?: {url: string}}[]).find(part => part.type === 'image_url');
+    assert.match(pixels?.image_url?.url ?? '', /^data:image\/jpeg;base64,/);
+    const old = (fixture.requests[0].messages as {role: string; content: unknown}[]).findLast(message => message.role === 'user');
+    assert.notDeepEqual(latestUser.content, old?.content, 'the changed file cannot reuse the old pixel payload');
+  });
+});
+
 test('C contract rejects an oversized handoff field within the same model conversation', {timeout: 20000}, async () => {
   await contractFixture(index => index === 1 ? {tool: {name: 'handoff', arguments: {
     done: ['x'.repeat(501)], evidence: [], remaining: ['verify score'], suggestion: 'Continue.',

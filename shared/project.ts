@@ -569,6 +569,19 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
         text: e.verdict === "pass" ? `通过：${e.reason}` : `${e.verdict === "escalate" ? "转人工" : "退回"}：${e.reason}` });
       break;
     }
+    case 'token.resumed': {
+      const token = s.tokens[e.token];
+      if (!token) break;
+      for (const key of token.at) remove(node(key).queue, token.id);
+      token.at = [];
+      token.status = 'active';
+      token.finishedAt = undefined;
+      token.finishedAtNode = undefined;
+      token.reason = undefined;
+      token.touchedAt = e.at;
+      pushComm(s, {seq: e.seq, at: e.at, token: e.token, kind: 'return', from: e.node, to: e.node, tone: 'info', text: e.reason});
+      break;
+    }
     case "token.returned": {
       const t = s.tokens[e.token];
       if (!t) break;
@@ -791,6 +804,28 @@ export function nodeLight(n: NodeState | undefined, dormant: boolean, now: numbe
 /** A cross-line delivery is independent work; its retries retain that identity. */
 export function tokenWorkKey(t: Pick<TokenState, 'data' | 'line' | 'item'>) {
   return JSON.stringify([t.data.channelDelivery ?? '', t.data.workflowPack ?? '', ['candidates', 'curation'].includes(t.line) ? 'curation' : t.line, t.item]);
+}
+
+/** All-run unresolved manual work, excluding superseded retries but not independent channels. */
+export function manualQueue(state: FactoryState): TokenState[] {
+  const latest = new Map<string, TokenState>();
+  for (const token of Object.values(state.tokens)) {
+    const successor = typeof token.data.retriedBy === 'string' ? state.tokens[token.data.retriedBy] : undefined;
+    if (successor && tokenWorkKey(successor) === tokenWorkKey(token)) continue;
+    const key = tokenWorkKey(token), previous = latest.get(key);
+    if (!previous || (token.touchedAt ?? token.createdAt) >= (previous.touchedAt ?? previous.createdAt)) latest.set(key, token);
+  }
+  return [...latest.values()].filter(token => token.status === 'manual' || token.at.some(node => node.endsWith('/manual')));
+}
+
+/** An exhausted technical retry is still system work, not an owner decision. */
+export function manualOwner(token: TokenState): 'agent' | 'human' {
+  const failure = token.data.failure as {owner?: string; category?: string; message?: string} | undefined;
+  const reason = String(token.reason || token.data.manualReason || '');
+  const currentFailure = failure?.message && reason.includes(failure.message.slice(0, 100));
+  if (currentFailure && (failure?.owner === 'user' || failure?.category === 'auth')) return 'human';
+  if (/分类分歧未决|(?:请|需要|等待)(?:站长|用户)(?:来|进行|做出)?(?:选择|取舍|确认许可)|需要.{0,12}(?:验证码|扫码|登录接管)|Needs an owner decision/iu.test(reason)) return 'human';
+  return 'agent';
 }
 
 function recoveryWorkKey(token: Pick<TokenState, 'data' | 'line' | 'item'>) {

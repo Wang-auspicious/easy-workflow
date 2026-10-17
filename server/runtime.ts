@@ -765,6 +765,7 @@ export class Runtime {
       this.journal.append({kind:"attempt.progress",attempt,text:`按 ${n.name} 的 ROLE.md 执行`,step:{tool:"role",text:`${role.path} @ ${role.revision}`}});
       res = await withModelAdmission(modelAdmission, () => withBrowserAttempt(browserScope, () => exec({
         token: t, node: n, attempt, worker: w, signal, redo: t.notes.get(n.key),
+        agentBudget: (t.data.agentContinuations as Record<string, {budget: AgentBudget}> | undefined)?.[n.key]?.budget,
         progress: (text, step) => {
           if (!signal.aborted && (t.nodeEpochs?.get(n.key)??0) === epoch && !t.finished) this.journal.append({ kind: "attempt.progress", attempt, text, step });
         },
@@ -943,7 +944,7 @@ export class Runtime {
       // handoff for manual continuation, without classifying a model failure.
       const patch = {...retainedRecoverySessions(t, n.key, res),
         agentHandoffs: {...t.data.agentHandoffs as object, [n.key]: {
-          handoff: res.handoff, agentContract: res.agentContract,
+          handoff: res.handoff, agentContract: res.agentContract, attempt,
         }}};
       Object.assign(t.data, patch);
       this.journal.append({kind: 'token.data', token: t.id, patch});
@@ -1148,7 +1149,13 @@ export class Runtime {
     const max = byHuman ? 3 : edge?.maxRounds ?? 0;
     if (!byHuman && !edge) { this.toManual(t, this.nodes.get(from)!, `退回目标 ${to} 不在规格的退回边里：${reason}`); return false; }
     const round = (t.rounds[to] ?? 0) + 1;
-    if (round > max) { this.toManual(t, this.nodes.get(from) ?? this.nodes.get(to)!, `退回 ${this.nodes.get(to)?.name} 已满 ${max} 轮：${reason}`); return false; }
+    const manualKey = `manual:${to}`;
+    const boundedRound = byHuman ? (t.rounds[manualKey] ?? 0) + 1 : round;
+    if (boundedRound > max) {
+      if (!byHuman) this.toManual(t, this.nodes.get(from) ?? this.nodes.get(to)!, `退回 ${this.nodes.get(to)?.name} 已满 ${max} 轮：${reason}`);
+      return false;
+    }
+    if (byHuman) t.rounds[manualKey] = boundedRound;
     t.rounds[to] = round;
     t.epoch++;
     const reset = this.descendants(t, to);
@@ -1310,6 +1317,13 @@ export class Runtime {
     this.checkpoint(t);
   }
 
+  manualCorrectionBudget(token: string, node: string) {
+    const recorded = this.tokens.get(token)?.rounds[`manual:${node}`];
+    const used = recorded ?? [...this.journal.read()].filter(event =>
+      event.kind === 'token.returned' && event.token === token && event.byHuman && event.to === node).length;
+    return {used, max: 3, remaining: Math.max(0, 3 - used)};
+  }
+
   correct(target: { token: string; node: string; evidence?: string }, reason: string, note?: string) {
     const t = this.tokens.get(target.token);
     if (!t) return { ok: false, message: "找不到这件货" };
@@ -1317,6 +1331,11 @@ export class Runtime {
     if (!n || !this.runnable(n) || !t.closure.has(target.node)) return { ok: false, message: "纠错目标必须是这件货经过的可执行工位" };
     const correction = `c-${short()}`;
     const history = [...this.journal.read()].filter(event => 'token' in event && event.token === t.id);
+    // Legacy automatic review rounds must not consume the distinct three
+    // user-authorized corrections. Recover their count from successful receipts.
+    const manualKey = `manual:${target.node}`;
+    if (t.rounds[manualKey] === undefined) t.rounds[manualKey] = this.manualCorrectionBudget(t.id, target.node).used;
+    if (t.rounds[manualKey] >= 3) return {ok: false, message: '已超过纠错次数，原任务和状态保持不变'};
     const last = history.findLast(event => event.kind === 'token.finished');
     const touched = history.findLast(event => event.kind === 'token.queued' || event.kind === 'token.created');
     const snapshot = { data: structuredClone(t.data), checkpoint: { version: 1, entry: t.entry, done: [...t.done], rounds: { ...t.rounds }, notes: [...t.notes], consult: structuredClone(t.consult), pendingConsults: structuredClone(t.pendingConsults) },
@@ -1329,7 +1348,45 @@ export class Runtime {
       this.journal.append({ kind: "correction.created", correction, evidence: target.evidence, token: t.id, node: target.node, reason, note, snapshot });
       ok = this.returnToken(t, "human", target.node, note ? `${reason}：${note}` : reason, true, note);
     });
-    return { ok, correction, message: ok ? `已退回 ${this.nodes.get(target.node)?.name}` : "已超过纠错轮数，转待人工" };
+    return { ok, correction, message: ok ? `已退回 ${this.nodes.get(target.node)?.name}` : '已超过纠错次数，原任务和状态保持不变' };
+  }
+
+  /** A bounded continuation keeps the paid session and does not spend correction rounds. */
+  resumeHandoff(token: string, node: string) {
+    this.requireStorage();
+    const t = this.tokens.get(token), n = this.nodes.get(node);
+    if (!t || !n || !this.runnable(n) || !t.closure.has(node)) throw new ControlError(404, 'item_node_not_found', '找不到这件货的工位');
+    const handoffs = t.data.agentHandoffs as Record<string, {handoff: AgentHandoff; agentContract: AgentContractReport}> | undefined;
+    const saved = handoffs?.[node];
+    if (!t.finished || !saved) throw new ControlError(409, 'not_waiting_budget', '该工位当前没有等待预算续接');
+    const session = (t.data.stationSessions as Record<string, SessionRef> | undefined)?.[node];
+    const closed = (t.data.closedStationSessions as Record<string, ClosedSessionReference> | undefined)?.[node];
+    if (!session && !closed) throw new ControlError(409, 'handoff_session_missing', '交接没有已保存会话，不能当作原地续接');
+    const original = saved.agentContract?.budget;
+    if (!original || !Number.isSafeInteger(original.maxTokens) || original.maxTokens <= 0 || !Number.isSafeInteger(original.maxMs) || original.maxMs <= 0) {
+      throw new ControlError(409, 'agent_budget_missing', '交接缺少有效原预算');
+    }
+    const continuations = t.data.agentContinuations as Record<string, {count: number; budget: AgentBudget}> | undefined;
+    const count = continuations?.[node]?.count ?? 0;
+    if (count >= 2) throw new ControlError(409, 'handoff_continuation_limit', '本工位已续接2次，需检查交接原因，不能无限追加预算');
+    const budget = {maxTokens: Math.min(original.maxTokens * 2, 128_000), maxMs: Math.min(original.maxMs * 2, 1_800_000)};
+    this.commitTransition(() => {
+      const remaining = {...handoffs};
+      delete remaining[node];
+      const patch = {agentHandoffs: remaining, agentContinuations: {...continuations, [node]: {count: count + 1, budget}}, manualReason: ''};
+      Object.assign(t.data, patch);
+      this.journal.append({kind: 'token.data', token, patch});
+      if (t.finishedStore) this.stockDelta(t.finishedStore, -1, '原会话预算续接');
+      t.finishedStore = undefined;
+      t.finished = false;
+      this.journal.append({kind: 'token.resumed', token, node, reason: '从已保存会话继续预算交接'});
+      t.notes.set(node, {reason: '继续已保存的预算交接', note: saved.handoff.suggestion, byHuman: false});
+      this.enqueue(t, node, node, true);
+      this.restoreFlow(t);
+      this.resumeFrontier(t, node);
+    });
+    this.schedule();
+    return {ok: true, token, node, budget, continuation: count + 1};
   }
 
   undoCorrection(id: string) {

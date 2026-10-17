@@ -217,7 +217,10 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   };
   const budgetFraction = () => Math.max(usedTokens(tokenUsage) / budget.maxTokens, (Date.now() - startedAt) / budget.maxMs);
   const checkBudget = () => {
-    if (handedOff) return;
+    // submit has already passed schema and station checks and spends no further
+    // model call. Late usage accounting must not turn that durable success into
+    // a forced handoff (which would replay and bill the same review again).
+    if (handedOff || submitted !== null) return;
     const fraction = budgetFraction();
     if (fraction >= 1 && !handedOff) { forcedHandoff(); budgetAbort.abort(new Error('AGENT_BUDGET_EXHAUSTED')); }
     else if (fraction >= .9 && !handoffRequested && submitted === null) requestHandoff();
@@ -688,7 +691,14 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   preparingImages = true;
   // A recovered task transcript already contains its images. A dialogue has a
   // newly scoped view, so its current images must accompany this new turn.
-  if (dialogue || !(saved && agent instanceof Agent) || ctx.redo) {
+  const lastSaved = saved?.messages.at(-1) as {role?: string} | undefined;
+  const continueSavedRequest = !dialogue && agent instanceof Agent && (Boolean(recoveredQuestionText) ||
+    saved && !ctx.redo && !saved.submitSummary && ['user', 'toolResult'].includes(lastSaved?.role ?? ''));
+  // A reused station conversation is not necessarily the same input. Downstream
+  // reviewers have no direct redo note when a photographer replaces an image.
+  // Every new input must include its current pixels; only a genuinely resumed
+  // pending request already has those pixels in its saved user message.
+  if (!continueSavedRequest) {
     for (const image of input.images ?? []) {
       const bytes = await EvidenceStore.jpegAsync(image.file, 720, { signal: sessionSignal, timeoutMs: 15000 });
       sessionSignal.throwIfAborted();
@@ -698,8 +708,7 @@ async function executeAgentStation<T>(def: AgentStationDef<T>, ctx: StationConte
   sessionSignal.throwIfAborted();
   preparingImages = false;
   ctx.progress(`读取身份、案卷与输入${input.images?.length ? `：${input.images.length} 张图 + 文字` : ""}；调用 ${external ? "闭源 Agent / " : ""}${modelId}`, { tool: "model", text: input.text.slice(0, 160) });
-  const lastSaved = saved?.messages.at(-1) as {role?: string} | undefined;
-  if (!dialogue && agent instanceof Agent && (Boolean(recoveredQuestionText) || saved && !ctx.redo && !saved.submitSummary && ['user', 'toolResult'].includes(lastSaved?.role ?? ''))) {
+  if (continueSavedRequest) {
     await invoke(() => agent.continue());
   } else await ask((recoveredQuestionText ? `${recoveredQuestionText}\n\n` : '') + (redo ? `${redo}\n\n当前输入：\n` : '') + input.text + previousSubmit, images.length ? images : undefined);
   let handoffPrompts = 0;

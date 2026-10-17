@@ -22,7 +22,7 @@ import {prioritizeCaptureCandidates} from './decisions.ts';
 import { ALL_AXES, CHOSEN_AXES, derivedFacets, loadTaxonomy, validateV3, webpSize } from "./v3.ts";
 import {
   VIEW, bestScrollFrame, checkImage, findStage, iframeEmpty, letterbox, links, motionFirst, previewsInViewport, breadthPreviewIssues, breadthRoleGuidance, recordScroll, sameSite,
-  scoreLinks, shoot, stageClip, visit, pageKey, locateCaptureTarget, sampleBrowserCapture, openReadOnlyPreview, waitProofCaptureReady,
+  scoreLinks, shoot, stageClip, visit, pageKey, locateCaptureTarget, sampleBrowserCapture, openReadOnlyPreview, openReadOnlyDialog, dismissReadOnlyOverlay, waitProofCaptureReady,
   type BrowserCaptureState, type CaptureLocation, type BreadthVisual, type Link,
 } from "./capture.ts";
 
@@ -45,11 +45,10 @@ function siteEntryThreeShots(ctx: StationContext): boolean {
     external?.intakeId === 'vislexicon-20261014' && typeof external.entryId === 'string';
 }
 
-type CorrectedCaptureTarget = {url: string; locate: string; interaction?: {kind: 'open-preview'; index: number}};
+type CorrectedCaptureTarget = {url: string; locate: string; selector?: string; position?: 'below' | 'above' | 'center'; dismissOverlay?: string; interaction?: {kind: 'open-preview'; index: number} | {kind: 'open-dialog'; label: string}};
 
 /** Keep an owner-validated entry target when another role invalidates this station. */
 function correctedCaptureTarget(ctx: StationContext, host: string, role: 'breadth' | 'proof'): CorrectedCaptureTarget | undefined {
-  if (!siteEntryThreeShots(ctx)) return undefined;
   let target: unknown;
   let explicit = false;
   if (ctx.redo?.byHuman && ctx.redo.note) {
@@ -64,36 +63,39 @@ function correctedCaptureTarget(ctx: StationContext, host: string, role: 'breadt
     const targets = ctx.token.data.ownerCaptureTargets as Record<string, unknown> | undefined;
     if (!targets || !Object.hasOwn(targets, role)) return undefined;
     const saved = targets[role];
-    const entryId = (ctx.token.data.externalResearch as Record<string, unknown> | undefined)?.entryId;
+    const entryId = (ctx.token.data.externalResearch as Record<string, unknown> | undefined)?.entryId ?? ctx.token.item;
     // An old entry binding must fail visibly, never become permission to select a sibling.
     if (saved && typeof saved === 'object' && typeof entryId === 'string' &&
         (saved as Record<string, unknown>).entryId === entryId) target = saved;
   }
   if (target && typeof target === 'object') {
     const requested = target as Record<string, unknown>;
+    const position = requested.position;
+    const dismissOverlay = requested.dismissOverlay;
+    const selector = requested.selector;
     const interaction = requested.interaction as Record<string, unknown> | undefined;
-    const validInteraction = interaction === undefined || role === 'proof' && interaction !== null &&
-      interaction.kind === 'open-preview' && Number.isSafeInteger(interaction.index ?? 0) &&
-      Number(interaction.index ?? 0) >= 0 && Number(interaction.index ?? 0) <= 49;
-    if (requested.role === role && validInteraction && typeof requested.url === 'string' && typeof requested.locate === 'string' &&
+    const validInteraction = interaction === undefined || role === 'proof' && interaction !== null && (
+      interaction.kind === 'open-preview' && Number.isSafeInteger(interaction.index ?? 0) && Number(interaction.index ?? 0) >= 0 && Number(interaction.index ?? 0) <= 49 ||
+      interaction.kind === 'open-dialog' && typeof interaction.label === 'string' && interaction.label.length >= 2 && interaction.label.length <= 120);
+    if (requested.role === role && validInteraction && (selector === undefined || typeof selector === 'string' && selector.length >= 1 && selector.length <= 600) && (dismissOverlay === undefined || typeof dismissOverlay === 'string' && dismissOverlay.length >= 2 && dismissOverlay.length <= 150) && (position === undefined || ['below', 'above', 'center'].includes(String(position))) && typeof requested.url === 'string' && typeof requested.locate === 'string' &&
         requested.locate.trim().length >= 2 && requested.locate.length <= 1000) {
       try {
         const url = new URL(requested.url);
         if (['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && sameSite(url.href, host)) {
-          return {url: url.href, locate: requested.locate.trim(),
-            ...(interaction ? {interaction: {kind: 'open-preview', index: Number(interaction.index ?? 0)}} : {})};
+          return {url: url.href, locate: requested.locate.trim(), selector: selector as string | undefined, position: position as CorrectedCaptureTarget['position'], dismissOverlay: dismissOverlay as string | undefined,
+            ...(interaction ? {interaction: interaction.kind === 'open-dialog' ? {kind: 'open-dialog', label: String(interaction.label)} : {kind: 'open-preview', index: Number(interaction.index ?? 0)}} : {})};
         }
       } catch { /* Invalid explicit target is rejected before opening a page. */ }
     }
   }
   throw new ClassifiedFailure({tag: 'needs_selection', category: 'system', owner: 'agent', retryable: true,
-    message: `纠错取景目标必须是同站的 ${role} HTTP(S) 页面，并提供可在页面实际命中的 locate 文本；仅允许已核验的 open-preview。`});
+    message: `纠错取景目标必须是同站的 ${role} HTTP(S) 页面，并提供可在页面实际命中的 locate 文本；仅允许已核验的只读预览或弹框。`});
 }
 
 /** Called only after the requested DOM target and ordinary image gates succeeded. */
 function ownerCaptureTargetPatch(ctx: StationContext, role: 'breadth' | 'proof',
   target: CorrectedCaptureTarget | undefined, capturedAt: string): Record<string, unknown> {
-  const entryId = (ctx.token.data.externalResearch as Record<string, unknown> | undefined)?.entryId;
+  const entryId = (ctx.token.data.externalResearch as Record<string, unknown> | undefined)?.entryId ?? ctx.token.item;
   if (!target || typeof entryId !== 'string') return {};
   return {ownerCaptureTargets: {...(ctx.token.data.ownerCaptureTargets as object ?? {}),
     [role]: {entryId, role, ...target, verifiedAt: capturedAt}}};
@@ -426,7 +428,7 @@ const breadth: Tool = async (ctx, svc) => {
   const title = String(ctx.token.data.title ?? host);
   const shots = shotsOf(ctx);
   const exclude = new Set<string>(((ctx.token.data.rejectedPages as string[]) ?? []).map(pageKey));
-  const repair = (ctx.token.data.shotRepairs as Record<string, { action: string; url?: string }> | undefined)?.breadth;
+  const repair = (ctx.token.data.shotRepairs as Record<string, { action: string; url?: string; reason?: string }> | undefined)?.breadth;
   const corrected = correctedCaptureTarget(ctx, host, 'breadth');
   const explicit = corrected?.url ?? (ctx.token.data.previewChoices as Record<string, string> | undefined)?.breadth;
   if (explicit) exclude.delete(pageKey(explicit));
@@ -460,20 +462,28 @@ const breadth: Tool = async (ctx, svc) => {
       const v = await visitCandidate(page, direct.href, host, ctx, accessFailures);
       retainedPage = Boolean(v.retainPage);
       if (!v.failure) {
+        const actions: string[] = [];
+        if (corrected?.dismissOverlay) actions.push(await dismissReadOnlyOverlay(page, corrected.dismissOverlay, ctx.signal));
         if (corrected) {
-          const location = await locateCaptureTarget(page, [corrected.locate]);
+          const location = await locateCaptureTarget(page, [corrected.locate], corrected.position, corrected.selector);
           if (!location.matched) return {ok: false, summary: '指定目录目标未在页面命中',
             error: '需要重新选页：指定的目录定位文字未在原页实际命中，未使用默认680px取景。'};
           ctx.progress(`目录实际定位到「${location.matched}」（${Math.round(location.scrollY ?? 0)}px）`,
             {tool: 'browser', text: corrected.locate, ok: true});
         } else if (direct.why === "review-reframe") {
-          const stage = await findStage(page);
-          if (stage) await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
+          const hints = [repair?.reason].filter((hint): hint is string => Boolean(hint));
+          const location = hints.length ? await locateCaptureTarget(page, hints) : undefined;
+          if (location?.matched) ctx.progress(`按目录返修定位到「${location.matched}」`, {tool: 'browser', text: hints.join('\n')});
+          else if (location?.anchors.length) return {ok: false, summary: '目录返修目标未命中', error: '需要重新选页：指定目录内容未在原页找到，未重复拍摄旧画面'};
+          else {
+            const stage = await findStage(page);
+            if (stage) await page.evaluate((y) => window.scrollTo(0, Math.max(0, y - 120)), stage.y);
+          }
           await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
           await sleep(1000);
           ctx.progress("按复审保留原页，等待预览并重新取景", { tool: "browser", text: "保留 URL，更新画面" });
         }
-        const captureState = await sampleBrowserCapture(page);
+        const captureState = {...await sampleBrowserCapture(page), actions};
         const png = await shoot(page, undefined, {signal: ctx.signal});
         const check = await checkImage(png, hashes, {signal: ctx.signal});
         const previews = await previewsInViewport(page);
@@ -576,7 +586,7 @@ const proof: Tool = async (ctx, svc) => {
   const role = PREVIEW_RULES.kinds[kind]?.roles.proof ?? {};
   const host = String(ctx.token.data.host);
   const shots = shotsOf(ctx);
-  const nativeViewport = siteEntryThreeShots(ctx);
+  const nativeViewport = siteEntryThreeShots(ctx) || Boolean(ctx.redo);
   const usesStage = ["component-source", "design-system"].includes(kind) || Boolean(role.stageSelectors);
   const breadthLinks = (ctx.token.data.breadthLinks as Link[]) ?? [];
   const homeLinks = (ctx.token.data.homeLinks as Link[]) ?? [];
@@ -633,7 +643,7 @@ const proof: Tool = async (ctx, svc) => {
   let retainedPage = false;
   try {
     const hashes = [shots.identity?.hash ?? "", shots.breadth?.hash ?? ""];
-    let best: { href: string; png: Buffer; content: number; hash: string; framing: string; title: string; location?: CaptureLocation; captureState: BrowserCaptureState; readiness?: ReadinessRef } | null = null;
+    let best: { href: string; png: Buffer; content: number; hash: string; framing: string; title: string; location?: CaptureLocation; captureState: BrowserCaptureState; readiness?: ReadinessRef; imageCheck: Awaited<ReturnType<typeof checkImage>> } | null = null;
     let tried = 0;
     const accessFailures:Failure[]=[];
     for (const href of candidates) {
@@ -647,11 +657,12 @@ const proof: Tool = async (ctx, svc) => {
       let captureState: BrowserCaptureState | undefined;
       let framing = "viewport";
       const locate=locateOf.get(norm(href));
+      const actions: string[] = [];
+      if (corrected?.dismissOverlay) actions.push(await dismissReadOnlyOverlay(page, corrected.dismissOverlay, ctx.signal));
       const hints = (corrected ? [corrected.locate] : [repair?.action === "reframe" ? repair.reason : undefined, locate]).filter((hint):hint is string=>Boolean(hint));
-      const location = hints.length ? await locateCaptureTarget(page,hints) : undefined;
+      let location = hints.length ? await locateCaptureTarget(page, hints, corrected?.position, corrected?.selector) : undefined;
       const readinessDeadline = Date.now() + 20000;
       let readinessRef: ReadinessRef | undefined;
-      const actions: string[] = [];
       if (location?.matched) {
         await sleep(800);
         framing = `定位到「${location.matched}」（滚动 ${Math.round(location.scrollY ?? 0)}px）`;
@@ -665,8 +676,11 @@ const proof: Tool = async (ctx, svc) => {
       }
       if (corrected?.interaction) {
         ctx.signal.throwIfAborted();
-        actions.push(await openReadOnlyPreview(page, corrected.interaction.index, ctx.signal));
-        ctx.progress('已点击原页图片预览，并核对真实灯箱图像已加载', {tool: 'browser', text: actions.at(-1)!, ok: true});
+        if (corrected.interaction.kind === 'open-dialog') {
+          const opened = await openReadOnlyDialog(page, corrected.interaction.label, ctx.signal);
+          actions.push(opened.action); location = opened.location;
+        } else actions.push(await openReadOnlyPreview(page, corrected.interaction.index, ctx.signal));
+        ctx.progress('已打开并核对原页预览，保留实际交互记录', {tool: 'browser', text: actions.at(-1)!, ok: true});
       }
       const stageDeadline = Date.now() + 45000;
       const stageWait = { deadline: stageDeadline, signal: ctx.signal, anchorY: location?.y };
@@ -708,10 +722,15 @@ const proof: Tool = async (ctx, svc) => {
         png = await shoot(page, undefined, {signal: ctx.signal});
       }
       if (actions.length && captureState) captureState = {...captureState, actions};
-      const check = await checkImage(png, hashes, {stage: Boolean(stage), signal: ctx.signal});
+      const previewRegion = corrected?.interaction?.kind === 'open-dialog' && location?.selector ? await page.locator(location.selector).evaluate(element => {
+        const box = (element.querySelector('.modal-content') ?? element).getBoundingClientRect();
+        const x = Math.max(0, Math.ceil(box.left)), y = Math.max(0, Math.ceil(box.top));
+        return {x, y, width: Math.max(0, Math.min(innerWidth, Math.floor(box.right)) - x), height: Math.max(0, Math.min(innerHeight, Math.floor(box.bottom)) - y)};
+      }) : undefined;
+      const check = await checkImage(png, hashes, {stage: Boolean(stage), signal: ctx.signal, previewRegion});
       if (check.issues.length) { ctx.progress(`拒收 ${new URL(href).pathname}：${check.issues.join("、")}`, { tool: "reject", text: check.issues.join(", "), ok: false }); continue; }
       ctx.progress(`候选 ${new URL(href).pathname}：${framing}，内容占比 ${(check.stats.content * 100).toFixed(1)}%`, { tool: "shot", text: framing, ok: true });
-      if (!best || check.stats.content > best.content || (locateOf.has(norm(href)) && !locateOf.has(norm(best.href)))) best = { href, png, content: check.stats.content, hash: check.hash, framing, title: await page.title().catch(() => ""), location, captureState: captureState!, readiness: readinessRef };
+      if (!best || check.stats.content > best.content || (locateOf.has(norm(href)) && !locateOf.has(norm(best.href)))) best = { href, png, content: check.stats.content, hash: check.hash, framing, title: await page.title().catch(() => ""), location, captureState: captureState!, readiness: readinessRef, imageCheck: check };
       if (locateOf.has(norm(href)) && check.stats.content > 0.05) break;
       if (!usesStage) break;
       if (best && tried >= 3 && best.content > 0.12) break;
@@ -719,7 +738,7 @@ const proof: Tool = async (ctx, svc) => {
     if (!best) return { ok: false, summary: "没有合格的特写", error: tried ? `试了 ${tried} 页都不合格` : "需要重新选页：交阅读员重新查找公开特写页面",failure:accessFailures.length===tried?accessFailures.at(-1):undefined, data:{needsPick:{proof:candidates},candidateAccessFailures:accessFailures},usage };
     const file = path.join(workDir(svc, ctx), "proof.png");
     fs.writeFileSync(file, best.png);
-    const ev = await shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, location: best.location, content: Number(best.content.toFixed(3)), tried, captureState: best.captureState, readiness: best.readiness });
+    const ev = await shotEvidence(ctx, svc, best.png, "proof", { href: best.href, framing: best.framing, location: best.location, content: Number(best.content.toFixed(3)), tried, captureState: best.captureState, readiness: best.readiness, imageCheck: best.imageCheck });
     ctx.progress(`选中 ${new URL(best.href).pathname}（试 ${tried} 页，内容占比最高 ${(best.content * 100).toFixed(1)}%）`, { tool: "shot", text: best.framing, ok: true, evidence: [ev.id] });
     shots.proof = { file, href: best.href, hash: best.hash, evidence: ev.id, framing: best.framing, content: best.content, title: best.title, location: best.location, capturedAt: best.captureState.capturedAt, captureState: best.captureState, readiness: best.readiness };
     return { ok: true, summary: `特写 ✓ ${new URL(best.href).pathname}`, data: { shots, candidateAccessFailures: accessFailures,

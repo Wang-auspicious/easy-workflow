@@ -688,6 +688,12 @@ export class Factory {
     return this.runtime.continueBudget(item, node);
   }
 
+  resumeAgentHandoff(token: string, node: string) {
+    if (this.runtime instanceof Kernel) throw new ControlError(409, 'use_budget_wait', 'v2 工位使用 continue_budget 的预算等待契约');
+    if (this.state.tokens[token]?.status !== 'manual') throw new ControlError(409, 'not_waiting_budget', '任务当前不在交接等待中');
+    return this.runtime.resumeHandoff(token, node);
+  }
+
   streamSnapshot() {
     if (!(this.runtime instanceof Kernel)) throw new ControlError(410, 'kernel_v2_required', '三流统计需要 v2 内核');
     return {kernel: 'v2' as const, ...kernelStreams(this.runtime.store, {now: Date.now(), runId: this.journal.run,

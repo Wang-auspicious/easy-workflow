@@ -139,6 +139,9 @@ try {
       }
       window.chatFixture.setState({view: 'review', version: state.version + 1});
     });
+    await page.getByRole('heading', {name: '暂时没有需要你决定的事'}).waitFor();
+    assert.equal(await page.locator('.rv-queue-item').count(), 0, 'technical repairs do not occupy the owner decision queue');
+    await page.getByRole('button', {name: /Agent 待修复\s*9/}).click();
     await page.locator('.rv-queue-item').first().waitFor();
     assert.equal(await page.locator('.rv-queue-item').count(), 9);
     assert.equal(await page.locator('.rv-context[open]').count(), 0);
@@ -161,7 +164,7 @@ try {
     await page.getByText(/记录末尾仍然可读/).waitFor();
     await page.locator('.rv-context summary').click();
     await page.getByRole('button', {name: '请主调度帮我看', exact: true}).click();
-    assert.match(await input.inputValue(), /先核对现有证据/);
+    assert.match(await input.inputValue(), /请实际修复待审任务 review-0/);
     assert.equal(await page.evaluate(() => window.chatFixture.getState().attachments[0].id), 'review-0');
     await page.getByLabel('退回工位').selectOption('curation/proof');
     await page.getByRole('button', {name: '换成可见的组件示例，避开文档文字和导航。', exact: true}).click();

@@ -84,6 +84,83 @@ export async function sampleBrowserCapture(page: Page,
     ...observed, clip, actions: []};
 }
 
+/** Click a real close control on a named presentation overlay; retain auth walls. */
+export async function dismissReadOnlyOverlay(page: Page, title: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  const before = pageKey(page.url());
+  const result = await page.evaluate(title => {
+    const norm = (text: string) => text.replace(/\s+/g, ' ').trim().toLowerCase();
+    const visible = (element: Element) => {const box = element.getBoundingClientRect(); return box.width > 0 && box.height > 0 && getComputedStyle(element).visibility !== 'hidden';};
+    const headings = [...document.querySelectorAll('h1,h2,h3,h4,p,span,div')].filter(element => visible(element) && norm((element as HTMLElement).innerText || '') === norm(title))
+      .sort((a, b) => Number(!a.closest('[role=dialog],dialog,[aria-modal=true]')) - Number(!b.closest('[role=dialog],dialog,[aria-modal=true]')));
+    let sawOverlay = false;
+    for (const heading of headings) for (let container = heading.parentElement, depth = 0; container && depth < 6 && !container.matches('main,body,html'); container = container.parentElement, depth++) {
+      sawOverlay ||= Boolean(container.closest('[role=dialog],dialog,[aria-modal=true]')) || getComputedStyle(container).position === 'fixed';
+      const text = (container.innerText || '').slice(0, 2000);
+      const close = [...container.querySelectorAll('button,[role=button],a,[aria-label]')].find(element => {
+        if (!visible(element) || element.closest('form') || element.hasAttribute('download')) return false;
+        if (element instanceof HTMLAnchorElement && !['', '#'].includes(element.getAttribute('href') ?? '')) return false;
+        const label = element.getAttribute('aria-label') || element.getAttribute('title') || (element as HTMLElement).innerText || '';
+        return /^(?:(?:close|dismiss)(?:\s+(?:modal|dialog|popup|window))?|关闭(?:弹窗|对话框)?|取消|×|✕|x)$/iu.test(label.trim()) || Boolean(element.querySelector('svg.lucide-x,svg[data-lucide="x"]'));
+      });
+      if (close) {
+        if (container.querySelector('input[type=password]') || /captcha|verify your|verify that|sign in to|log in to|unlock|subscribe to continue|验证码|验证身份/iu.test(text)) return {state: 'auth'};
+        const selectorOf = (target: Element) => {
+          const parts: string[] = [];
+          for (let element: Element | null = target; element; element = element.parentElement) {
+            if (element.id && document.querySelectorAll(`#${CSS.escape(element.id)}`).length === 1) {parts.unshift(`#${CSS.escape(element.id)}`); break;}
+            if (!element.parentElement) {parts.unshift(element.tagName.toLowerCase()); break;}
+            const siblings = [...element.parentElement.children].filter(sibling => sibling.tagName === element!.tagName);
+            parts.unshift(`${element.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(element) + 1})`);
+          }
+          return parts.join(' > ');
+        };
+        return {state: 'ready', selector: selectorOf(container), closeSelector: selectorOf(close)};
+      }
+    }
+    return {state: sawOverlay ? 'no-close-control' : 'not-present'};
+  }, title);
+  if (result.state === 'auth') throw new Error('该弹层涉及登录或验证，保留给用户接管，未关闭');
+  if (result.state === 'no-close-control') throw new Error('没有找到与指定弹层绑定的真实关闭按钮，未隐藏页面内容');
+  if (result.state === 'ready') {
+    await page.locator(result.closeSelector!).click({timeout: 5000});
+    await page.waitForFunction(({selector, title}) => {
+      const element = document.querySelector(selector!);
+      if (!element || !((element as HTMLElement).innerText || '').toLowerCase().includes(title.toLowerCase())) return true;
+      const box = element.getBoundingClientRect();
+      return box.width === 0 || box.height === 0 || getComputedStyle(element).visibility === 'hidden';
+    }, {selector: result.selector, title}, {timeout: 5000});
+  }
+  signal?.throwIfAborted();
+  if (pageKey(page.url()) !== before) throw new Error('关闭弹层离开原页，停止截图');
+  return `dismiss-overlay: ${title}; ${result.state === 'ready' ? 'clicked' : result.state}`;
+}
+
+/** Follow an existing declarative preview-to-dialog binding on the original page. */
+export async function openReadOnlyDialog(page: Page, label: string, signal?: AbortSignal): Promise<{action: string; location: CaptureLocation}> {
+  signal?.throwIfAborted();
+  const before = pageKey(page.url());
+  const trigger = page.locator('[data-toggle="modal"][data-target]').filter({hasText: label});
+  if (await trigger.count() !== 1) throw new Error('需要唯一的原页预览入口，未点击');
+  const selector = await trigger.evaluate(element => {
+    const target = element.getAttribute('data-target') ?? '';
+    if (!/^#[a-zA-Z][\w:-]*$/.test(target) || element.closest('form') || element.hasAttribute('download') ||
+        element instanceof HTMLAnchorElement && !['', '#', target].includes(element.getAttribute('href') ?? '')) return null;
+    const dialog = document.querySelector(target);
+    if (!dialog?.matches('[role=dialog],dialog') || dialog.querySelector('input[type=password]') ||
+        /captcha|sign in|log in|checkout|payment|验证码|支付/iu.test(dialog.textContent ?? '')) return null;
+    return target;
+  });
+  if (!selector) throw new Error('入口没有绑定只读页面预览，未点击');
+  await trigger.scrollIntoViewIfNeeded({timeout: 5000});
+  await trigger.click({timeout: 5000});
+  await page.locator(selector).waitFor({state: 'visible', timeout: 8000});
+  signal?.throwIfAborted();
+  if (pageKey(page.url()) !== before) throw new Error('预览离开原页，停止截图');
+  const coordinates = await page.locator(selector).evaluate(element => ({y: element.getBoundingClientRect().top + scrollY, scrollY}));
+  return {action: `open-dialog: ${label}; ${selector}`, location: {matched: label, anchors: [label], selector, ...coordinates}};
+}
+
 /** Only open an original Webflow image lightbox; never arbitrary links or scripts. */
 export async function openReadOnlyPreview(page: Page, index: number,
     signal?: AbortSignal): Promise<string> {
@@ -342,15 +419,28 @@ export async function shoot(page: Page, clip?: { x: number; y: number; width: nu
   });
 }
 
-export async function checkImage(png: Buffer, others: string[], options: ImageProcessOptions & {stage?: boolean} = {}) {
+export async function checkImage(png: Buffer, others: string[], options: ImageProcessOptions & {stage?: boolean; previewRegion?: {x: number; y: number; width: number; height: number}} = {}) {
   const issues: string[] = [];
   const stats = await imageStatsAsync(png, options);
   if (stats.std < 6 || stats.content < 0.02) issues.push(`blank(std ${stats.std.toFixed(1)}, content ${(stats.content * 100).toFixed(1)}%)`);
   else if (options.stage && stats.content < 0.03) issues.push(`stage-nearly-empty(${(stats.content * 100).toFixed(1)}%)`);
-  if (stats.flatBlock) issues.push("flat-block");
+  let preview: {region: NonNullable<typeof options.previewRegion>; stats: typeof stats} | undefined;
+  if (stats.flatBlock && options.previewRegion) {
+    const region = options.previewRegion;
+    const width = png.readUInt32BE(16), height = png.readUInt32BE(20);
+    if (Object.values(region).every(Number.isSafeInteger) && region.x >= 0 && region.y >= 0 && region.width >= 240 && region.height >= 160 &&
+        region.x + region.width <= width && region.y + region.height <= height && region.width * region.height >= width * height * .15) {
+      const pixels = await runFfmpeg(['-loglevel', 'error', '-f', 'image2pipe', '-i', 'pipe:0', '-vf', `crop=${region.width}:${region.height}:${region.x}:${region.y}`, '-f', 'image2', '-c:v', 'png', 'pipe:1'], {...options, input: png});
+      preview = {region, stats: await imageStatsAsync(pixels, options)};
+    }
+  }
+  // A verified original dialog has a deliberately flat backdrop. Assess its
+  // actual content pixels as well; preserve the full native screenshot and all
+  // duplicate/blank checks and require the same independent visual review.
+  if (stats.flatBlock && (!preview || preview.stats.flatBlock || preview.stats.std < 6 || preview.stats.content < .03)) issues.push('flat-block');
   const hash = await aHashAsync(png, options);
   for (const other of others) if (other && hamming(hash, other) <= 6) issues.push("duplicate");
-  return { issues, stats, hash };
+  return {issues, stats, hash, preview};
 }
 
 export async function motionFirst(page: Page) {
@@ -432,7 +522,8 @@ function captureAnchors(hints: readonly string[]): string[] {
     // A review often describes an old, incorrect frame before stating the new
     // target. Do not scroll back to labels mentioned only in that old frame.
     const request = hint.match(/(?:请|\bplease\b)([\s\S]*)/i)?.[1] ?? hint;
-    const text = request.replace(/https?:\/\/[^\s，。；、）)]+/gi, ' ');
+    const text = request.replace(/https?:\/\/[^\s，。；、）)]+/gi, ' ')
+      .replace(/(?:不要|不再|避免|别再|而非|不要只|\bdo not\b)[^，。；;\n]*/gi, ' ');
     const quoted = [...text.matchAll(/[「『“\"]([^」』”\"]{2,240})[」』”\"]/g)]
       .map(match => match[1].trim());
     // Chinese capture notes frequently name English headings without quotes:
@@ -446,41 +537,64 @@ function captureAnchors(hints: readonly string[]): string[] {
     const literal = compact.length >= 2 && compact.length <= 80 &&
       !/[，,。；;：:\n（）()]/.test(compact) &&
       !/(?:请|滚到|滚动|定位|重新|取景|拍到|拍摄|点击|不要|scroll|reframe|capture|click)/i.test(compact) ? [compact] : [];
-    return [...quoted, ...labels, ...literal];
+    return quoted.length ? quoted : literal.length ? literal : labels;
   }))];
 }
 
 /** Reader/reviewer prose contains quoted visible text, not a literal DOM text
  * node. Match the complete rendered heading (including nested spans and breaks)
  * and verify that scrolling actually brought it into the viewport. */
-export async function locateCaptureTarget(page: Page, hints: string[]): Promise<CaptureLocation> {
+export async function locateCaptureTarget(page: Page, hints: string[], position: 'below' | 'above' | 'center' = 'below', selector?: string): Promise<CaptureLocation> {
   const anchors = captureAnchors(hints);
-  const candidates = anchors;
-  return page.evaluate(async ({ anchors, candidates }) => {
+  const candidates = selector ? [hints[0] || selector] : anchors;
+  return page.evaluate(async ({ anchors, candidates, position, selector }) => {
     const normalize = (text: string) => text.normalize('NFKC').toLowerCase().replace(/[\s\u200b]+/g, ' ').replace(/[.。…]+$/g, '').trim();
-    const eligible = (el: Element) => {
-      if (el.closest('nav,header,footer,aside,script,style,noscript,pre,code')) return false;
+    const eligible = (el: Element, explicit = false) => {
+      if (el.closest(explicit ? 'script,style,noscript,pre,code' : 'nav,header,footer,aside,script,style,noscript,pre,code')) return false;
       const box = el.getBoundingClientRect(), style = getComputedStyle(el);
-      return box.width > 0 && box.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
+      // An observed target may be a real tool sidebar or a lazy visual that only
+      // fades in after scrolling. Locate it first; readiness still verifies its
+      // original rendered pixels before the camera is allowed to capture it.
+      return box.width > 0 && box.height > 0 && style.display !== 'none' && (explicit || style.visibility !== 'hidden' && Number(style.opacity) !== 0);
     };
-    const elements = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role=heading],p,label,span,strong,a,button,[role=button],div,section')].filter(eligible);
+    const elements = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role=heading],p,label,span,strong,a,button,[role=button],div,section,input:not([type=password]):not([type=hidden]),textarea,select')].filter(element => eligible(element));
     for (const candidate of candidates) {
       const wanted = normalize(candidate); if (wanted.length < 2) continue;
-      const matches = elements.map(element => ({ element, text: normalize((element as HTMLElement).innerText || '') }))
+      const matches = elements.map(element => ({ element, text: normalize((element as HTMLElement).innerText || element.getAttribute('aria-label') || '') }))
         .filter(({ text }) => text.length <= 1000 && text.includes(wanted))
         .sort((a, b) => Number(!a.element.matches('h1,h2,h3,h4,h5,h6,[role=heading]')) - Number(!b.element.matches('h1,h2,h3,h4,h5,h6,[role=heading]')) || a.text.length - b.text.length);
-      const target = matches[0]?.element; if (!target) continue;
+      let target = matches[0]?.element;
+      if (selector) {
+        const exact = document.querySelectorAll(selector);
+        if (exact.length !== 1 || !eligible(exact[0], true)) return {anchors};
+        target = exact[0];
+      }
+      if (!target) continue;
+      // A label can sit in the middle of a drop zone. Aligning the label itself
+      // cuts off its working area and fills the frame with the following FAQ.
+      if (!selector && !target.matches('h1,h2,h3,h4,h5,h6,[role=heading]')) {
+        for (let parent = target.parentElement, depth = 0; parent && depth < 5 && !parent.matches('main,body,html'); parent = parent.parentElement, depth++) {
+          const box = parent.getBoundingClientRect();
+          if (box.height > innerHeight - 120) break;
+          if (box.width >= 240 && box.height >= 160 &&
+              (parent.querySelector('input[type=file]') || parent.querySelectorAll('input:not([type=hidden]),textarea,select').length >= 2)) target = parent;
+        }
+      }
       target.scrollIntoView({ block: 'start', behavior: 'instant' });
       // At the page bottom scrollIntoView is already clamped. A relative -96px
       // scroll can move that still-visible last heading below the viewport.
-      window.scrollTo({ top: Math.max(0, scrollY + target.getBoundingClientRect().top -
-        Math.min(96, innerHeight / 6)), behavior: 'instant' });
+      const targetBox = target.getBoundingClientRect();
+      const inset = position === 'above' ? innerHeight - targetBox.height - 64
+        : position === 'center' ? (innerHeight - targetBox.height) / 2 : Math.min(96, innerHeight / 6);
+      window.scrollTo({top: Math.max(0, scrollY + targetBox.top - inset), behavior: 'instant'});
       await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
       const box = target.getBoundingClientRect();
       if (box.bottom > 0 && box.top < innerHeight) {
         const parts: string[] = [];
         for (let element: Element | null = target; element; element = element.parentElement) {
-          if (element.id) {parts.unshift(`#${CSS.escape(element.id)}`); break;}
+          if (element.id && document.querySelectorAll(`#${CSS.escape(element.id)}`).length === 1) {
+            parts.unshift(`#${CSS.escape(element.id)}`); break;
+          }
           if (!element.parentElement) {parts.unshift(element.tagName.toLowerCase()); break;}
           const siblings = [...element.parentElement?.children ?? []].filter(sibling => sibling.tagName === element!.tagName);
           parts.unshift(`${element.tagName.toLowerCase()}:nth-of-type(${siblings.indexOf(element) + 1})`);
@@ -489,7 +603,7 @@ export async function locateCaptureTarget(page: Page, hints: string[]): Promise<
       }
     }
     return { anchors };
-  }, { anchors, candidates });
+  }, { anchors, candidates, position, selector });
 }
 
 export interface Stage { sel: string; x: number; y: number; w: number; h: number; painted: number; media: number; locked: boolean }

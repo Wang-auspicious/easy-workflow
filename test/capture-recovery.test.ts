@@ -4,7 +4,7 @@ import {EvidenceStore, runFfmpeg} from '../server/evidence.ts';import type {Stat
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'h2-capture-recovery-'));
 const previousProject=process.env.FACTORY_VAR;process.env.FACTORY_VAR=dir;
-const {findStage,links,pageKey,shoot,checkImage,letterbox,locateCaptureTarget}=await import('../packs/vislexicon/capture.ts');
+const {findStage,links,pageKey,shoot,checkImage,letterbox,locateCaptureTarget,dismissReadOnlyOverlay,openReadOnlyDialog}=await import('../packs/vislexicon/capture.ts');
 const {TOOLS}=await import('../packs/vislexicon/tools.ts');
 const {facts,factReview,shotReview}=await import('../packs/vislexicon/agents.ts');
 after(async()=>{
@@ -35,6 +35,14 @@ test('image checks and letterboxing yield to HTTP while retaining pixel quality 
     assert.deepEqual([padded.readUInt32BE(16), padded.readUInt32BE(20)], [640, 400]);
     assert.deepEqual(checked.issues, []);
     assert.ok((await checkImage(padded, [checked.hash])).issues.includes('duplicate'));
+    const backdrop = await runFfmpeg(['-loglevel', 'error', '-f', 'image2pipe', '-i', 'pipe:0', '-vf', 'pad=1280:800:320:200:color=gray', '-f', 'image2', '-c:v', 'png', 'pipe:1'], {input: png});
+    assert.ok((await checkImage(backdrop, [])).issues.includes('flat-block'));
+    const preview = await checkImage(backdrop, [], {previewRegion: {x: 320, y: 200, width: 640, height: 400}});
+    assert.deepEqual(preview.issues, [], 'a verified dialog body is checked independently of its intentional flat backdrop');
+    assert.equal(preview.stats.flatBlock, true, 'the full-frame observation remains honest');
+    assert.equal(preview.preview?.stats.flatBlock, false);
+    assert.ok((await checkImage(backdrop, [], {previewRegion: {x: 0, y: 0, width: 1280, height: 160}})).issues.includes('flat-block'), 'a blank claimed preview still fails');
+    assert.ok((await checkImage(backdrop, [preview.hash], {previewRegion: {x: 320, y: 200, width: 640, height: 400}})).issues.includes('duplicate'));
     const controller = new AbortController();
     controller.abort(new Error('Fixture image cancellation'));
     await assert.rejects(checkImage(png, [], {signal: controller.signal}), /Fixture image cancellation/);
@@ -70,9 +78,12 @@ test('facts and reviewer share the same evidence; reframing does not blacklist a
  assert.ok(facts.check!({...out,license:{...out.license,quote:quote+'; invented permission'}} as never,ctx).length,'a real prefix cannot validate an invented quote tail');
  const review=shotReview({} as EvidenceStore),url='https://fixture.test/demo';
  ctx.token.data.shots={proof:{href:url}};
+ ctx.token.data.ownerCaptureTargets={proof:{url,locate:'Obsolete frame'},breadth:{url:'https://fixture.test/catalog',locate:'Keep this independently accepted role'}};
  const reframe=await review.after!({verdict:'return',returnTo:'proof',repair:'reframe',reason:'Scroll to the actual demo',perImage:[]},ctx,{rounds:1} as never);
  assert.deepEqual(reframe.data?.rejectedPages,undefined);
  assert.equal((reframe.data?.shotRepairs as any).proof.url,url);
+ assert.equal((reframe.data?.ownerCaptureTargets as any).proof,undefined);
+ assert.equal((reframe.data?.ownerCaptureTargets as any).breadth.locate,'Keep this independently accepted role');
  const replace=await review.after!({verdict:'return',returnTo:'proof',repair:'replace-page',reason:'This page only contains installation',perImage:[]},ctx,{rounds:1} as never);
  assert.deepEqual(replace.data?.rejectedPages,[url]);
 });
@@ -98,6 +109,53 @@ test('reframing locates visible labels inside mixed-language review instructions
     assert.ok(!manyPixels.anchors.some(anchor => anchor.includes('https:')));
     const missing = await locateCaptureTarget(page, ['请滚动到「Missing demo」并重新取景。']);
     assert.equal(missing.matched, undefined, 'a missing requested section cannot silently use the current viewport');
+    await page.setContent('<main><div style="height:900px"></div><div id="upload" style="width:900px;height:500px;display:flex;align-items:center;justify-content:center;background:#eee"><input type="file" hidden><span>Drag and drop your image here</span></div><section style="height:800px"><h2>FAQ</h2></section></main>');
+    const upload = await locateCaptureTarget(page, ['请以上传区 Drag and drop your image here 居中取景，不要拍「FAQ」。']);
+    assert.equal(upload.matched, 'Drag and drop your image here');
+    assert.ok(!upload.anchors.includes('FAQ'), 'negative examples cannot become the framing target');
+    const bounds = await page.locator('#upload').boundingBox();
+    assert.ok(bounds && bounds.y >= 0 && bounds.y + bounds.height <= 800, 'the complete upload control must fit, not just its label');
+    await page.setContent('<main><section id="viewer-" style="height:1200px"><h2>Old section</h2></section><section id="viewer-" style="height:800px"><h2 id="viewer-">Citation-Ready Answer</h2><p>The actual current source.</p></section></main>');
+    const duplicateIds = await locateCaptureTarget(page, ['Citation-Ready Answer']);
+    assert.equal(duplicateIds.matched, 'Citation-Ready Answer');
+    assert.equal(await page.locator(duplicateIds.selector!).count(), 1, 'duplicate site IDs cannot point readiness checks at unrelated hidden elements');
+    const above = await locateCaptureTarget(page, ['Citation-Ready Answer'], 'above');
+    const anchor = await page.locator(above.selector!).boundingBox();
+    assert.ok(anchor && anchor.y > 600, 'above captures the real content before an anchor instead of the following section');
+    const exactMissing = await locateCaptureTarget(page, ['Old section 42']);
+    assert.equal(exactMissing.matched, undefined, 'an exact supplied label must not degrade to a broad partial match');
+    await page.setContent('<aside><button id="actual-tool">Generate illustration</button></aside><div style="height:1300px"></div><div id="lazy-art" style="height:240px;width:320px;opacity:0">Actual illustration</div>');
+    assert.equal((await locateCaptureTarget(page, ['Generate illustration'], 'center', '#actual-tool')).matched, 'Generate illustration', 'an observed tool sidebar is a valid explicit target');
+    assert.equal((await locateCaptureTarget(page, ['Actual illustration'], 'center', '#lazy-art')).matched, 'Actual illustration', 'locating must scroll before the independent readiness check can wait for a lazy visual');
+    assert.equal(await page.locator('#lazy-art').evaluate(element => getComputedStyle(element).opacity), '0', 'locating never forces hidden content visible');
+    await page.setContent('<main><p>Better on mobile</p><div role="dialog"><h2>Better on mobile</h2><button aria-label="Close" onclick="this.parentElement.remove()">×</button></div><p>Real gallery</p></main>');
+    assert.match(await dismissReadOnlyOverlay(page, 'Better on mobile'), /clicked/);
+    assert.equal(await page.locator('[role=dialog]').count(), 0);
+    assert.match(await dismissReadOnlyOverlay(page, 'Better on mobile'), /not-present/, 'repeated capture can reuse an already dismissed overlay');
+    await page.setContent('<main><div role="dialog"><h2>Better on mobile</h2><button style="display:none" aria-label="Close Modal">×</button><svg aria-label="Close Modal" width="24" height="24" onclick="this.parentElement.remove()"><path d="M0 0L24 24M0 24L24 0" stroke="black"/></svg></div></main>');
+    assert.match(await dismissReadOnlyOverlay(page, 'Better on mobile'), /clicked/);
+    assert.equal(await page.locator('[role=dialog]').count(), 0, 'the visible labelled desktop SVG is a real dismiss control; hidden mobile button stays unused');
+    await page.setContent('<main><div role="dialog"><h2>Sign in to continue</h2><button aria-label="Close" onclick="this.parentElement.remove()">×</button></div></main>');
+    await assert.rejects(dismissReadOnlyOverlay(page, 'Sign in to continue'), /登录或验证/);
+    assert.equal(await page.locator('[role=dialog]').count(), 1, 'auth content remains intact');
+    await page.setContent('<main><div data-toggle="modal" data-target="#preview" onclick="document.getElementById(\'preview\').style.display=\'block\'"><h3>Jigsaw</h3><button type="button">Use Pattern</button></div><div id="preview" role="dialog" style="display:none"><h2>Selected Pattern</h2><p>Jigsaw</p><textarea>background-image: original pattern</textarea></div></main>');
+    const opened = await openReadOnlyDialog(page, 'Jigsaw');
+    assert.equal(opened.location.selector, '#preview');
+    assert.equal(await page.locator('#preview').isVisible(), true);
+    await assert.rejects(openReadOnlyDialog(page, 'Missing card'), /唯一/);
+    await page.setContent('<main><h1>Actual work area</h1><div style="height:1200px"></div><svg id="actual-art" aria-label="Rendered icon" width="320" height="240"><rect width="300" height="220" fill="blue"/></svg><input type="password" value="private-fixture-value"><input type="hidden" value="private-hidden-value"></main>');
+    const {observePage} = await import('../server/page-observation.ts');
+    const observed = await observePage(page);
+    const media = observed.media.find(item => item.label === 'Rendered icon');
+    assert.equal(media?.label, 'Rendered icon');
+    assert.equal(await page.locator(media!.selector!).count(), 1, 'semantic selectors identify the original visual uniquely');
+    assert.ok(media && media.y > 1000);
+    assert.ok(!JSON.stringify(observed).includes('private-fixture-value'));
+    assert.ok(!JSON.stringify(observed).includes('private-hidden-value'));
+    const exactMedia = await locateCaptureTarget(page, ['Observed rendered icon'], 'center', media!.selector);
+    assert.equal(exactMedia.selector, '#actual-art');
+    const mediaBounds = await page.locator('#actual-art').boundingBox();
+    assert.ok(mediaBounds && mediaBounds.y >= 0 && mediaBounds.y + mediaBounds.height <= 800, 'the selected original media is fully visible even when page-end scrolling clamps');
   } finally {
     await close();
     await closeBrowser();
@@ -165,6 +223,15 @@ test('external site entries retain native three-shot capture state through WebP 
     assert.equal(corrected.ok, true, corrected.error ?? corrected.summary);
     assert.equal((corrected.data?.shots as Record<string, any>).proof.href, base + '/requested');
     assert.equal((corrected.data?.shots as Record<string, any>).proof.location.matched, 'Actual demo');
+    const ordinaryTool = await TOOLS['curation.proof']({...context, token: {...context.token,
+      data: {...context.token.data, externalResearch: undefined, kind: 'tool', shots: {}}},
+      redo: {byHuman: true, reason: 'Repair an ordinary candidate, not a special intake',
+        note: JSON.stringify({captureTarget: {role: 'proof', url: base + '/requested', locate: '「Actual demo」'}})}}, svc);
+    assert.equal(ordinaryTool.ok, true, ordinaryTool.error ?? ordinaryTool.summary);
+    const ordinaryShot = (ordinaryTool.data?.shots as Record<string, any>).proof;
+    assert.equal(ordinaryShot.href, base + '/requested');
+    assert.equal(ordinaryShot.captureState.clip, null, 'tool repair preserves the whole working area instead of a tiny preview crop');
+    assert.ok(ordinaryShot.captureState.controls.some((control: any) => control.value === '#3264d8'));
     const sameFrame = await TOOLS['curation.proof']({...context, redo: {byHuman: true,
       reason: 'Check that a different role cannot reuse the identity frame.',
       note: JSON.stringify({captureTarget: {role: 'proof', url: base + '/', locate: '「Native example source」'}}),

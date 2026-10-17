@@ -332,11 +332,15 @@ function shotReviewResult(out: ShotReviewOut, ctx: StationContext): StationResul
     const rejected = out.verdict === "return" && out.repair === "replace-page" && out.returnTo ? [...((d.rejectedPages as string[]) ?? []), d.shots?.[out.returnTo]?.href].filter(Boolean) : d.rejectedPages;
     const shotRepairs = { ...d.shotRepairs };
     if (out.verdict === "return" && out.returnTo) shotRepairs[out.returnTo] = { action: out.repair, url: d.shots?.[out.returnTo]?.href, reason: out.reason };
+    const ownerCaptureTargets = {...d.ownerCaptureTargets};
+    // A rejected framing cannot keep overriding the reviewer's newer request.
+    // Other roles retain their entry binding when a parallel role is redone.
+    if (out.verdict === 'return' && out.returnTo && ['reframe', 'replace-page'].includes(out.repair ?? '')) delete ownerCaptureTargets[out.returnTo];
     ctx.addEvidence({ id: `sr-${ctx.attempt}`, kind: "verdict", label: "截图审查", verdict: out.verdict === "pass" ? "三张图 ✓" : `退回 ${({ identity: "首屏", breadth: "目录", proof: "特写" } as D)[out.returnTo ?? ""] ?? ""}`, tone: out.verdict === "pass" ? "ok" : "warn", meta: { ...out } });
     if (d.mode === "video" && out.verdict === "return") return { ok: true, summary: "录屏封面不合格 → 交人", data: { shotReview: "escalate" }, verdict: { verdict: "escalate", reason: out.reason } };
     return {
       ok: true, summary: out.verdict === "pass" ? "截图通过" : `退回${out.returnTo}：${out.reason.slice(0, 60)}`,
-      data: { shotReview: out.verdict, shotRepairs, rejectedPages: rejected, reviews: reviewsWith(ctx, { station: "shot-review", verdict: out.verdict, reason: out.reason }) },
+      data: { shotReview: out.verdict, shotRepairs, ownerCaptureTargets, rejectedPages: rejected, reviews: reviewsWith(ctx, { station: "shot-review", verdict: out.verdict, reason: out.reason }) },
       verdict: { verdict: out.verdict, returnTo: out.returnTo ? `curation/${out.returnTo}` : undefined, reason: out.reason },
     };
 }

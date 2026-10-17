@@ -222,10 +222,23 @@ export async function browserCommand(args: Record<string, any>): Promise<any> {
       const previous = connection;
       if (previous && !(await previous.catch(() => null))?.isConnected() && connection === previous) connection = null;
       connection ??= import('playwright-core').then(({chromium}) => chromium.connectOverCDP(target.endpoint));
-      for (const p of (await connection).contexts().flatMap(c=>c.pages())) { const s=await p.context().newCDPSession(p); try { if((await s.send("Target.getTargetInfo")).targetInfo.targetId===target.targetId) {page=p;break;} } finally {await s.detach();} }
+      const connected = await connection;
+      // Electron can return a new WebContents target before Playwright's page
+      // list receives it. Wait briefly for that exact target, not another tab.
+      for (let attempt = 0; attempt < 15 && !page; attempt++) {
+        for (const candidate of connected.contexts().flatMap(context => context.pages())) {
+          if (candidate.isClosed()) continue;
+          const session = await candidate.context().newCDPSession(candidate);
+          try {
+            if ((await session.send('Target.getTargetInfo')).targetInfo.targetId === target.targetId) {page = candidate; break;}
+          } finally {await session.detach();}
+        }
+        if (!page) await new Promise(resolve => setTimeout(resolve, 100));
+      }
     }
     if (!page) throw new Error("找不到标签页");
-    return {id:args.id,url:page.url(),title:await page.title(),text:(await page.locator("body").innerText({timeout:5000})).slice(0,30000)};
+    const {observePage} = await import('./page-observation.ts');
+    return {id: args.id, url: page.url(), title: await page.title(), ...await observePage(page)};
   }
   if (desktop) return rpc({...args, action});
   if (action === "state") { if (!context && data.tabs.length) await persistent(); data.prune(); update(); return state; }

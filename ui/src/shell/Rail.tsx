@@ -5,6 +5,7 @@ import { actions, api } from "../api.ts";
 import { getState, setState, useStore, type View } from "../store.ts";
 import { toast } from "./Toasts.tsx";
 import { alertPresentation } from "./alert-presentation.ts";
+import {manualOwner, manualQueue} from '../../../shared/project.ts';
 
 const ITEMS: { view: View; icon: typeof Workflow; label: string; key?: string }[] = [
   { view: "canvas", icon: Workflow, label: "画布 · 流水线", key: "Alt 1" },
@@ -21,7 +22,7 @@ export function Rail() {
   const connected = useStore((s) => s.connected);
   const replay = useStore((s) => s.replay);
   const browser = useStore((s) => s.browser);
-  const manualCount = useStore((s) => Object.values(s.fs.tokens).filter((t) => t.status === "manual" || t.at.some((key) => key.endsWith("/manual"))).length);
+  const manualCount = useStore(s => manualQueue(s.fs).filter(token => manualOwner(token) === 'human').length);
   return (
     <nav className="rail" aria-label="工作台导航">
       <div className="rail-mark" data-tip="Easy Workflow">

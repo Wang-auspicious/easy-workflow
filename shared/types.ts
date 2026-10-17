@@ -361,6 +361,7 @@ export type JournalEvent =
   | { kind: "evidence.added"; evidence: EvidenceRef }
   | { kind: "review.verdict"; token: string; node: string; verdict: "pass" | "return" | "escalate"; returnTo?: string; reason: string }
   | { kind: "token.returned"; token: string; from: string; to: string; reason: string; round: number; byHuman?: boolean; reset?: string[] }
+  | {kind: 'token.resumed'; token: string; node: string; reason: string}
   | { kind: "token.finished"; token: string; status: TokenStatus; node: string; reason: string }
   | { kind: "token.data"; token: string; patch: Record<string, unknown> }
   | { kind: "worker.spawned"; node: string; worker: string; label: string; reason: string }

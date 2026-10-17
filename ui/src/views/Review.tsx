@@ -1,7 +1,7 @@
 import {useEffect, useRef, useState} from 'react';
 import {ArrowUpRight, Check, ChevronRight, ChevronLeft, Loader2, Undo2, Play, Search, Clock3, MessageSquare, Image as ImageIcon, Maximize2, X, ShieldCheck} from 'lucide-react';
 import type {EvidenceRef} from '../../../shared/types.ts';
-import type {TokenState} from '../../../shared/project.ts';
+import {manualOwner, manualQueue, type TokenState} from '../../../shared/project.ts';
 import {actions, api} from '../api.ts';
 import {getState, setState, useStore} from '../store.ts';
 import {toast} from '../shell/Toasts.tsx';
@@ -17,7 +17,7 @@ const REDO: [string, string][] = [
 const isManual = (token: TokenState | undefined) => Boolean(token && (token.status === 'manual' || token.at.some(key => key.endsWith('/manual'))));
 const text = (value: unknown): string => typeof value === 'string' ? value : '';
 const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-const reason = (token: TokenState) => text(token.data.manualReason) || token.reason || '审查尚未通过，需要你决定下一步。';
+const reason = (token: TokenState) => token.reason || text(token.data.manualReason) || '审查尚未通过，需要先核对阻塞原因。';
 function summary(token: TokenState) {
   const raw = reason(token).replace(/^\[[^\]]{1,40}\]\s*/u, '').replace(/（[^）]*token[^）]*）/gu, '')
     .replace(/^终审员发现需要站长处理的问题[：:]\s*/u, '')
@@ -49,15 +49,19 @@ export function Review() {
   useStore(state => state.version);
   const state = getState();
   // Journal projections mutate token maps in place; derive from every version.
-  const items = Object.values(state.fs.tokens).filter(isManual).sort((a, b) => (a.finishedAt ?? a.createdAt) - (b.finishedAt ?? b.createdAt));
+  const items = manualQueue(state.fs).sort((a, b) => (a.finishedAt ?? a.createdAt) - (b.finishedAt ?? b.createdAt));
   const pick = useStore(state => state.reviewPick);
   const setPick = (reviewPick: string | null) => setState({reviewPick});
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('全部');
+  const [owner, setOwner] = useState<'human' | 'agent'>('human');
+  const owned = items.filter(token => manualOwner(token) === owner);
+  const humanCount = items.filter(token => manualOwner(token) === 'human').length;
+  const agentCount = items.length - humanCount;
   const deferred = useStore(state => state.reviewDeferred);
   const setDeferred = (update: (previous: string[]) => string[]) => setState(state => ({reviewDeferred: update(state.reviewDeferred)}));
   const [processed, setProcessed] = useState(0);
-  const shown = items.filter(token => `${token.title} ${token.item} ${token.url} ${reason(token)}`.toLowerCase().includes(query.toLowerCase()) &&
+  const shown = owned.filter(token => `${token.title} ${token.item} ${token.url} ${reason(token)}`.toLowerCase().includes(query.toLowerCase()) &&
     (filter === '稍后处理' ? deferred.includes(token.id) : !deferred.includes(token.id) && (filter === '全部' || group(token) === filter)));
   const current = shown.find(token => token.id === pick) ?? shown[0];
   const index = current ? shown.indexOf(current) : 0;
@@ -68,10 +72,11 @@ export function Review() {
     setPick(shown[index + 1]?.id ?? shown[index - 1]?.id ?? null);
   };
   return <div className="view review review-workbench">
-    <aside className="rv-queue"><header><span className="rv-eyebrow">人工审计</span><div><h1>只看需要你决定的</h1><span className="rv-total num">{items.length}</span></div><p>{processed ? `本次已处理 ${processed} 件，按自己的节奏来。` : '一次一件。先看问题，再看证据。'}</p></header>
+    <aside className="rv-queue"><header><span className="rv-eyebrow">人工审计</span><div><h1>{owner === 'human' ? '只看需要你决定的' : '交给 Agent 处理'}</h1><span className="rv-total num">{owned.length}</span></div><p>{owner === 'agent' ? '采集、来源、执行问题先由主调度排查。' : processed ? `本次已处理 ${processed} 件，按自己的节奏来。` : '一次一件。先看问题，再看证据。'}</p></header>
+      <div className="rv-filters" aria-label="处理责任"><button aria-pressed={owner === 'human'} onClick={() => {setOwner('human'); setFilter('全部');}}>需要你决定<span>{humanCount}</span></button><button aria-pressed={owner === 'agent'} onClick={() => {setOwner('agent'); setFilter('全部');}}>Agent 待修复<span>{agentCount}</span></button></div>
       <label className="rv-search"><Search size={15} /><input aria-label="搜索待审条目" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索名称、网址或问题" /></label>
       <div className="rv-filters" aria-label="筛选审计问题">{GROUPS.map(name => {
-        const count = items.filter(token => name === '稍后处理' ? deferred.includes(token.id) : !deferred.includes(token.id) && (name === '全部' || group(token) === name)).length;
+        const count = owned.filter(token => name === '稍后处理' ? deferred.includes(token.id) : !deferred.includes(token.id) && (name === '全部' || group(token) === name)).length;
         return (count > 0 || name === '全部' || name === filter) && <button key={name} aria-pressed={filter === name} onClick={() => setFilter(name)}>{name}<span>{count}</span></button>;
       })}</div>
       <div className="rv-queue-items">{shown.map(token => <button key={token.id} className={`rv-queue-item${current?.id === token.id ? ' is-on' : ''}`} aria-current={current?.id === token.id ? 'true' : undefined} onClick={() => setPick(token.id)}>
@@ -83,7 +88,7 @@ export function Review() {
     {current ? <Detail key={current.id} token={current} disabled={!state.connected || Boolean(state.replay)} position={`${index + 1} / ${shown.length}`} deferred={deferred.includes(current.id)}
       restore={() => setDeferred(previous => previous.filter(id => id !== current.id))} done={() => next(false)} later={() => next(true)}
       previous={() => setPick(shown[Math.max(0, index - 1)]?.id ?? null)} hasPrevious={index > 0} />
-      : <section className="rv-rest"><div><ShieldCheck size={36} /><h2>{items.length ? '留一点注意力给重要的事' : '审计队列已清空'}</h2><p>{items.length ? '选择一个队列，继续查看需要你决定的条目。' : '有新的待审条目时，你可以在这里继续。'}</p></div></section>}
+      : <section className="rv-rest"><div><ShieldCheck size={36} /><h2>{owner === 'human' && !humanCount ? '暂时没有需要你决定的事' : '这个队列已看完'}</h2><p>{agentCount ? `还有 ${agentCount} 件待 Agent 诊断或修复，记录和证据均已保留。` : '需要你判断时，会出现在这里。'}</p>{owner === 'human' && agentCount > 0 && <button className="rv-resume" onClick={() => setOwner('agent')}>查看 Agent 待修复</button>}</div></section>}
   </div>;
 }
 
@@ -158,7 +163,7 @@ function Detail({token, disabled, position, deferred, restore, done, later, prev
   const askAgent = () => {
     setState(current => ({chatOpen: true, chatList: false, chatHistoryOpen: false, chatSessionView: null, chatRoom: 'root',
       attachments: [...current.attachments.filter(attachment => attachment.type !== 'token' || attachment.id !== token.id), {type: 'token', id: token.id, label: token.title || token.item}],
-      draft: `${current.draft.trim() ? current.draft.trim() + '\n\n' : ''}请检查这个待审条目的阻塞原因，先核对现有证据和失败记录，给我简短结论与可执行的修复建议：${summary(token)}`}));
+      draft: `${current.draft.trim() ? current.draft.trim() + '\n\n' : ''}请实际修复待审任务 ${token.id}：先用 manual_review 核对当前状态、来源和已保存证据，能自动修的从失败工位恢复，预算交接用 resume_handoff 续接。经过原审查与发布闸门后核对真实结果；只有明确需要我选择或接管的问题才留给我。不要新增候选。问题：${summary(token)}`}));
     window.dispatchEvent(new Event('easy:focus-composer'));
   };
   const openSite = async () => {
@@ -175,7 +180,7 @@ function Detail({token, disabled, position, deferred, restore, done, later, prev
     <div className="rv-focus-scroll">
       <nav className="rv-focus-nav"><span>{group(token)}</span><div><button aria-label="上一件待审条目" disabled={!hasPrevious || Boolean(busy)} onClick={previous}><ChevronLeft size={15} /></button><span className="num">{position}</span><button onClick={deferred ? restore : later} disabled={Boolean(busy)}><Clock3 size={13} />{deferred ? '移回待审队列' : '稍后处理'}</button></div></nav>
       <header className="rv-focus-head"><h2>{token.title || token.item}</h2>{/^https?:\/\//i.test(token.url) && <button onClick={() => void openSite()}>{token.url.replace(/^https?:\/\//i, '').replace(/\/$/, '')}<ArrowUpRight size={12} /></button>}</header>
-      <div className="rv-decision"><span className="rv-eyebrow">这次需要你判断</span><p>{summary(fullToken)}</p></div>
+      <div className="rv-decision"><span className="rv-eyebrow">{manualOwner(token) === 'human' ? '这次需要你判断' : '主调度需要解决的问题'}</span><p>{summary(fullToken)}</p></div>
       <section className="rv-evidence" aria-label="相关证据"><header><b>先看证据</b><span>{shots.length ? `${shots.length} 份可视证据` : '尚未取得可视证据'}</span></header>
         {shots.length > 0 ? <><div className="rv-evidence-tabs" role="tablist" aria-label="证据类型">{shots.map(([key, evidence]) => <button role="tab" aria-selected={selected?.[0] === key} key={key} onClick={() => setShot(key)}>{ROLE[key] ?? evidence.label}{key === preferred && <i>相关</i>}</button>)}</div>
           <div className="rv-stage">{selected![1].kind === 'video' ? <video key={selected![1].id} src={selected![1].src} poster={selected![1].poster ?? selected![1].card} controls preload="metadata" />
@@ -184,6 +189,7 @@ function Detail({token, disabled, position, deferred, restore, done, later, prev
       </section>
       <details className="rv-context" onToggle={event => setExpanded(event.currentTarget.open)}><summary>完整原因与执行记录<span>按需展开</span></summary>
         <div className="rv-context-body"><h3>完整阻塞原因</h3><p>{reason(fullToken)}</p>
+          {text(fullToken.data.manualReason) && text(fullToken.data.manualReason) !== reason(fullToken) && <><h3>历史审查补充</h3><p>{text(fullToken.data.manualReason)}</p></>}
           {text(object(fullToken.data.copy).descriptionZh) && <><h3>当前简介</h3><p>{text(object(fullToken.data.copy).descriptionZh)}</p></>}
           {!state.replay && !details && !loadError && <p><Loader2 size={12} className="spin-i" /> 正在读取完整记录…</p>}
           {loadError && <p role="alert">{loadError}，收起后可重新展开读取。</p>}
