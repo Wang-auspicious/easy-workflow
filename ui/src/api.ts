@@ -269,6 +269,13 @@ export const actions = {
   chat: (text: string, attachments: Attachment[], options?: { requestId: string; mode: "steer" | "followUp" }) => api.post("/api/chat", { text, attachments, ...options }),
   abortChat: () => api.post("/api/chat/abort", {}),
   continueChat: () => api.post("/api/chat/continue", {}),
+  newChat: async (requestId: string) => {
+    const result = await api.post<{ok: boolean; session: {id: string; after: string | null; at: number}; status: DispatcherStatus}>('/api/chat/session', {requestId});
+    if (!result.ok || !result.session?.id) throw new Error('新对话尚未确认，请重试');
+    setState(state => ({fs: {...state.fs, chatSessions: [...(state.fs.chatSessions ?? []).filter(session => session.id !== result.session.id), result.session]},
+      version: state.version + 1, dispatcher: result.status, live: reconcileChatLive({id: null, text: '', tools: []}, result.status), chatSessionView: null, chatHistoryOpen: false}));
+    return result;
+  },
   browser: async (args: Record<string,unknown>) => { const browser = await api.post<import("../../shared/browser.ts").BrowserState>("/api/browser",args); setState({browser}); return browser; },
   run: (action: "start" | "pause" | "resume" | "end", title?: string) => api.post("/api/run", { action, title }),
   pull: (count: number, category?: string) => api.post("/api/pull", { count, category }),

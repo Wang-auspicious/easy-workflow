@@ -13,10 +13,11 @@ test("real HTTP chat acceptance, steering, idempotency, SSE reconnect and failed
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const token = "chat-http-fixture-secret";
   let release!: () => void; const released = new Promise<void>(r => { release = r; });
-  let modelCalls = 0, unavailable = false;
+  let modelCalls = 0, unavailable = false, slowNext = false;
   const provider = http.createServer(async (req, res) => {
     for await (const _chunk of req) { /* consume the request */ }
     modelCalls++;
+    if (slowNext) {slowNext = false; await delay(2500);}
     if (modelCalls === 1) await released;
     if (unavailable) { res.writeHead(401, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message: "invalid API key" } })); return; }
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -74,6 +75,25 @@ test("real HTTP chat acceptance, steering, idempotency, SSE reconnect and failed
     const resumed = await waitState("completed");
     assert.equal(resumed.dispatcher.turn, "m-failed-request");
     assert.equal(resumed.conversation.filter((m: any) => m.message.role === "user").length, 3, "continuing and duplicate POST must not add user requests");
+    const reset = await request('/api/chat/session', {requestId: 'http-new-session'});
+    assert.equal(reset.status, 200);
+    assert.equal(reset.data.status.status, 'idle');
+    assert.equal((await request('/api/chat/session', {requestId: 'http-new-session'})).data.duplicate, true);
+    const afterReset = (await request('/api/state')).data;
+    assert.equal(afterReset.chatSessions.length, 1);
+    assert.equal(afterReset.conversation.length, resumed.conversation.length, 'clearing context preserves historical messages');
+    assert.equal(afterReset.run.id, resumed.run.id, 'clearing chat does not end the production run');
+    assert.equal((await request('/api/chat/continue', {})).status, 409, 'an archived checkpoint cannot resume into the new session');
+    slowNext = true;
+    await request('/api/chat', {text: '这条回答会被新对话中断', attachments: [], requestId: 'interrupt-for-new'});
+    const duplicateReset = await request('/api/chat/session', {requestId: 'http-new-session'});
+    assert.equal(duplicateReset.data.status.busy, true, 'retrying an old reset receipt cannot stop newer work');
+    const resetWhileBusy = await request('/api/chat/session', {requestId: 'http-stop-and-new'});
+    assert.equal(resetWhileBusy.status, 200);
+    assert.equal(resetWhileBusy.data.status.status, 'idle');
+    const finalState = (await request('/api/state')).data;
+    assert.equal(finalState.chatSessions.length, 2);
+    assert.equal(finalState.run.id, resumed.run.id);
   } finally {
     release();
     if (child && child.exitCode === null) await new Promise<void>(resolve => {

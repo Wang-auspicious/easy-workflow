@@ -25,6 +25,17 @@ declare module '@earendil-works/pi-agent-core' {
 export type PiMessage = Exclude<Message, { role: "system" }> | NativeAssistantMessage;
 export interface ConversationEntry { id: string; turn: string; message: PiMessage; attachments?: Attachment[] }
 
+/** A durable context boundary; old messages and operation receipts remain intact. */
+export interface ChatSession {id: string; after: string | null; at: number}
+export function sessionEntries(entries: ConversationEntry[], sessions: ChatSession[], id?: string | null): ConversationEntry[] {
+  const selected = id ?? sessions.at(-1)?.id ?? 'legacy';
+  const index = sessions.findIndex(session => session.id === selected);
+  const start = index < 0 ? 0 : sessions[index].after ? entries.findIndex(entry => entry.id === sessions[index].after) + 1 : 0;
+  const next = sessions[index + 1];
+  const end = next ? next.after ? entries.findIndex(entry => entry.id === next.after) + 1 : 0 : entries.length;
+  return entries.slice(start, end);
+}
+
 export const TOOL_MESSAGE_BYTES = 32 * 1024;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

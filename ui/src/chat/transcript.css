@@ -1,6 +1,13 @@
 /* 转录样式，参考 Grok Bot 的行结构：小人在左，右边是名字 / 时间 / 状态，正文依次排开。
    颜色沿用应用的设计变量（:root 的自定义属性会穿过 shadow 边界）。 */
 :host { color: var(--ink-2); font: 13px/1.65 var(--font); }
+.tr-actions { display:flex; gap:12px; align-items:center; color:var(--ink-3); }
+.tr-actions button, .tr-read-more { display:inline-flex; gap:5px; align-items:center; padding:3px 0; color:var(--ink-3); font:11px/1.5 var(--font); }
+.tr-actions button:hover, .tr-read-more:hover { color:var(--accent); }
+.tr-actions button:focus-visible, .tr-read-more:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+.tr-text-group { min-width:0; }
+.tr-text.is-folded { max-height:330px; overflow:hidden; mask-image:linear-gradient(#000 84%, transparent); }
+.tr-read-more { color:var(--accent); padding:7px 0; }
 .tr { display: flex; flex-direction: column; gap: 18px; padding: 14px 0 22px; }
 .tr-row { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; align-items: start; }
 .tr-av { position: sticky; top: 0; padding-top: 1px; }

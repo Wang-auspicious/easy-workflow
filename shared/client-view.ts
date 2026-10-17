@@ -22,6 +22,7 @@ function tokenData(data: Record<string, unknown>) {
   const summary = pick(data, [
     'retriedBy', 'channelDelivery', 'workflowPack', 'recoveryRoot', 'batchRecovery', 'failure',
     'title', 'kind', 'kindAgreed', 'mode', 'shotReview', 'factReview', 'copyReview',
+    'manualReason',
   ]);
   if (Object.hasOwn(data, '__runtimeRecovery')) {
     const plan = object(data.__runtimeRecovery);

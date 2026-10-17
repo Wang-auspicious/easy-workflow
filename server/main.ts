@@ -285,6 +285,18 @@ const server = http.createServer(async (req, res) => {
         case '/api/kernel/continue': return send(res, 200, await control.execute('continue_budget', b, 'user'));
         case '/api/lessons/shared/delete': return send(res, 200, await control.execute('delete_shared_lesson', b, 'user'));
         case "/api/chat/abort": dispatcher.abort(); return send(res, 200, { ok: true });
+        case '/api/chat/session': {
+          if (typeof b.requestId !== 'string' || !/^[a-zA-Z0-9_-]{8,120}$/.test(b.requestId)) throw new ControlError(400, 'invalid_request_id', '新对话需要有效的 requestId');
+          const receipt = dispatcher.sessionReceipt(b.requestId);
+          if (receipt) return send(res, 200, receipt);
+          if (dispatcher.busy) {
+            dispatcher.abort();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try { await Promise.race([chatTask, new Promise(resolve => {timer = setTimeout(resolve, 5000);})]); }
+            finally {clearTimeout(timer);}
+          }
+          return send(res, 200, dispatcher.newSession(b.requestId));
+        }
         case "/api/chat/continue": {
           if (dispatcher.busy) return send(res, 202, { ok: true, accepted: true, turn: dispatcher.status.turn, status: dispatcher.status });
           if (!dispatcher.status.recoverable) throw new ControlError(409, "nothing_to_resume", "没有需要恢复的回答");

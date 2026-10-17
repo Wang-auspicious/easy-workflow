@@ -15,6 +15,8 @@ const posts = [], errors = [];
 let failNextChat = false;
 let failNextQuota = false;
 let failNextCatalog = false;
+let failNextCorrection = true;
+let failNextSession = false;
 try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   page.on("pageerror", error => errors.push(error.message));
@@ -32,6 +34,25 @@ try {
     const url = new URL(request.url());
     const body = request.postDataJSON();
     posts.push({ path: url.pathname, body });
+    if (url.pathname === '/api/correct' && process.argv.includes('--review')) {
+      if (failNextCorrection) {failNextCorrection = false; await route.fulfill({json: {ok: false, results: [{ok: false, message: '这次退回未执行，意见已保留'}]}}); return;}
+      await page.evaluate(id => {
+        const state = window.chatFixture.getState();
+        state.fs.tokens[id].status = 'active'; state.fs.tokens[id].at = ['curation/proof'];
+        window.chatFixture.setState({version: state.version + 1});
+      }, body.items[0].token);
+      await route.fulfill({json: {ok: true, results: [{ok: true}]}}); return;
+    }
+    if (url.pathname === '/api/tools/inspect' && process.argv.includes('--review')) {
+      const token = await page.evaluate(id => window.chatFixture.getState().fs.tokens[id], body.token);
+      await route.fulfill({json: {ok: true, result: token}}); return;
+    }
+    if (url.pathname === '/api/chat/session') {
+      if (failNextSession) {failNextSession = false; await route.abort('failed'); return;}
+      const session = await page.evaluate(id => ({id, after: window.chatFixture.getState().fs.conversation.at(-1)?.id ?? null, at: Date.now()}), body.requestId);
+      await route.fulfill({json: {ok: true, session, status: {turn: '', status: 'idle', busy: false, attempt: 0, maxAttempts: 3, recoverable: false, message: '新对话已就绪', updatedAt: Date.now()}}});
+      return;
+    }
     if (url.pathname === '/api/settings') {
       if (failNextQuota) {failNextQuota = false; await route.fulfill({status: 400, json: {error: '配额未保存，fixture 拒绝'}}); return;}
       const settings = await page.evaluate(values => ({...window.chatFixture.getState().settings, ...values}), body);
@@ -107,6 +128,106 @@ try {
   await page.screenshot({ path: path.join(out, "transcript-1440.png") });
 
   const input = page.locator(".composer textarea");
+  if (process.argv.includes('--review')) {
+    await page.evaluate(() => {
+      const state = window.chatFixture.getState();
+      state.factory.nodes.push({...state.factory.nodes[0], key: 'curation/proof', name: '特写摄影'}, {...state.factory.nodes[0], key: 'curation/facts', name: '事实核验'});
+      state.fs.tokens = {};
+      const reasons = ['特写中主体被导航遮挡，需要换一张组件预览。', '许可条款没有可核对的出处，需要补充事实来源。', '公开页面连接超时，已有证据保留。'];
+      for (let i = 0; i < 9; i++) {
+        state.fs.tokens[`review-${i}`] = {id: `review-${i}`, line: 'curation', item: `review-${i}`, title: ['Forma 组件与设计系统', 'Editorial 素材库', 'Canvas 工具集'][i % 3] + (i > 2 ? ` ${i}` : ''), url: `https://review-${i}.example.test`, status: 'manual', at: ['curation/manual'], attempts: [], evidence: [], rounds: {}, corrections: 0, source: 'fixture', createdAt: i, reason: reasons[i % 3], data: {manualReason: reasons[i % 3] + '\n\n' + '完整审查记录：保留每一项判断与原始依据。'.repeat(80) + '记录末尾仍然可读'}};
+      }
+      window.chatFixture.setState({view: 'review', version: state.version + 1});
+    });
+    await page.locator('.rv-queue-item').first().waitFor();
+    assert.equal(await page.locator('.rv-queue-item').count(), 9);
+    assert.equal(await page.locator('.rv-context[open]').count(), 0);
+    assert.ok((await page.locator('.rv-decision p').innerText()).length < 150);
+    await page.getByRole('button', {name: /截图与页面\s*3/}).click();
+    assert.equal(await page.locator('.rv-queue-item').count(), 3);
+    await page.getByLabel('修改意见', {exact: true}).fill('待核对：先保留这条人工意见');
+    await page.getByRole('button', {name: '稍后处理', exact: true}).click();
+    assert.equal(await page.locator('.rv-queue-item').count(), 2);
+    await page.getByRole('button', {name: /稍后处理\s*1/}).click();
+    assert.equal(await page.locator('.rv-queue-item').count(), 1);
+    assert.equal(await page.getByLabel('修改意见', {exact: true}).inputValue(), '待核对：先保留这条人工意见', 'deferring and returning keeps the human draft');
+    await page.getByRole('button', {name: '移回待审队列', exact: true}).click();
+    await page.getByRole('button', {name: /全部\s*9/}).click();
+    await page.getByLabel('搜索待审条目').fill('Forma');
+    assert.equal(await page.locator('.rv-queue-item').count(), 3);
+    await page.getByLabel('搜索待审条目').fill('');
+    await page.locator('.rv-queue-item').first().click();
+    await page.locator('.rv-context summary').click();
+    await page.getByText(/记录末尾仍然可读/).waitFor();
+    await page.locator('.rv-context summary').click();
+    await page.getByRole('button', {name: '请主调度帮我看', exact: true}).click();
+    assert.match(await input.inputValue(), /先核对现有证据/);
+    assert.equal(await page.evaluate(() => window.chatFixture.getState().attachments[0].id), 'review-0');
+    await page.getByLabel('退回工位').selectOption('curation/proof');
+    await page.getByRole('button', {name: '换成可见的组件示例，避开文档文字和导航。', exact: true}).click();
+    await page.getByRole('button', {name: '退回并看下一件', exact: true}).click();
+    await page.getByRole('alert').filter({hasText: '这次退回未执行'}).waitFor();
+    assert.match(await page.getByLabel('修改意见', {exact: true}).inputValue(), /可见的组件示例/);
+    assert.equal(await page.locator('.rv-queue-item').count(), 9);
+    await page.getByRole('button', {name: '退回并看下一件', exact: true}).click();
+    await page.waitForFunction(() => document.querySelectorAll('.rv-queue-item').length === 8);
+    assert.equal(posts.filter(post => post.path === '/api/correct').length, 2);
+    assert.equal(posts.find(post => post.path === '/api/correct').body.items[0].node, 'curation/proof');
+    await page.screenshot({path: path.join(out, 'review-redesigned.png')});
+    await page.setViewportSize({width: 1050, height: 800});
+    await page.waitForTimeout(300);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    const reviewBounds = await page.evaluate(() => {
+      const queue = document.querySelector('.rv-queue').getBoundingClientRect();
+      const focus = document.querySelector('.rv-focus').getBoundingClientRect();
+      const workspace = document.querySelector('.workspace').getBoundingClientRect();
+      return {stacked: queue.bottom <= focus.top + 1, inside: focus.right <= workspace.right + 1};
+    });
+    assert.ok(reviewBounds.stacked && reviewBounds.inside, JSON.stringify(reviewBounds));
+    await page.screenshot({path: path.join(out, 'review-1050.png')});
+    assert.deepEqual(errors, []);
+    console.log('PASS: focused review, filters, full evidence, deferred queue, failure retention and successful advance');
+  } else if (process.argv.includes('--clear-regression')) {
+    await input.fill('/clear');
+    await input.press('Enter');
+    await page.waitForTimeout(100);
+    assert.ok(posts.some(post => post.path === '/api/chat/session'), '/clear must start a real fresh conversation, not merely erase the input');
+    await page.getByText('新对话已开启。旧记录在「历史对话」，流水线任务继续保留。', {exact: true}).waitFor();
+    assert.equal(await page.locator('.tr-row--user').count(), 0);
+    await page.getByRole('button', {name: '历史对话', exact: true}).click();
+    await page.locator('.chat-session').filter({hasText: '把 100 个网站持续处理完'}).click();
+    assert.equal(await page.locator('.tr-row--user').count(), 1, 'archived messages remain readable');
+    await page.getByRole('button', {name: '回到当前对话', exact: true}).click();
+    await input.fill('/clear');
+    await page.getByRole('button', {name: '发送消息', exact: true}).click();
+    await page.getByText('新对话已开启。旧记录在「历史对话」，流水线任务继续保留。', {exact: true}).waitFor();
+    assert.equal(posts.filter(post => post.path === '/api/chat/session').length, 2, 'send button and Enter run the same command');
+    failNextSession = true;
+    await input.fill('/new');
+    await input.press('Enter');
+    await page.locator('.composer-feedback').waitFor();
+    const lostSessionId = posts.at(-1).body.requestId;
+    assert.equal(await input.inputValue(), '/new');
+    await page.getByRole('button', {name: '收起对话', exact: true}).click();
+    await page.keyboard.press('Control+k');
+    await input.press('Enter');
+    await page.getByText('新对话已开启。旧记录在「历史对话」，流水线任务继续保留。', {exact: true}).waitFor();
+    assert.equal(posts.at(-1).body.requestId, lostSessionId, 'lost session receipt reuses the same id after sidebar reopen');
+    await input.fill('/does-not-exist');
+    await input.press('Enter');
+    await page.getByText(/没有 \/does-not-exist 这个命令/).waitFor();
+    assert.equal(posts.filter(post => post.path === '/api/chat').length, 0, 'unknown commands never leak into the model prompt');
+    await input.fill('/hist');
+    await input.press('Tab');
+    assert.equal(await input.inputValue(), '/history');
+    await input.press('Escape');
+    await input.fill('/help');
+    await input.press('Enter');
+    await page.locator('.cmd-palette').waitFor();
+    await page.screenshot({path: path.join(out, 'commands-redesigned.png')});
+    console.log('clear command regression passed');
+    process.exitCode = 0;
+  } else {
   await input.fill("先检查连接问题");
   await page.getByRole("button", { name: "发送补充要求", exact: true }).click();
   await page.waitForFunction(() => !document.querySelector(".composer .send[aria-label='发送补充要求']"));
@@ -363,6 +484,7 @@ try {
   assert.deepEqual(errors, []);
   await fs.writeFile(path.join(out, "result.json"), JSON.stringify({ ok: true, checks: ["100-site goal accounting", "partial answer retention", "automatic recovery", "steer", "followUp", "SSE reconnect after missed end", "continue checkpoint", "stop answer", "idempotent resend", "network is not login", "recheck instead of blind clear", "activate exact tab", "narrow window", "journaled alert resolution"], requests: posts, errors }, null, 2));
   console.log("PASS: isolated chat recovery and responsive composer checks, screenshots in var/verification/chat-recovery");
+  }
 } finally {
   await browser.close();
   await server.close();

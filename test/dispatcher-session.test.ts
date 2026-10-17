@@ -59,6 +59,31 @@ function fixture(handler: (count: number, context: TranscriptContext, signal: Ab
   } };
 }
 
+test('new chat resets model context durably without deleting history or replaying writes', async () => {
+  const seen: string[][] = [];
+  const f = fixture((_count, context) => {
+    seen.push(context.messages.filter(message => message.role === 'user').map(message => JSON.stringify(message.content)));
+    return answer('会话测试回答');
+  });
+  try {
+    let dispatcher = f.newDispatcher();
+    await dispatcher.chat('OLD_PRIVATE_CONTEXT', [], 'old-session-input');
+    const original = structuredClone(f.conversation);
+    const reset = dispatcher.newSession('new-session-request');
+    assert.equal(reset.ok, true);
+    assert.equal(dispatcher.status.status, 'idle');
+    assert.equal(dispatcher.status.recoverable, false);
+    assert.deepEqual(f.conversation, original, 'history remains available');
+    assert.equal(dispatcher.newSession('new-session-request').duplicate, true);
+    dispatcher = f.newDispatcher();
+    await dispatcher.chat('NEW_CONTEXT', [], 'new-session-input');
+    assert.ok(seen[1].some(value => value.includes('NEW_CONTEXT')));
+    assert.ok(seen[1].every(value => !value.includes('OLD_PRIVATE_CONTEXT')), 'restart must honor the context boundary');
+    assert.equal(f.writes, 0);
+    assert.equal(dispatcher.receipt('old-session-input')?.duplicate, true, 'old write/request receipts survive reset');
+  } finally {f.cleanup();}
+});
+
 test('dispatcher model changes apply at the next request without replacing in-flight work or tool receipts', async () => {
   const started = deferred();
   const released = deferred();

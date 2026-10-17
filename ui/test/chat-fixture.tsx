@@ -13,6 +13,7 @@ import {Settings} from '../src/views/Settings.tsx';
 import {Library} from '../src/views/Library.tsx';
 import {BrowserView} from '../src/views/BrowserView.tsx';
 import {PreviewChoice} from '../src/views/PreviewChoice.tsx';
+import {Review} from '../src/views/Review.tsx';
 import { connect } from "../src/api.ts";
 import {getState, setState, useStore} from '../src/store.ts';
 import { apply, initialState, type TokenState } from "../../shared/project.ts";
@@ -98,8 +99,9 @@ function FixtureWorkspace() {
   if (view === 'settings') return <Settings />;
   if (view === 'library') return <Library />;
   if (view === 'browser') return <BrowserView />;
+  if (view === 'review') return <Review />;
   if (view === 'candidates') return <PreviewChoice item="fixture-item" onMessage={message => setState({draft: message})} />;
   return <><h2>恢复流程验收</h2><p>隔离测试数据 · 不连接真实工厂</p></>;
 }
-createRoot(document.getElementById("root")!).render(<div className="app" style={{ "--chat-w": "420px" } as React.CSSProperties}><Rail /><main className="workspace" style={{ padding: 40 }}><FixtureWorkspace /></main><Chat /><Toasts /></div>);
+createRoot(document.getElementById("root")!).render(<div className="app" style={{ "--chat-w": "420px" } as React.CSSProperties}><Rail /><main className="workspace"><FixtureWorkspace /></main><Chat /><Toasts /></div>);
 connect(0);

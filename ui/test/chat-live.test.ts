@@ -3,6 +3,11 @@ import test from "node:test";
 import { legacyReply } from "../../shared/conversation.ts";
 import { emptyLive, idleDispatcher, reconcileChatLive, reduceChatLive } from "../src/chat/live.ts";
 
+test('a fresh session clears the previous live fragment even on another connected window', () => {
+  const old = {id: 'old', text: '', tools: [], messageId: 'old-reply', message: legacyReply('old answer', 1)};
+  assert.deepEqual(reconcileChatLive(old, idleDispatcher()), emptyLive());
+});
+
 test("message_end keeps the partial answer visible until the queued journal update is rendered", () => {
   const started = reduceChatLive(emptyLive(), { kind: "chat.start", id: "turn-1" });
   const streaming = reduceChatLive(started, { kind: "chat.pi", turn: "turn-1", id: "reply-1", message: legacyReply("已检查前 20 个网站", 1) });

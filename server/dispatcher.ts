@@ -16,6 +16,7 @@ import {dispatcherContext, dispatcherError, dispatcherOperationKey, recoverDispa
 import {withModelAdmission} from './model-requests.ts';
 import {resolveNativeCommand} from './agent-bindings.ts';
 import {NativeDispatcher} from './dispatcher-native.ts';
+import {ControlError} from './errors.ts';
 
 const SYSTEM = `你是“主调度”，一个多 agent 流水线工厂的总调度，站长（用户）只和你说话。
 - 你负责把目标变成真实可执行的工作：使用现有线，或自主创建新线；投料、启停、纠错、核对产物。
@@ -68,13 +69,34 @@ export class Dispatcher {
     this.options = { requestTimeoutMs: options.requestTimeoutMs ?? 120_000, maxAttempts: options.maxAttempts ?? 3, retryDelaysMs: options.retryDelaysMs ?? [1000, 3000], modelFactory: options.modelFactory ?? models };
     this.checkpoint = { state: idle(this.options.maxAttempts), prompted: false, messageNumber: 0, request: { text: "", attachments: [] }, scope: "", inputs: [], operations: [] };
     const saved = f.journal.latestEvent('chat.checkpoint');
-    if (saved) this.checkpoint = structuredClone(saved.checkpoint);
+    const session = f.journal.latestEvent('chat.session');
+    if (saved && (!session || saved.seq > session.seq)) this.checkpoint = structuredClone(saved.checkpoint);
     if (this.checkpoint.state.busy || ["running", "recovering", "interrupted"].includes(this.checkpoint.state.status)) {
       this.checkpoint.state = { ...this.checkpoint.state, status: "interrupted", busy: false, recoverable: true, nextRetryAt: undefined, message: "服务曾中断，已保存对话和工具回执，将继续未完成的回答。" };
       this.restored = true;
     }
   }
   get status(): DispatcherStatus { return { ...this.checkpoint.state, busy: this.busy }; }
+  sessionReceipt(requestId: string) {
+    const existing = [...this.f.journal.readKinds(['chat.session'])].find(event => event.kind === 'chat.session' && event.id === requestId);
+    if (existing) return {ok: true, duplicate: true, session: this.f.journal.latestEvent('chat.session'), status: this.status};
+    return null;
+  }
+  newSession(requestId: string) {
+    const receipt = this.sessionReceipt(requestId);
+    if (receipt) return receipt;
+    if (this.busy) throw new ControlError(409, 'dispatcher_busy', '当前回答仍在停止，请稍后再开启新对话');
+    this.f.journal.append({kind: 'chat.session', id: requestId, after: this.f.state.conversation.at(-1)?.id ?? null});
+    this.checkpoint = {state: idle(this.options.maxAttempts), prompted: false, messageNumber: 0,
+      request: {text: '', attachments: []}, scope: '', inputs: [], operations: []};
+    this.agent = null;
+    this.native = null;
+    this.live = null;
+    this.restored = false;
+    this.replayOperations = [];
+    this.update('idle', '新对话已就绪，历史记录和流水线任务保留。');
+    return {ok: true, duplicate: false, session: this.f.journal.latestEvent('chat.session'), status: this.status};
+  }
   receipt(requestId: string) {
     const id = `m-${requestId}`;
     if (!this.f.state.conversation.some(m => m.id === id && m.message.role === "user")) return null;
@@ -206,7 +228,8 @@ export class Dispatcher {
   }
   private orderedHistory() {
     const order = new Map<string, number>(); const queued = new Set<string>(); const delivered = new Map<string, number>();
-    for (const event of this.f.journal.read()) {
+    const boundary = this.f.journal.latestEvent('chat.session')?.seq ?? 0;
+    for (const event of this.f.journal.readKinds(['chat.user', 'chat.message', 'chat.assistant', 'chat.checkpoint'], boundary)) {
       if (event.kind === "chat.user" || event.kind === "chat.message" || event.kind === "chat.assistant") order.set(event.id, event.seq);
       if (event.kind === "chat.checkpoint") for (const input of event.checkpoint.inputs) {
         queued.add(input.id);
@@ -215,7 +238,7 @@ export class Dispatcher {
     }
     // chat.user is accepted immediately for the UI; Pi receives steering only
     // at its safe boundary. Replay must preserve that delivery order.
-    return this.f.state.conversation.filter(m => !queued.has(m.id) || delivered.has(m.id))
+    return this.f.state.conversation.filter(m => (order.get(m.id) ?? 0) > boundary && (!queued.has(m.id) || delivered.has(m.id)))
       .slice().sort((a, b) => (delivered.get(a.id) ?? order.get(a.id) ?? 0) - (delivered.get(b.id) ?? order.get(b.id) ?? 0));
   }
   describe(a: Attachment): string {

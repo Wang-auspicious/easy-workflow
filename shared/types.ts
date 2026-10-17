@@ -383,6 +383,7 @@ export type JournalEvent =
   | { kind: "chat.assistant"; id: string; text: string; tools: { name: string; summary: string }[]; usage?: Usage }
   | { kind: "chat.message"; id: string; turn: string; message: import("./conversation.ts").PiMessage }
   | { kind: "chat.checkpoint"; checkpoint: import("./conversation.ts").DispatcherCheckpoint }
+  | { kind: 'chat.session'; id: string; after: string | null }
   | { kind: "spec.patched"; patch: string; summary: string; status: "proposed" | "accepted" | "rejected" }
   | { kind: "resource.sample"; used: Record<string, number>; limits: Record<string, number>; freeMemMB: number; waiting?: Record<string, string>; modelRequests?: {active: number; queued: number; limit: number} }
   | { kind: "report.ready"; runId: string }

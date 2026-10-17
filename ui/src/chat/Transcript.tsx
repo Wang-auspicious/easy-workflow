@@ -5,7 +5,7 @@
 // 数据来自 transcript.ts；这里只负责显示和展开交互。
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, GitFork, Info, Wrench, Loader2, Check, X, ChevronsDownUp, ChevronsUpDown, User } from "lucide-react";
+import { AlertTriangle, GitFork, Info, Wrench, Loader2, Check, X, ChevronsDownUp, ChevronsUpDown, Copy } from "lucide-react";
 import type { ConversationEntry } from "../../../shared/conversation.ts";
 import type { ChatMessage } from "../../../shared/project.ts";
 import { getState, setState, useStore } from "../store.ts";
@@ -90,6 +90,13 @@ function Row({ item, toolsOpen, picker, onPick }: {
   const station = item.actor.kind === "station";
   const me = item.actor.kind === "user";
   const userAvatar = useStore((s) => s.userAvatar);
+  const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState('');
+  const copyText = (item.parts ?? []).filter(part => part.type === 'text').map(part => part.text).join('\n\n');
+  const copy = async () => {
+    try {await navigator.clipboard.writeText(copyText); setCopied(true); setCopyError('');}
+    catch {setCopyError('复制失败，可选中文字手动复制');}
+  };
   const open = () => { const key = item.actor.node; if (!key) return; setState({ view: "canvas" }); toggleInspector(key); };
   return (
     <article className={`tr-row tr-row--${item.actor.kind}${item.tone ? ` tr-row--${item.tone}` : ""}`} style={{ ["--hue" as string]: item.actor.hue }}>
@@ -132,13 +139,14 @@ function Row({ item, toolsOpen, picker, onPick }: {
           : (item.parts ?? []).map((part, i) => (
             <Part key={i} part={part} toolsOpen={toolsOpen} streaming={Boolean(item.streaming) && i === (item.parts?.length ?? 0) - 1} />
           ))}
+        {copyText && !item.streaming && <div className="tr-actions"><button onClick={() => void copy()} aria-label="复制消息">{copied ? <Check size={12} /> : <Copy size={12} />}{copied ? '已复制' : '复制'}</button>{me && <button onClick={() => {setState({draft: copyText}); window.dispatchEvent(new Event('easy:focus-composer'));}}>再次编辑</button>}{copyError && <small role="status">{copyError}</small>}</div>}
       </div>
     </article>
   );
 }
 
 function Part({ part, streaming, toolsOpen }: { part: TranscriptPart; streaming?: boolean; toolsOpen: boolean | null }) {
-  if (part.type === "text") return <div className={`tr-text${streaming ? " is-streaming" : ""}`}><Markdown text={part.text} /></div>;
+  if (part.type === 'text') return <TextPart text={part.text} streaming={streaming} />;
   if (part.type === "attachments") {
     return <div className="tr-atts">{part.items.map((a) => <span key={`${a.type}:${a.id}`} className="tr-att" title={a.label}>{a.label}</span>)}</div>;
   }
@@ -158,17 +166,24 @@ function Part({ part, streaming, toolsOpen }: { part: TranscriptPart; streaming?
   return <ToolCard part={part} toolsOpen={toolsOpen} />;
 }
 
+function TextPart({text, streaming}: {text: string; streaming?: boolean}) {
+  const [expanded, setExpanded] = useState(false);
+  const long = !streaming && text.length > 650;
+  return <div className="tr-text-group"><div className={`tr-text${streaming ? ' is-streaming' : ''}${long && !expanded ? ' is-folded' : ''}`}><Markdown text={text} /></div>
+    {long && <button className="tr-read-more" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? '收起长消息' : `展开完整消息 · ${text.length.toLocaleString()} 字`}</button>}</div>;
+}
+
 /** 工具卡片：默认收起；报错也不自动展开，只在摘要下面留一行原因。 */
 function ToolCard({ part, toolsOpen }: { part: Extract<TranscriptPart, { type: "tool" }>; toolsOpen: boolean | null }) {
   const [open, setOpen] = useState(false);
-  const isOpen = toolsOpen ?? open;
+  useLayoutEffect(() => {if (toolsOpen !== null) setOpen(toolsOpen);}, [toolsOpen]);
+  const isOpen = open;
   const Icon = part.status === "pending" ? Loader2 : part.status === "error" ? X : Check;
   const reason = part.detail ?? (part.status === "error" ? firstLine(part.result) : "");
   return (
     <div className={`tr-tool-wrap tr-tool--${part.status}`}>
-      <details className="tr-tool" open={isOpen}
-        onToggle={(e) => { if (toolsOpen === null) setOpen((e.currentTarget as HTMLDetailsElement).open); }}>
-        <summary>
+      <details className="tr-tool" open={isOpen}>
+        <summary onClick={event => {event.preventDefault(); setOpen(!open);}}>
           <span className={`tr-tool-status${part.status === "pending" ? " spin-i" : ""}`}><Icon size={12} /></span>
           <Wrench size={11} className="tr-tool-wrench" />
           <span className="tr-tool-name">{part.label}</span>

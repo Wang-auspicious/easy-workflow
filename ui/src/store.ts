@@ -69,6 +69,8 @@ export interface Store {
   roomRailOpen: boolean;
   /** Grok Bot style: the conversation list replaces the open conversation. */
   chatList: boolean;
+  chatHistoryOpen: boolean;
+  chatSessionView: string | null;
   /** 每个群看到哪一刻，用来算未读。 */
   roomSeen: Record<string, number>;
   live: LiveChat;
@@ -92,6 +94,9 @@ export interface Store {
   userAvatar: string;
   /** 发过的消息，供输入框用 ↑/↓ 回溯。 */
   history: string[];
+  reviewPick: string | null;
+  reviewDeferred: string[];
+  reviewDrafts: Record<string, {target: string; note: string}>;
 }
 
 const LS = (k: string, v?: unknown) => {
@@ -111,9 +116,11 @@ let state: Store = {
   attachments: [], chatOpen: (LS("chatOpen") as boolean) ?? false, chatWidth: (LS("chatWidth") as number) ?? 320, unread: 0,
   chatRoom: (LS("chatRoom") as string) ?? "root", roomRailOpen: (LS("roomRailOpen") as boolean) ?? true, chatList: false, roomSeen: (LS("roomSeen") as Record<string, number>) ?? {},
   live: emptyLive(), dispatcher: idleDispatcher(),
+  chatHistoryOpen: false, chatSessionView: null,
   browser: emptyBrowser(),
   inspectors: [], selected: [], follow: false, trail: null, flashes: {}, settings: {}, model: "", keyPresent: false, replay: null, focus: null, draft: "", boardFocus: null,
   userAvatar: (LS("userAvatar") as string) ?? "ada", history: (LS("history") as string[]) ?? [],
+  reviewPick: null, reviewDeferred: [], reviewDrafts: {},
 };
 
 const listeners = new Set<() => void>();

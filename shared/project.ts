@@ -258,6 +258,7 @@ export interface FactoryState {
   evidenceOrder: string[];
   chat: ChatMessage[];
   conversation: ConversationEntry[];
+  chatSessions?: import('./conversation.ts').ChatSession[];
   activity: ChatMessage[];
   recoveries: Record<string, import("./failures.ts").CandidateRecovery>;
   totals: { usage: Usage; published: number; manual: number; failed: number; rejected: number; merged: number; returned: number; corrections: number };
@@ -690,6 +691,10 @@ export function apply(s: FactoryState, e: Stamped): FactoryState {
     case "chat.user":
       s.chat.push({ id: e.id, role: "user", text: e.text, at: e.at, attachments: e.attachments });
       s.conversation.push({ id: e.id, turn: e.id, message: { role: "user", content: e.text, timestamp: e.at }, attachments: e.attachments });
+      break;
+    case 'chat.session':
+      s.chatSessions ??= [];
+      if (!s.chatSessions.some(session => session.id === e.id)) s.chatSessions.push({id: e.id, after: e.after, at: e.at});
       break;
     case "chat.message":
       if (!s.conversation.some((m) => m.id === e.id)) s.conversation.push({ id: e.id, turn: e.turn, message: e.message });

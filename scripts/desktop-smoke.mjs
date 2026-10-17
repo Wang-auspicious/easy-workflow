@@ -102,6 +102,16 @@ try {
   const { url } = await app.evaluate(() => globalThis.__factoryDesktop());
   assert.equal((await fetch(`${url}/api/state`)).status, 401);
   results.checks.push('current compiled graph renders without running work', 'isolated writable workspace', 'sandbox and context isolation', 'unauthenticated local request rejected');
+  await page.keyboard.press('Control+k');
+  await page.getByLabel('给主调度的消息', {exact: true}).fill('/clear');
+  await page.getByLabel('给主调度的消息', {exact: true}).press('Enter');
+  await page.getByText('新对话已开启。旧记录在「历史对话」，流水线任务继续保留。', {exact: true}).waitFor();
+  const clearedChat = await page.evaluate(async () => (await fetch('/api/state')).json());
+  assert.equal(clearedChat.chatSessions.length, 1);
+  assert.equal(clearedChat.dispatcher.status, 'idle');
+  assert.equal(clearedChat.run.status, boot.state.run.status);
+  results.checks.push('native /clear persists a fresh context and leaves workflow state intact');
+  await page.getByRole('button', {name: '收起对话', exact: true}).click();
   await page.evaluate((url) => new Promise((resolve, reject) => {
     const w = document.createElement('webview'); w.id = 'desktop-smoke-webview';
     w.setAttribute('partition', 'persist:social-x'); w.src = url;
@@ -221,6 +231,10 @@ try {
   await closeAndVerify(app); app = null;
   app = await launch();
   await (await app.firstWindow()).locator('.node').first().waitFor({ timeout: 30000 });
+  const restoredChat = await (await app.firstWindow()).evaluate(async () => (await fetch('/api/state')).json());
+  assert.equal(restoredChat.chatSessions.at(-1).id, clearedChat.chatSessions[0].id);
+  assert.equal(restoredChat.dispatcher.status, 'idle');
+  results.checks.push('fresh conversation boundary survives native restart');
   await checkNativeLayers(app);
   const cookies = await app.evaluate(async ({ session }) => session.fromPartition('persist:social-x').cookies.get({ name: 'factory-persistence-test' }));
   assert.equal(cookies[0]?.value, 'survives-restart');

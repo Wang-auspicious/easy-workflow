@@ -2,8 +2,8 @@
 // 跑法：node --test ui/test/transcript.test.ts（或 npm run test:ui）
 import assert from "node:assert/strict";
 import test from "node:test";
-import {compactToolMessage, legacyReply, TOOL_MESSAGE_BYTES, type ConversationEntry, type PiMessage} from '../../shared/conversation.ts';
-import {initialState} from '../../shared/project.ts';
+import {compactToolMessage, legacyReply, sessionEntries, TOOL_MESSAGE_BYTES, type ConversationEntry, type PiMessage} from '../../shared/conversation.ts';
+import {apply, initialState} from '../../shared/project.ts';
 import {uiEvent, uiState} from '../../shared/client-view.ts';
 import { emptyLive, idleDispatcher, type LiveChat, type DispatcherStatus } from "../src/chat/live.ts";
 import { buildTranscript, correctionReceipt, dispatcherState, toolLabel } from "../src/chat/transcript.ts";
@@ -13,6 +13,19 @@ import { botFor } from "../../shared/palette.ts";
 const dispatcher = (patch: Partial<DispatcherStatus> = {}): DispatcherStatus => ({ ...idleDispatcher(), ...patch });
 const live = (patch: Partial<LiveChat> = {}): LiveChat => ({ ...emptyLive(), ...patch });
 const assistant = (text: string) => legacyReply(text, 1000);
+
+test('session boundaries partition legacy, empty and current chat without erasing messages', () => {
+  const state = initialState();
+  apply(state, {kind: 'chat.user', id: 'before', text: 'old', attachments: [], at: 1, seq: 1, run: ''});
+  apply(state, {kind: 'chat.session', id: 'empty', after: 'before', at: 2, seq: 2, run: ''});
+  apply(state, {kind: 'chat.session', id: 'current', after: 'before', at: 3, seq: 3, run: ''});
+  apply(state, {kind: 'chat.user', id: 'after', text: 'new', attachments: [], at: 4, seq: 4, run: ''});
+  assert.deepEqual(sessionEntries(state.conversation, state.chatSessions!, 'legacy').map(entry => entry.id), ['before']);
+  assert.deepEqual(sessionEntries(state.conversation, state.chatSessions!, 'empty'), []);
+  assert.deepEqual(sessionEntries(state.conversation, state.chatSessions!).map(entry => entry.id), ['after']);
+  assert.deepEqual(uiState(state).chatSessions, state.chatSessions);
+  assert.equal(state.conversation.length, 2);
+});
 
 test('large chat tool receipts stay bounded in UI snapshots and SSE without erasing the journal view', () => {
   for (const payload of ['历史报告'.repeat(50000), '\u0000"\\'.repeat(50000)]) {

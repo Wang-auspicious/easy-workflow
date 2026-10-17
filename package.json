@@ -24,7 +24,7 @@
     "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
     "test:ui": "node --test \"ui/test/*.test.ts\"",
     "test:ui:nodes": "node ui/test/inspector-browser.mjs --message-open",
-    "test:ui:browser": "node ui/test/api-browser.mjs && node ui/test/chat-browser.mjs && node ui/test/inspector-browser.mjs --message-open && node ui/test/workflows-browser.mjs && node ui/test/history-browser.mjs && node ui/test/rooms-browser.mjs"
+    "test:ui:browser": "node ui/test/api-browser.mjs && node ui/test/chat-browser.mjs && node ui/test/chat-browser.mjs --clear-regression && node ui/test/chat-browser.mjs --review && node ui/test/inspector-browser.mjs --message-open && node ui/test/workflows-browser.mjs && node ui/test/history-browser.mjs && node ui/test/rooms-browser.mjs"
   },
   "engines": {
     "node": ">=24"

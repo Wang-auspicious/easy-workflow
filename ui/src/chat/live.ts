@@ -26,6 +26,7 @@ export const idleDispatcher = (): DispatcherStatus => ({ turn: "", status: "idle
 
 /** Reconnection receives the server's current status, including when chat.end was missed. */
 export function reconcileChatLive(live: LiveChat, state: DispatcherStatus): LiveChat {
+  if (state.status === 'idle' && !state.turn) return emptyLive();
   if (state.busy && state.turn !== live.id) return { ...emptyLive(), id: state.turn };
   return { ...live, id: state.busy ? state.turn : null, tools: state.busy ? live.tools : [] };
 }
