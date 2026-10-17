@@ -96,7 +96,8 @@ test("stdio MCP reaches the existing authenticated control registry without cred
     const bootstrap = JSON.parse((await rpc("tools/call", { name: "easy_workflow_help", arguments: {} })).result.content[0].text);
     assert.equal(bootstrap.product, "Easy Workflow");
     assert.ok(bootstrap.instructions.length < 1500);
-    assert.match(bootstrap.roleAuthoring.guide, /站长批准/);
+    assert.match(bootstrap.roleAuthoring.guide, /workflow_draft.*workflow_trial.*workflow_activate/);
+    assert.match(bootstrap.roleAuthoring.guide, /既有内置职责或用户安装包.*站长/);
     const schema = await rpc("tools/call", { name: "h2_help", arguments: { name: "read_spec" } });
     assert.equal(JSON.parse(schema.result.content[0].text).inputSchema.additionalProperties, false);
     const spec = await rpc("tools/call", { name: "easy_workflow_call", arguments: { name: "read_spec", arguments: {} } });

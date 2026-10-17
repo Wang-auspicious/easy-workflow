@@ -273,6 +273,7 @@ export const pack: Pack = {
     ...["watch", "github", "x", "xhs", "douyin", "bilibili"].map((s) => ({ from: `sources/${s}`, to: "candidates/tidy", kind: "flow" as const })),
     { from: "candidates/route", to: "curation/dedupe", kind: "flow", when: "website", label: "网站" },
     { from: "candidates/route", to: "skills/inbox", kind: "flow", when: "skill", label: "Skill" },
+    { from: "candidates/route", to: "components/inbox", kind: "flow", when: "component", label: "组件" },
     { from: "candidates/route", to: "sci-figure/inbox", kind: "flow", when: "figure", label: "绘图" },
     { from: "candidates/route", to: "ppt/inbox", kind: "flow", when: "deck", label: "PPT" },
     { from: "candidates/route", to: "image-fx/inbox", kind: "flow", when: "fx", label: "图像处理" },
@@ -281,6 +282,7 @@ export const pack: Pack = {
   conditions: {
     website: (d) => (d.route ?? "curation") === "curation",
     skill: (d) => d.route === "skills",
+    component: (d) => d.route === "components",
     figure: (d) => d.route === "sci-figure",
     deck: (d) => d.route === "ppt",
     fx: (d) => d.route === "image-fx",

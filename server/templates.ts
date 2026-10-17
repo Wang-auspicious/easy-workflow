@@ -21,7 +21,10 @@ const templates = [
 ];
 export function listWorkflowTemplates() { return structuredClone(templates); }
 
-export async function instantiateWorkflowTemplate(projectDir: string, request: { templateId: string; id: string; name: string; includeBuiltins?: boolean }, guard: WorkflowGuard, availableBuiltins: Pack[] = []): Promise<WorkflowManifest> {
+export interface WorkflowTemplateRequest {templateId: string; id: string; name: string; includeBuiltins?: boolean}
+
+/** The coordinator can inspect and adapt a complete template before installing it. */
+export function workflowTemplateSource(request: WorkflowTemplateRequest) {
   const card = templates.find(template => template.id === request.templateId);
   if (!card) throw new Error('未知工作流模板');
   const id = request.id, files: Record<string, string> = {}, bindings: Record<string, WorkflowBinding> = {};
@@ -85,5 +88,9 @@ export async function instantiateWorkflowTemplate(projectDir: string, request: {
     entry = `${id}/route`;
   }
   const manifest: WorkflowManifest = { format: 1, id, name: request.name, version: '1.0.0', blurb: card.description, entry, inputSchema: 'input', lines, channels: [], links, resources: { browser: 8, model: 8, cpu: 4, http: 6 }, schemas, bindings, conditions };
-  return installWorkflowPack(projectDir, { manifest, files, ...(request.includeBuiltins === false ? { builtins: [] } : {}) }, guard, availableBuiltins);
+  return {manifest, files};
+}
+
+export async function instantiateWorkflowTemplate(projectDir: string, request: WorkflowTemplateRequest, guard: WorkflowGuard, availableBuiltins: Pack[] = []): Promise<WorkflowManifest> {
+  return installWorkflowPack(projectDir, {...workflowTemplateSource(request), ...(request.includeBuiltins === false ? {builtins: []} : {})}, guard, availableBuiltins);
 }

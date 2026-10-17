@@ -6,8 +6,8 @@ import { ControlError } from './errors.ts';
 import {deserializeSnapshot, serializeSnapshot} from '../shared/project.ts';
 import type {Snapshottable} from './snapshots.ts';
 
-type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'sources'> & Partial<Pick<Factory, 'recovery'>>;
-const internal = new Set(['runtimeCheckpoint', 'checkpointDone', 'recoveryRoot', 'recoveryStation', 'retryOf', 'retriedBy', 'retryTag', 'batchRecovery', 'capacityWait', 'browserRecoveries', 'published', 'gate', 'digest', 'failure', 'manualReason', 'accessVerified', 'workflowPack', 'channelDelivery', 'sourceCandidate']);
+type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks'> & Partial<Pick<Factory, 'recovery' | 'sources'>>;
+const internal = new Set(['runtimeCheckpoint', 'checkpointDone', 'recoveryRoot', 'recoveryStation', 'retryOf', 'retriedBy', 'retryTag', 'batchRecovery', 'capacityWait', 'browserRecoveries', 'published', 'gate', 'digest', 'failure', 'manualReason', 'accessVerified', 'workflowPack', 'channelDelivery', 'sourceCandidate', 'stationSessions']);
 const channelField = (key: string) => !internal.has(key) && !key.startsWith('__runtime');
 /** A delivery transfers business data, never its parent's scheduler identity. */
 export function channelPayload(data: Record<string, unknown>) {
@@ -15,6 +15,20 @@ export function channelPayload(data: Record<string, unknown>) {
 }
 function stable(value: unknown): unknown { return Array.isArray(value) ? value.map(stable) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, stable(value)])) : value; }
 function deliveryId(channel: string, token: string, data: Record<string, unknown>) { return 'delivery-' + crypto.createHash('sha256').update(JSON.stringify([channel, token, stable(data)])).digest('hex').slice(0, 24); }
+
+/** Shared pagination contract for both durable runtimes. */
+export function componentContinuation(token: {id: string; item: string; url: string; title?: string; data: Record<string, unknown>}) {
+  const found = token.data.componentDiscovery as {all?: unknown[]; total?: number; cursor?: number; next?: number | null} | undefined;
+  if (!found || !Array.isArray(found.all) || !Number.isSafeInteger(found.next) || Number(found.next) <= Number(found.cursor ?? 0) || Number(found.next) >= Number(found.total) || found.all.length !== found.total) return null;
+  const cursor = Number(found.next), root = String(token.data.componentRootToken ?? token.id), sourceItem = String(token.data.componentSourceItem ?? token.item);
+  return {id: deliveryId('components.continuation', root, {cursor, all: found.all}), input: {
+    item: `${sourceItem}#components-${cursor}`, url: token.url, title: token.title,
+    data: {canonical: token.data.canonical ?? token.url, componentAdapter: token.data.componentAdapter,
+      componentDiscovery: {all: structuredClone(found.all), total: found.total}, componentCursor: cursor,
+      componentLimit: token.data.componentLimit ?? 20, componentRootToken: root, componentSourceItem: sourceItem,
+      parentToken: token.id, input: {...(token.data.input && typeof token.data.input === 'object' ? channelPayload(token.data.input as Record<string, unknown>) : {}), componentCursor: cursor}},
+  }};
+}
 const record = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 type FieldVersion = number | {seq: number; value: unknown};
@@ -196,18 +210,10 @@ export class ChannelSupervisor implements Snapshottable {
   private continueComponents(tokenId: string) {
     const token = this.f.state.tokens[tokenId];
     if (!token || !token.finishedAtNode?.startsWith('components/')) return;
-    const found = token.data.componentDiscovery as { all?: unknown[]; total?: number; cursor?: number; next?: number | null } | undefined;
-    if (!found || !Array.isArray(found.all) || !Number.isSafeInteger(found.next) || Number(found.next) <= Number(found.cursor ?? 0) || Number(found.next) >= Number(found.total) || found.all.length !== found.total) return;
-    const cursor = Number(found.next), root = String(token.data.componentRootToken ?? token.id), sourceItem = String(token.data.componentSourceItem ?? token.item);
-    const id = deliveryId('components.continuation', root, { cursor, all: found.all });
-    if (this.deliveries.has(id)) return;
-    const data: Record<string, unknown> = {
-      canonical: token.data.canonical ?? token.url, componentAdapter: token.data.componentAdapter,
-      componentDiscovery: { all: structuredClone(found.all), total: found.total }, componentCursor: cursor,
-      componentLimit: token.data.componentLimit ?? 20, componentRootToken: root, componentSourceItem: sourceItem,
-      parentToken: token.id, input: { ...(token.data.input && typeof token.data.input === 'object' ? channelPayload(token.data.input as Record<string, unknown>) : {}), componentCursor: cursor },
-    };
-    this.f.runtime.atomicTransition(() => this.append({ id, channel: 'components.continuation', sourceToken: token.id, target: 'components/discover', item: `${sourceItem}#components-${cursor}`, url: token.url, title: token.title, data, attempts: 0, status: 'pending', inventory: { node: 'components/discover', held: false } }));
+    const next = componentContinuation(token);
+    if (!next || this.deliveries.has(next.id)) return;
+    this.f.runtime.atomicTransition(() => this.append({id: next.id, channel: 'components.continuation', sourceToken: token.id,
+      target: 'components/discover', ...next.input, attempts: 0, status: 'pending', inventory: {node: 'components/discover', held: false}}));
   }
   private acknowledge(tokenId: string) {
     const token = this.f.state.tokens[tokenId]; if (!token || token.status === 'active') return;

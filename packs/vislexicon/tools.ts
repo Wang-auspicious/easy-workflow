@@ -2,6 +2,7 @@
 // candidate ordering. Each returns a structured result; evidence is written to the content store and
 // shows up next to its node on the canvas.
 import crypto from "node:crypto";
+import {businessInput, candidateRoute} from './intake.ts';
 import fs from "node:fs";
 import path from "node:path";
 import type { EvidenceRef, Usage } from "../../shared/types.ts";
@@ -168,11 +169,10 @@ const extract: Tool = async (ctx) => ({ ok: true, summary: ctx.token.title ? `�
 const index: Tool = async (ctx) => ({ ok: true, summary: `按来源 ${ctx.token.source.split("/").pop()} 建索引`, data: {} });
 const route: Tool = async (ctx) => {
   const u = String(ctx.token.data.canonical ?? ctx.token.url);
-  let r = "curation";
-  if (/github\.com\/.+\/(DESIGN|SKILL)\.md$/i.test(u) || /\/(DESIGN|SKILL)\.md$/i.test(u)) r = "skills";
-  else if (/\.(pptx?|key)$/i.test(u)) r = "ppt";
-  const zh: Record<string, string> = { curation: "策展线", skills: "Skill 线", ppt: "PPT 线" };
-  return { ok: true, summary: `→ ${zh[r]}`, data: { route: r } };
+  const r = candidateRoute(u, ctx.token.data);
+  const input = r === 'curation' ? {} : businessInput(r, u, ctx.token.data);
+  const zh: Record<string, string> = {curation: '策展线', components: '组件入库线', skills: 'Skill 线', 'sci-figure': '科研绘图线', ppt: 'PPT 线', 'image-fx': '图像处理线'};
+  return {ok: true, summary: `→ ${zh[r]}`, data: {...input, route: r}};
 };
 
 /* ------------------------------------------------------------------ ① dedupe */

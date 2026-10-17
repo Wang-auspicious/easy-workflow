@@ -12,6 +12,8 @@ process.env.FACTORY_VAR = dir; process.env.FACTORY_HTTP_CACHE = '0'; process.env
 const vocabulary = path.join(process.env.VISLEXICON_ROOT, 'VisLexicon-browser-design-kit/frontend/public/spec/v1');
 fs.mkdirSync(vocabulary, { recursive: true }); fs.writeFileSync(path.join(vocabulary, 'vocab.json'), JSON.stringify({ styles: [], componentTypes: ['button'] }));
 const { Runtime } = await import('../server/runtime.ts');
+const { Kernel } = await import('../server/kernel/kernel.ts');
+const {businessInput, candidateRoute, businessCatalog} = await import('../packs/vislexicon/intake.ts');
 const { Journal } = await import('../server/journal.ts');
 const { Broker } = await import('../server/broker.ts');
 const { EvidenceStore } = await import('../server/evidence.ts');
@@ -50,12 +52,13 @@ after(async () => {
   assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir())); fs.rmSync(dir, { recursive: true, force: true });
 });
 
-async function executeLine(line: string, data: Record<string, unknown>, options: { fixOnce?: boolean; fixField?: string; missingOriginalFile?: boolean; reject?: boolean } = {}) {
+async function executeLine(line: string, data: Record<string, unknown>, options: { fixOnce?: boolean; fixField?: string; missingOriginalFile?: boolean; reject?: boolean; kernel?: 'v2' } = {}) {
   const journal = new Journal(':memory:'), store = new EvidenceStore(path.join(dir, 'evidence'));
   const services: Services = { store, workDir: path.join(dir, 'work'), publishDir: path.join(dir, 'published'), inFlight: () => new Set<string>() };
   const definitions = { ...componentAgents(services), ...mediaAgents(services) }, tools = { ...COMPONENT_TOOLS, ...MEDIA_TOOLS };
   const counts: Record<string, number> = {};
-  const runtime = new Runtime(compile([pack]), journal, new Broker({ cpu: 2, browser: 1, model: 3, http: 2 }, 0), pack.conditions, node => {
+  const Engine = options.kernel === 'v2' ? Kernel : Runtime;
+  const runtime = new Engine(compile([pack]), journal, new Broker({ cpu: 2, browser: 1, model: 3, http: 2 }, 0), pack.conditions, node => {
     if (node.tool && tools[node.tool]) return ctx => { counts[node.key] = (counts[node.key] ?? 0) + 1; return tools[node.tool!](ctx, services); };
     const definition = definitions[node.key]; if (!definition) return null;
     return async ctx => {
@@ -72,12 +75,12 @@ async function executeLine(line: string, data: Record<string, unknown>, options:
       return definition.after(output, ctx, { rounds: 1, issues: [] });
     };
   });
-  runtime.ensureWorkers([]); runtime.start(`business ${line}`);
+  if (!options.kernel) runtime.ensureWorkers([]); runtime.start(`business ${line}`);
   const token = runtime.create(`${line}/inbox`, { item: `${line}-${options.reject ? 'reject' : 'fixture'}`, url: `${base}/${line === 'skills' ? 'SKILL.md' : line === 'ppt' ? data.file ?? 'deck.pdf' : ''}`, source: 'fixture', data: { express: true, ...data } });
   try {
     await runtime.settle();
     const finished = [...journal.read()].filter((event): event is Extract<Stamped, { kind: 'token.finished' }> => event.kind === 'token.finished' && event.token === token.id).at(-1);
-    return { token, finished, counts, services, events: [...journal.read()] };
+    return {token: runtime.tokens.get(token.id)!, finished, counts, services, events: [...journal.read()]};
   } finally { await runtime.close(); journal.close(); }
 }
 
@@ -170,4 +173,38 @@ test('components and atlas use real isolated browser evidence and persistent rev
   const rejected = await executeLine('atlas-feed', { componentInstances: [{ ...(components.token.data.componentInstances as any[])[0], id: 'unaccepted-new-id' }] }, { reject: true });
   assert.notEqual(rejected.finished?.status, 'published');
   assert.equal(Object.keys(JSON.parse(fs.readFileSync(path.join(atlas.services.publishDir, 'business/atlas-feed/index.json'), 'utf8')).types.button).length, 1);
+});
+
+test('business intake declares every line and rejects missing evidence before starting work', () => {
+  assert.equal(businessCatalog().length, 6);
+  assert.equal(candidateRoute('https://example.test/SKILL.md?raw=true', {}), 'skills');
+  assert.equal(candidateRoute('https://example.test/deck.pptx?download=1', {}), 'ppt');
+  assert.equal(candidateRoute('https://example.test/paper.pdf', {}), 'curation');
+  assert.equal(candidateRoute(base, {figure: {series: []}}), 'sci-figure');
+  assert.equal(candidateRoute(base, {effect: {kind: 'grayscale'}}), 'image-fx');
+  assert.equal(candidateRoute(base, {componentUrls: []}), 'components');
+  assert.throws(() => businessInput('sci-figure', base, {}), /真实数值/);
+  assert.throws(() => businessInput('sci-figure', base, {figure: {series: [{x: [1], y: [NaN]}]}}), /有限数值/);
+  assert.throws(() => businessInput('image-fx', base, {effect: {kind: 'blur', radius: 0}}), /radius/);
+  assert.throws(() => businessInput('components', base, {componentUrls: ['https://another.test/components/button']}), /同站/);
+  assert.equal(businessInput('components', base, {limit: 7}).componentLimit, 7);
+  assert.equal(businessInput('components', base, {runtimeCheckpoint: {done: ['components/quality']}, published: true}).runtimeCheckpoint, undefined);
+  assert.equal((businessInput('image-fx', `${base}/image.png`, {effect: {kind: 'grayscale'}}).effect as {imageUrl: string}).imageUrl, `${base}/image.png`);
+});
+
+test('v2 executes all resource lines with real local files, rendering and automatic components-to-atlas delivery', {timeout: 120000}, async () => {
+  for (const [line, data] of [
+    ['skills', {}],
+    ['sci-figure', {figure: {kind: 'line', series: [{x: [1, 2], y: [3, 4]}], seed: 5}}],
+    ['image-fx', {effect: {kind: 'grayscale', imageUrl: `${base}/image.png`}}],
+    ['ppt', {file: 'deck.pdf'}],
+    ['components', {canonical: base, componentUrls: [`${base}/components/button`]}],
+  ] as [string, Record<string, unknown>][]) {
+    const result = await executeLine(line, data, {kernel: 'v2'});
+    assert.equal(result.finished?.status, 'published', `${line}: ${result.finished?.reason}`);
+    if (line === 'components') {
+      assert.equal(result.counts['atlas-feed/type-map'], 1, 'real accumulated instances reach the atlas automatically');
+      assert.ok(result.events.some(event => event.kind === 'token.finished' && event.node === 'atlas-feed/published' && event.status === 'published'));
+    }
+  }
 });

@@ -379,6 +379,50 @@ test('v2 channels create one deterministic child when the parent output is compl
   } finally {await kernel.close(); journal.close();}
 });
 
+test('v2 component pagination and publication channels retain accumulated business data without scheduler state', async () => {
+  const node = (id: string) => station({id, name: id, role: 'process', kind: 'program', resource: 'none', accept: ['Keep real batch data']});
+  const published = () => station({id: 'published', name: 'Published', kind: 'store', role: 'store'});
+  const spec: Pack = {id: 'component-fixture', name: 'Component transfer', version: '1', blurb: '',
+    lines: [line({id: 'components', name: 'Components', layer: 3, priority: 'mid', wired: true, blurb: '',
+      stations: [node('discover'), node('quality'), published()], edges: [['discover', 'quality'], ['quality', 'published']]}),
+    line({id: 'atlas-feed', name: 'Atlas', layer: 3, priority: 'low', wired: true, blurb: '',
+      stations: [node('consume'), published()], edges: [['consume', 'published']]})],
+    channels: [{id: 'components.instances.published', from: {line: 'components', station: 'published'}, to: {line: 'atlas-feed', station: 'consume'}, label: 'Published components'}],
+    links: [], resources: {browser: 0, model: 0, cpu: 1, http: 0}, conditions: {}, order: [], collapsed: [], hints: {}};
+  const journal = new Journal(path.join(root, 'component-pagination.db'));
+  const consumed: Record<string, unknown>[] = [];
+  const cursors: number[] = [];
+  const all = [0, 1, 2].map(number => ({url: `https://fixture.test/components/${number}`}));
+  const kernel = new Kernel(compile([spec]), journal, broker(), {}, () => async ctx => {
+    if (ctx.node.key === 'components/discover') {
+      const cursor = Number(ctx.token.data.componentCursor ?? 0); cursors.push(cursor);
+      assert.equal((ctx.token.data.componentAdapter as {version: number}).version, 1);
+      return {ok: true, summary: 'Found current batch', data: {componentDiscovery: {all, total: 3, cursor, next: cursor < 2 ? cursor + 1 : null}, components: [{id: `component-${cursor}`, type: 'button'}]}};
+    }
+    if (ctx.node.key === 'atlas-feed/consume') {
+      consumed.push(structuredClone(ctx.token.data));
+      assert.equal(ctx.token.data.published, undefined);
+      assert.equal(ctx.token.data.stationSessions, undefined);
+      assert.equal(ctx.token.data.gate, undefined);
+      assert.equal(ctx.token.data.failure, undefined);
+      assert.ok(Array.isArray(ctx.token.data.components), 'published store must transfer prior station outputs');
+    }
+    return {ok: true, summary: 'Batch verified'};
+  });
+  try {
+    kernel.start('All component pages');
+    kernel.create('components/discover', {item: 'component-source', url: 'https://fixture.test/', source: 'manual', data: {
+      componentAdapter: {version: 1}, componentLimit: 1, gate: 'pass', failure: {old: true}, stationSessions: {old: 'private session'},
+    }});
+    await kernel.settle();
+    assert.deepEqual(cursors, [0, 1, 2]);
+    assert.equal(consumed.length, 3);
+    assert.deepEqual(consumed.map(data => (data.components as {id: string}[])[0].id).sort(), ['component-0', 'component-1', 'component-2']);
+    assert.equal(kernel.store.list().filter(item => item.status === 'published').length, 6);
+    assert.equal(new Set(kernel.store.list().map(item => item.id)).size, 6);
+  } finally {await kernel.close(); journal.close();}
+});
+
 test('v2 explicit checkpoints expand an earlier entry closure without dropping evidence or sessions', async () => {
   const executed: string[] = [];
   const fixture = reviewFixture('checkpoint-entry-expansion', async ctx => {

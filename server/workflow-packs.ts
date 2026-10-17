@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { Check, Errors } from 'typebox/value';
 import type { TSchema } from 'typebox';
@@ -416,6 +417,29 @@ async function builtin(name: Extract<WorkflowExecution, { kind: 'builtin' }>['na
 }
 
 export interface InstallWorkflowRequest { directory?: string; manifest?: WorkflowManifest; files?: Record<string, string>; replace?: boolean; builtins?: string[] }
+
+/** Same compiler and contracts as installation, without imports or an index swap. */
+export function validateWorkflowPack(manifest: WorkflowManifest, files: Record<string, string>, existing: Pack[] = [], patches: Patch[] = []) {
+  const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'easy-workflow-validate-'));
+  try {
+    if (Object.values(files).some(content => typeof content !== 'string') ||
+        Buffer.byteLength(JSON.stringify({manifest, files})) > 8 * 1024 * 1024) bad('工作流草稿必须是文本且总量不超过 8MiB');
+    for (const [relative, content] of Object.entries(files)) {
+      const file = contained(staging, relative);
+      fs.mkdirSync(path.dirname(file), {recursive: true});
+      fs.writeFileSync(file, content);
+    }
+    const loaded = materialize(structuredClone(manifest), staging, staging);
+    const compiled = compile([...existing.filter(pack => pack.id !== manifest.id), loaded.pack], patches);
+    return {valid: compiled.issues.length === 0, issues: compiled.issues, digest: compiled.digest,
+      nodes: compiled.nodes.filter(node => manifest.lines.some(line => line.id === node.line)).map(node => ({key: node.key, kind: node.kind, resource: node.resource})),
+      edges: compiled.edges.filter(edge => manifest.lines.some(line => edge.from.startsWith(`${line.id}/`)))};
+  } catch (error) {
+    return {valid: false, issues: [{at: 'manifest', message: error instanceof Error ? error.message : String(error)}], nodes: [], edges: []};
+  } finally {
+    if (path.dirname(staging) === path.resolve(os.tmpdir())) fs.rmSync(staging, {recursive: true, force: true});
+  }
+}
 const installs = new Map<string, Promise<unknown>>();
 async function withInstallLock<T>(projectDir: string, action: () => Promise<T>): Promise<T> {
   const key = path.resolve(projectDir), previous = installs.get(key) ?? Promise.resolve();

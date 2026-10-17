@@ -7,9 +7,9 @@ export const businessLines = ['components', 'skills', 'sci-figure', 'ppt', 'imag
 export type BusinessLine = typeof businessLines[number];
 const descriptions: Record<BusinessLine, string> = {
   components: '读取网站中的组件，采集页面与组件证据，再审查可复用性。可指定组件页面；留空时由页面链接发现。',
-  skills: '从指定页面提取操作步骤与适用边界，生成经过审查的技能包。',
+  skills: '保存 SKILL.md / DESIGN.md 原件，核对出处与许可，再生成简介并审查。原始文件保持字节不变。',
   'sci-figure': '使用你提供的真实数值绘制科研图，保存输入、生成文件和审查记录。',
-  ppt: '从来源页面提取内容，生成演示文稿并检查结构与来源。',
+  ppt: '保存直接下载地址中的完整 PPTX 或 PDF 演示文件，逐页生成预览并审查。',
   'image-fx': '下载指定原图，执行明确的图像变换，保留原图、参数与结果。',
 };
 const figureExample = '{\n  "kind": "line",\n  "series": [{ "x": [1, 2], "y": [3, 5], "label": "替换为真实数据" }],\n  "title": "实验标题",\n  "xLabel": "横轴",\n  "yLabel": "纵轴",\n  "seed": 42\n}';
@@ -34,7 +34,7 @@ export function BusinessForm({ line, title, disabled, onBusy, onClose, onDone }:
       if (line === 'components') {
         const pages = componentUrls.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
         if (pages.length) data.componentUrls = pages;
-        if (limit) data.limit = Number(limit);
+        if (limit) data.componentLimit = Number(limit);
       }
       if (line === 'image-fx') {
         const options: Record<string, unknown> = { kind: effect, imageUrl: url.trim() };

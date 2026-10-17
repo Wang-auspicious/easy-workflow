@@ -19,6 +19,7 @@ import {KernelStore} from './store.ts';
 import {planFailure, nextModelFailure, claimModelProbe, modelProbeSucceeded, releaseModelProbe} from './retry.ts';
 import {admittedCandidates, sortReady, wakeWaiting} from './scheduler.ts';
 import type {BoardStore} from '../board.ts';
+import {channelPayload, componentContinuation} from '../channels.ts';
 
 const uid = (prefix: string) => `${prefix}-${crypto.randomBytes(8).toString('hex')}`;
 const terminal = (item: ItemState) => !['queued', 'active'].includes(item.status);
@@ -293,6 +294,12 @@ export class Kernel extends Runtime {
       });
     }
     this.journal.afterCommit(() => this.syncView(next));
+    if (next.status === 'published' && previous?.status !== 'published' && next.line === 'components') {
+      const continuation = componentContinuation(next);
+      if (continuation && this.nodes.has('components/discover') && !this.store.get(continuation.id)) {
+        this.insertItem(continuation.id, 'components/discover', {...continuation.input, source: 'components.continuation'});
+      }
+    }
   }
 
   /** A room id is the generation of its hold. Removed holds never become valid
@@ -315,7 +322,7 @@ export class Kernel extends Runtime {
     const lifecycle = state ? [] : [...this.journal.readKinds(['run.started', 'run.paused', 'run.resumed', 'run.ended', 'scope.paused'])];
     const last = lifecycle.findLast(event => event.kind.startsWith('run.'));
     this.running = state ? ['running', 'paused'].includes(state.run.status) : Boolean(last && last.kind !== 'run.ended');
-    this.paused = state ? state.run.status === 'paused' || process.env.FACTORY_START_PAUSED === '1' : this.running;
+    this.paused = this.running && (state ? state.run.status === 'paused' || process.env.FACTORY_START_PAUSED === '1' : true);
     this.runStartedAt = state?.run.startedAt ?? lifecycle.findLast(event => event.kind === 'run.started')?.at ?? Date.now();
     this.pausedLines.clear(); this.pausedStations.clear();
     for (const event of lifecycle) if (event.kind === 'scope.paused') {
@@ -902,7 +909,11 @@ export class Kernel extends Runtime {
       const read = (key: string) => key.split('.').reduce<unknown>((value, part) => value && typeof value === 'object' ? (value as Record<string, unknown>)[part] : undefined, source);
       const data = mapping ? Object.fromEntries(Object.entries(mapping).map(([name, selector]) => [name,
         typeof selector === 'string' ? read(selector) : 'value' in selector ? selector.value : read(selector.path ?? '')]))
-        : {item: item.item, url: item.url, title: item.title, ...output};
+        : channelPayload({...item.data, ...output});
+      // The complete accumulated business payload is the channel contract.
+      // Terminal/attempt/session identity must not leak into the new work item.
+      if (item.data.workflowPack && !mapping) data.workflowPack = item.data.workflowPack;
+      data.parentToken = item.id;
       this.insertItem(id, edge.to, {item: item.item, url: item.url, title: item.title, source: key, data});
     }
   }
