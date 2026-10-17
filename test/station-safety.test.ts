@@ -62,6 +62,25 @@ test('station input and salvage retain the same quality contract as a normal sub
       const result = await runAgentStation({ ...definition, check: () => ['cannot pass'], repairAttempts: 2 }, ctx);
       assert.equal(result.ok, false); assert.equal(accepted, before);
       assert.equal(result.metrics?.time?.modelCalls, 3);
+      assert.equal(result.agentContract?.ending, 'forced_handoff');
+      assert.equal(result.agentContract?.repairs, 2);
+      assert.equal(result.agentContract?.rounds, 3);
+      assert.equal(result.failure, undefined);
+      assert.ok(result.sessionCheckpoint?.pi, 'the failed corrections remain available to a later continuation');
+    });
+    await t.test('a closed agent can hand off through real scoped MCP without accepting partial work', async () => {
+      process.env.FACTORY_STATION_MODEL = 'fixture-handoff';
+      const before = accepted;
+      const result = await runAgentStation(definition, ctx);
+      assert.equal(result.ok, false);
+      assert.equal(accepted, before, 'handoff must never invoke the successful submission callback');
+      assert.equal(result.failure, undefined);
+      assert.equal(result.agentContract?.ending, 'handoff');
+      assert.equal(result.agentContract?.actualTokens, 155, 'input, output and both cache counters all consume budget');
+      assert.deepEqual(result.handoff, {done: ['read fixture'], evidence: ['fixture-only observation'],
+        remaining: ['verify score'], suggestion: 'Continue score verification.'});
+      assert.ok(result.sessionCheckpoint?.pi);
+      assert.ok(fs.existsSync(path.join(dir, result.sessionCheckpoint.pi.file)));
     });
   } finally {
     for (const [key, value] of Object.entries(prior)) if (value === undefined) delete process.env[key]; else process.env[key] = value;

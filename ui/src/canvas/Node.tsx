@@ -40,6 +40,8 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
   const actualExecution = useStore(state => state.nodeExecutions[node.key]);
   const recoveryTokens = useStore(state => state.nodeRecoveries[node.key]);
   const replay = useStore(state => Boolean(state.replay));
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
+  const kernelNumbers = useStore(state => state.replay ? undefined : state.kernelSnapshot?.stations[node.key]);
   const colorOverride = useStore((s) => s.layout.colors[node.key]);
   const open = useStore((s) => s.inspectors.some((i) => i.key === node.key));
   const trail = useStore((s) => s.trail);
@@ -83,15 +85,16 @@ export const NodeCard = memo(function NodeCard({ node, place, selected, dim, onH
         data-tip={`${node.name}：${node.blurb ?? ""}${dormant ? "（休眠）" : ""}`} onPointerEnter={() => onHover(node.key)} onPointerLeave={() => onHover(null)}>
         <StationIcon role={node.role} size={15} />
         <span className="node-name">{displayName}</span>
-        <span className="node-src-sub" data-tip={counts.detail}>{dormant ? '休眠 · ' : ''}库存 {fmt(n?.stock ?? 0)}</span>
+        <span className="node-src-sub" data-tip={counts.detail}>{dormant ? '休眠 · ' : ''}{kernel === 'v2' && kernelNumbers ? `就绪 ${kernelNumbers.ready} · 完成 ${kernelNumbers.done}` : `库存 ${fmt(n?.stock ?? 0)}`}</span>
       </div>
     );
   }
 
   const {usesModel, label: execution} = nodeExecutionPresentation(node, actualExecution, agentBinding, replay);
-  const queue = n?.queue.length ?? 0, active = n?.active.length ?? 0;
+  const queue = (kernel === 'v2' ? kernelNumbers?.ready : undefined) ?? n?.queue.length ?? 0;
+  const active = (kernel === 'v2' ? kernelNumbers?.running : undefined) ?? n?.active.length ?? 0;
   // What a person wants to know at a glance: what is it doing now, and is anything stuck.
-  const working = active ? s.fs.tokens[s.fs.attempts[n!.active[0]]?.token ?? ""]?.item : undefined;
+  const working = n?.active.length ? s.fs.tokens[s.fs.attempts[n!.active[0]]?.token ?? ""]?.item : undefined;
   const paused = status.light === 'yellow' && /暂停/.test(status.label);
   const failedLast = Boolean(n && n.lastFailAt > n.lastOkAt);
   const doing = dormant ? '休眠' : working ? `正在处理 ${working}${active > 1 ? ` 等 ${active} 件` : ''}`

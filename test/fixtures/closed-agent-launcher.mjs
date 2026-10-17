@@ -26,18 +26,33 @@ const rpc = (method, params) => new Promise(resolve => { const id = ++next; pend
 const call = (name, args) => rpc("tools/call", { name, arguments: args });
 await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fixture", version: "1" } });
 child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
-assert.deepEqual((await rpc("tools/list", {})).result.tools.map(x => x.name), ["submit", "env_help", "env_call"]);
+assert.deepEqual((await rpc("tools/list", {})).result.tools.map(x => x.name), ["submit", "handoff", "env_help", "env_call"]);
 assert.ok((await call("h2_call", { name: "run_control", arguments: { action: "end" } })).error);
 assert.ok((await call("easy_workflow_call", { name: "run_control", arguments: { action: "end" } })).error);
 const disallowed = await call("env_call", { name: "feed_urls", arguments: { urls: ["https://example.test"] } });
 assert.equal(JSON.parse(disallowed.result.content[0].text).ok, false);
 const help = await call("env_help", {});
 assert.equal(JSON.parse(help.result.content[0].text).ok, true);
-assert.ok((await call("submit", { score: "not a number" })).error);
-const score = request.model === 'fixture-two-repairs' ? Math.min(2, Math.floor((request.messages.length - 1) / 2)) : request.messages.length > 1 ? 1 : 0;
-const result = await call("submit", { score });
-assert.equal(result.result.content[0].text, "received");
-assert.equal((await call("submit", { score: 9 })).result.isError, true);
+if (request.model === 'fixture-schema-probe') {
+  const invalid = await call('submit', {score: 'not a number'});
+  assert.equal(invalid.result.isError, true);
+  assert.match(invalid.result.content[0].text, /schema|score|integer|number/i);
+}
+if (request.model === 'fixture-handoff') {
+  const result = await call('handoff', {done: ['read fixture'], evidence: ['fixture-only observation'],
+    remaining: ['verify score'], suggestion: 'Continue score verification.'});
+  assert.equal(result.result.content[0].text, 'handoff saved');
+  assert.equal((await call('submit', {score: 2})).result.isError, true);
+} else {
+  const score = request.model === 'fixture-two-repairs' ? Math.min(2, Math.floor((request.messages.length - 1) / 2)) : request.messages.length > 1 ? 1 : 0;
+  const result = await call('submit', {score});
+  if (result.result.isError) {
+    assert.match(result.result.content[0].text, /提交未通过校验/);
+  } else {
+    assert.equal(result.result.content[0].text, 'received');
+    assert.equal((await call('submit', {score: 9})).result.isError, true);
+  }
+}
 child.stdin.end();
 await new Promise(resolve => child.once("exit", resolve));
 const reply = { model: "fixture-actual-model", usage: { input: 100, output: 20, cost: .001, cacheRead: 30, cacheWrite: 5 }, time: { firstTokenMs: 8, outputMs: 12, modelCalls: 1 } };

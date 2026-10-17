@@ -4,17 +4,26 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {randomUUID} from 'node:crypto';
 import type {CompiledFactory, CompiledNode, ProjectAgentDefaults, Stamped, StationAgentBinding} from '../shared/types.ts';
-import { apply, initialState, latestRunTokens, tokenWorkKey, recoveryKey, type FactoryState } from "../shared/project.ts";
+import { apply, initialState, latestRunTokens, tokenWorkKey, recoveryKey, validateState, serializeSnapshot, deserializeSnapshot, type FactoryState } from "../shared/project.ts";
 import { compile, type Patch } from "./spec/compile.ts";
 import { Journal } from "./journal.ts";
 import { Broker } from "./broker.ts";
 import { EvidenceStore } from "./evidence.ts";
-import { Runtime, type Executor, type ExecutorRegistration, type TokenRun } from "./runtime.ts";
-import { runAgentStation, type AgentStationDef } from "./agent-station.ts";
+import { Runtime, type Executor, type ExecutorRegistration, type TokenRun, type StationContext, type StationResult } from "./runtime.ts";
+import { runAgentStation, runStationDialogue, type AgentStationDef } from "./agent-station.ts";
 import { pack } from "../packs/vislexicon/pack.ts";
 import { TOOLS, canonical, type Services } from "../packs/vislexicon/tools.ts";
 import { agentDefs, warmStyleLib } from "../packs/vislexicon/agents.ts";
+import {Kernel} from './kernel/kernel.ts';
+import {kernelStreams} from './kernel/streams.ts';
+import {asTokenRun} from './kernel/item.ts';
+import {BoardStore} from './board.ts';
+import {Collaboration, type CollaborationTurn} from './collaboration.ts';
+import {collaborationView, collaborationImages, collaborationPixels, judgeCollaboration} from './collaboration-views.ts';
+import type {EnvContext} from './toolbox.ts';
+import type {BoardPostInput} from '../shared/board.ts';
 import { loadCatalog, loadPublished, type CatalogEntry } from "../packs/vislexicon/env.ts";
 import { ControlError } from "./errors.ts";
 import { classifyFailure, type CandidateRecovery, type Failure } from "../shared/failures.ts";
@@ -28,7 +37,8 @@ import { preflight } from "./preflight.ts";
 import type { Alert } from "../shared/types.ts";
 import type { BrowserState } from "../shared/browser.ts";
 import { BatchSupervisor } from './batch.ts';
-import { browserCommand } from './browser.ts';
+import { browserCommand, openPage } from './browser.ts';
+import {visit, VIEW} from '../packs/vislexicon/capture.ts';
 import { loadWorkflowPacks, type LoadedWorkflowPacks } from './workflow-packs.ts';
 import { flushAtlas } from '../packs/vislexicon/components.ts';
 import { ChannelSupervisor } from './channels.ts';
@@ -42,12 +52,28 @@ import {importExternalIntake, readExternalIntake, type ExternalIntakeManifest} f
 import {continuationPriority, externalResearchFor, reuseExternalStation} from './intake-continuation.ts';
 import {reuseExternalCapture} from './intake-captures.ts';
 import {PublicationOutbox} from './publication-outbox.ts';
+import {restoreSnapshots, saveSnapshots, snapshotVersion, type Snapshottable} from './snapshots.ts';
 import {projectDecisionClient, withDecisionAttempt} from './decision-model.ts';
 
 export const ROOT = process.env.FACTORY_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const VAR = process.env.FACTORY_VAR ?? path.join(ROOT, "var");
 
-export interface Settings { browser: number; model: number; modelWorkers: number; cpu: number; http: number; memoryFloorMB: number; socialPerMinute: number; socialPerDay: number }
+export interface Settings { browser: number; model: number; modelWorkers: number; cpu: number; http: number; memoryFloorMB: number; socialPerMinute: number; socialPerDay: number; maxActiveItems: number; kernel?: 'v1' | 'v2' }
+
+interface RecoveryProjection {
+  done: Map<string, Set<string>>;
+  removed: Map<string, Set<string>>;
+  notes: Map<string, TokenRun['notes']>;
+  checkpointed: Set<string>;
+  arrivals: Map<string, number[]>;
+  sampleTokens: Set<string>;
+  run: string;
+}
+
+function initialRecoveryProjection(): RecoveryProjection {
+  return {done: new Map(), removed: new Map(), notes: new Map(), checkpointed: new Set(),
+    arrivals: new Map(), sampleTokens: new Set(), run: ''};
+}
 
 export class Factory {
   compiled!: CompiledFactory;
@@ -76,47 +102,380 @@ export class Factory {
   modelCircuits!: ModelCircuits;
   private services!: Services;
   private stationAgents: Record<string, AgentStationDef> = {};
+  board?: BoardStore;
+  collaboration?: Collaboration;
   decisionModel: ReturnType<typeof projectDecisionClient> = null;
+  private recoveryProjection = initialRecoveryProjection();
+  private snapshotComponents: Snapshottable[] = [];
+  private projectionVersion = '';
+  private snapshotSeq = 0;
+  private snapshotTimer?: ReturnType<typeof setTimeout>;
+  private snapshotUnsubscribe?: () => void;
+  private snapshotTask?: Promise<void>;
+  private snapshotClosing?: Promise<void>;
+  private snapshotsActive = false;
 
-  constructor(projectDirectory = VAR) {
+  get kernel(): 'v1' | 'v2' {
+    return this.runtime instanceof Kernel ? 'v2' : this.runtime ? 'v1'
+      : process.env.FACTORY_KERNEL === 'v1' ? 'v1'
+      : process.env.FACTORY_KERNEL === 'v2' || this.settings.kernel === 'v2' ? 'v2' : 'v1';
+  }
+
+  private createRuntime(compiled: CompiledFactory, conditions: Runtime['conditions'], executors: Runtime['executors']): Runtime {
+    if (this.kernel === 'v2') {
+      const kernel = new Kernel(compiled, this.journal, this.broker, conditions, executors);
+      kernel.maxActiveItems = this.settings.maxActiveItems;
+      this.wireCollaboration(kernel, compiled);
+      return kernel;
+    }
+    return new Runtime(compiled, this.journal, this.broker, conditions, executors);
+  }
+
+  private wireCollaboration(kernel: Kernel, compiled: CompiledFactory) {
+    const contracts = Object.assign({}, ...this.workflowPacks!.packs.map(pack => pack.contracts ?? {}));
+    const historical: Record<string, string[]> = {};
+    for (const attempt of Object.values(this.state.attempts).filter(attempt => attempt.ok && attempt.output && !Object.hasOwn(attempt.output, 'dialogue'))
+      .sort((left, right) => (left.endedAt ?? left.startedAt) - (right.endedAt ?? right.startedAt))) {
+      historical[attempt.node] = Object.keys(attempt.output!);
+    }
+    const board = new BoardStore(this.journal, compiled, contracts, historical);
+    const owner = (id: string, field: string) => {
+      const item = kernel.store.get(id);
+      if (!item) return undefined;
+      if (field === 'kind' && item.nodes[`${item.line}/kind-join`]) return `${item.line}/kind-join`;
+      return board.owners(item, field)[0];
+    };
+    const collaboration = new Collaboration(board, {
+      compiled, getItem: id => kernel.store.get(id), owner,
+      view: (id, node, field) => collaborationView(compiled, kernel.store.get(id)!.data, node, field),
+      runTurn: turn => this.runCollaborationTurn(kernel, turn),
+      programJudge: async (name, input) => {
+        const node = owner(input.itemId, input.field);
+        if (!node) return {decided: false};
+        const context = this.collaborationContext(kernel, input.itemId, node, `rules-${randomUUID()}`, new AbortController().signal);
+        return judgeCollaboration(name, context, input.posts, this.store);
+      },
+      evidenceText: (id, evidenceId) => {
+        const evidence = this.state.evidence[evidenceId];
+        if (!evidence || evidence.token !== id) return undefined;
+        const fragments: string[] = [];
+        const collect = (value: unknown, key = '') => {
+          if (typeof value === 'string' && ['quote', 'text', 'excerpt', 'body', 'verdict'].includes(key)) fragments.push(value);
+          else if (Array.isArray(value)) value.forEach(entry => collect(entry, key));
+          else if (value && typeof value === 'object') Object.entries(value).forEach(([name, entry]) => collect(entry, name));
+        };
+        collect(evidence);
+        const file = evidence.src && this.store.resolve(evidence.src);
+        if (file && /\.(?:txt|md|json|html)$/i.test(file) && fs.statSync(file).size <= 1_048_576) fragments.push(fs.readFileSync(file, 'utf8'));
+        return fragments.length ? fragments.join('\n') : undefined;
+      },
+      applyResolution: (id, field, value, node, room) => kernel.applyRoomResolution(id, field, value, node, room),
+      park: (id, node, reason) => kernel.parkCollaboration(id, node, reason),
+    });
+    kernel.configureCollaboration({board, answer: (question, signal) => collaboration.answer(question, signal),
+      runRoom: (room, signal) => collaboration.runRoom(room, signal),
+      openRoom: (item, field, topic) => {
+        const policy = compiled.rooms?.find(rule => rule.field === field || rule.field.endsWith('.*') && field.startsWith(rule.field.slice(0, -1)));
+        if (!policy) throw new ControlError(422, 'room_policy_missing', '该字段没有讨论室配置');
+        return board.createRoom({item, field, topic, participants: policy.participants, judge: policy.judge});
+      }});
+    this.board = board;
+    this.collaboration = collaboration;
+  }
+
+  private collaborationContext(kernel: Kernel, id: string, key: string, attempt: string, signal: AbortSignal,
+    validSession: () => boolean = () => true): StationContext {
+    const item = kernel.store.get(id), node = kernel.nodes.get(key);
+    if (!item || !node) throw new ControlError(404, 'collaboration_node_missing', '答疑节点或货不存在');
+    return {token: asTokenRun(item), node, attempt, signal, session: item.nodes[key]?.session,
+      checkpointSession: checkpoint => { if (validSession()) kernel.saveDialogueSession(id, key, {sessionCheckpoint: checkpoint}, true); },
+      worker: {id: `dialogue-${attempt}`, node: key, label: node.name, busy: id, idleSince: 0},
+      progress: (text, step) => { this.journal.append({kind: 'attempt.progress', attempt, text, ...(step ? {step} : {})}); },
+      activity: activity => { this.journal.append({kind: 'attempt.activity', attempt, activity}); },
+      addEvidence: input => {
+        const evidence = {...input, station: key, token: id, attempt, at: Date.now()};
+        this.journal.append({kind: 'evidence.added', evidence});
+        return evidence;
+      }};
+  }
+
+  private async runCollaborationTurn(kernel: Kernel, turn: CollaborationTurn): Promise<StationResult> {
+    const signal = turn.signal ?? new AbortController().signal;
+    await kernel.waitForStationIdle(turn.itemId, turn.node, signal);
+    const node = kernel.nodes.get(turn.node);
+    if (!node || !['agent', 'review'].includes(node.kind)) throw new ControlError(422, 'dialogue_not_agent', '只有 Agent 节点可以参加答疑');
+    const attempt = `dialogue-${randomUUID()}`, startedAt = Date.now();
+    const generation = kernel.store.get(turn.itemId)?.nodes[turn.node];
+    const validSession = () => {
+      const current = kernel.store.get(turn.itemId);
+      const owner = current?.nodes[turn.node];
+      return current?.status === 'active' && Boolean(generation && owner) && owner?.lastAttempt === generation?.lastAttempt &&
+        owner?.rounds === generation?.rounds && (!turn.room || current.roomHolds?.[turn.room.id]?.field === turn.room.field);
+    };
+    const context = this.collaborationContext(kernel, turn.itemId, turn.node, attempt, signal, validSession);
+    let view = turn.view;
+    if (view.viewKind === 'dossier+home' && (!Array.isArray(view.images) || !view.images.length)) {
+      let screenshot = Object.values(this.state.evidence).filter(evidence => evidence.token === turn.itemId && evidence.label === '讨论首页截图').at(-1);
+      if (!screenshot) {
+        const browserLease = await this.broker.acquire('browser', {signal});
+        if (!browserLease) throw new ControlError(503, 'dialogue_resource', '讨论截图等待浏览器资源');
+        let close: (() => Promise<void>) | undefined;
+        try {
+          const browser = await openPage(VIEW, 'zh-CN', signal);
+          close = browser.close;
+          const url = context.token.url;
+          const result = await visit(browser.page, url, new URL(url).hostname);
+          if (result.issues.length) throw new ControlError(422, 'dialogue_capture_failed', result.issues.join('；'));
+          const bytes = await browser.page.screenshot({type: 'png'});
+          const stored = this.store.put(await EvidenceStore.webpAsync(bytes, 1280, 82, {signal}), 'webp');
+          screenshot = context.addEvidence({id: `room-home-${randomUUID()}`, kind: 'image', label: '讨论首页截图',
+            src: stored.src, tone: 'ok', meta: {href: browser.page.url(), role: 'identity'}});
+        } finally { try { await close?.(); } finally { browserLease.release(); } }
+      }
+      view = {...view, images: [{role: 'identity', src: screenshot.src, evidence: screenshot.id}], homeScreenshotAvailable: true};
+    }
+    const lease = await this.broker.acquire(node.resource, {signal});
+    if (!lease) throw new ControlError(503, 'dialogue_resource', '答疑资源暂不可用');
+    const request = {kind: turn.mode, prompt: turn.prompt, input: {text: JSON.stringify(view), images: collaborationImages(view, this.store)},
+      post: turn.post ? (value: Parameters<NonNullable<CollaborationTurn['post']>>[0]) => {
+        if (!validSession()) throw new ControlError(409, 'stale_dialogue', '原工位已退回或结束，本次协作发言已经失效');
+        return turn.post!(value);
+      } : undefined, posted: Boolean(turn.existingPost), read: () => turn.posts, model: turn.model, repairReason: turn.repairReason};
+    try {
+      request.input.text = JSON.stringify(await collaborationPixels(view, this.store, signal));
+      this.journal.atomic(() => {
+        kernel.store.saveAttempt({id: attempt, item: turn.itemId, node: turn.node, startedAt, status: 'running', body: {dialogue: turn.mode}});
+        this.journal.append({kind: 'attempt.started', attempt, token: turn.itemId, node: turn.node, worker: context.worker.id, input: `${turn.mode} 协作回合`});
+      });
+      const run = (definition: AgentStationDef, ctx: StationContext) => runStationDialogue(this.bindAgent(turn.node, definition), ctx, request);
+      const installed = this.workflowPacks?.executor(node, run);
+      const definition = this.stationAgents[turn.node];
+      const result = installed ? await installed(context) : definition ? await run(definition, context) : undefined;
+      if (!result) throw new ControlError(422, 'dialogue_definition_missing', '答疑节点没有执行契约');
+      const current = validSession();
+      this.journal.atomic(() => {
+        if (current) kernel.saveDialogueSession(turn.itemId, turn.node, result, true);
+        kernel.store.saveAttempt({id: attempt, item: turn.itemId, node: turn.node, startedAt, endedAt: Date.now(),
+          status: !current ? 'cancelled' : result.handoff ? 'handoff' : result.ok ? 'ok' : 'failed', body: {dialogue: turn.mode, ...result}});
+        this.journal.append({kind: 'attempt.finished', attempt, ok: current && result.ok, cancelled: !current, summary: result.summary,
+          ms: Date.now() - startedAt, queuedMs: 0, usage: result.usage, metrics: result.metrics, error: result.error});
+      });
+      return result;
+    } catch (error) {
+      const partial = error as Partial<StationResult>;
+      const current = validSession();
+      this.journal.atomic(() => {
+        if (current && partial.sessionCheckpoint) kernel.saveDialogueSession(turn.itemId, turn.node, {sessionCheckpoint: partial.sessionCheckpoint}, true);
+        kernel.store.saveAttempt({id: attempt, item: turn.itemId, node: turn.node, startedAt, endedAt: Date.now(),
+          status: signal.aborted || !current ? 'cancelled' : 'failed', body: {dialogue: turn.mode, error: '协作回合未完成'}});
+        this.journal.append({kind: 'attempt.finished', attempt, ok: false, cancelled: signal.aborted || !current, summary: '协作回合未完成', ms: Date.now() - startedAt, queuedMs: 0});
+      });
+      throw error;
+    } finally { lease.release(); }
+  }
+
+  private async postBoard(context: EnvContext, input: BoardPostInput) {
+    if (!(this.runtime instanceof Kernel) || !this.board || !this.collaboration || !context.token) throw new ControlError(410, 'kernel_v2_required', '黑板需要 v2 内核');
+    const item = this.runtime.store.get(context.token);
+    if (!item) throw new ControlError(404, 'item_not_found', '没有这件货');
+    if (input.type === 'question') {
+      const target = input.addressee && item.nodes[input.addressee];
+      if (input.addressee === context.node || target && target.status === 'waiting' && target.waitingFor === 'room' && target.pendingQuestion) {
+        throw new ControlError(409, 'question_cycle', '不能向自己或正在等待答疑的节点提问，请依据现有证据判断');
+      }
+      if (!context.attempt || !context.toolCallId || !context.questionCheckpoint) {
+        throw new ControlError(409, 'question_checkpoint_required', '提问需要当前会话与工具回执检查点');
+      }
+    }
+    const kernel = this.runtime;
+    let post!: ReturnType<BoardStore['addPost']>;
+    this.journal.atomic(() => {
+      post = this.board!.addPost({...input, item, author: context.node});
+      if (post.type === 'question') kernel.savePendingQuestion(item.id, context.node, context.attempt!, {
+        id: post.id, toolCallId: context.toolCallId!, askedBy: context.node, addressee: post.addressee!,
+      }, context.questionCheckpoint!);
+    });
+    if (post.type !== 'question') return {id: post.id};
+    const answer = () => this.collaboration!.answer(post, context.signal);
+    const reply = context.waitForRoom ? await context.waitForRoom(answer) : await answer();
+    return {id: post.id, answer: reply};
+  }
+
+  constructor(projectDirectory = VAR, options: {projectionOnly?: boolean} = {}) {
     const readOnly = process.env.FACTORY_READONLY === "1";
+    const initializeProject = !readOnly && !options.projectionOnly;
     const directory = path.resolve(projectDirectory);
-    if (!readOnly) fs.mkdirSync(directory, { recursive: true });
-    this.project = readOnly ? { name: path.basename(directory), dir: directory, pack: "vislexicon", createdAt: "" } : ensureProject(directory, process.env.FACTORY_PROJECT_NAME ?? path.basename(directory));
+    if (initializeProject) fs.mkdirSync(directory, { recursive: true });
+    const projectFallback = {name: path.basename(directory), dir: directory, pack: 'vislexicon', createdAt: ''};
+    this.project = initializeProject ? ensureProject(directory, process.env.FACTORY_PROJECT_NAME ?? path.basename(directory))
+      : options.projectionOnly ? {...this.readJson<ProjectInfo>(path.join(directory, 'project.json'), projectFallback), dir: directory}
+      : projectFallback;
     this.journal = new Journal(path.join(this.project.dir, 'journal.db'), readOnly);
-    this.store = new EvidenceStore(path.join(this.project.dir, 'evidence'), readOnly);
+    this.store = new EvidenceStore(path.join(this.project.dir, 'evidence'), !initializeProject);
     const settingsFile = path.join(this.project.dir, 'settings.json');
     const saved = this.readJson<Partial<Settings> & { browserCapV2?: boolean }>(settingsFile, {});
     if (saved.modelWorkers === undefined) {
       // Allow independent stations to run while Pi waits for tools.
       // Persist this independently so later model quota changes keep user intent.
       saved.modelWorkers = Math.max(3, saved.model ?? 8);
-      if (!readOnly) fs.writeFileSync(settingsFile, JSON.stringify(saved, null, 2));
+      if (initializeProject) fs.writeFileSync(settingsFile, JSON.stringify(saved, null, 2));
     }
     // Browser pages were capped at three before Spec §30.6; lift old saved caps once to the new default.
     if (!saved.browserCapV2 && (saved.browser ?? 0) <= 3) delete saved.browser;
-    this.settings = { browser: 8, model: 8, modelWorkers: saved.modelWorkers, cpu: 4, http: 6, memoryFloorMB: 1024, socialPerMinute: 6, socialPerDay: 300, ...saved };
+    this.settings = { browser: 8, model: 8, modelWorkers: saved.modelWorkers, cpu: 4, http: 6, memoryFloorMB: 1024, socialPerMinute: 6, socialPerDay: 300, maxActiveItems: 12, ...saved };
+    if (!Number.isSafeInteger(this.settings.maxActiveItems) || this.settings.maxActiveItems < 1) {
+      this.settings.maxActiveItems = 12;
+    }
     this.patches = this.readJson(path.join(this.project.dir, 'patches.json'), []);
   }
 
   private readJson<T>(file: string, fallback: T): T { try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; } catch { return fallback; } }
 
-  async boot() {
-    this.decisionModel = projectDecisionClient(this.project.dir);
-    this.externalIntake = readExternalIntake(this.project.dir);
+  /** Offline migration reads the same projection without starting any consumers. */
+  async projectState() {
+    await this.prepareProjection();
+    return {compiled: this.compiled, state: this.state};
+  }
+
+  private async prepareProjection() {
+    const started = performance.now();
+    console.log('BOOT_STAGE journal 0');
     this.workflowPacks = await this.loadWorkflowPacks();
     this.compiled = compile(this.workflowPacks.packs, this.patches);
     if (this.compiled.issues.length) throw new ControlError(422, "invalid_spec", "规格校验失败，未启动运行时", this.compiled.issues);
-    if (process.env.FACTORY_READONLY !== '1') this.project = synchronizeProjectPacks(this.project.dir, this.workflowPacks.packs.map(entry => entry.id));
+    console.log(`BOOT_STAGE compile ${Math.round(performance.now() - started)}`);
     this.state = initialState(this.compiled);
-    this.docs = new Docs(this, this.project.dir, this.project.name);
-    const completedRuns = new Set<string>();
-    for (const e of this.journal.read(0)) {
-      apply(this.state, e);
-      this.docs.observeReplay(e);
-      if (e.kind === 'run.ended') completedRuns.add(e.runId);
+    this.recoveryProjection = initialRecoveryProjection();
+    this.docs = new Docs(this, this.project.dir, this.project.name, {deferReplay: true});
+    this.lessons = new Lessons(this, this.project.dir, {deferReplay: true});
+    this.channels = new ChannelSupervisor(this, {deferReplay: true});
+    this.sources = new SourceSupervisor(this, {deferReplay: true});
+    if (this.compiled.nodes.some(node => node.key === 'curation/gate') &&
+        this.compiled.nodes.some(node => node.key === 'curation/published')) {
+      this.publicationOutbox = new PublicationOutbox(this.project.dir, this.journal, {deferReplay: true});
     }
-    this.journal.subscribeProjection((e) => apply(this.state, e));
+    const factoryProjection: Snapshottable = {
+      snapshotName: 'factory-state',
+      serialize: () => serializeSnapshot({state: this.state, recovery: this.recoveryProjection}),
+      restore: body => {
+        const saved = deserializeSnapshot(body);
+        if (!saved || typeof saved !== 'object' || !('state' in saved) ||
+            !('recovery' in saved) || !saved.recovery || typeof saved.recovery !== 'object') {
+          throw new Error('Invalid factory snapshot');
+        }
+        const state = validateState(saved.state);
+        const index = saved.recovery as RecoveryProjection;
+        if (!(index.done instanceof Map) || !(index.removed instanceof Map) || !(index.notes instanceof Map) ||
+            !(index.checkpointed instanceof Set) || !(index.arrivals instanceof Map) ||
+            !(index.sampleTokens instanceof Set) || typeof index.run !== 'string' ||
+            [...index.done.values(), ...index.removed.values()].some(value => !(value instanceof Set)) ||
+            [...index.notes.values()].some(value => !(value instanceof Map)) ||
+            [...index.arrivals.values()].some(value => !Array.isArray(value))) {
+          throw new Error('Invalid recovery snapshot');
+        }
+        this.state = state;
+        this.recoveryProjection = index;
+      },
+      observe: event => {
+        apply(this.state, event);
+        this.observeRecovery(event);
+      },
+    };
+    this.snapshotComponents = [factoryProjection, this.docs, this.lessons, this.channels, this.sources,
+      ...(this.publicationOutbox ? [this.publicationOutbox] : [])];
+    this.projectionVersion = snapshotVersion(this.compiled.digest);
+    const restored = restoreSnapshots(this.journal, this.snapshotComponents, this.projectionVersion);
+    this.journal.subscribeProjection(event => {
+      for (const component of this.snapshotComponents) component.observe(event);
+    });
+    this.snapshotSeq = restored.through;
+    return restored;
+  }
+
+  /** Offline upgrade: projection only, without workers, recovery or publication. */
+  async snapshot() {
+    await this.prepareProjection();
+    await this.writeSnapshots();
+  }
+
+  private writeSnapshots(): Promise<void> {
+    if (process.env.FACTORY_READONLY === '1' || !this.snapshotComponents.length) return Promise.resolve();
+    if (this.snapshotTask) return this.snapshotTask;
+    this.snapshotTask = new Promise<void>((resolve, reject) => {
+      const write = () => {
+        if (this.journal.inTransaction) {
+          setImmediate(write);
+          return;
+        }
+        try {
+          if (this.projectionVersion !== snapshotVersion(this.compiled.digest)) this.rebuildCompiledProjection();
+          saveSnapshots(this.journal, this.snapshotComponents, this.projectionVersion);
+          this.snapshotSeq = this.journal.seq;
+          this.scheduleSnapshotTimer();
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      };
+      setImmediate(write);
+    }).finally(() => { this.snapshotTask = undefined; });
+    return this.snapshotTask;
+  }
+
+  private startSnapshots() {
+    if (process.env.FACTORY_READONLY === '1') return;
+    this.snapshotsActive = true;
+    this.snapshotUnsubscribe = this.journal.subscribe(() => {
+      if (this.journal.seq - this.snapshotSeq >= 5000) this.backgroundSnapshot();
+    });
+    this.scheduleSnapshotTimer();
+  }
+
+  private backgroundSnapshot(): void {
+    void this.writeSnapshots().catch(() => {
+      console.warn('boot.snapshot failed');
+      this.scheduleSnapshotTimer();
+    });
+  }
+
+  private scheduleSnapshotTimer(): void {
+    clearTimeout(this.snapshotTimer);
+    this.snapshotTimer = undefined;
+    if (!this.snapshotsActive) return;
+    this.snapshotTimer = setTimeout(() => this.backgroundSnapshot(), 600_000);
+    this.snapshotTimer.unref();
+  }
+
+  /** Call after runtime and document writers settle, before closing the journal. */
+  closeSnapshots(): Promise<void> {
+    if (this.snapshotClosing) return this.snapshotClosing;
+    this.snapshotsActive = false;
+    this.snapshotUnsubscribe?.();
+    this.snapshotUnsubscribe = undefined;
+    clearTimeout(this.snapshotTimer);
+    this.snapshotTimer = undefined;
+    this.snapshotClosing = (async () => {
+      if (process.env.FACTORY_READONLY === '1' || !this.snapshotComponents.length) return;
+      // An earlier background capture may finish before a final writer's queued
+      // microtask. Drain it, then capture again if the journal has advanced.
+      do {
+        await this.writeSnapshots();
+      } while (this.snapshotSeq !== this.journal.seq);
+    })().finally(() => { this.snapshotClosing = undefined; });
+    return this.snapshotClosing;
+  }
+
+  async boot() {
+    const started = performance.now();
+    this.decisionModel = projectDecisionClient(this.project.dir);
+    this.externalIntake = readExternalIntake(this.project.dir);
+    const restored = await this.prepareProjection();
+    if (restored.fullReplay) await this.writeSnapshots();
+    this.docs.start();
+    this.lessons.start();
+    this.startSnapshots();
+    if (process.env.FACTORY_READONLY !== '1') this.project = synchronizeProjectPacks(this.project.dir, this.workflowPacks!.packs.map(entry => entry.id));
+    const completedRuns = this.journal.completedRuns();
     if (!this.state.agentDefaults) {
       const selection = piSelection();
       const binding: StationAgentBinding = {adapter: 'pi', provider: selection.provider, model: selection.id};
@@ -126,8 +485,11 @@ export class Factory {
     }
     if (process.env.FACTORY_READONLY !== "1" && this.state.digest !== this.compiled.digest) this.journal.append({ kind: "factory.loaded", digest: this.compiled.digest, specVersion: this.compiled.specVersion });
     this.broker = new Broker({ browser: this.settings.browser, model: this.settings.model, modelWorkers: this.settings.modelWorkers, cpu: this.settings.cpu, http: this.settings.http }, this.settings.memoryFloorMB);
-    this.lessons = new Lessons(this, this.project.dir);
-    this.toolbox = new Toolbox({ journal: this.journal, broker: this.broker, docs: () => this.docs });
+    this.toolbox = new Toolbox({journal: this.journal, broker: this.broker, docs: () => this.docs,
+      ...(this.kernel === 'v2' ? {board: {
+        read: (context: EnvContext, options: {field?: string; openOnly?: boolean}) => this.board?.read(context.token ?? '', options) ?? [],
+        post: (context: EnvContext, input: BoardPostInput) => this.postBoard(context, input),
+      }} : {})});
     const services: Services = {
       store: this.store, workDir: path.join(this.project.dir, 'work'), publishDir: path.join(this.project.dir, 'published'),
       tryBrowser:()=>this.broker.tryAcquire("browser"),
@@ -200,7 +562,7 @@ export class Factory {
         },
       };
     };
-    this.runtime = new Runtime(this.compiled, this.journal, this.broker, this.workflowPacks.conditions, executors);
+    this.runtime = this.createRuntime(this.compiled, this.workflowPacks!.conditions, executors);
     this.runtime.roleResolver = key => this.workflowPacks?.role(key) ?? readRole(key);
     this.modelCircuits = new ModelCircuits(this);
     this.batch = new BatchSupervisor(this);
@@ -208,9 +570,11 @@ export class Factory {
     this.runtime.onTick = () => this.maintainRuntime();
     this.wireRecovery();
     if (process.env.FACTORY_READONLY === "1") {
+      if (this.runtime instanceof Kernel) this.runtime.recover(this.state);
       this.catalog = this.runtime.nodes.has('candidates/pool') ? loadCatalog() : [];
-      this.channels = new ChannelSupervisor(this);
-      this.sources = new SourceSupervisor(this);
+      if (this.kernel === 'v1') this.channels!.start();
+      this.sources.start();
+      console.log(`BOOT_STAGE factory ${Math.round(performance.now() - started)}`);
       return;
     }
     this.wireStock();
@@ -220,27 +584,27 @@ export class Factory {
     try { this.lessons.write(); } catch (error) { this.lessonIssue(error); }
     if (this.runtime.nodes.has('curation/style')) void warmStyleLib();
     this.loadStock();
-    this.recoverLegacyFailures();
-    for(const c of Object.values(this.state.recoveries))if(c.failure?.tag==="tool_error") {
+    if (this.kernel === 'v1') this.recoverLegacyFailures();
+    for(const c of Object.values(this.state.recoveries))if(this.kernel === 'v1' && c.failure?.tag==="tool_error") {
       const failure=classifyFailure(c.failure.message,{url:c.url});
       if(failure.tag!=="tool_error")this.journal.append({kind:"candidate.disposition",candidate:{...c,failure}});
     }
     this.reconcileFailureAlerts();
-    this.batch.restoreModelCircuit();
-    this.broker.modelHold = Object.values(this.state.alerts).find(a => a.kind === 'model' && !a.dependency)?.message ?? null;
+    if (this.kernel === 'v1') {
+      this.batch.restoreModelCircuit();
+      this.broker.modelHold = Object.values(this.state.alerts).find(a => a.kind === 'model' && !a.dependency)?.message ?? null;
+    }
     this.restore();
-    this.modelCircuits.restore();
+    if (this.kernel === 'v1') this.modelCircuits.restore();
     this.reconcileManualStock();
     this.reconcileBusinessStock();
-    this.channels = new ChannelSupervisor(this);
-    this.sources = new SourceSupervisor(this);
-    if (this.runtime.nodes.has('curation/gate') && this.runtime.nodes.has('curation/published')) {
-      this.publicationOutbox = new PublicationOutbox(this.project.dir, this.journal);
-    }
-    this.recovery.start();
+    if (this.kernel === 'v1') this.channels!.start();
+    this.publicationOutbox?.start();
+    if (this.kernel === 'v1') this.recovery.start();
     this.sources.start();
     this.runtime.tick();
-    this.batch.schedule();
+    if (this.kernel === 'v1') this.batch.schedule();
+    console.log(`BOOT_STAGE factory ${Math.round(performance.now() - started)}`);
   }
 
   /* -------------------------------------------------------------- stock (候选层 / 已发布) */
@@ -298,7 +662,8 @@ export class Factory {
     for (const pool of previous.workers.values()) for (const worker of pool) this.journal.append({ kind: 'worker.retired', node: worker.node, worker: worker.id, reason: '流水线包更新，按新规格配员' });
     this.workflowPacks = loaded; this.compiled = compiled;
     this.project = synchronizeProjectPacks(this.project.dir, loaded.packs.map(entry => entry.id));
-    this.runtime = new Runtime(compiled, this.journal, this.broker, loaded.conditions, previous.executors);
+    this.rebuildCompiledProjection();
+    this.runtime = this.createRuntime(compiled, loaded.conditions, previous.executors);
     this.runtime.roleResolver = key => loaded.role(key) ?? readRole(key);
     this.runtime.onTick = () => this.maintainRuntime();
     this.wireRecovery(); this.restore(); this.loadStock(); this.reconcileManualStock(); this.runtime.tick();
@@ -314,7 +679,37 @@ export class Factory {
   }
 
   private stationServices() {
-    return {docs: () => this.docs, toolbox: () => this.toolbox};
+    return {docs: () => this.docs, toolbox: () => this.toolbox, journal: this.journal,
+      activeLessons: (node: string) => this.lessons.activeFor(node)};
+  }
+
+  continueAgentBudget(item: string, node: string) {
+    if (!(this.runtime instanceof Kernel)) throw new ControlError(410, 'kernel_v2_required', '预算交接由 v2 内核处理');
+    return this.runtime.continueBudget(item, node);
+  }
+
+  streamSnapshot() {
+    if (!(this.runtime instanceof Kernel)) throw new ControlError(410, 'kernel_v2_required', '三流统计需要 v2 内核');
+    return {kernel: 'v2' as const, ...kernelStreams(this.runtime.store, {now: Date.now(), runId: this.journal.run,
+      alerts: this.state.alerts, patches: this.state.patches, nodeKeys: this.compiled.nodes.map(node => node.key)})};
+  }
+
+  streamEvents(since: number, includeProgress: boolean) {
+    if (!(this.runtime instanceof Kernel)) throw new ControlError(410, 'kernel_v2_required', '三流记录需要 v2 内核');
+    if (!Number.isSafeInteger(since) || since < 0) throw new ControlError(400, 'invalid_cursor', 'since 必须是非负整数');
+    const conversation = "((kind = 'board.posted' AND json_extract(body, '$.post.type') != 'claim') OR kind LIKE 'room.%' OR kind LIKE 'chat.%' OR kind = 'supervisor.summary')";
+    const progress = "kind IN ('attempt.started', 'attempt.progress', 'attempt.activity', 'attempt.finished', 'token.queued', 'token.data', 'token.created', 'evidence.added', 'resource.sample')";
+    type Row = {seq: number; at: number; run: string; body: string};
+    const read = (where: string, order: 'ASC' | 'DESC', limit: number) => this.journal.database.prepare(
+      `SELECT seq, at, run, body FROM events WHERE seq > ? AND (${where}) ORDER BY seq ${order} LIMIT ?`
+    ).all(since, limit) as Row[];
+    const rows = since === 0
+      ? [...read(conversation, 'DESC', 500), ...(includeProgress ? read(progress, 'DESC', 500) : [])].sort((a, b) => a.seq - b.seq)
+      : read(includeProgress ? `${conversation} OR ${progress}` : conversation, 'ASC', 501);
+    const hasMore = since > 0 && rows.length > 500;
+    const selected = hasMore ? rows.slice(0, 500) : rows;
+    return {events: selected.map(row => ({...JSON.parse(row.body), seq: row.seq, at: row.at, run: row.run}) as Stamped),
+      seq: hasMore ? selected.at(-1)!.seq : this.journal.seq, hasMore};
   }
 
   private captureAgent(node: string, declared?: StationAgentBinding) {
@@ -481,7 +876,7 @@ export class Factory {
   }
 
   private maintainRuntime() {
-    this.resumeVerifiedCandidates(); this.batch.pump();
+    if (this.kernel === 'v1') { this.resumeVerifiedCandidates(); this.batch.pump(); }
     if (this.compiled.lines.some(line => line.id === 'atlas-feed' && line.wired)) flushAtlas(this.services);
     this.reconcileBusinessStock();
   }
@@ -755,7 +1150,7 @@ export class Factory {
   }
 
   private wireRecovery() {
-    this.runtime.onRecovery = (token, failure) => this.recordRecovery(token, failure);
+    if (this.kernel === 'v1') this.runtime.onRecovery = (token, failure) => this.recordRecovery(token, failure);
     this.runtime.onAlert = (token, node, failure, dependency) => {
       const kind: Alert["kind"] | undefined = failure.tag === "network_tls" ? "tls" : failure.tag === "model_unavailable" || failure.tag === "model_transport" ? "model" : failure.tag === "auth_required" ? "auth" : undefined;
       if (!kind) return;
@@ -764,13 +1159,14 @@ export class Factory {
       this.raiseAlert({ id: kind === 'model' && dependency ? `${id}:${dependency.key}` : id,
         dependency: kind === 'model' ? dependency : undefined,
         level: "red", kind, message: `${token.title || token.item}：${failure.message}`.slice(0, 400), nextAction: failure.nextAction, token: token.id, item: token.item, node: node.key, url: kind === 'model' ? undefined : failure.url ?? token.url });
+      if (this.kernel === 'v2') return;
       if (kind === 'model' && dependency) this.modelCircuits.failed(dependency, token.id, node.key, failure);
       if (failure.tag === 'model_transport') {
         if (!dependency) this.batch.modelFailed();
         this.recovery?.modelFailed();
       }
     };
-    this.runtime.onPark = token => this.recordRecovery(token, {tag:"run_ended",category:"system",message:"本轮结束，工作尚未完成",url:token.url,retryable:true});
+    if (this.kernel === 'v1') this.runtime.onPark = token => this.recordRecovery(token, {tag:"run_ended",category:"system",message:"本轮结束，工作尚未完成",url:token.url,retryable:true});
   }
 
   private recordRecovery(token:Pick<TokenRun,"id"|"item"|"url"|"title"|"source">,failure:Failure) {
@@ -1143,8 +1539,83 @@ export class Factory {
 
   /* -------------------------------------------------------------- restart */
 
+  /** A different graph changes initial nodes and which queued nodes are stores.
+   * Rebuild both graph-dependent views before writing the new snapshot version.
+   * The other components index event data without consulting the compiled graph. */
+  private rebuildCompiledProjection(): void {
+    const state = initialState(this.compiled);
+    const through = this.journal.seq;
+    for (const event of this.journal.read(0, undefined, through)) apply(state, event);
+    const recovery = initialRecoveryProjection();
+    recovery.run = state.run.id;
+    // Legacy restore resolves attempts against the final state, not the state
+    // at each historical receipt. Keep that behavior when replacing the graph.
+    for (const event of this.journal.readKinds(['token.queued', 'token.finished', 'token.data',
+      'token.returned', 'attempt.finished'], 0, through)) this.observeRecovery(event, state, recovery);
+    this.state = state;
+    this.recoveryProjection = recovery;
+    if (this.broker) this.broker.modelCircuits = state.modelCircuits;
+    this.projectionVersion = snapshotVersion(this.compiled.digest);
+  }
+
+  private observeRecovery(event: Stamped, state = this.state, index = this.recoveryProjection) {
+    if (event.kind === 'run.started') {
+      index.run = event.runId;
+      index.arrivals.clear();
+      index.sampleTokens.clear();
+    }
+    if (event.run === index.run && event.kind === 'token.queued') {
+      const arrivals = index.arrivals.get(event.node) ?? [];
+      arrivals.push(event.at);
+      index.arrivals.set(event.node, arrivals);
+    }
+    if (event.run === index.run && event.kind === 'token.finished' &&
+        ['published', 'manual', 'merged', 'rejected'].includes(event.status)) {
+      index.sampleTokens.add(event.token);
+    }
+    if (event.kind === 'token.data' &&
+        (event.patch.runtimeCheckpoint as {version?: number} | undefined)?.version === 1) {
+      const checkpoint = event.patch.runtimeCheckpoint as {done: string[]; notes: [string, {reason: string; note?: string; byHuman: boolean}][]};
+      index.done.set(event.token, new Set(checkpoint.done));
+      index.notes.set(event.token, new Map(checkpoint.notes));
+      index.checkpointed.add(event.token);
+      index.removed.delete(event.token);
+    } else if (event.kind === 'token.returned') {
+      const notes = index.notes.get(event.token) ?? new Map();
+      notes.set(event.to, {reason: event.reason, byHuman: event.byHuman});
+      index.notes.set(event.token, notes);
+    } else if (event.kind === 'attempt.finished' && event.ok && event.error !== 'restart' && event.error !== 'stale') {
+      const attempt = state.attempts[event.attempt];
+      if (attempt) index.notes.get(attempt.token)?.delete(attempt.node);
+    }
+    const markDone = (token: string, node: string) => {
+      const done = index.done.get(token) ?? new Set();
+      done.add(node);
+      index.done.set(token, done);
+      index.removed.get(token)?.delete(node);
+    };
+    if (event.kind === 'attempt.finished' && event.ok && event.error !== 'stale') {
+      const attempt = state.attempts[event.attempt];
+      if (attempt && !index.checkpointed.has(attempt.token)) markDone(attempt.token, attempt.node);
+    } else if (event.kind === 'token.returned') {
+      const removed = index.removed.get(event.token) ?? new Set();
+      for (const node of event.reset ?? []) {
+        index.done.get(event.token)?.delete(node);
+        removed.add(node);
+      }
+      index.removed.set(event.token, removed);
+    } else if (event.kind === 'token.queued' &&
+        this.compiled.nodes.find(node => node.key === event.node)?.kind === 'store') {
+      markDone(event.token, event.node);
+    }
+  }
+
   private restore() {
     const rt = this.runtime;
+    if (rt instanceof Kernel) {
+      rt.recover(this.state);
+      return;
+    }
     rt.locked = new Set(this.state.lockedStations);
     rt.pausedLines = new Set(this.state.pausedScopes?.lines ?? []);
     rt.pausedStations = new Set(this.state.pausedScopes?.stations ?? []);
@@ -1158,31 +1629,21 @@ export class Factory {
     rt.running = resumable; rt.paused = resumable&&(run.status === "paused" || process.env.FACTORY_START_PAUSED === "1" && !managedResume); rt.runStartedAt = run.startedAt;
     if (rt.paused && this.state.run.status === "running") this.journal.append({ kind: "run.paused", runId: run.id });
     // Which nodes each token has finished, per the journal (returns reset descendants).
-    const done = new Map<string, Set<string>>(Object.values(this.state.tokens).map(t=>[t.id,new Set((t.data.checkpointDone as string[])??[])]));
-    const notes=new Map<string,TokenRun["notes"]>();
-    const checkpointed = new Set<string>();
-    for (const e of this.journal.readKinds(['token.queued', 'token.finished', 'token.data', 'token.returned', 'attempt.finished'])) {
-      if (e.run === run.id && e.kind === 'token.queued') {
-        const arrivals = rt.arrivals.get(e.node) ?? []; arrivals.push(e.at); rt.arrivals.set(e.node, arrivals);
-      }
-      if (e.run === run.id && e.kind === 'token.finished' && ['published', 'manual', 'merged', 'rejected'].includes(e.status)) {
-        const item = this.state.tokens[e.token]?.item; if (item) rt.sampleItems.add(item);
-      }
-      if (e.kind === 'token.data' && (e.patch.runtimeCheckpoint as { version?: number } | undefined)?.version === 1) {
-        const checkpoint = e.patch.runtimeCheckpoint as { done: string[]; notes: [string, { reason: string; note?: string; byHuman: boolean }][] };
-        done.set(e.token, new Set(checkpoint.done));
-        notes.set(e.token, new Map(checkpoint.notes));
-        checkpointed.add(e.token);
-      } else if(e.kind==="token.returned"){
-        const entries=notes.get(e.token)??new Map();entries.set(e.to,{reason:e.reason,byHuman:e.byHuman});notes.set(e.token,entries);
-      }else if(e.kind==="attempt.finished"&&e.ok&&e.error!=="restart"&&e.error!=="stale"){
-        const a=this.state.attempts[e.attempt];if(a)notes.get(a.token)?.delete(a.node);
-      }
-      if (e.kind === "attempt.finished" && e.ok && e.error !== "stale") {
-        const a = this.state.attempts[e.attempt];
-        if (a && !checkpointed.has(a.token)) (done.get(a.token) ?? done.set(a.token, new Set()).get(a.token)!).add(a.node);
-      } else if (e.kind === "token.returned") for (const k of e.reset ?? []) done.get(e.token)?.delete(k);
-      else if (e.kind === "token.queued" && this.compiled.nodes.find((n) => n.key === e.node)?.kind === "store") (done.get(e.token) ?? done.set(e.token, new Set()).get(e.token)!).add(e.node);
+    const index = this.recoveryProjection;
+    const done = new Map<string, Set<string>>();
+    const notes = structuredClone(index.notes);
+    const checkpointed = index.checkpointed;
+    for (const token of Object.values(this.state.tokens)) {
+      const completed = index.checkpointed.has(token.id) ? new Set<string>()
+        : new Set((token.data.checkpointDone as string[]) ?? []);
+      for (const node of index.removed.get(token.id) ?? []) completed.delete(node);
+      for (const node of index.done.get(token.id) ?? []) completed.add(node);
+      done.set(token.id, completed);
+    }
+    for (const [node, arrivals] of index.arrivals) rt.arrivals.set(node, [...arrivals]);
+    for (const token of index.sampleTokens) {
+      const item = this.state.tokens[token]?.item;
+      if (item) rt.sampleItems.add(item);
     }
     let requeued = 0, voided = 0;
     for (const ts of Object.values(this.state.tokens)) {
@@ -1263,11 +1724,15 @@ export class Factory {
   /* -------------------------------------------------------------- settings / layout / patches */
 
   saveSettings(next: Partial<Settings>) {
+    if (next.kernel !== undefined && next.kernel !== this.kernel && this.runtime?.running) {
+      throw new ControlError(409, 'run_active', '结束本轮后再选择下次启动使用的内核');
+    }
     this.settings = { ...this.settings, ...next };
     fs.writeFileSync(path.join(this.project.dir, 'settings.json'), JSON.stringify({ ...this.settings, browserCapV2: true }, null, 2));
     Object.assign(this.broker.limits, { browser: this.settings.browser, model: this.settings.model, modelWorkers: this.settings.modelWorkers, cpu: this.settings.cpu, http: this.settings.http });
     this.broker.modelRequests.notifyCapacityChanged();
     this.broker.memoryFloorMB = this.settings.memoryFloorMB;
+    if (this.runtime instanceof Kernel) this.runtime.maxActiveItems = this.settings.maxActiveItems;
     this.runtime.schedule();
   }
 
@@ -1308,18 +1773,22 @@ export class Factory {
       previous.dispose();
       for (const pool of previous.workers.values()) for (const w of pool) this.journal.append({ kind: "worker.retired", node: w.node, worker: w.id, reason: "规格新版本生效，重新配员" });
       this.compiled = trial;
-      this.runtime = new Runtime(trial, this.journal, this.broker, this.workflowPacks?.conditions ?? pack.conditions, previous.executors);
+      this.rebuildCompiledProjection();
+      this.runtime = this.createRuntime(trial, this.workflowPacks?.conditions ?? pack.conditions, previous.executors);
       this.runtime.roleResolver = previous.roleResolver;
       this.runtime.onTick = () => this.maintainRuntime();
       this.wireRecovery();
       this.runtime.stock = previous.stock;
-      this.runtime.tokens = previous.tokens;
-      for (const t of this.runtime.tokens.values()) t.closure = this.runtime.closureOf(t.entry);
+      if (this.runtime instanceof Kernel) this.runtime.recover(this.state);
+      else {
+        this.runtime.tokens = previous.tokens;
+        for (const t of this.runtime.tokens.values()) t.closure = this.runtime.closureOf(t.entry);
+      }
       this.runtime.locked = new Set([...previous.locked].filter((key) => this.runtime.nodes.has(key)));
       this.runtime.pausedLines = new Set(previous.pausedLines); this.runtime.pausedStations = new Set(previous.pausedStations);
       this.lastPreflight = 0;
       this.journal.append({ kind: "factory.loaded", digest: trial.digest, specVersion: trial.specVersion });
-      this.runtime.ensureWorkers([]);
+      if (this.kernel === 'v1') this.runtime.ensureWorkers([]);
       this.runtime.tick();
     }
     return true;

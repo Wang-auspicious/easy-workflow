@@ -3,41 +3,107 @@ import type { ChannelDelivery, Stamped } from '../shared/types.ts';
 import type { Factory } from './factory.ts';
 import type { TokenRun } from './runtime.ts';
 import { ControlError } from './errors.ts';
+import {deserializeSnapshot, serializeSnapshot} from '../shared/project.ts';
+import type {Snapshottable} from './snapshots.ts';
 
 type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'sources'> & Partial<Pick<Factory, 'recovery'>>;
 const internal = new Set(['runtimeCheckpoint', 'checkpointDone', 'recoveryRoot', 'recoveryStation', 'retryOf', 'retriedBy', 'retryTag', 'batchRecovery', 'capacityWait', 'browserRecoveries', 'published', 'gate', 'digest', 'failure', 'manualReason', 'accessVerified', 'workflowPack', 'channelDelivery', 'sourceCandidate']);
+const channelField = (key: string) => !internal.has(key) && !key.startsWith('__runtime');
 /** A delivery transfers business data, never its parent's scheduler identity. */
 export function channelPayload(data: Record<string, unknown>) {
-  return structuredClone(Object.fromEntries(Object.entries(data).filter(([key]) => !internal.has(key) && !key.startsWith('__runtime'))));
+  return structuredClone(Object.fromEntries(Object.entries(data).filter(([key]) => channelField(key))));
 }
 function stable(value: unknown): unknown { return Array.isArray(value) ? value.map(stable) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, stable(value)])) : value; }
 function deliveryId(channel: string, token: string, data: Record<string, unknown>) { return 'delivery-' + crypto.createHash('sha256').update(JSON.stringify([channel, token, stable(data)])).digest('hex').slice(0, 24); }
+const record = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+type FieldVersion = number | {seq: number; value: unknown};
 
-export class ChannelSupervisor {
+/** The journal uses JSON. Keep uncommon non-JSON live values inline so looking
+ * up ordinary durable fields does not change existing channel payloads. */
+function jsonStable(value: unknown): boolean {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value) && !Object.is(value, -0);
+  if (Array.isArray(value)) {
+    return Object.keys(value).length === value.length && value.every(jsonStable);
+  }
+  return record(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value)) &&
+    Object.values(value).every(jsonStable);
+}
+
+export class ChannelSupervisor implements Snapshottable {
+  readonly snapshotName = 'channels';
+  private indexedSeq = 0;
   private f: Host;
   private deliveries = new Map<string, ChannelDelivery>();
-  private snapshots = new Map<number, Record<string, unknown>>();
+  private snapshots = new Map<number, Map<string, FieldVersion>>();
+  private dataSequences = new Map<string, Map<string, FieldVersion>>();
+  private emissions = new Map<number, Extract<Stamped, {kind: 'channel.emitted'}>>();
   private tokensByDelivery = new Map<string, Set<string>>();
   private deliveryByToken = new Map<string, string>();
-  private unsubscribe: () => void;
+  private unsubscribe: () => void = () => {};
+  private started = false;
   private scheduled = false;
   private closed = false;
-  constructor(factory: Host) {
+  constructor(factory: Host, options: {deferReplay?: boolean} = {}) {
     this.f = factory;
-    const replayData = new Map<string, Record<string, unknown>>();
-    const emissions: Extract<Stamped, { kind: 'channel.emitted' }>[] = [];
+    if (options.deferReplay) return;
     for (const event of factory.journal.readKinds(['token.data', 'channel.emitted', 'channel.delivery'])) {
-      this.project(event, replayData);
-      if (event.kind === 'channel.emitted') emissions.push(event);
+      this.observe(event);
     }
-    replayData.clear();
-    this.unsubscribe = () => {};
-    if (process.env.FACTORY_READONLY === '1') { this.snapshots.clear(); return; }
-    const projection = factory.journal.subscribeProjection(event => this.project(event));
-    const consumer = factory.journal.subscribe(event => this.observe(event));
+    this.start();
+  }
+
+  serialize(): string {
+    return serializeSnapshot({indexedSeq: this.indexedSeq, deliveries: this.deliveries, snapshots: this.snapshots,
+      dataSequences: this.dataSequences, emissions: this.emissions,
+      tokensByDelivery: this.tokensByDelivery, deliveryByToken: this.deliveryByToken});
+  }
+
+  restore(body: string): void {
+    const saved = deserializeSnapshot(body);
+    if (!saved || typeof saved !== 'object') throw new Error('Invalid channels snapshot');
+    const value = saved as Record<string, unknown>;
+    if (!Number.isSafeInteger(value.indexedSeq) || Number(value.indexedSeq) < 0 ||
+        !(value.deliveries instanceof Map) || !(value.snapshots instanceof Map) ||
+        !(value.dataSequences instanceof Map) || !(value.emissions instanceof Map) ||
+        !(value.tokensByDelivery instanceof Map) || !(value.deliveryByToken instanceof Map)) {
+      throw new Error('Invalid channels snapshot');
+    }
+    const validSequences = (fields: unknown, through: number): fields is Map<string, FieldVersion> =>
+      fields instanceof Map && [...fields].every(([key, version]) => {
+        const seq = typeof version === 'number' ? version : record(version) && Object.hasOwn(version, 'value') ? version.seq : undefined;
+        return typeof key === 'string' && channelField(key) && Number.isSafeInteger(seq) && Number(seq) > 0 && Number(seq) <= through;
+      });
+    if ([...value.deliveries].some(([key, delivery]) => typeof key !== 'string' ||
+          !record(delivery) || delivery.id !== key || !record(delivery.data)) ||
+        [...value.snapshots].some(([key, data]) => !Number.isSafeInteger(key) || !validSequences(data, key)) ||
+        [...value.dataSequences].some(([key, data]) => typeof key !== 'string' || !validSequences(data, Number(value.indexedSeq))) ||
+        [...value.emissions].some(([key, event]) => !Number.isSafeInteger(key) ||
+          !record(event) || event.kind !== 'channel.emitted' || event.seq !== key) ||
+        [...value.tokensByDelivery].some(([key, tokens]) => typeof key !== 'string' ||
+          !(tokens instanceof Set) || [...tokens].some(token => typeof token !== 'string')) ||
+        [...value.deliveryByToken].some(([key, delivery]) => typeof key !== 'string' || typeof delivery !== 'string')) {
+      throw new Error('Invalid channels snapshot entries');
+    }
+    this.indexedSeq = Number(value.indexedSeq);
+    this.deliveries = value.deliveries;
+    this.snapshots = value.snapshots;
+    this.dataSequences = value.dataSequences;
+    this.emissions = value.emissions;
+    this.tokensByDelivery = value.tokensByDelivery;
+    this.deliveryByToken = value.deliveryByToken;
+  }
+
+  start(): void {
+    if (this.started || this.closed || process.env.FACTORY_READONLY === '1') return;
+    this.started = true;
+    const factory = this.f;
+    const projection = factory.journal.subscribeProjection(event => this.observe(event));
+    const consumer = factory.journal.subscribe(event => this.consume(event));
     this.unsubscribe = () => { projection(); consumer(); };
     // Recover a crash after emission but before its consumer recorded a delivery.
-    for (const event of emissions) this.receive(event);
+    for (const event of [...this.emissions.values()]) this.receive(event);
     for (const delivery of this.deliveries.values()) {
       this.adoptCreated(delivery);
       const current = this.deliveries.get(delivery.id)!;
@@ -48,25 +114,30 @@ export class ChannelSupervisor {
   }
   /** Projections run for the complete committed batch before any consumer. This
    * keeps nested emissions deduplicated and captures data at the emission seq. */
-  private project(event: Stamped, replayData?: Map<string, Record<string, unknown>>) {
+  observe(event: Stamped): void {
+    if (event.seq <= this.indexedSeq) return;
+    this.indexedSeq = event.seq;
     if (event.kind === 'token.data') {
-      if (replayData) {
-        const data = replayData.get(event.token) ?? {};
-        Object.assign(data, event.patch);
-        replayData.set(event.token, data);
+      const fields = this.dataSequences.get(event.token) ?? new Map<string, FieldVersion>();
+      for (const [key, value] of Object.entries(event.patch)) if (channelField(key)) {
+        fields.set(key, jsonStable(value) ? event.seq : {seq: event.seq, value: structuredClone(value)});
       }
+      this.dataSequences.set(event.token, fields);
       if (typeof event.patch.channelDelivery === 'string') this.bindToken(event.patch.channelDelivery, event.token);
     }
     if (event.kind === 'channel.emitted') {
-      // Factory's projection applies each event before this projection. Read
-      // its state here, before the batch advances, instead of retaining a
-      // second complete token-data projection for the lifetime of the app.
-      const data = replayData ? replayData.get(event.token) : this.f.state.tokens[event.token]?.data;
-      this.snapshots.set(event.seq, channelPayload(data ?? {}));
+      // Retain the exact per-field journal versions at emission, without
+      // duplicating every historical token's potentially large business data.
+      this.snapshots.set(event.seq, new Map(this.dataSequences.get(event.token)));
+      this.emissions.set(event.seq, event);
     }
     if (event.kind === 'channel.delivery') {
       this.deliveries.set(event.delivery.id, event.delivery);
       if (event.delivery.targetToken) this.bindToken(event.delivery.id, event.delivery.targetToken);
+      for (const seq of event.delivery.emissions ?? []) {
+        this.snapshots.delete(seq);
+        this.emissions.delete(seq);
+      }
     }
   }
   private bindToken(delivery: string, token: string) {
@@ -79,9 +150,20 @@ export class ChannelSupervisor {
     return delivery.inventory ?? { node: delivery.target, held: ['pending', 'blocked'].includes(delivery.status) && !delivery.targetToken && this.f.runtime.nodes.get(delivery.target)?.kind === 'store' };
   }
   private receive(event: Extract<Stamped, { kind: 'channel.emitted' }>) {
-    const data = this.snapshots.get(event.seq);
-    this.snapshots.delete(event.seq);
-    if (!data) return;
+    const fields = this.snapshots.get(event.seq);
+    if (!fields) return;
+    const patches = new Map<number, Record<string, unknown>>();
+    // Sparse primary-key reads occur only for an actual unconsumed emission,
+    // after the commit. Restore and observe remain pure; no tail is reread.
+    const sequences = [...new Set([...fields.values()].filter((value): value is number => typeof value === 'number'))];
+    for (const source of this.f.journal.readSequences(sequences.sort((a, b) => a - b))) {
+      if (source.kind !== 'token.data' || source.token !== event.token) {
+        throw new Error('Invalid channel payload event reference');
+      }
+      patches.set(source.seq, source.patch);
+    }
+    const data = channelPayload(Object.fromEntries([...fields].map(([key, version]) =>
+      [key, typeof version === 'number' ? patches.get(version)![key] : version.value])));
     const id = deliveryId(event.channel, event.token, data);
     const previous = this.deliveries.get(id);
     if (previous?.emissions?.includes(event.seq)) return;
@@ -99,8 +181,10 @@ export class ChannelSupervisor {
       if (event.inventory === 'consumer' && held) this.f.runtime.stockDelta(target, 1, '信道已持久排队，等待下游领取');
       this.append({ id, channel: event.channel, sourceToken: event.token, target, item: event.item, url: token?.url ?? '', title: token?.title, data, attempts: 0, emissions: [event.seq], inventory: { node: target, held }, status: target ? 'pending' : 'blocked', ...(target ? {} : { reason: '信道定义当前不可用，保留原始投递等待修复' }) });
     });
+    this.snapshots.delete(event.seq);
+    this.emissions.delete(event.seq);
   }
-  private observe(event: Stamped) {
+  private consume(event: Stamped) {
     if (this.closed) return;
     if (event.kind === 'channel.emitted') this.receive(event);
     if (event.kind === 'channel.delivery') {

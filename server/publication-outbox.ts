@@ -4,6 +4,8 @@ import crypto from 'node:crypto';
 import type {Journal} from './journal.ts';
 import type {Stamped} from '../shared/types.ts';
 import {readExternalIntake} from './external-intake.ts';
+import {deserializeSnapshot, serializeSnapshot} from '../shared/project.ts';
+import type {Snapshottable} from './snapshots.ts';
 
 type JsonObject = Record<string, unknown>;
 
@@ -44,6 +46,11 @@ interface BlockedPublication {
   readonly runId: string;
   readonly at: number;
   readonly error: string;
+}
+
+interface QueuedPublication {
+  readonly event: Extract<Stamped, {kind: 'token.finished'}>;
+  readonly token?: PendingToken;
 }
 
 function object(value: unknown): JsonObject {
@@ -90,26 +97,35 @@ function parseItem(value: unknown): PublicationOutboxItem {
 }
 
 /** Durable local preparation only. A prepared batch is never a remote receipt. */
-export class PublicationOutbox {
+export class PublicationOutbox implements Snapshottable {
+  readonly snapshotName = 'outbox';
+  private indexedSeq = 0;
+  private readonly journal: Journal;
   private readonly projectDir: string;
   private readonly directory: string;
   private readonly recordsDir: string;
   private readonly indexPath: string;
   private readonly batchSize: number;
   private readonly maxWaitMs: number;
-  private readonly tokens = new Map<string, PendingToken>();
+  private tokens = new Map<string, PendingToken>();
+  private queued = new Map<number, QueuedPublication>();
+  private readonly acceptedQueued = new Set<number>();
   private readonly knownDigests = new Set<string>();
   private readonly batches: PublicationBatch[] = [];
   private readonly blocked = new Map<string, BlockedPublication>();
   private unsubscribe: () => void = () => {};
   private pending: PublicationOutboxItem[] = [];
   private cursor: number;
+  private diskState?: {cursor: number; pending: PublicationOutboxItem[];
+    blocked: Map<string, BlockedPublication>; batches: PublicationBatch[]};
   private timer: ReturnType<typeof setTimeout> | undefined;
   private closed = false;
+  private started = false;
   private issue: string | null = null;
 
   constructor(projectDir: string, journal: Journal,
-      options: {readonly batchSize?: number; readonly maxWaitMs?: number} = {}) {
+      options: {readonly batchSize?: number; readonly maxWaitMs?: number; readonly deferReplay?: boolean} = {}) {
+    this.journal = journal;
     this.projectDir = path.resolve(projectDir);
     this.directory = path.join(this.projectDir, 'work', 'publication-batches');
     this.recordsDir = path.join(this.directory, 'records');
@@ -123,15 +139,21 @@ export class PublicationOutbox {
     // The first installation does not relabel historical publications as new work.
     this.cursor = journal.seq;
     try {
-      this.restore(journal);
+      this.readDiskState();
+      if (!options.deferReplay) {
+        for (const event of journal.readKinds(['token.created', 'token.data', 'token.finished'])) this.observe(event);
+        this.start();
+      }
     } catch (error) {
       this.suspend(error);
     }
   }
 
-  private restore(journal: Journal): void {
-    fs.mkdirSync(this.recordsDir, {recursive: true});
-    if (fs.existsSync(this.indexPath)) {
+  /** Read metadata only: deferred boot and the offline snapshot command do not
+   * create records, prepare batches, or touch any referenced publication file. */
+  private readDiskState(): void {
+    const hasIndex = fs.existsSync(this.indexPath);
+    if (hasIndex) {
       const saved = object(JSON.parse(fs.readFileSync(this.indexPath, 'utf8')) as unknown);
       if (saved.schemaVersion !== 1 || !Number.isSafeInteger(saved.cursor) ||
           Number(saved.cursor) < 0 ||
@@ -139,8 +161,8 @@ export class PublicationOutbox {
         throw new Error('Invalid publication outbox checkpoint');
       }
       this.cursor = Number(saved.cursor);
-      if (this.cursor > journal.seq) {
-        throw new Error(`Publication checkpoint sequence ${this.cursor} exceeds journal sequence ${journal.seq}; retained files require reconciliation`);
+      if (this.cursor > this.journal.seq) {
+        throw new Error(`Publication checkpoint sequence ${this.cursor} exceeds journal sequence ${this.journal.seq}; retained files require reconciliation`);
       }
       this.pending = saved.pending.map(parseItem);
       for (const value of saved.blocked) {
@@ -152,7 +174,8 @@ export class PublicationOutbox {
         this.blocked.set(text(failure.sourceToken), failure as unknown as BlockedPublication);
       }
     }
-    for (const name of fs.readdirSync(this.directory).filter(name => /^batch-[a-f0-9]{32}\.json$/.test(name))) {
+    const names = fs.existsSync(this.directory) ? fs.readdirSync(this.directory) : [];
+    for (const name of names.filter(name => /^batch-[a-f0-9]{32}\.json$/.test(name))) {
       const manifestPath = path.join(this.directory, name);
       const saved = object(JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as unknown);
       if (saved.schemaVersion !== 1 || saved.status !== 'prepared' || saved.remotePublished !== false ||
@@ -160,28 +183,109 @@ export class PublicationOutbox {
         throw new Error('Invalid prepared publication manifest');
       }
       const items = saved.items.map(parseItem);
-      for (const item of items) this.verifySnapshot(item);
       this.batches.push({...saved, items, manifestPath} as unknown as PublicationBatch);
       for (const item of items) this.knownDigests.add(item.contentDigest);
     }
     // A crash after manifest rename but before index rename must not emit it twice.
     this.pending = this.pending.filter(item => !this.knownDigests.has(item.contentDigest));
     for (const item of this.pending) this.knownDigests.add(item.contentDigest);
-    for (const event of journal.readKinds(['token.created', 'token.data', 'token.finished'])) this.observe(event);
-    this.persist();
-    this.unsubscribe = journal.subscribe(event => {
-      try {
-        this.observe(event);
-        if (event.kind === 'token.finished' && event.status === 'published') {
-          this.flushFullBatches();
-          this.schedule();
-        }
-      } catch (error) {
-        this.suspend(error);
+    if (hasIndex || this.batches.length) {
+      this.diskState = structuredClone({cursor: this.cursor, pending: this.pending,
+        blocked: this.blocked, batches: this.batches});
+    }
+  }
+
+  serialize(): string {
+    return serializeSnapshot({indexedSeq: this.indexedSeq, tokens: this.tokens, queued: this.queued, cursor: this.cursor,
+      pending: this.pending, blocked: this.blocked, batches: this.batches});
+  }
+
+  restore(body: string): void {
+    const saved = object(deserializeSnapshot(body));
+    if (!Number.isSafeInteger(saved.indexedSeq) || Number(saved.indexedSeq) < 0 ||
+        !(saved.tokens instanceof Map) || !(saved.queued instanceof Map) ||
+        !(saved.blocked instanceof Map) || !Array.isArray(saved.pending) ||
+        !Array.isArray(saved.batches) || !Number.isSafeInteger(saved.cursor) ||
+        Number(saved.cursor) < 0 || Number(saved.cursor) > this.journal.seq) {
+      throw new Error('Invalid publication outbox snapshot');
+    }
+    const pending = saved.pending.map(parseItem);
+    const batches = saved.batches.map(value => {
+      const batch = object(value);
+      if (batch.schemaVersion !== 1 || batch.status !== 'prepared' ||
+          batch.remotePublished !== false || !Array.isArray(batch.items) || !batch.items.length) {
+        throw new Error('Invalid publication batch snapshot');
       }
+      return {...batch, items: batch.items.map(parseItem)} as unknown as PublicationBatch;
     });
-    this.flushFullBatches();
-    this.schedule();
+    for (const [key, value] of saved.tokens) {
+      const token = object(value);
+      object(token.data);
+      if (typeof key !== 'string' || typeof token.item !== 'string' ||
+          typeof token.line !== 'string' || typeof token.source !== 'string') {
+        throw new Error('Invalid publication token snapshot');
+      }
+    }
+    for (const [key, value] of saved.blocked) {
+      const failure = object(value);
+      if (typeof key !== 'string' || failure.sourceToken !== key ||
+          !Number.isSafeInteger(failure.sourceEventSeq) || typeof failure.at !== 'number' ||
+          typeof failure.error !== 'string') throw new Error('Invalid blocked publication snapshot');
+    }
+    for (const [seq, queued] of saved.queued) {
+      if (!Number.isSafeInteger(seq) || !queued || typeof queued !== 'object' ||
+          queued.event?.kind !== 'token.finished' || queued.event.seq !== seq ||
+          queued.event.status !== 'published') throw new Error('Invalid queued publication snapshot');
+    }
+    this.indexedSeq = Number(saved.indexedSeq);
+    this.tokens = saved.tokens;
+    this.queued = saved.queued;
+    this.acceptedQueued.clear();
+    // The immutable manifests and index remain authoritative. They may be
+    // newer than a periodic SQLite snapshot (including a manifest/index crash).
+    const durable = this.diskState ?? {cursor: Number(saved.cursor), pending,
+      blocked: saved.blocked as Map<string, BlockedPublication>,
+      batches};
+    this.cursor = Math.max(Number(saved.cursor), durable.cursor);
+    this.pending = structuredClone(durable.pending);
+    this.blocked.clear();
+    for (const [key, value] of durable.blocked) this.blocked.set(key, structuredClone(value));
+    this.batches.splice(0, this.batches.length, ...structuredClone(durable.batches));
+    this.knownDigests.clear();
+    for (const batch of this.batches) for (const item of batch.items) this.knownDigests.add(item.contentDigest);
+    this.pending = this.pending.filter(item => !this.knownDigests.has(item.contentDigest));
+    for (const item of this.pending) this.knownDigests.add(item.contentDigest);
+    if (this.diskState) {
+      for (const seq of this.queued.keys()) if (seq <= this.diskState.cursor) this.queued.delete(seq);
+    }
+  }
+
+  start(): void {
+    if (this.started || this.closed || this.issue || process.env.FACTORY_READONLY === '1') return;
+    this.started = true;
+    try {
+      fs.mkdirSync(this.recordsDir, {recursive: true});
+      for (const batch of this.batches) for (const item of batch.items) this.verifySnapshot(item);
+      this.acceptQueued();
+      this.persist();
+      this.unsubscribe = this.journal.subscribe(event => {
+        try {
+          this.observe(event);
+          if (event.kind === 'token.finished' && event.status === 'published') {
+            this.acceptQueued();
+            this.persist();
+            this.flushFullBatches();
+            this.schedule();
+          }
+        } catch (error) {
+          this.suspend(error);
+        }
+      });
+      this.flushFullBatches();
+      this.schedule();
+    } catch (error) {
+      this.suspend(error);
+    }
   }
 
   status() {
@@ -215,7 +319,7 @@ export class PublicationOutbox {
     this.unsubscribe();
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    if (!this.issue) this.persist();
+    if (this.started && !this.issue) this.persist();
   }
 
   /** Optional preparation must never take down the workflow or overwrite its evidence. */
@@ -229,9 +333,12 @@ export class PublicationOutbox {
     this.batches.length = 0;
     this.blocked.clear();
     this.knownDigests.clear();
+    this.acceptedQueued.clear();
   }
 
-  private observe(event: Stamped): void {
+  observe(event: Stamped): void {
+    if (event.seq <= this.indexedSeq) return;
+    this.indexedSeq = event.seq;
     if (event.kind === 'token.created') {
       this.tokens.set(event.token, {item: event.item, line: event.line,
         source: event.source, data: {}});
@@ -243,17 +350,28 @@ export class PublicationOutbox {
         }
       }
     } else if (event.kind === 'token.finished' && event.status === 'published' && event.seq > this.cursor) {
-      if (event.node === 'curation/published') {
-        this.accept(event.token, event.seq, event.run, event.at);
-      }
+      this.queued.set(event.seq, {event, token: structuredClone(this.tokens.get(event.token))});
       this.cursor = event.seq;
-      this.persist();
     }
   }
 
-  private accept(sourceToken: string, sourceEventSeq: number, runId: string, at: number): void {
+  private acceptQueued(): void {
+    for (const [seq, queued] of this.queued) {
+      if (this.acceptedQueued.has(seq)) continue;
+      const event = queued.event;
+      if (event.node === 'curation/published') {
+        this.accept(event.token, event.seq, event.run, event.at, queued.token ?? null);
+      }
+      // Keep the original event and its data until the index rename succeeds.
+      // A suspended outbox can still be captured by the SQLite snapshot writer.
+      this.acceptedQueued.add(seq);
+    }
+  }
+
+  private accept(sourceToken: string, sourceEventSeq: number, runId: string, at: number,
+      pendingToken: PendingToken | null | undefined = this.tokens.get(sourceToken)): void {
     try {
-      const token = this.tokens.get(sourceToken);
+      const token = pendingToken;
       if (!token || !['candidates', 'curation'].includes(token.line) ||
           token.source.startsWith('channel:') || token.data.importSource) {
         this.blocked.delete(sourceToken);
@@ -358,8 +476,14 @@ export class PublicationOutbox {
   }
 
   private persist(): void {
-    atomicJson(this.indexPath, {schemaVersion: 1, cursor: this.cursor,
+    let cursor = this.cursor;
+    for (const seq of this.queued.keys()) {
+      if (!this.acceptedQueued.has(seq)) cursor = Math.min(cursor, seq - 1);
+    }
+    atomicJson(this.indexPath, {schemaVersion: 1, cursor,
       pending: this.pending, blocked: [...this.blocked.values()]});
+    for (const seq of this.acceptedQueued) this.queued.delete(seq);
+    this.acceptedQueued.clear();
   }
 
   private schedule(): void {

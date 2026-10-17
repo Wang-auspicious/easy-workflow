@@ -1,0 +1,92 @@
+{
+  "command": "FACTORY_KERNEL=v1 npm test",
+  "tests": 779,
+  "pass": 759,
+  "fail": 20,
+  "skipped": 0,
+  "durationMs": 786426.8555,
+  "status": "failed; includes parent subtest counts",
+  "leafFailures": [
+    {
+      "test": "test/model-circuit.test.ts",
+      "name": "a Pi station waiting on another provider preserves paid tool context and resumes only after that dependency recovers",
+      "category": "old_C_contract_assertion"
+    },
+    {
+      "test": "test/pi.test.ts",
+      "name": "a real Pi Agent submits through the schema and repairs failed checks",
+      "category": "old_C_contract_assertion"
+    },
+    {
+      "test": "test/recovery.test.ts",
+      "name": "channel with paused website batch",
+      "category": "EPERM"
+    },
+    {
+      "test": "test/station-activity.test.ts",
+      "name": "request/wait/output boundaries are journaled while live, with concurrent stations and HTTP tools",
+      "category": "fetch_forbidden_port"
+    },
+    {
+      "test": "test/station-activity.test.ts",
+      "name": "cancellation during waiting closes only observed intervals and never commits output",
+      "category": "fetch_forbidden_port"
+    },
+    {
+      "test": "test/station-activity.test.ts",
+      "name": "cancellation during output closes only observed intervals and never commits output",
+      "category": "fetch_forbidden_port"
+    },
+    {
+      "test": "test/station-activity.test.ts",
+      "name": "cancellation during tools closes only observed intervals and never commits output",
+      "category": "fetch_forbidden_port"
+    },
+    {
+      "test": "test/station-activity.test.ts",
+      "name": "socket failure after completed tools continues the same transcript once and retains usage and trace",
+      "category": "fetch_forbidden_port"
+    },
+    {
+      "test": "test/station-activity.test.ts",
+      "name": "a second socket failure stops without a whole-station retry",
+      "category": "fetch_forbidden_port"
+    },
+    {
+      "test": "test/station-activity.test.ts",
+      "name": "continuation shares the original deadline and cancellation interrupts backoff",
+      "category": "fetch_forbidden_port"
+    },
+    {
+      "test": "test/station-activity.test.ts",
+      "name": "SQLite reopen and a later run preserve historical intervals and station filters",
+      "category": "fetch_forbidden_port"
+    },
+    {
+      "test": "test/station-deadlines.test.ts",
+      "name": "provider recovery resumes the saved tool receipt across station attempts",
+      "category": "old_C_contract_assertion"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "name": "SystemOne null and low-confidence answers fail; strong negatives and low scores with high confidence remain valid",
+      "category": "EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "name": "SystemOne retains output-schema, preserve-input and review gates and propagates cancellation",
+      "category": "EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "name": "parallel workflow writers are rejected before replacing the installed index and on reload",
+      "category": "EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "name": "workflow Agent defaults are validated, versioned and forwarded without changing other stations",
+      "category": "EPERM"
+    }
+  ],
+  "note": "C contract assertions updated without weakening operation/time checks; forbidden-port fixture repaired separately; Windows install rename failure also existed before BCDE. A clean full rerun follows."
+}

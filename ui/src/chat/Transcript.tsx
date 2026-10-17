@@ -33,6 +33,7 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
   /** null = 每张卡片各记各的；true/false = 全部展开 / 全部收起。 */
   const [toolsOpen, setToolsOpen] = useState<boolean | null>(null);
   useStore((s) => s.version);
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
   const now = useNow(2000);
   const state = getState();
   const items = useMemo(
@@ -40,7 +41,7 @@ export function Transcript({ entries, live, dispatcher, onResize }: {
       // 主调度这一格只放你和主调度的对话；工位的播报在各自的群和画布上。
       entries, live, dispatcher, notes: [], factory: state.factory, station: stationLook(state.factory, state.fs, state.layout.bots, now),
     }),
-    [entries, entries.length, live, dispatcher, state.fs.activity, state.factory, state.version, now],
+    [entries, entries.length, live, dispatcher, state.fs.activity, state.factory, state.version, now, kernel],
   );
   const tools = items.reduce((n, item) => n + (item.parts?.filter((p) => p.type === "tool").length ?? 0), 0);
   useLayoutEffect(() => {

@@ -14,13 +14,14 @@ import { CorrectionPopover } from "../board/Correction.tsx";
 import { Transcript } from "./Transcript.tsx";
 import { Avatar } from "./Avatar.tsx";
 import { RoomList, useRooms } from "./RoomRail.tsx";
-import { RoomLog } from "./RoomLog.tsx";
+import { RoomLog, KernelProgressLog } from "./RoomLog.tsx";
 import { GroupAvatar } from "./GroupAvatar.tsx";
 import { ROOT_ROOM } from "../../../shared/rooms.ts";
 import { dispatcherState, DISPATCHER_HUE } from "./transcript.ts";
 import { useNow } from "../util/useNow.ts";
 import "./activity.css";
 import "./composer.css";
+import {KernelSummary, ProgressToggle} from '../KernelPanels.tsx';
 
 const SUGGEST = [
   "从候选库取 10 个「UI 组件与设计系统」开始入库",
@@ -107,6 +108,7 @@ export function Chat() {
       <div style={{ display: open ? "contents" : "none" }}>
         <div className={`chat-resize ${drag ? "is-drag" : ""}`} onPointerDown={startResize} />
         <ChatHead />
+        <KernelSummary />
         {list ? <RoomList /> : <ChatPane />}
         {!list && isRoot && <Composer inputRef={composer} />}
       </div>
@@ -187,6 +189,8 @@ function RootLog({ entries, live, dispatcher }: {
   dispatcher: Parameters<typeof Transcript>[0]["dispatcher"];
 }) {
   const patches = useStore((s) => s.fs.patches);
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
+  const showProgress = useStore(state => state.showProgress);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const followBottom = useCallback(() => {
@@ -197,9 +201,11 @@ function RootLog({ entries, live, dispatcher }: {
   const onScroll = () => { const el = ref.current!; stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; };
   return (
     <section className="chat-pane" aria-label="与主调度的对话">
+      {kernel === 'v2' && <ProgressToggle />}
       <div className="chat-log" ref={ref} onScroll={onScroll}>
         {!entries.length && !live.id && <Empty />}
         <Transcript entries={entries} live={live} dispatcher={dispatcher} onResize={followBottom} />
+        {kernel === 'v2' && showProgress && <KernelProgressLog />}
         <ChatRecovery />
         {live.id && !live.message && dispatcher.status !== "recovering" && <div className="pi-waiting"><Loader2 size={12} className="spin-i" />主调度正在处理，可继续补充要求…</div>}
         {patches.filter(patch => patch.status === 'proposed').map(patch => <PatchCard key={patch.id} patch={patch} />)}
@@ -273,6 +279,8 @@ function ChatRecovery() {
 }
 
 function Empty() {
+  const kernel = useStore(state => state.kernel);
+  const suggestions = kernel === 'v2' ? SUGGEST.map(text => text === '给组件特写摄影加一个人' ? '查看等待预算和讨论的工位' : text) : SUGGEST;
   return (
     <div className="chat-intro">
       <div className="msg msg--assistant">
@@ -280,7 +288,7 @@ function Empty() {
         <div className="body">贴入网址，描述你的目标。<br />我来编排工作，你随时查看过程。</div>
       </div>
       <div className="chat-suggest">
-        {SUGGEST.map((s) => <button key={s} onClick={() => setState({ draft: s })}>{s}</button>)}
+        {suggestions.map((s) => <button key={s} onClick={() => setState({ draft: s })}>{s}</button>)}
       </div>
     </div>
   );

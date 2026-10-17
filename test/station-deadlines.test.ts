@@ -98,7 +98,19 @@ test("station clocks: real Pi requests and tools may outlive the old whole-loop 
       assert.equal(recovered.ok,true,recovered.error ?? 'checkpoint recovery failed');
       assert.equal(current.tools,1,'a provider disconnect must not repeat a completed page read');
       assert.match(JSON.stringify(current.requests.at(-1)),/long-tool-completed/);
-      assert.deepEqual(recovered.data?.stationSessions,{});
+      const sessions = recovered.data?.stationSessions as Record<string, {file: string; signature: string}>;
+      assert.deepEqual(Object.keys(sessions), ['curation/copy-review'], 'C keeps only the completed station session for later returns');
+      const prior = (failed.data?.stationSessions as typeof sessions)['curation/copy-review'];
+      assert.equal(sessions['curation/copy-review'].signature, prior.signature, 'provider recovery retains the original signed contract');
+      const retained = JSON.parse(fs.readFileSync(path.join(dir, sessions['curation/copy-review'].file), 'utf8'));
+      assert.equal(retained.signature, prior.signature);
+      assert.deepEqual(JSON.parse(retained.submitSummary), {value: 7});
+      assert.equal(retained.messages.filter((message: {role: string; toolName?: string; content?: unknown}) =>
+        message.role === 'toolResult' && message.toolName === 'env_call' && JSON.stringify(message.content).includes('long-tool-completed')).length, 1,
+      'the saved conversation contains exactly one completed paid tool receipt');
+      assert.ok(retained.messages.some((message: {role: string; content: {type?: string; name?: string; arguments?: unknown}[]}) =>
+        message.role === 'assistant' && message.content.some(part => part.type === 'toolCall' && part.name === 'submit' &&
+          JSON.stringify(part.arguments) === JSON.stringify({value: 7}))), 'the retained conversation includes the accepted submit');
     });
     await t.test("an explicit work deadline stays absolute and is never extended for recovery", async () => {
       const current = { requests: [] as any[], tools: 0, progress: [] as string[], hold: 1 }; scenarios.set("work-limit", current);

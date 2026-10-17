@@ -1,0 +1,21 @@
+{
+  "ok": true,
+  "kind": "isolated UI fixture, not live-model acceptance",
+  "groups": [
+    "主调度\n总台",
+    "分类\n工序",
+    "三屏\n工序",
+    "风格\n工序",
+    "事实\n工序",
+    "文案\n工序"
+  ],
+  "checked": [
+    "summary-attention",
+    "field-conversation",
+    "claim-evidence-chain",
+    "progress-toggle-persistence",
+    "lesson-deletion",
+    "canvas-wait-colors",
+    "v2-worker-controls-hidden"
+  ]
+}

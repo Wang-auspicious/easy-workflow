@@ -9,7 +9,7 @@ export class ModelCircuits {
 
   constructor(factory: Factory) {
     this.factory = factory;
-    factory.broker.modelCircuits = factory.state.modelCircuits;
+    if (factory.kernel === 'v1') factory.broker.modelCircuits = factory.state.modelCircuits;
   }
 
   get(dependency: ModelDependency) {

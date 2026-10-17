@@ -1,0 +1,283 @@
+{
+  "command": "FACTORY_KERNEL=v1 npm test",
+  "sourceCommit": "5771d7b",
+  "conditions": "No concurrent build or browser acceptance run",
+  "tests": 780,
+  "pass": 743,
+  "fail": 37,
+  "skipped": 0,
+  "durationMs": 736535.0467,
+  "status": "failed; not a successful full-suite acceptance",
+  "categories": {
+    "windows_install_rename_EPERM": 35,
+    "native_launcher_exit_1_unresolved": 1,
+    "same_millisecond_FIFO_fixed": 1
+  },
+  "failures": [
+    {
+      "test": "test/channels.test.ts",
+      "line": 77,
+      "name": "channel snapshots preserve an unconsumed emission independently of a newer factory projection",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 134,
+      "name": "source snapshots restore request limits and candidates without completing a delivery during replay",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 169,
+      "name": "one committed batch deduplicates repeated emissions using the payload at each emission",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 186,
+      "name": "historical deliveries add at most one active child and respect global and line pauses",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 204,
+      "name": "emission survives a failed pending commit and is queued once on restart",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 226,
+      "name": "child creation and delivered receipt roll back together and recover without duplicate creation",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 250,
+      "name": "committed child identity is adopted when a legacy journal lacks its delivered receipt",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 268,
+      "name": "completed child is acknowledged after an ack commit fails without repeating work",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 290,
+      "name": "legacy emitter inventory and repeated emissions migrate exactly once",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 309,
+      "name": "retry survives restart, preserves paid results and evidence, and keeps parent and child identities separate",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 350,
+      "name": "a failed child without a durable checkpoint is blocked rather than restarted from its entrance",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 361,
+      "name": "component continuations are finite, unique and discard prior batch execution output",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 391,
+      "name": "unmanaged source and channel backlogs share a bounded flow window without starvation",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 436,
+      "name": "a due channel checkpoint shares live source and channel intake without replaying its paid upstream",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 510,
+      "name": "continuous sources rotate admissions while keeping reputation order inside each source",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 537,
+      "name": "source admission bypasses an unrelated paused root but bounds a shared paused downstream frontier",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 579,
+      "name": "channel resume and new delivery isolate unrelated paused children without multiplying the live child slot",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 635,
+      "name": "source failure classification survives restart and retry reuses its completed upstream checkpoint",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 684,
+      "name": "sources reject middle stations, terminal stores, connected lines and fractional rate limits",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 707,
+      "name": "a source terminal result in the same committed batch is acknowledged and retry lineage cannot lose completion",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 748,
+      "name": "source delivery is bounded, respects pauses and rolls back a failed claim before restart",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 824,
+      "name": "manual and parked records retain their backlog without consuming source execution slots",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 873,
+      "name": "source login, timeout, persisted quotas and backlog affect only the configured source",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 926,
+      "name": "a downstream rejection resolves its source backlog without counting as publication",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/channels.test.ts",
+      "line": 953,
+      "name": "source HTTP collection shares capacity and releases it after cancellation",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/dispatcher-recovery.test.ts",
+      "line": 196,
+      "name": "native dispatcher cancellation and restart preserve the captured client, queued input and mutation receipts",
+      "category": "native_launcher_exit_1_unresolved"
+    },
+    {
+      "test": "test/kernel-graph.test.ts",
+      "line": 534,
+      "name": "E resource waits are durable, do not spam receipts, and resume after a real broker lease is released",
+      "category": "same_millisecond_FIFO_fixed"
+    },
+    {
+      "test": "test/recovery.test.ts",
+      "line": 590,
+      "name": "a policy deadline expires queued work after restart without executing or losing manual recovery",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "line": 72,
+      "name": "SystemOne manifests are typed program contracts with bounded static questions and no connection secrets",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "line": 141,
+      "name": "SystemOne null and low-confidence answers fail; strong negatives and low scores with high confidence remain valid",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "line": 178,
+      "name": "SystemOne retains output-schema, preserve-input and review gates and propagates cancellation",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "line": 237,
+      "name": "parallel workflow writers are rejected before replacing the installed index and on reload",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "line": 260,
+      "name": "workflow recovery policies validate atomically and binding overrides affect the compiled graph",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "line": 294,
+      "name": "spec validation rejects unbounded returns and ambiguous edge identities without replacing an installed workflow",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "line": 321,
+      "name": "I/O unions accept every declared output alternative and reject a downstream missing one",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "line": 344,
+      "name": "ordered replacement and independent token entries keep their actual data semantics",
+      "category": "windows_install_rename_EPERM"
+    },
+    {
+      "test": "test/workflow-packs.test.ts",
+      "line": 641,
+      "name": "Node exports, accepted patches and live-idle guards are checked before changing the installed index",
+      "category": "windows_install_rename_EPERM"
+    }
+  ],
+  "followup": {
+    "sameMillisecondFIFO": {
+      "commit": "3dd597b",
+      "status": "fixed; deterministic old-code failure and corrected-code pass",
+      "command": "node --test --test-concurrency=1 test/kernel-graph.test.ts test/kernel-retry.test.ts test/board.test.ts",
+      "pass": 55,
+      "fail": 0,
+      "durationMs": 7230
+    },
+    "nativeDispatcher": {
+      "status": "cause unproven; no production changes",
+      "completeFile": {
+        "pass": 5,
+        "fail": 0,
+        "durationMs": 7647
+      },
+      "boundedTargetReruns": [
+        {
+          "pass": 1,
+          "fail": 0,
+          "durationMs": 4066
+        },
+        {
+          "pass": 1,
+          "fail": 0,
+          "durationMs": 3856
+        },
+        {
+          "pass": 1,
+          "fail": 0,
+          "durationMs": 3938
+        }
+      ],
+      "diagnostic": "Temporary child exception monitor observed no exception; original test bytes restored"
+    },
+    "windowsInstallRename": {
+      "status": "unresolved; installer unchanged in BCDE; same symptom observed before BCDE",
+      "location": "server/workflow-packs.ts:469",
+      "channelBeforeHookFailures": 25,
+      "otherFailures": 10
+    }
+  },
+  "note": "Subsequent targeted passes do not replace the failed complete run. No third full run, blanket retries, skipped tests or loosened business acceptance checks."
+}

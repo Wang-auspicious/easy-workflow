@@ -225,9 +225,9 @@ function definitions(f: Factory): Tool[] {
             const x = f.runtime.stationNumbers(n.key);
             return { key: n.key, name: n.name, queue: st?.queue.length ?? 0, active: st?.active.length ?? 0, workers: st?.workers.length ?? 0, processed: st?.processed ?? 0, failed: st?.failed ?? 0, returned: st?.returned ?? 0, medianS: +(median(st?.durations ?? []) / 1000).toFixed(1), takt: +x.takt.toFixed(1), waiting: s.resources.waiting[n.key] };
           }).filter((x) => x.queue || x.active || x.processed || x.failed || x.returned);
-          const bottleneck = f.runtime.lineTakt("curation");
+          const bottleneck = f.kernel === 'v2' ? {at: undefined, takt: 0} : f.runtime.lineTakt("curation");
           return ok({
-            run: { ...s.run, elapsedMin: +(elapsed(s.run, now) / 60000).toFixed(1) }, totals: {...s.totals,
+            kernel: f.kernel, run: { ...s.run, elapsedMin: +(elapsed(s.run, now) / 60000).toFixed(1) }, totals: {...s.totals,
               published:items.filter(t=>t.status==="published").length,parked:items.filter(t=>t.status==="parked").length,
               manual:items.filter(t=>t.status==="manual").length,merged:items.filter(t=>t.status==="merged").length,rejected:items.filter(t=>t.status==="rejected").length,
               failedAttempts:stations.reduce((n,station)=>n+station.failed,0)},
@@ -255,6 +255,27 @@ function definitions(f: Factory): Tool[] {
         name: 'run_batch', label: '持续托管本轮目标', description: 'Persist a total unique-site target for this run. The backend refills idle intake stages with bounded in-flight work and retries transient failures from checkpoints, without a chat polling loop. Existing sites in the run count toward target. Pause/resume preserve progress; stop disables further admission and automatic retries, leaving current work running.',
         parameters: object({ action: choice('start','configure','status','pause','resume','stop'), target: Type.Optional(Type.Integer({minimum:1,maximum:10000})), flow: Type.Optional(Type.Boolean()), maxInFlight: Type.Optional(Type.Integer({minimum:1,maximum:40})), intakeWindow: Type.Optional(Type.Integer({minimum:1,maximum:20})), category: Type.Optional(name()), query: Type.Optional(name()), candidateIds: Type.Optional(Type.Array(name(), {minItems: 1, maxItems: 10000})) }),
         execute: async (_id, p, actor) => {
+          if (f.kernel === 'v2') {
+            if (p.action === 'configure') {
+              if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '入场上限由用户选择');
+              if (p.maxInFlight !== undefined) f.saveSettings({maxActiveItems: p.maxInFlight});
+            } else if (p.action === 'start') {
+              if (!p.target) throw new ControlError(400, 'missing_target', '请提供本轮总目标数量');
+              await f.ensureReady();
+              if (!f.runtime.running) f.runtime.start(`候选 × ${p.target}`);
+              const tokens = f.pull(p.target, {category: p.category, query: p.query, candidateIds: p.candidateIds});
+              f.runtime.resume();
+              return ok({kernel: 'v2', queued: tokens.length, maxActiveItems: f.settings.maxActiveItems,
+                tokens: tokens.map(token => token.id)}, '目标已持久排队，按资源和入场上限执行');
+            } else if (p.action === 'resume') {
+              await f.ensureReady();
+              f.runtime.resume();
+            } else if (p.action === 'pause' || p.action === 'stop') f.runtime.pause();
+            const items = latestRunTokens(f.state);
+            return ok({kernel: 'v2', paused: f.runtime.paused, total: items.length,
+              terminal: items.filter(token => token.status !== 'active').length,
+              maxActiveItems: f.settings.maxActiveItems}, '读取或更新 v2 持久队列');
+          }
           if (p.action === 'status') return ok(batchSummary(f.state), '读取持久任务目标');
           if (p.action === 'configure') {
             if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '流水线入场上限由用户选择，自动调度在该上限内调整');
@@ -294,7 +315,7 @@ function definitions(f: Factory): Tool[] {
           }
           if (p.action === "start") { if (!f.runtime.running) await f.ensureReady(); f.runtime.start(p.title ?? "新一轮"); }
           else if (p.action === "pause") f.runtime.pause();
-          else if (p.action === "resume") { await f.ensureReady(); if (f.state.batch?.runId === f.state.run.id && f.state.batch.mode === 'paused') f.batch.setMode('running'); else f.runtime.resume(); }
+          else if (p.action === "resume") { await f.ensureReady(); if (f.kernel === 'v1' && f.state.batch?.runId === f.state.run.id && f.state.batch.mode === 'paused') f.batch.setMode('running'); else f.runtime.resume(); }
           else { const { endRun } = await import("./report.ts"); await endRun(f); }
           return ok({ ...f.state.run }, `本轮：${p.action}`);
         },
@@ -305,6 +326,15 @@ function definitions(f: Factory): Tool[] {
         if(!p.id)throw new ControlError(400,'missing_measurement','需要建议 id');
         return ok(f.runtime.decideMeasurement(p.id,p.action==='accept'),'已记录配员决定');
       }},
+      {
+        name: 'continue_budget', label: '继续交接会话',
+        description: 'The owner doubles this waiting station budget and resumes its saved conversation.',
+        parameters: object({item: name(), node: name()}),
+        execute: async (_id, p, actor) => {
+          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '预算交接由用户点击继续');
+          return ok(f.continueAgentBudget(p.item, p.node), '预算已加倍，从原会话继续');
+        },
+      },
       { name:'undo_correction',label:'撤销尚未执行的纠错',description:'Restore the durable snapshot of a correction before any new attempt has run. Executed corrections are rejected; all audit events are retained.',parameters:object({correction:name()}),execute:async(_id,p)=>ok(f.runtime.undoCorrection(p.correction),'已撤销未执行的纠错') },
       {
         name: 'candidate_failures',
@@ -454,7 +484,7 @@ function definitions(f: Factory): Tool[] {
       },
       {
         name: "settings", label: "读取 / 更新资源设置", description: "Read settings, or update supplied resource limits. model limits Pi requests and native client calls; modelWorkers independently limits model-class station lifetimes, including tool waits. Browser pages shrink automatically while free memory is short.",
-        parameters: object({ values: Type.Optional(object({ browser: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })), model: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })), modelWorkers: Type.Optional(Type.Integer({minimum: 1, maximum: 64})), cpu: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })), http: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })), memoryFloorMB: Type.Optional(Type.Integer({ minimum: 0 })), socialPerMinute: Type.Optional(Type.Integer({ minimum: 1, maximum: 6 })), socialPerDay: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })) })) }),
+        parameters: object({ values: Type.Optional(object({ browser: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })), model: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })), modelWorkers: Type.Optional(Type.Integer({minimum: 1, maximum: 64})), cpu: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })), http: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })), memoryFloorMB: Type.Optional(Type.Integer({ minimum: 0 })), socialPerMinute: Type.Optional(Type.Integer({ minimum: 1, maximum: 6 })), socialPerDay: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })), maxActiveItems: Type.Optional(Type.Integer({minimum: 1, maximum: 200})), kernel: Type.Optional(choice('v1', 'v2')) })) }),
         execute: async (_id, p) => { if (p.values) f.saveSettings(p.values); return ok(f.settings, "读取 / 更新资源设置"); },
       },
       {
@@ -511,6 +541,15 @@ function definitions(f: Factory): Tool[] {
           const summary = p.view === 'summary' ? compactReport(selected) : undefined;
           if (p.view === 'summary' && !summary) throw new ControlError(500, 'report_summary_invalid', '报告结构无法生成摘要');
           return ok(summary ?? selected, p.station ? `读取 ${p.station} 的工作报告` : "读取工作报告");
+        },
+      },
+      {
+        name: 'delete_shared_lesson', label: '删除生效经验',
+        description: 'User removes a shared station lesson. Its journal history remains available for audit.',
+        parameters: object({id: name()}),
+        execute: async (_id, p, actor) => {
+          if (actor !== 'user') throw new ControlError(403, 'owner_decision_required', '经验由用户删除');
+          return ok(f.lessons.deleteShared(p.id), '经验已停止注入');
         },
       },
       {

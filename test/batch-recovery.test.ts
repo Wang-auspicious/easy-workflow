@@ -1157,7 +1157,7 @@ test('publication outbox batches only digest-bound local gate publications and k
   }
 });
 
-test('publication outbox resumes pending files and missed events, deduplicates manifest recovery and flushes by age', async () => {
+test('publication outbox resumes pending files and missed events, deduplicates manifest recovery and flushes by age', async t => {
   const {Journal} = await import('../server/journal.ts');
   const {PublicationOutbox} = await import('../server/publication-outbox.ts');
   const {createHash} = await import('node:crypto');
@@ -1178,23 +1178,53 @@ test('publication outbox resumes pending files and missed events, deduplicates m
       status: 'published', reason: 'Passed current gate'});
   };
   publish('historical');
+  const offline = new PublicationOutbox(project, journal, {deferReplay: true});
+  for (const event of journal.read()) offline.observe(event);
+  offline.close();
+  assert.equal(fs.existsSync(path.join(project, 'work', 'publication-batches')), false,
+    'offline replay and close do not create publication files');
   let outbox = new PublicationOutbox(project, journal, {maxWaitMs: 50});
   try {
     assert.equal(outbox.status().pending.length, 0, 'first installation does not requeue historical output');
     publish('first');
+    const snapshot = outbox.serialize();
+    const snapshotSeq = journal.seq;
     outbox.close();
     publish('while-closed');
-    outbox = new PublicationOutbox(project, journal, {maxWaitMs: 50});
-    assert.equal(outbox.status().pending.length, 2, 'pending data and committed missed events both survive restart');
+    journal.append({kind: 'token.data', token: 'while-closed', patch: {gate: 'later value'}});
     const indexPath = path.join(project, 'work', 'publication-batches', 'outbox.json');
+    const replayCheckpoint = fs.readFileSync(indexPath);
+    const replayRecords = fs.readdirSync(path.join(project, 'work', 'publication-batches', 'records'));
+    outbox = new PublicationOutbox(project, journal, {maxWaitMs: 50, deferReplay: true});
+    outbox.restore(snapshot);
+    for (const event of journal.read(snapshotSeq)) {
+      outbox.observe(event);
+      outbox.observe(event);
+    }
+    const queuedSnapshot = outbox.serialize();
+    outbox.close();
+    outbox = new PublicationOutbox(project, journal, {maxWaitMs: 50, deferReplay: true});
+    outbox.restore(queuedSnapshot);
+    assert.deepEqual(fs.readFileSync(indexPath), replayCheckpoint,
+      'snapshot restore and tail observation never persist publication state');
+    assert.deepEqual(fs.readdirSync(path.join(project, 'work', 'publication-batches', 'records')), replayRecords,
+      'queued publications remain unprocessed until start');
+    outbox.start();
+    outbox.start();
+    assert.equal(outbox.status().pending.length, 2,
+      'pending data and missed events retain the gate data at publication, before later patches');
     const beforeFlush = fs.readFileSync(indexPath);
+    const beforeFlushSnapshot = outbox.serialize();
+    const beforeFlushSeq = journal.seq;
     const batch = outbox.flush();
     assert.equal(batch?.items.length, 2);
     assert.equal(batch?.reason, 'manual');
     outbox.close();
     // Reproduce a crash between manifest rename and pending-index replacement.
     fs.writeFileSync(indexPath, beforeFlush);
-    outbox = new PublicationOutbox(project, journal, {maxWaitMs: 50});
+    outbox = new PublicationOutbox(project, journal, {maxWaitMs: 50, deferReplay: true});
+    outbox.restore(beforeFlushSnapshot);
+    outbox.start();
     assert.equal(outbox.status().pending.length, 0);
     assert.equal(outbox.status().batches.length, 1);
     journal.append({kind: 'token.finished', token: 'first', node: 'curation/published',
@@ -1206,6 +1236,36 @@ test('publication outbox resumes pending files and missed events, deduplicates m
     assert.equal(outbox.status().batches.length, 2);
     assert.equal(outbox.status().batches[1].reason, 'timeout');
     assert.equal(outbox.status().batches.every(batch => batch.remotePublished === false), true);
+    publish('disk-newer-pending');
+    outbox.close();
+    const newerCheckpoint = fs.readFileSync(indexPath);
+    outbox = new PublicationOutbox(project, journal, {deferReplay: true});
+    outbox.restore(beforeFlushSnapshot);
+    for (const event of journal.read(beforeFlushSeq)) outbox.observe(event);
+    assert.deepEqual(fs.readFileSync(indexPath), newerCheckpoint);
+    outbox.start();
+    assert.equal(outbox.status().batches.length, 2, 'newer disk manifests survive an older SQLite snapshot');
+    assert.deepEqual(outbox.status().pending.map(item => item.sourceToken), ['disk-newer-pending'],
+      'a newer disk cursor retains pending publications without reaccepting earlier tail events');
+    assert.equal(outbox.status().blocked.length, 0);
+    const rename = fs.renameSync;
+    const checkpointFault = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+      if (to === indexPath) throw new Error('Fixture publication checkpoint write failure');
+      rename(from, to);
+    });
+    publish('checkpoint-fault');
+    assert.equal(outbox.status().suspended, true);
+    const failedSnapshot = outbox.serialize();
+    outbox.close();
+    checkpointFault.mock.restore();
+    outbox = new PublicationOutbox(project, journal, {deferReplay: true});
+    outbox.restore(failedSnapshot);
+    outbox.start();
+    assert.equal(outbox.status().suspended, false);
+    assert.deepEqual(outbox.status().pending.map(item => item.sourceToken),
+      ['disk-newer-pending', 'checkpoint-fault'],
+      'a snapshot after an index-write failure must retain its unfinished publication despite an advanced cursor');
+    assert.equal(outbox.status().batches.length, 2);
     const prepared = outbox.status().batches[0];
     outbox.close();
     fs.writeFileSync(prepared.items[0].recordPath, 'Prepared snapshot was corrupted');

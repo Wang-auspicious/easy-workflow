@@ -14,8 +14,22 @@ import { classifyFailure, type Failure } from "../shared/failures.ts";
 import { visit } from "../packs/vislexicon/capture.ts";
 import { parseHtml } from "../packs/vislexicon/tools.ts";
 import {decideInCurrentAttempt, type DecisionRequest} from './decision-model.ts';
+import type {BoardPostInput} from '../shared/board.ts';
+import type {StationResult} from './runtime.ts';
 
-export interface EnvContext { node: string; token?: string; caseId?: string; signal: AbortSignal; progress?: (text: string, step?: { tool: string; text: string; ok?: boolean }) => void }
+export interface EnvContext {
+  node: string; token?: string; caseId?: string; signal: AbortSignal;
+  attempt?: string; toolCallId?: string; questionCheckpoint?: StationResult['sessionCheckpoint'];
+  progress?: (text: string, step?: { tool: string; text: string; ok?: boolean }) => void;
+  waitForRoom?<T>(action: () => Promise<T>): Promise<T>;
+}
+interface ToolboxDependencies {
+  journal: Journal; broker: Broker; docs: () => Docs;
+  board?: {
+    read(context: EnvContext, options: {field?: string; openOnly?: boolean}): unknown[];
+    post(context: EnvContext, input: BoardPostInput): Promise<unknown>;
+  };
+}
 interface Def { name: string; description: string; parameters: TSchema; run: (a: any, c: EnvContext) => Promise<unknown> }
 
 const S = (d: string, o: Record<string, unknown> = {}) => Type.String({ description: d, ...o });
@@ -31,8 +45,8 @@ const fail = (err: unknown, url?: string, tried?: string[]) => {
 
 export class Toolbox {
   private defs = new Map<string, Def>();
-  private deps: { journal: Journal; broker: Broker; docs: () => Docs };
-  constructor(deps: { journal: Journal; broker: Broker; docs: () => Docs }) {
+  private deps: ToolboxDependencies;
+  constructor(deps: ToolboxDependencies) {
     this.deps = deps;
     for (const d of this.definitions()) this.defs.set(d.name, d);
   }
@@ -48,7 +62,7 @@ export class Toolbox {
     return {
       ok: true,
       tools: allowed.map((n) => ({ name: n, description: this.defs.get(n)?.description.split("。")[0] })),
-      environment: "网络走统一出口（自动代理、按主机限速、短暂错误自动重试一次、结果缓存 6 小时）。page_* 在共享浏览器里渲染页面，会自动拒绝 Cookie、隐藏浮层；遇到登录或验证会保留页面并亮红灯，你不需要也不能自己登录。证书错误不会被跳过。每次处理最多调用 10 次工具，用完请根据已有资料提交。",
+      environment: "网络走统一出口（自动代理、按主机限速、短暂错误自动重试一次、结果缓存 6 小时）。page_* 在共享浏览器里渲染页面，会自动拒绝 Cookie、隐藏浮层；遇到登录或验证会保留页面并亮红灯，你不需要也不能自己登录。证书错误不会被跳过。在本工位的 token 与时间预算内使用工具；完成后 submit，无法完成时 handoff。",
     };
   }
 
@@ -89,6 +103,20 @@ ${p.text}`);
 
   private definitions(): Def[] {
     return [
+      ...(this.deps.board ? [{
+        name: 'board_read', description: '读取本货最近 40 条黑板记录，按发言顺序排列。',
+        parameters: Type.Object({field: Type.Optional(Type.String()), openOnly: Type.Optional(Type.Boolean())}, {additionalProperties: false}),
+        run: async (options: {field?: string; openOnly?: boolean}, context: EnvContext) => ({posts: this.deps.board!.read(context, options)}),
+      }, {
+        name: 'board_post', description: '就本货字段向归属节点质疑、提问或回复；提问会等待答复后返回。',
+        parameters: Type.Object({
+          type: Type.Union(['challenge', 'answer', 'question', 'evidence', 'note'].map(value => Type.Literal(value))),
+          field: Type.String({minLength: 1}), body: Type.String({minLength: 1, maxLength: 2000}),
+          addressee: Type.Optional(Type.String()), target: Type.Optional(Type.String()),
+          evidence: Type.Optional(Type.Array(Type.String())),
+        }, {additionalProperties: false}),
+        run: (input: BoardPostInput, context: EnvContext) => this.deps.board!.post(context, input),
+      }] : []),
       {
         name: 'system_one',
         description: '调用服务器上的 Kev-9B 做文字分类、真假判断和评分，返回结构化概率。适合从已读到的材料中选择候选、筛查证据和发现矛盾；不看图片，不产生新事实，不代替最终复核。一次最多 8 题，state 请用直接相关的短原文；失败时继续自己判断，不把失败当作 false。',

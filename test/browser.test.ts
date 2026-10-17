@@ -19,11 +19,20 @@ test("independent service shares a persistent browser, retains auth failures and
   });
   await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));
   const url=`http://127.0.0.1:${(server.address() as {port:number}).port}`;
+  const require = createRequire(import.meta.url);
+  const playwrightRoot = path.dirname(require.resolve('playwright-core/package.json')) + path.sep;
+  const playwrightLoaded = () => Object.keys(require.cache).some(file => file.startsWith(playwrightRoot));
+  const loadedBeforeImport = playwrightLoaded();
   const {openPage,browserCommand,browserAttention,closeBrowser}=await import("../server/browser.ts");
   try{
-    const abort=new AbortController(),a=await openPage(undefined,undefined,abort.signal);
+    assert.equal(loadedBeforeImport, false);
+    assert.equal(playwrightLoaded(), false, 'importing the browser service must not load the browser automation runtime');
+    const abort=new AbortController();
+    const [a, b] = await Promise.all([openPage(undefined, undefined, abort.signal), openPage()]);
+    assert.strictEqual(a.context, b.context, 'concurrent first leases must share the pending persistent startup');
+    assert.equal(playwrightLoaded(), true, 'the runtime loads when a real page is requested');
     await a.context.addCookies([{name:"shared-fixture",value:"present",url,expires:Date.now()/1000+3600}]);
-    await a.page.goto(url);const b=await openPage();await b.page.goto(url);
+    await a.page.goto(url);await b.page.goto(url);
     assert.match(await b.page.evaluate(()=>document.cookie),/shared-fixture=present/);
     assert.equal((await browserCommand({action:"state"})).tabs.length,2);
     await browserAttention(b.page,"登录需要检查");await b.close();

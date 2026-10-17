@@ -1191,7 +1191,19 @@ test('a Pi station waiting on another provider preserves paid tool context and r
     assert.equal(requests.filter(request => request.provider === 'a').length, 4);
     assert.equal(requests.filter(request => request.provider === 'b').length, 2);
     assert.match(requests.filter(request => request.provider === 'a')[2].text, /retained-read/);
-    assert.equal((token.data.stationSessions as object | undefined) && Object.keys(token.data.stationSessions as object).length, 0);
+    const completedSessions = token.data.stationSessions as Record<string, {file: string; signature: string}>;
+    assert.deepEqual(Object.keys(completedSessions), ['curation/reader'], 'C retains exactly this station session for returns and questions');
+    const completed = JSON.parse(fs.readFileSync(path.join(factory.project.dir, completedSessions['curation/reader'].file), 'utf8'));
+    assert.equal(completed.signature, completedSessions['curation/reader'].signature);
+    assert.match(completed.signature, /^[a-f0-9]{64}$/);
+    assert.deepEqual(completed.evidence, [{url: 'https://retained.example/', text: 'retained-read'}]);
+    assert.deepEqual(JSON.parse(completed.submitSummary), {value: 7});
+    const completedTools = completed.messages.filter((message: {role: string}) => message.role === 'toolResult');
+    assert.match(JSON.stringify(completedTools), /retained-read/);
+    assert.match(JSON.stringify(completedTools), /helper-ready/);
+    assert.ok(completed.messages.some((message: {role: string; content: {type?: string; name?: string; arguments?: unknown}[]}) =>
+      message.role === 'assistant' && message.content.some(part => part.type === 'toolCall' && part.name === 'submit' &&
+        JSON.stringify(part.arguments) === JSON.stringify({value: 7}))), 'the retained transcript contains the accepted submit');
     assert.equal((token.data.modelWait as Record<string, unknown>)['curation/reader'], undefined,
       'a completed wait cannot later block a newly bound provider at this station');
     assert.equal(factory.broker.modelRequests.active, 0);

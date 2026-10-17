@@ -8,6 +8,7 @@ import { deriveRooms, ROOT_ROOM, speakersOf, talks } from "../../shared/rooms.ts
 import { buildRoomLines, routeComm, type RoomContext } from "../src/chat/rooms.ts";
 import { apply, initialState, type FactoryState } from "../../shared/project.ts";
 import type { Stamped } from "../../shared/types.ts";
+import {kernelRooms, kernelRoomLines, mergeKernelEvents} from '../src/kernel.ts';
 
 const factory = compile([pack]);
 const at = (seq: number, at: number) => ({ seq, at, run: "rooms-test" });
@@ -20,6 +21,42 @@ const build = (events: Stamped[]): FactoryState => {
   for (const event of events) apply(state, event);
   return state;
 };
+
+test('v2 groups follow the five declared fields and keep progress separate from conversation', () => {
+  const rooms = kernelRooms(factory);
+  assert.equal(rooms[0].kind, 'root');
+  assert.deepEqual(rooms.slice(1).map(room => room.name), ['分类', '三屏', '风格', '事实', '文案']);
+  const shots = rooms.find(room => room.id === 'field:shots.*')!;
+  const post = {id: 'challenge', item: 'item', seq: 1, at: 100, author: 'curation/shot-review', type: 'challenge' as const,
+    field: 'shots.proof', addressee: 'curation/proof', round: 0, body: 'The selected component is missing.', evidence: [], status: 'open' as const};
+  const events: Stamped[] = [
+    {...at(1, 100), kind: 'board.posted', post},
+    {...at(2, 101), kind: 'board.posted', post: {...post, id: 'claim', author: 'curation/proof', type: 'claim', body: 'Automatic completion'}},
+    {...at(3, 102), kind: 'attempt.started', token: 'item', node: 'curation/shot-review', attempt: 'review-attempt', worker: 'fixture', input: 'Review'},
+    {...at(4, 103), kind: 'attempt.progress', attempt: 'review-attempt', text: 'Checking the selected page.'},
+    {...at(5, 104), kind: 'board.posted', post: {...post, status: 'resolved'}},
+  ];
+  const state = initialState(factory);
+  apply(state, {...at(0, 99), kind: 'token.created', token: 'item', line: 'curation', item: 'Fixture', url: '', source: 'fixture'});
+  for (const event of events) apply(state, event);
+  const merged = mergeKernelEvents([], [...events, events[0]]);
+  assert.equal(merged.filter(event => event.kind === 'board.posted').length, 2, 'claim never enters the conversation event buffer');
+  const ctx = context(state);
+  const hidden = kernelRoomLines(shots, ctx, merged, false);
+  assert.equal(hidden.length, 1, 'updates change the existing post instead of repeating its body');
+  assert.equal(hidden[0].text, post.body);
+  assert.equal(hidden[0].note, 'resolved');
+  assert.equal(hidden[0].label, '质疑');
+  const visible = kernelRoomLines(shots, ctx, merged, true);
+  assert.ok(visible.some(line => line.label === '进展' && line.text === 'Checking the selected page.'));
+  assert.ok(!kernelRoomLines(rooms.find(room => room.id === 'field:facts.*')!, ctx, merged, true).length);
+  const noisy: Stamped[] = Array.from({length: 3000}, (_, index) => ({...at(index + 10, index + 200),
+    kind: 'attempt.progress', attempt: 'review-attempt', text: `Progress ${index}`}));
+  const retained = mergeKernelEvents(merged, noisy);
+  assert.equal(retained.filter(event => event.kind === 'attempt.progress').length, 1000);
+  assert.equal(kernelRoomLines(shots, ctx, retained, false)[0].text, post.body,
+    'hidden high-frequency progress must not evict a previously received challenge');
+});
 
 test("群组从流程图上推出来：每一段工序、声明的返工环、跨段移交都在", () => {
   const rooms = deriveRooms(factory);

@@ -8,6 +8,115 @@ import { legacyReply, type ConversationEntry } from "./conversation.ts";
 import { mergeActivity } from "./activity.ts";
 import {observedUsage} from './usage.ts';
 
+// Bump this whenever apply() changes meaning, so cached projections are rebuilt.
+export const PROJECTION_VERSION = 'p1';
+
+const SNAPSHOT_TAGS = new Set(['$map', '$set', '$undefined', '$object', '$nullObject', '$number']);
+
+function snapshotRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** JSON with explicit undefined and escaped user keys, including __proto__. */
+export function serializeSnapshot(value: unknown): string {
+  const visiting = new Set<object>();
+  const encode = (entry: unknown): unknown => {
+    if (entry === undefined) return {$undefined: true};
+    if (typeof entry === 'number' && (!Number.isFinite(entry) || Object.is(entry, -0))) {
+      return {$number: Object.is(entry, -0) ? '-0' : String(entry)};
+    }
+    if (entry === null || typeof entry === 'string' || typeof entry === 'number' || typeof entry === 'boolean') return entry;
+    if (typeof entry !== 'object') throw new TypeError('Unsupported snapshot value');
+    if (visiting.has(entry)) throw new TypeError('Circular snapshot value');
+    visiting.add(entry);
+    try {
+      if (entry instanceof Map) return {$map: [...entry].map(([key, item]) => [encode(key), encode(item)])};
+      if (entry instanceof Set) return {$set: [...entry].map(encode)};
+      // Most large payloads already contain only JSON data. Reuse those trees
+      // and copy only ancestors of values that need tagged encodings.
+      if (Array.isArray(entry)) {
+        let result = entry;
+        for (let index = 0; index < entry.length; index++) {
+          if (!Object.hasOwn(entry, index)) continue;
+          const encoded = encode(entry[index]);
+          if (!Object.is(encoded, entry[index])) {
+            if (result === entry) result = entry.slice();
+            result[index] = encoded;
+          }
+        }
+        return result;
+      }
+      if (!snapshotRecord(entry)) throw new TypeError('Unsupported snapshot object');
+      const keys = Object.keys(entry);
+      if (Object.getPrototypeOf(entry) === null || keys.some(key => SNAPSHOT_TAGS.has(key))) {
+        const pairs = keys.map(key => [key, encode(entry[key])]);
+        return Object.getPrototypeOf(entry) === null ? {$nullObject: pairs} : {$object: pairs};
+      }
+      let result = entry;
+      for (const key of keys) {
+        const encoded = encode(entry[key]);
+        if (!Object.is(encoded, entry[key])) {
+          if (result === entry) result = {...entry};
+          result[key] = encoded;
+        }
+      }
+      return result;
+    } finally {
+      visiting.delete(entry);
+    }
+  };
+  return JSON.stringify(encode(value));
+}
+
+/** Decode in a separate pass: JSON.parse revivers delete undefined properties. */
+export function deserializeSnapshot(body: string): unknown {
+  const decoded: unknown = JSON.parse(body);
+  const invalid = (): never => { throw new TypeError('Invalid snapshot encoding'); };
+  const decode = (entry: unknown): unknown => {
+    if (entry === null || typeof entry !== 'object') return entry;
+    if (Array.isArray(entry)) {
+      for (let index = 0; index < entry.length; index++) entry[index] = decode(entry[index]);
+      return entry;
+    }
+    if (!snapshotRecord(entry)) return invalid();
+    const keys = Object.keys(entry);
+    let tag: string | undefined;
+    for (const key of keys) if (SNAPSHOT_TAGS.has(key)) {
+      tag = key;
+      break;
+    }
+    if (tag === undefined) {
+      // JSON.parse made every key an own data property, including __proto__.
+      // Replacing that value cannot invoke the inherited prototype setter.
+      for (const key of keys) entry[key] = decode(entry[key]);
+      return entry;
+    }
+    if (keys.length !== 1) return invalid();
+    const payload = entry[tag];
+    if (tag === '$undefined') return payload === true ? undefined : invalid();
+    if (tag === '$number') {
+      if (payload === '-0') return -0;
+      if (payload === 'NaN') return NaN;
+      if (payload === 'Infinity') return Infinity;
+      if (payload === '-Infinity') return -Infinity;
+      return invalid();
+    }
+    if (!Array.isArray(payload)) return invalid();
+    if (tag === '$set') return new Set(payload.map(decode));
+    if (!payload.every(pair => Array.isArray(pair) && pair.length === 2)) return invalid();
+    if (tag === '$map') return new Map(payload.map(pair => [decode(pair[0]), decode(pair[1])]));
+    const result: Record<string, unknown> = tag === '$nullObject' ? Object.create(null) : {};
+    for (const [key, item] of payload) {
+      if (typeof key !== 'string' || Object.hasOwn(result, key)) return invalid();
+      Object.defineProperty(result, key, {value: decode(item), enumerable: true, writable: true, configurable: true});
+    }
+    return result;
+  };
+  return decode(decoded);
+}
+
 export interface WorkerState {
   id: string;
   label: string;
@@ -194,6 +303,72 @@ export function initialState(factory?: CompiledFactory): FactoryState {
     transfers: [], comms: [], patches: [], reportReady: null, lockedStations: [],
     alerts: {}, modelCircuits: {}, preflight: null, cases: {}, contextNotes: {}, consults: {}, corrections: {}, pausedScopes: { lines: [], stations: [] }, agentBindings: {},
   };
+}
+
+export function serializeState(state: FactoryState): string {
+  return serializeSnapshot(state);
+}
+
+/** Validate cache structure before its owner replaces the live projection. */
+export function deserializeState(body: string): FactoryState {
+  return validateState(deserializeSnapshot(body));
+}
+
+/** Validate an already decoded state without serializing its large tree again. */
+export function validateState(value: unknown): FactoryState {
+  const invalid = (): never => { throw new TypeError('Invalid factory state snapshot'); };
+  const record = (entry: unknown): Record<string, unknown> => snapshotRecord(entry) ? entry : invalid();
+  const array = (entry: unknown): unknown[] => Array.isArray(entry) ? entry : invalid();
+  const strings = (entry: unknown) => {
+    if (!array(entry).every(item => typeof item === 'string')) invalid();
+  };
+  const shape = (entry: unknown, sample: Record<string, unknown>) => {
+    const object = record(entry);
+    for (const [key, expected] of Object.entries(sample)) {
+      const actual = object[key];
+      if (!Object.hasOwn(object, key)) invalid();
+      if (Array.isArray(expected)) array(actual);
+      else if (expected !== null && typeof expected === 'object') record(actual);
+      else if (expected === null ? actual !== null && typeof actual !== 'number' : typeof actual !== typeof expected) invalid();
+    }
+  };
+  const state = record(value);
+  if (!Number.isSafeInteger(state.seq) || (state.seq as number) < 0 || typeof state.digest !== 'string') invalid();
+  const run = record(state.run);
+  shape(run, {id: '', title: '', startedAt: 0, pausedMs: 0, status: ''});
+  if (!['idle', 'running', 'paused', 'ended'].includes(run.status as string)) invalid();
+  for (const field of ['tokenOrder', 'evidenceOrder', 'lockedStations']) strings(state[field]);
+  for (const field of ['chat', 'conversation', 'activity', 'transfers', 'comms', 'patches']) array(state[field]);
+  for (const field of ['nodes', 'tokens', 'attempts', 'workers', 'evidence', 'recoveries', 'alerts', 'modelCircuits', 'cases', 'contextNotes', 'consults']) {
+    record(state[field]);
+  }
+  const totals = record(state.totals);
+  shape(totals, {usage: {}, published: 0, manual: 0, failed: 0, rejected: 0, merged: 0, returned: 0, corrections: 0});
+  shape(totals.usage, {input: 0, output: 0, cost: 0});
+  shape(state.resources, {used: {}, limits: {}, freeMemMB: 0, at: 0, waiting: {}});
+  if (state.reportReady !== null && typeof state.reportReady !== 'string') invalid();
+  if (state.preflight !== null) shape(state.preflight, {at: 0, ok: false, checks: []});
+  for (const node of Object.values(record(state.nodes))) {
+    shape(node, {...emptyNode('')});
+    const entry = record(node);
+    for (const field of ['queue', 'active', 'workers', 'strip']) strings(entry[field]);
+    shape(entry.usage, {input: 0, output: 0, cost: 0});
+  }
+  for (const token of Object.values(record(state.tokens))) {
+    shape(token, {id: '', line: '', item: '', url: '', source: '', status: '', at: [], attempts: [], evidence: [], rounds: {}, corrections: 0, data: {}, createdAt: 0});
+    const entry = record(token);
+    for (const field of ['at', 'attempts', 'evidence']) strings(entry[field]);
+  }
+  for (const attempt of Object.values(record(state.attempts))) {
+    shape(attempt, {id: '', token: '', node: '', worker: '', input: '', startedAt: 0, steps: [], usage: {}});
+    shape(record(attempt).usage, {input: 0, output: 0, cost: 0});
+  }
+  for (const worker of Object.values(record(state.workers))) {
+    shape(worker, {id: '', label: '', node: '', done: 0, busyMs: 0, spawnedAt: 0, forked: false, spans: []});
+    const busy = record(worker).busy;
+    if (busy !== null && typeof busy !== 'string') invalid();
+  }
+  return value as FactoryState;
 }
 
 const KEEP = 60;

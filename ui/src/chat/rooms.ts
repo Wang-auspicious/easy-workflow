@@ -10,12 +10,15 @@
 //
 // 一条消息只出现在最贴切的那个群里：同时含收发双方的群最贴切，其次
 // 含其中一方的群里挑人数最少的。这样同一个群里的对话不会被复制到五个群。
-import type { CompiledFactory, StationKind } from "../../../shared/types.ts";
+import type { CompiledFactory, StationKind, Stamped, BotShape } from "../../../shared/types.ts";
+import {kernelRoomLines} from '../kernel.ts';
 import type { CommEntry, FactoryState } from "../../../shared/project.ts";
 import type { RoomSpec } from "../../../shared/rooms.ts";
 import { roomsOf } from "../../../shared/rooms.ts";
 import type { AvatarState } from "./avatar-look.ts";
-import type { StationLook } from "./station-look.ts";
+import type {GrokShapeName} from './grokbot-shapes.ts';
+
+interface RoomLook {shape: BotShape | GrokShapeName; hue: number; state: AvatarState}
 
 export const DISPATCHER_KEY = "dispatcher";
 export const USER_KEY = "user";
@@ -26,7 +29,7 @@ export interface RoomActor {
   key: string;
   name: string;
   kind: RoomActorKind;
-  shape: StationLook["shape"];
+  shape: RoomLook['shape'];
   hue: number;
   state: AvatarState;
   line?: string;
@@ -35,6 +38,7 @@ export interface RoomActor {
 }
 
 export interface RoomLine {
+  label?: string;
   id: string;
   at: number;
   actor: RoomActor;
@@ -81,10 +85,12 @@ function stationActor(key: string, ctx: RoomContext): RoomActor | null {
 }
 
 export interface RoomContext {
+  kernelEvents?: readonly Stamped[];
+  showProgress?: boolean;
   factory: CompiledFactory | null;
   state: FactoryState;
   /** 工位外观与动作。由界面注入，与画布、转录用同一只小人。 */
-  look: (key: string) => StationLook | undefined;
+  look: (key: string) => RoomLook | undefined;
   now: number;
 }
 
@@ -136,6 +142,7 @@ function addressed(entry: CommEntry, ctx: RoomContext): RoomActor | null {
 
 /** 一个群里的往来，按真实时间排出。一条消息只去它最贴切的那个群。 */
 export function buildRoomLines(room: RoomSpec, rooms: readonly RoomSpec[], ctx: RoomContext): RoomLine[] {
+  if (ctx.kernelEvents) return kernelRoomLines(room, ctx, ctx.kernelEvents, ctx.showProgress ?? false);
   if (room.kind === "root") return [];
   const lines: RoomLine[] = [];
   for (const entry of ctx.state.comms ?? []) {

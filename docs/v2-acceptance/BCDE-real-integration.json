@@ -1,0 +1,243 @@
+{
+  "kind": "real-model integration on acceptance copy; not a passing final acceptance",
+  "run": "run-2026-10-16-fbd1a3b27ccb1f4e",
+  "startedAt": 1792163211314,
+  "stoppedAt": 1792164342712,
+  "elapsedMs": 1131398,
+  "target": 30,
+  "maxActiveItems": 12,
+  "counts": {
+    "active": 12,
+    "queued": 14,
+    "parked": 4
+  },
+  "waitingBudget": [
+    {
+      "item": "t-0d6794eb1b8d819e",
+      "node": "curation/reader"
+    },
+    {
+      "item": "t-271a32a5c11e0a3a",
+      "node": "curation/reader"
+    },
+    {
+      "item": "t-4760184703d79435",
+      "node": "curation/reader"
+    },
+    {
+      "item": "t-abfad214b7cda600",
+      "node": "curation/reader"
+    },
+    {
+      "item": "t-bc1bb42f23e71e59",
+      "node": "curation/facts"
+    },
+    {
+      "item": "t-c7285568d1833de5",
+      "node": "curation/facts"
+    },
+    {
+      "item": "t-c9c67cd12e1acdc0",
+      "node": "curation/reader"
+    },
+    {
+      "item": "t-cba77313e1569d8c",
+      "node": "curation/reader"
+    },
+    {
+      "item": "t-ce57477fc829f317",
+      "node": "curation/reader"
+    },
+    {
+      "item": "t-d6e3d9b9a116ed24",
+      "node": "curation/reader"
+    },
+    {
+      "item": "t-e7cf5d44f5e441c1",
+      "node": "curation/reader"
+    },
+    {
+      "item": "t-f49ba88e1117b5ea",
+      "node": "curation/reader"
+    }
+  ],
+  "parked": [
+    {
+      "item": "t-4927445b1df79ec2",
+      "node": "curation/scout",
+      "code": "http_forbidden",
+      "reason": "HTTP 403"
+    },
+    {
+      "item": "t-96916c93722902f3",
+      "node": "curation/scout",
+      "code": "auth",
+      "reason": "页面需要完成人机验证"
+    },
+    {
+      "item": "t-c14ece3af932db03",
+      "node": "curation/scout",
+      "code": "auth",
+      "reason": "页面需要完成人机验证"
+    },
+    {
+      "item": "t-fcf66043f9266a08",
+      "node": "curation/reader",
+      "code": "max_rounds",
+      "reason": "所有候选都被拒收：看了 1 页截图，没有一页能体现范围：唯一的候选截图只是授权文字说明，未展示任何图标素材。"
+    }
+  ],
+  "publishedTokens": [],
+  "observedTokens": 1933083,
+  "attempts": 155,
+  "noSubmitFailures": 0,
+  "handoffs": {
+    "forced_handoff": 8,
+    "handoff": 4
+  },
+  "handoffNodes": [
+    {
+      "item": "t-abfad214b7cda600",
+      "node": "curation/reader",
+      "ending": "forced_handoff",
+      "actualTokens": 79013,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-271a32a5c11e0a3a",
+      "node": "curation/reader",
+      "ending": "forced_handoff",
+      "actualTokens": 65142,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-c9c67cd12e1acdc0",
+      "node": "curation/reader",
+      "ending": "handoff",
+      "actualTokens": 80231,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-cba77313e1569d8c",
+      "node": "curation/reader",
+      "ending": "forced_handoff",
+      "actualTokens": 90971,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-d6e3d9b9a116ed24",
+      "node": "curation/reader",
+      "ending": "handoff",
+      "actualTokens": 73127,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-e7cf5d44f5e441c1",
+      "node": "curation/reader",
+      "ending": "handoff",
+      "actualTokens": 75168,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-c7285568d1833de5",
+      "node": "curation/facts",
+      "ending": "forced_handoff",
+      "actualTokens": 70156,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-ce57477fc829f317",
+      "node": "curation/reader",
+      "ending": "forced_handoff",
+      "actualTokens": 67717,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-bc1bb42f23e71e59",
+      "node": "curation/facts",
+      "ending": "handoff",
+      "actualTokens": 89282,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-4760184703d79435",
+      "node": "curation/reader",
+      "ending": "forced_handoff",
+      "actualTokens": 85063,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-0d6794eb1b8d819e",
+      "node": "curation/reader",
+      "ending": "forced_handoff",
+      "actualTokens": 77420,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    },
+    {
+      "item": "t-f49ba88e1117b5ea",
+      "node": "curation/reader",
+      "ending": "forced_handoff",
+      "actualTokens": 63930,
+      "budget": {
+        "maxTokens": 60000,
+        "maxMs": 900000
+      }
+    }
+  ],
+  "board": {
+    "posts": 320,
+    "challengeResolved": 0,
+    "rooms": []
+  },
+  "sampling": {
+    "count": 18,
+    "intervalMs": 60000,
+    "staleItems": [
+      "t-abfad214b7cda600",
+      "t-271a32a5c11e0a3a",
+      "t-c9c67cd12e1acdc0",
+      "t-d6e3d9b9a116ed24",
+      "t-cba77313e1569d8c",
+      "t-e7cf5d44f5e441c1"
+    ]
+  },
+  "forcedRestart": {
+    "executed": 0,
+    "status": "automatic approval rejected before execution",
+    "reason": "blocked by policy"
+  },
+  "disposition": "paused; existing data and handoff sessions retained; no automatic budget override"
+}

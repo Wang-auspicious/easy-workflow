@@ -35,6 +35,28 @@ export interface StationRecoveryPolicy {
   exhausted: 'parked' | 'manual';
 }
 
+export interface AgentBudget {
+  maxTokens: number;
+  maxMs: number;
+}
+
+export interface AgentHandoff {
+  done: string[];
+  evidence: string[];
+  remaining: string[];
+  suggestion: string;
+}
+
+export interface AgentContractReport {
+  budget: AgentBudget;
+  actualTokens: number;
+  actualMs: number;
+  rounds: number;
+  reminders: number;
+  repairs: number;
+  ending: 'submit' | 'handoff' | 'forced_handoff';
+}
+
 export interface StationSpec {
   id: string;
   name: string;
@@ -42,6 +64,7 @@ export interface StationSpec {
   num?: string;
   role: Role;
   kind: StationKind;
+  budget?: Partial<AgentBudget>;
   /** Contract names; the compiler checks both ends of every flow edge agree. */
   input: string;
   output: string;
@@ -88,7 +111,19 @@ export interface LineSpec {
   wired: boolean;
 }
 
-export interface ChannelSpec { id: string; from: { line: string; station: string }; to: { line: string; station: string }; label: string }
+export type ChannelInput = Record<string, string | {path?: string; value?: unknown}>;
+export interface ChannelSpec { id: string; from: { line: string; station: string }; to: { line: string; station: string }; label: string; input?: ChannelInput }
+
+export type RoomView = 'dossier' | 'dossier+home' | 'shots+pixels' | 'shots' |
+  'plan+sitemap' | 'sources' | 'source-quotes' | 'facts+style';
+export interface RoomPolicy {
+  field: string;
+  participants: string[];
+  judge: string;
+  fallbackJudge?: string;
+  views: Record<string, RoomView>;
+  models?: Record<string, StationAgentBinding>;
+}
 
 export interface PackSpec {
   id: string;
@@ -97,6 +132,7 @@ export interface PackSpec {
   blurb: string;
   lines: LineSpec[];
   channels: ChannelSpec[];
+  rooms?: RoomPolicy[];
   resources: Record<Exclude<ResourceClass, "none">, number>;
 }
 
@@ -108,6 +144,7 @@ export interface CompiledFactory {
   nodes: CompiledNode[];
   edges: CompiledEdge[];
   channels: ChannelSpec[];
+  rooms?: RoomPolicy[];
   resources: PackSpec["resources"];
   issues: { at: string; message: string }[];
   /** Hash of the compiled runtime graph; layout never changes it (acceptance A11). */
@@ -132,6 +169,7 @@ export interface CompiledEdge {
   when?: string;
   label?: string;
   maxRounds?: number;
+  input?: ChannelInput;
 }
 
 /* ------------------------------------------------------------------ journal */
@@ -299,6 +337,7 @@ export interface ModelCircuit {
 
 export type JournalEvent =
   | import("./lessons.ts").LessonEvent
+  | import('./board.ts').BoardEvent
   | { kind: "factory.loaded"; digest: string; specVersion: string }
   | { kind: 'agent.binding'; node: string; binding: StationAgentBinding | null }
   | { kind: 'agent.defaults'; defaults: ProjectAgentDefaults }

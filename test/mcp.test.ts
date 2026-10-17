@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { McpPeer, mcpText } from "../server/mcp-protocol.ts";
-import { mcpRequest } from "../server/mcp.ts";
+import { mcpRequest, stationMcp } from "../server/mcp.ts";
 import { openStationMcp } from "../server/mcp-station.ts";
 import { FactoryControl } from "../server/control.ts";
 import { compile } from "../server/spec/compile.ts";
@@ -19,6 +19,29 @@ import type { Factory } from "../server/factory.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const init = { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } };
+
+test('dialogue closers deliver schema repairs through the scoped MCP handler only', async () => {
+  let calls = 0;
+  const scope = await openStationMcp(['submit_answer', 'submit_turn'].map(name => ({name, label: name,
+    description: 'A bounded dialogue ending', parameters: Type.Object({}, {additionalProperties: false}), validateInTool: true,
+    execute: async (_id: string, args: Record<string, unknown>) => {calls++; return mcpText('repair in the same session', Object.keys(args).length > 0);},
+  })), new AbortController().signal);
+  const peer = new McpPeer(stationMcp(scope.config.env.EASY_WORKFLOW_STATION_CONNECTION));
+  const rpc = (id: number, method: string, params = {}) => peer.receive({jsonrpc: '2.0', id, method, params}) as Promise<any>;
+  try {
+    await rpc(1, 'initialize', init);
+    await peer.receive({jsonrpc: '2.0', method: 'notifications/initialized'});
+    for (const [index, name] of ['submit_answer', 'submit_turn'].entries()) {
+      const invalid = await rpc(index * 2 + 2, 'tools/call', {name, arguments: {unexpected: true}});
+      assert.equal(invalid.result.isError, true);
+      const valid = await rpc(index * 2 + 3, 'tools/call', {name, arguments: {}});
+      assert.notEqual(valid.result.isError, true);
+    }
+    assert.equal(calls, 4);
+    assert.equal((await rpc(6, 'tools/call', {name: 'run_control', arguments: {}})).error.code, -32602);
+    assert.equal(calls, 4);
+  } finally {await scope.close();}
+});
 
 test("MCP lifecycle, schema errors and cancellation are real protocol messages", async () => {
   const peer = new McpPeer({ name: "test", instructions: "bounded", tools: () => [{ name: "wait", description: "wait", inputSchema: Type.Object({ value: Type.Number() }, { additionalProperties: false }) }],

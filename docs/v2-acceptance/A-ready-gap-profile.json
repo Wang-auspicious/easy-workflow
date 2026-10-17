@@ -1,0 +1,267 @@
+{
+  "started": 430.5173,
+  "marks": [
+    {
+      "name": "construct-enter",
+      "at": 57.36220000000003
+    },
+    {
+      "name": "construct-done",
+      "at": 64.69290000000001
+    },
+    {
+      "name": "BOOT_STAGE journal 0",
+      "at": 96.37
+    },
+    {
+      "name": "BOOT_STAGE compile 11",
+      "at": 107.62040000000002
+    },
+    {
+      "name": "BOOT_STAGE restore-factory-state 1492",
+      "at": 1611.477
+    },
+    {
+      "name": "BOOT_STAGE restore-docs 18",
+      "at": 1630.1007
+    },
+    {
+      "name": "BOOT_STAGE restore-lessons 20",
+      "at": 1650.0347000000002
+    },
+    {
+      "name": "BOOT_STAGE restore-channels 18",
+      "at": 1668.4496
+    },
+    {
+      "name": "BOOT_STAGE restore-sources 1",
+      "at": 1669.1819
+    },
+    {
+      "name": "BOOT_STAGE restore-outbox 18",
+      "at": 1687.6054
+    },
+    {
+      "name": "BOOT_STAGE replay 0",
+      "at": 1688.1053000000002
+    },
+    {
+      "name": "warm-enter",
+      "at": 2191.364
+    },
+    {
+      "name": "BOOT_STAGE factory 2418",
+      "at": 2482.7733
+    },
+    {
+      "name": "BOOT_STAGE dispatcher 0",
+      "at": 2488.9371
+    },
+    {
+      "name": "listen-call",
+      "at": 2489.5272
+    },
+    {
+      "name": "style-done",
+      "at": 2932.023
+    },
+    {
+      "name": "taxonomy-done",
+      "at": 2939.8985000000002
+    },
+    {
+      "name": "listen-callback",
+      "at": 2945.7297
+    },
+    {
+      "name": "ready-send",
+      "at": 2946.2436000000002
+    }
+  ],
+  "methods": {
+    "Docs.renderContext": {
+      "count": 83,
+      "ms": 413.3781999999983
+    },
+    "Docs.atomicWrite": {
+      "count": 83,
+      "ms": 60.503000000001975
+    },
+    "Docs.write": {
+      "count": 83,
+      "ms": 479.9606999999978
+    },
+    "Docs.writeAllContexts": {
+      "count": 1,
+      "ms": 375.74029999999993
+    },
+    "Docs.scheduleAllCases": {
+      "count": 1,
+      "ms": 4.543299999999817
+    },
+    "Factory.wireDocs": {
+      "count": 1,
+      "ms": 380.3804
+    },
+    "Lessons.recoverApproved": {
+      "count": 1,
+      "ms": 0.1414999999997235
+    },
+    "Lessons.draftRun": {
+      "count": 4,
+      "ms": 8.949300000000221
+    },
+    "Lessons.write": {
+      "count": 1,
+      "ms": 107.01750000000038
+    },
+    "Factory.loadStock": {
+      "count": 1,
+      "ms": 68.1913999999997
+    },
+    "Factory.recoverLegacyFailures": {
+      "count": 1,
+      "ms": 2.579200000000128
+    },
+    "Factory.reconcileFailureAlerts": {
+      "count": 1,
+      "ms": 1.5014999999998508
+    },
+    "Factory.restore": {
+      "count": 1,
+      "ms": 37.30339999999978
+    },
+    "Factory.reconcileManualStock": {
+      "count": 1,
+      "ms": 1.7542999999996027
+    },
+    "Factory.reconcileBusinessStock": {
+      "count": 1,
+      "ms": 1.819300000000112
+    },
+    "PublicationOutbox.start": {
+      "count": 1,
+      "ms": 115.13250000000016
+    },
+    "SourceSupervisor.start": {
+      "count": 1,
+      "ms": 1.1802999999999884
+    },
+    "SourceSupervisor.pump": {
+      "count": 1,
+      "ms": 0.030600000000049477
+    }
+  },
+  "files": {
+    "module:readFileSync:other": {
+      "count": 10,
+      "ms": 3.5504999999999427
+    },
+    "module:mkdirSync:other": {
+      "count": 8,
+      "ms": 2.542199999999923
+    },
+    "module:existsSync:other": {
+      "count": 2,
+      "ms": 0.2367999999999597
+    },
+    "module:existsSync:rules": {
+      "count": 1,
+      "ms": 0.22859999999997171
+    },
+    "module:readFileSync:rules": {
+      "count": 2,
+      "ms": 11.79770000000002
+    },
+    "journal:existsSync:other": {
+      "count": 1,
+      "ms": 0.300899999999956
+    },
+    "compile:existsSync:outbox": {
+      "count": 2,
+      "ms": 0.5207000000000335
+    },
+    "compile:readFileSync:outbox": {
+      "count": 52,
+      "ms": 7.178900000000226
+    },
+    "compile:readdirSync:outbox": {
+      "count": 1,
+      "ms": 0.25119999999992615
+    },
+    "replay:readFileSync:other": {
+      "count": 40,
+      "ms": 30.767100000000937
+    },
+    "replay:readFileSync:rules": {
+      "count": 84,
+      "ms": 19.492099999998118
+    },
+    "replay:existsSync:rules": {
+      "count": 83,
+      "ms": 16.93719999999894
+    },
+    "replay:lstatSync:other": {
+      "count": 247,
+      "ms": 29.858699999997043
+    },
+    "replay:lstatSync:context": {
+      "count": 83,
+      "ms": 6.750900000000456
+    },
+    "replay:readFileSync:context": {
+      "count": 83,
+      "ms": 14.987099999999828
+    },
+    "replay:existsSync:other": {
+      "count": 15,
+      "ms": 2.4037999999986823
+    },
+    "replay:readFileSync:playwright": {
+      "count": 3,
+      "ms": 8.643300000000181
+    },
+    "replay:readdirSync:other": {
+      "count": 1,
+      "ms": 0.5457000000001244
+    },
+    "replay:mkdirSync:outbox": {
+      "count": 1,
+      "ms": 0.4084000000002561
+    },
+    "replay:readFileSync:outbox": {
+      "count": 61,
+      "ms": 10.753699999998389
+    },
+    "replay:writeFileSync:other": {
+      "count": 1,
+      "ms": 0.11390000000028522
+    },
+    "replay:fsyncSync:other": {
+      "count": 1,
+      "ms": 1.4654999999997926
+    },
+    "replay:renameSync:outbox": {
+      "count": 1,
+      "ms": 1.1417999999998756
+    },
+    "replay:lstatSync:outbox": {
+      "count": 1,
+      "ms": 0.10290000000031796
+    },
+    "dispatcher:readFileSync:playwright": {
+      "count": 4,
+      "ms": 12.146699999999782
+    },
+    "dispatcher:readFileSync:other": {
+      "count": 3,
+      "ms": 1.859299999999621
+    },
+    "dispatcher:existsSync:other": {
+      "count": 1,
+      "ms": 0.4717000000000553
+    }
+  },
+  "callbacks": [],
+  "phase": "dispatcher"
+}

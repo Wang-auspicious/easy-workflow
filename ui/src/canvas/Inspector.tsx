@@ -27,6 +27,7 @@ import { nodeExecutionPresentation, recordedUsage, stationStatus, tokenStatus } 
 import { CrewStrip, CrewTimeline, WorkerTrace } from "./CrewTrace.tsx";
 import {useDetail, type TokenDetail} from '../details.ts';
 import {failureLabels} from '../../../shared/failures.ts';
+import {BoardChain, SharedLessons} from '../KernelPanels.tsx';
 
 export function Inspectors({ geo, cam }: { geo: Geometry; cam: Camera }) {
   const list = useStore((s) => s.inspectors);
@@ -109,6 +110,7 @@ function Head({ onDrag, onClose, onPin, pinned, children }: { onDrag: (e: React.
 /* ------------------------------------------------------------------ station */
 
 function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspector; onDrag: (e: React.PointerEvent) => void; onClose: () => void; onPin: () => void; onWorker: (w: string) => void }) {
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
   useStore((s) => s.nodeRev[insp.key]);
   const recoveryTokens = useStore(state => state.nodeRecoveries[insp.key]);
   const clock = useNow(1000);
@@ -190,7 +192,7 @@ function NodeInspector({ insp, onDrag, onClose, onPin, onWorker }: { insp: Inspe
       </div>
       {linePaused && <p className="insp-note">所属流水线已暂停。<button className="insp-text-btn" disabled={controlsDisabled} onClick={() => void togglePause('line')}>恢复流水线</button></p>}
       {controlError && <p className="insp-note is-bad" role="alert">{controlError}</p>}
-      {tab === "spec" ? <About node={node} /> : <Feed node={node} attempts={attempts} now={now} dormant={Boolean(node.dormant) || !lineWired} />}
+      {tab === "spec" ? <>{kernel === 'v2' && <SharedLessons node={node.key} />}<About node={node} /></> : <Feed node={node} attempts={attempts} now={now} dormant={Boolean(node.dormant) || !lineWired} />}
     </div>
   );
 }
@@ -611,6 +613,7 @@ function EvThumbBody({ ev, tok, small }: { ev: EvidenceRef; tok?: TokenState; sm
 /* ------------------------------------------------------------------ token: evidence chain */
 
 function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onDrag: (e: React.PointerEvent) => void; onClose: () => void; onPin: () => void }) {
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
   useStore((s) => s.version);
   const now = useNow(1000);
   const s = getState();
@@ -652,6 +655,7 @@ function TokenInspector({ insp, onDrag, onClose, onPin }: { insp: Inspector; onD
       </div>
       {d.copy?.takeawayZh && <div className="chain-copy sel">「{d.copy.takeawayZh}」<span className="muted">{d.copy.descriptionZh}</span></div>}
       {t.reason && t.status !== "active" && <div className="chain-reason">{t.reason}</div>}
+      {kernel === 'v2' && <BoardChain item={t.id} />}
       <div className="chain">
         {steps.map(({ node, a, ev }, i) => {
           const n = name(node);

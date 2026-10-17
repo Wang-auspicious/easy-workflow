@@ -206,22 +206,66 @@ test("read-only Docs never mkdir or write, and unsafe item/context names cannot 
   } finally { f.close(); }
 });
 
+test('unchanged derived documents skip atomic writes while changed or missing files are repaired', t => {
+  const f = fixture();
+  try {
+    create(f.journal, 'document-token');
+    f.docs.write('case', 'site');
+    f.docs.write('context', 'dispatcher');
+    const write = t.mock.method(fs, 'writeFileSync');
+    const sync = t.mock.method(fs, 'fsyncSync');
+    const rename = t.mock.method(fs, 'renameSync');
+    f.docs.write('case', 'site');
+    f.docs.write('context', 'dispatcher');
+    assert.equal(write.mock.callCount(), 0);
+    assert.equal(sync.mock.callCount(), 0);
+    assert.equal(rename.mock.callCount(), 0);
+
+    f.journal.append({kind: 'token.data', token: 'document-token', patch: {facts: {license: 'changed'}}});
+    f.docs.write('case', 'site');
+    assert.equal(sync.mock.callCount(), 2, 'both changed case files follow the atomic replacement path');
+    assert.equal(rename.mock.callCount(), 2);
+    assert.equal(fs.readFileSync(f.docs.caseFile('site'), 'utf8'), f.docs.renderCase('site'));
+
+    f.journal.append({kind: 'context.noted', node: 'dispatcher', note: {kind: 'note', text: 'Changed context', by: 'fixture'}});
+    f.docs.write('context', 'dispatcher');
+    assert.equal(sync.mock.callCount(), 3);
+    assert.equal(rename.mock.callCount(), 3);
+    assert.equal(fs.readFileSync(f.docs.contextFile('dispatcher'), 'utf8'), f.docs.renderContext('dispatcher'));
+
+    const expected = fs.readFileSync(f.docs.caseJsonFile('site'), 'utf8');
+    fs.unlinkSync(f.docs.caseJsonFile('site'));
+    f.docs.write('case', 'site');
+    assert.equal(fs.readFileSync(f.docs.caseJsonFile('site'), 'utf8'), expected);
+    assert.equal(sync.mock.callCount(), 4, 'a missing JSON file is rebuilt while identical Markdown is retained');
+    assert.equal(rename.mock.callCount(), 4);
+  } finally { f.close(); }
+});
+
 test("junctions are rejected and failed atomic replacements preserve the prior complete file and clean only their temporary file", (t) => {
   const f = fixture();
   try {
     f.docs.write("case", "site");
     const file = f.docs.caseFile("site"), before = fs.readFileSync(file, "utf8"), rename = fs.renameSync;
+    create(f.journal, 'atomic-replacement');
     const mock = t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => { if (String(to) === file) throw new Error("simulated rename failure"); return rename(from, to); });
     assert.throws(() => f.docs.write("case", "site"), /simulated rename failure/);
     assert.equal(fs.readFileSync(file, "utf8"), before);
     assert.deepEqual(fs.readdirSync(path.dirname(file)).sort(), ["CASE.md", "case.json"].sort());
     mock.mock.restore();
+    const sync = t.mock.method(fs, 'fsyncSync', () => { throw new Error('simulated sync failure'); });
+    assert.throws(() => f.docs.write('case', 'site'), /simulated sync failure/);
+    assert.equal(fs.readFileSync(file, 'utf8'), before);
+    assert.deepEqual(fs.readdirSync(path.dirname(file)).sort(), ['CASE.md', 'case.json'].sort());
+    sync.mock.restore();
     const outside = path.join(f.dir, "outside"), link = path.dirname(f.docs.caseFile("linked"));
-    fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, "CASE.md"), "must survive");
+    const identical = f.docs.renderCase('linked');
+    fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, "CASE.md"), identical);
     try { fs.symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir"); }
     catch (error) { if (["EPERM", "EACCES", "ENOTSUP"].includes((error as NodeJS.ErrnoException).code ?? "")) { t.diagnostic("Directory symlinks unavailable; atomic replacement assertions passed"); return; } throw error; }
     assert.throws(() => f.docs.write("case", "linked"), /symbolic link or junction/);
-    assert.equal(fs.readFileSync(path.join(outside, "CASE.md"), "utf8"), "must survive");
+    assert.equal(fs.readFileSync(path.join(outside, "CASE.md"), "utf8"), identical,
+      'path safety runs before the identical-content shortcut');
     assert.equal(fs.existsSync(path.join(outside, "case.json")), false);
   } finally { f.close(); }
 });

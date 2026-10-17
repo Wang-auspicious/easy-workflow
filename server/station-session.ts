@@ -3,7 +3,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 export interface SessionRef { file: string; signature: string }
-export interface SavedStationSession { messages: unknown[]; evidence: {url:string;text:string}[]; calls: number }
+export interface SavedStationSession {
+  messages: unknown[]; evidence: {url:string;text:string}[]; calls: number;
+  /** Only a bounded prior submit is carried into a session with a new role. */
+  submitSummary?: string;
+  /** Dialogue tools may change while the original station contract stays fixed. */
+  roleRevision?: string;
+  contractSignature?: string;
+}
 export const sessionSignature = (value: unknown) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 export function loadStationSession(root: string, ref: SessionRef | undefined, signature: string): SavedStationSession | undefined {

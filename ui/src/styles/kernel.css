@@ -1,0 +1,28 @@
+.kernel-overview {flex:none; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--panel-2);}
+.kernel-summary {font-size:11px; font-weight:650; white-space:nowrap; overflow-x:auto; line-height:1.7;}
+.kernel-offline {font-size:10px;}
+.kernel-attention {display:flex; align-items:center; gap:8px; margin-top:5px; padding:5px 7px; border-radius:6px; background:var(--panel); border:1px solid color-mix(in oklab,var(--warn) 35%,var(--line));}
+.kernel-attention>span {flex:1; min-width:0; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.kernel-attention button {flex:none;}
+.kernel-progress-toggle {display:flex; align-items:center; gap:5px; font-size:11px; color:var(--ink-3); padding:5px 0; cursor:pointer;}
+.chat-pane>.kernel-progress-toggle {padding:7px 14px; border-bottom:1px solid var(--line);}
+.kernel-counts {width:100%; padding:8px 12px; font-size:11px;}
+.kernel-count-row {display:flex; flex-wrap:wrap; align-items:center; gap:5px 10px;}
+.kernel-count-row b {font-variant-numeric:tabular-nums;}
+.kernel-counts.is-compact {padding:0; font-size:12px; line-height:1.4;}
+.kernel-counts.is-compact .kernel-count-row {gap:4px 7px;}
+.kernel-waits {display:flex; flex-wrap:wrap; gap:4px 7px; margin-top:3px; font-size:11px;}
+.kernel-wait {border-radius:4px; padding:1px 4px; font-weight:600;}
+.kernel-wait--model {color:#946400; background:#fff0bd;}
+.kernel-wait--budget {color:#9b480f; background:#ffe0bf;}
+.kernel-wait--room {color:#7041a1; background:#eddefa;}
+.kernel-wait--backoff,.kernel-wait--resource,.kernel-wait--supervisor {color:#58606a; background:#e9edf1;}
+.kernel-lessons,.kernel-board-chain {padding:10px 14px; border-top:1px solid var(--line); font-size:12px;}
+.kernel-lesson {padding:7px 0; border-bottom:1px solid var(--line);}
+.kernel-lesson p,.kernel-board-post p {white-space:pre-wrap; overflow-wrap:anywhere; margin:4px 0;}
+.kernel-lesson>div,.kernel-board-post header {display:flex; justify-content:space-between; gap:8px; align-items:center;}
+.kernel-board-post {padding:8px 0; border-bottom:1px solid var(--line);}
+.kernel-board-post header span,.kernel-board-post small {font-size:10px; color:var(--ink-3);}
+.kernel-board-post.is-superseded {opacity:.6;}
+.kernel-post-evidence {display:flex; flex-wrap:wrap; gap:6px; font-size:10px;}
+.rlog-state {font-size:10px; color:var(--ink-4); margin-left:6px;}

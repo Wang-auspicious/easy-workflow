@@ -7,6 +7,8 @@ import { webGetBytes } from './network.ts';
 import { workflowValue } from './workflow-packs.ts';
 import { workflowEntry } from './workflow-entry.ts';
 import {batchSummary, flowWindow, latestBatchTokens, occupiesIntake, type FlowObservation} from '../shared/batch.ts';
+import {deserializeSnapshot, serializeSnapshot} from '../shared/project.ts';
+import type {Snapshottable} from './snapshots.ts';
 
 type Host = Pick<Factory, 'journal' | 'runtime' | 'compiled' | 'state' | 'workflowPacks' | 'toolbox' | 'settings' | 'broker' | 'batch' | 'channels'> & Partial<Pick<Factory, 'recovery'>>;
 type Poll = { nextAt: number; count: number; duplicates: number; invalid?: number; attention?: string; failure?: ReturnType<typeof classifyFailure> };
@@ -41,15 +43,18 @@ function feedItems(xml: string): Incoming[] {
   }));
 }
 
-export class SourceSupervisor {
+export class SourceSupervisor implements Snapshottable {
+  readonly snapshotName = 'sources';
+  private indexedSeq = 0;
   private readonly f: Host;
-  private readonly definitions = new Map<string, SourceSpec>();
-  private readonly polls = new Map<string, Poll>();
-  private readonly requests = new Map<string, {at: number; nextAt: number}[]>();
-  private readonly candidates = new Map<string, SourceCandidate>();
-  private readonly authors = new Map<string, {accepted: number; rejected: number}>();
+  private definitions = new Map<string, SourceSpec>();
+  private polls = new Map<string, Poll>();
+  private requests = new Map<string, {at: number; nextAt: number}[]>();
+  private candidates = new Map<string, SourceCandidate>();
+  private authors = new Map<string, {accepted: number; rejected: number}>();
   private readonly jobs = new Map<string, {promise: Promise<unknown>; controller: AbortController}>();
-  private readonly unsubscribe: () => void;
+  private unsubscribe: () => void = () => {};
+  private activated = false;
   private readonly now: () => number;
   private readonly random: () => number;
   private timer?: ReturnType<typeof setInterval>;
@@ -57,17 +62,51 @@ export class SourceSupervisor {
   private polling = false;
   private closed = false;
 
-  constructor(factory: Host, options: {now?: () => number; random?: () => number} = {}) {
+  constructor(factory: Host, options: {now?: () => number; random?: () => number; deferReplay?: boolean} = {}) {
     this.f = factory;
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
+    if (options.deferReplay) return;
     for (const event of factory.journal.readKinds(['source.configured', 'source.polled', 'source.requested',
-      'source.candidate', 'source.reputation'])) this.apply(event);
-    this.unsubscribe = () => {};
-    if (process.env.FACTORY_READONLY === '1') return;
+      'source.candidate', 'source.reputation'])) this.observe(event);
+    this.activate();
+  }
+
+  serialize(): string {
+    return serializeSnapshot({indexedSeq: this.indexedSeq, definitions: this.definitions, polls: this.polls,
+      requests: this.requests, candidates: this.candidates, authors: this.authors});
+  }
+
+  restore(body: string): void {
+    const saved = deserializeSnapshot(body);
+    if (!record(saved) || !Number.isSafeInteger(saved.indexedSeq) || Number(saved.indexedSeq) < 0 ||
+        !(saved.definitions instanceof Map) ||
+        !(saved.polls instanceof Map) || !(saved.requests instanceof Map) ||
+        !(saved.candidates instanceof Map) || !(saved.authors instanceof Map)) {
+      throw new Error('Invalid sources snapshot');
+    }
+    if ([saved.definitions, saved.polls, saved.candidates, saved.authors].some(map =>
+          [...map].some(([key, value]) => typeof key !== 'string' || !record(value))) ||
+        [...saved.requests].some(([key, requests]) => typeof key !== 'string' ||
+          !Array.isArray(requests) || requests.some(request => !record(request) ||
+            typeof request.at !== 'number' || typeof request.nextAt !== 'number'))) {
+      throw new Error('Invalid sources snapshot entries');
+    }
+    this.indexedSeq = Number(saved.indexedSeq);
+    this.definitions = saved.definitions;
+    this.polls = saved.polls;
+    this.requests = saved.requests;
+    this.candidates = saved.candidates;
+    this.authors = saved.authors;
+  }
+
+  private activate(): void {
+    if (this.activated || this.closed || process.env.FACTORY_READONLY === '1') return;
+    this.activated = true;
+    const factory = this.f;
     // The complete committed batch must be projected before terminal consumers
     // inspect a candidate whose delivered receipt follows token.finished.
-    const projection = factory.journal.subscribeProjection(event => this.apply(event));
+    const projection = factory.journal.subscribeProjection(event => this.observe(event));
     const consumer = factory.journal.subscribe(event => {
       if (event.kind === 'token.finished') this.completeCandidate(event.token);
       if (event.kind === 'source.candidate' && event.candidate.targetToken) {
@@ -93,7 +132,9 @@ export class SourceSupervisor {
     if (this.closed) throw new ControlError(409, 'sources_closed', '来源调度已关闭');
   }
 
-  private apply(event: Stamped) {
+  observe(event: Stamped): void {
+    if (event.seq <= this.indexedSeq) return;
+    this.indexedSeq = event.seq;
     if (event.kind === 'source.configured') {
       this.definitions.set(event.source.id, event.source);
     }
@@ -247,6 +288,7 @@ export class SourceSupervisor {
   }
 
   start() {
+    this.activate();
     if (this.timer || this.closed || process.env.FACTORY_READONLY === '1') return;
     this.timer = setInterval(() => {
       void this.runDue().catch(error => console.error('source scheduler', error));

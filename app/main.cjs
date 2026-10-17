@@ -46,7 +46,9 @@ async function stopBackend() {
   const child = backend; backend = null;
   if (child.exitCode !== null) return;
   await new Promise((resolve) => {
-    const timer = setTimeout(() => { child.kill(); resolve(); }, 3500);
+    // Closing includes a full durable projection snapshot. Large projects can
+    // exceed the former 3.5-second cleanup allowance; retain a finite deadline.
+    const timer = setTimeout(() => { child.kill(); resolve(); }, 180000);
     child.once('exit', () => { clearTimeout(timer); resolve(); });
     if (child.connected) child.send({ type: 'shutdown' }); else child.kill();
   });
@@ -107,12 +109,16 @@ async function startBackend() {
   child.once('exit', () => log.end());
   const ready = await new Promise((resolve, reject) => {
     let settled = false;
+    const deadline = performance.now() + 180000;
+    let timer;
+    let stageBuffer = '';
     const finish = (error, message, details) => {
       if (settled) return;
       settled = true; clearTimeout(timer);
       // Keep the existing once-only child error guard after ready/kill, while
       // removing the startup-only IPC and exit listeners.
       child.off('exit', onExit); child.off('message', onMessage);
+      child.stdout.off('data', onStage);
       startup(error ? 'failure' : 'ready', details);
       error ? reject(error) : resolve(message);
     };
@@ -123,11 +129,32 @@ async function startBackend() {
       if (message?.type !== 'ready') return;
       finish(null, message);
     };
-    const timer = setTimeout(() => {
+    const timeout = () => {
       finish(new Error('后台启动超时；请查看用户数据目录中的 logs/desktop.log。'), null,
-        {reason: 'ready_timeout', deadlineMs: 180000});
+        {reason: 'ready_timeout', deadlineMs: Math.round(performance.now() - startedAt)});
       child.kill();
-    }, 180000);
+    };
+    const extend = () => {
+      clearTimeout(timer);
+      timer = setTimeout(timeout, Math.max(0, Math.min(30000, deadline - performance.now())));
+    };
+    const onStage = chunk => {
+      stageBuffer += chunk.toString();
+      let newline;
+      while ((newline = stageBuffer.indexOf('\n')) !== -1) {
+        const line = stageBuffer.slice(0, newline).replace(/\r$/, '');
+        stageBuffer = stageBuffer.slice(newline + 1);
+        const stage = /^BOOT_STAGE ([a-z0-9-]+) (\d+)$/.exec(line);
+        if (stage) {
+          startup('stage', {stage: stage[1], durationMs: Number(stage[2])});
+          extend();
+        }
+      }
+      // Stage records are short; unrelated or partial output cannot grow this buffer indefinitely.
+      if (stageBuffer.length > 4096) stageBuffer = '';
+    };
+    child.stdout.on('data', onStage);
+    extend();
     child.once('error', onError); child.once('exit', onExit); child.on('message', onMessage);
   });
   baseURL = ready.url;

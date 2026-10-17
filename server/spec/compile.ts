@@ -214,7 +214,7 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
   for (const c of channels) {
     const from = `${c.from.line}/${c.from.station}`, to = `${c.to.line}/${c.to.station}`;
     if (!byKey.has(from) || !byKey.has(to)) { issues.push({ at: c.id, message: "channel end not found" }); continue; }
-    edges.push({ key: `${from}->${to}:channel`, from, to, kind: "channel", label: c.label });
+    edges.push({ key: `${from}->${to}:channel`, from, to, kind: "channel", label: c.label, ...(c.input ? {input: c.input} : {}) });
   }
 
   // Checks (Spec F1.4): acyclic flow, compatible I/O, acceptance on every runnable station.
@@ -260,16 +260,51 @@ export function compile(packs: Pack[], patches: Patch[] = []): CompiledFactory {
   }
   checkOutputWriters(packs, nodes, flow, issues);
 
+  for (const pack of packs) if (pack.rooms !== undefined && !Array.isArray(pack.rooms)) {
+    issues.push({at: `${pack.id}.rooms`, message: 'rooms must be an array'});
+  }
+  const rooms = packs.flatMap(pack => Array.isArray(pack.rooms) ? pack.rooms : []);
+  const roomFields = new Set<string>();
+  const roomViews = new Set(['dossier', 'dossier+home', 'shots+pixels', 'shots',
+    'plan+sitemap', 'sources', 'source-quotes', 'facts+style']);
+  for (const room of rooms) {
+    const at = `rooms.${room?.field ?? 'invalid'}`;
+    if (!room || typeof room !== 'object' || typeof room.field !== 'string' ||
+        typeof room.judge !== 'string' || !Array.isArray(room.participants) ||
+        room.participants.some(key => typeof key !== 'string') ||
+        !room.views || typeof room.views !== 'object' || Array.isArray(room.views)) {
+      issues.push({at, message: 'room must declare a field, participants, judge and scoped views'});
+      continue;
+    }
+    if (!room.field || roomFields.has(room.field)) issues.push({at, message: 'room field must be unique and non-empty'});
+    roomFields.add(room.field);
+    if (!Array.isArray(room.participants) || room.participants.length < 2 || room.participants.length > 3 ||
+        new Set(room.participants).size !== room.participants.length ||
+        room.participants.some(key => !nodes.some(node => node.key === key && ['agent', 'review'].includes(node.kind)))) {
+      issues.push({at, message: 'room requires two or three distinct Agent participants'});
+    }
+    if (!room.views || room.participants.some(key => !roomViews.has(room.views[key]))) {
+      issues.push({at, message: 'every participant requires a scoped room view'});
+    }
+    if (!['program:shot-rules', 'program:style-veto'].includes(room.judge) &&
+        !nodes.some(node => node.key === room.judge && ['agent', 'review'].includes(node.kind))) {
+      issues.push({at, message: 'room judge must be a declared program or Agent station'});
+    }
+    if (room.judge.startsWith('program:') && !nodes.some(node => node.key === room.fallbackJudge && ['agent', 'review'].includes(node.kind))) {
+      issues.push({at, message: 'program judge requires a declared Agent fallback'});
+    }
+  }
+
   const runtimeGraph = {
     nodes: nodes.map(({ bot, ...rest }) => ({ ...rest, bot: { shape: bot.shape, hue: bot.hue, eyes: bot.eyes } })),
-    edges, channels, contracts: packs.flatMap(pack => Object.entries(pack.contracts ?? {})),
+    edges, channels, ...(rooms.length ? {rooms} : {}), contracts: packs.flatMap(pack => Object.entries(pack.contracts ?? {})),
   };
   const digest = crypto.createHash("sha256").update(JSON.stringify(runtimeGraph)).digest("hex").slice(0, 16);
   const resources = Object.assign({}, ...packs.map((p) => p.resources));
   return {
     specVersion: SPEC_VERSION,
     packs: packs.map((p) => ({ id: p.id, name: p.name, version: p.version, blurb: p.blurb })),
-    lines, nodes, edges, channels, resources, issues, digest,
+    lines, nodes, edges, channels, ...(rooms.length ? {rooms} : {}), resources, issues, digest,
     ui: {
       order: packs.flatMap((p) => p.order),
       collapsed: packs.flatMap((p) => p.collapsed),

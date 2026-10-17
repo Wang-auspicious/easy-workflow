@@ -79,6 +79,24 @@ function fixture() {
   };
 }
 
+test('shared lessons inject five newest active entries and deletion survives replay without changing ROLE', () => {
+  const f = fixture();
+  try {
+    f.seed();
+    const evidence = Object.keys(f.f.state.attempts).slice(0, 1);
+    for (let index = 0; index < 7; index++) f.lessons.writeShared({id: `shared-${index}`, node: station,
+      text: `经验 ${index}`, evidence, at: index, status: 'active'});
+    f.lessons.writeShared({id: 'trial', node: station, text: '尚未生效', evidence, at: 100, status: 'canary'});
+    assert.deepEqual(f.lessons.activeFor(station), ['经验 6', '经验 5', '经验 4', '经验 3', '经验 2']);
+    assert.throws(() => f.lessons.writeShared({id: 'long', node: station, text: '长'.repeat(301), evidence, at: 101, status: 'active'}));
+    assert.throws(() => f.lessons.writeShared({id: 'fake', node: station, text: '虚构证据', evidence: ['missing'], at: 101, status: 'active'}));
+    f.lessons.deleteShared('shared-6');
+    assert.deepEqual(f.reload().activeFor(station), ['经验 5', '经验 4', '经验 3', '经验 2', '经验 1']);
+    assert.equal(fs.readFileSync(f.roleFile, 'utf8'), f.role);
+    assert.equal(f.lessons.activeFor('curation/style').length, 0);
+  } finally { f.close(); }
+});
+
 test("round-end review conserves candidate, return and every consultation observation, without leaking later frameworks", () => {
   const f = fixture();
   try {
@@ -120,6 +138,41 @@ test("LESSONS and pending CONTEXT persist from journal; private notes and stable
   } finally { f.close(); }
 });
 
+test('unchanged lessons skip writes while revisions and missing lessons or context files are repaired', t => {
+  const f = fixture();
+  try {
+    const file = path.join(f.dir, 'LESSONS.md');
+    // Missing-file recovery uses this existing default heading; human/template
+    // text outside the managed block cannot be recreated from journal events.
+    fs.writeFileSync(file, '# 经验（LESSONS）\n');
+    const draft = f.seed();
+    const original = fs.readFileSync(file, 'utf8');
+    const write = t.mock.method(fs, 'writeFileSync');
+    f.lessons.write();
+    assert.equal(write.mock.callCount(), 0, 'identical lessons and contexts require no file write');
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+
+    const context = f.docs.contextFile(station);
+    const contextBody = fs.readFileSync(context, 'utf8');
+    fs.unlinkSync(context);
+    f.lessons.write();
+    assert.equal(fs.readFileSync(context, 'utf8'), contextBody,
+      'unchanged LESSONS must still repair a missing station context');
+    assert.equal(write.mock.calls.filter(call => call.arguments[0] === file).length, 0);
+
+    f.lessons.revise(draft.id, {digest: draft.digest, suggestion: 'Changed fixture lesson with direct evidence.'}, 'user');
+    assert.equal(write.mock.calls.filter(call => call.arguments[0] === file).length, 1);
+    const revised = fs.readFileSync(file, 'utf8');
+    assert.match(revised, /Changed fixture lesson with direct evidence/);
+    fs.unlinkSync(file);
+    f.lessons.write();
+    assert.equal(fs.readFileSync(file, 'utf8'), revised, 'a missing lessons document is regenerated');
+    assert.equal(write.mock.calls.filter(call => call.arguments[0] === file).length, 2);
+    f.lessons.write();
+    assert.equal(write.mock.calls.filter(call => call.arguments[0] === file).length, 2);
+  } finally { f.close(); }
+});
+
 test('ordinary context reads retain only lesson records and do not rebuild the view for business events', t => {
   const f = fixture();
   try {
@@ -141,21 +194,35 @@ test('ordinary context reads retain only lesson records and do not rebuild the v
     assert.ok(!JSON.stringify(cache.cachedLessonEvents).includes(marker));
     const returned = f.lessons.list();
     returned[0].suggestion = 'External mutation';
+    returned[0].observations[0].framework.push('external framework');
     assert.deepEqual(f.lessons.list(), expected, 'callers still receive detached views');
+    const fetched = f.lessons.get(draft.id);
+    fetched.observations[0].message = 'External nested mutation';
+    fetched.framework.push('external framework');
+    assert.deepEqual(f.lessons.get(draft.id), expected[0], 'get also returns a detached nested view');
+    const clone = t.mock.method(globalThis, 'structuredClone');
+    const rendered = f.lessons.render();
+    for (const node of [station, 'dispatcher', 'curation/copy']) {
+      f.lessons.pendingContext(node);
+      assert.equal(f.lessons.render(), rendered);
+    }
+    assert.equal(clone.mock.callCount(), 0, 'internal context and document rendering do not clone the full lesson cache');
+    clone.mock.restore();
 
     f.create('ordinary', 'ordinary');
     f.emit({kind: 'attempt.started', attempt: 'ordinary-active', token: 'ordinary', node: station,
       worker: 'ordinary-worker', input: 'Ordinary production work'});
-    const read = f.journal.readKinds.bind(f.journal);
-    const reads: number[] = [];
-    const observer = t.mock.method(f.journal, 'readKinds', function* (kinds: Parameters<Journal['readKinds']>[0], since = 0, through?: number) {
-      reads.push(since);
-      yield* read(kinds, since, through);
+    const observer = t.mock.method(f.journal, 'readKinds', () => {
+      assert.fail('The live lesson index must not reread journal kinds');
+    });
+    const historyObserver = t.mock.method(f.journal, 'read', () => {
+      assert.fail('An ordinary context read must not reread journal history');
     });
     assert.equal(f.lessons.validationContext(station, 'ordinary', {token: 'ordinary', attempt: 'ordinary-active'}), '');
-    assert.ok(reads.length > 0 && reads.every(since => since > 0),
-      'checking an ordinary station for trial exposure must use the incremental lesson index, not full history');
+    assert.equal(observer.mock.callCount(), 0);
+    assert.equal(historyObserver.mock.callCount(), 0);
     observer.mock.restore();
+    historyObserver.mock.restore();
 
     const revised = f.lessons.revise(draft.id, {digest: draft.digest, suggestion: '保留直接出处，修复后重跑原工位。'}, 'user');
     assert.notEqual(revised.digest, draft.digest);
@@ -185,6 +252,72 @@ test("restored and orphan consultation replies remain in the new round with unkn
     assert.equal(observations.length, 3);
     assert.ok(observations.every((o) => o.station === station));
     assert.ok(observations.every((o) => o.framework.join() === "unknown"));
+  } finally { f.close(); }
+});
+
+test('lesson snapshots preserve old run observations and recover undrafted work without history rereads', t => {
+  const f = fixture();
+  try {
+    f.start('snapshot-old');
+    f.create('snapshot-site', 'snapshot-token');
+    f.attempt('snapshot-token', false);
+    f.emit({kind: 'consult.opened', consult: 'snapshot-consult', token: 'snapshot-token',
+      reviewer: 'curation/fact-review', owner: station, fields: ['facts.license'], problem: '出处需核对', round: 1});
+    const middle = f.journal.seq;
+    f.emit({kind: 'token.data', token: 'snapshot-token', patch: {dossier: {framework: ['Astro']}}});
+    f.emit({kind: 'consult.replied', consult: 'snapshot-consult', token: 'snapshot-token', owner: station,
+      reply: '同轮回复保留最初框架', ok: true});
+    f.end('snapshot-old');
+    const ended = f.journal.seq;
+    f.start('snapshot-new');
+    f.emit({kind: 'token.data', token: 'snapshot-token', patch: {dossier: {framework: ['Next.js']},
+      unrelatedLargePayload: 'do-not-retain-business-data'.repeat(400)}});
+    f.emit({kind: 'consult.closed', consult: 'snapshot-consult', token: 'snapshot-token',
+      outcome: 'resolved', reason: '跨轮回复按当时上下文'});
+    f.emit({kind: 'consult.replied', consult: 'snapshot-orphan', token: 'snapshot-token', owner: station,
+      reply: '缺失开场的历史回复', ok: false});
+    f.emit({kind: 'token.finished', token: 'snapshot-token', node: 'curation/manual', status: 'manual', reason: '待复核'});
+    f.emit({kind: 'token.returned', token: 'snapshot-token', from: 'curation/manual', to: station,
+      reason: '重做核验', round: 1});
+    f.emit({kind: 'candidate.disposition', candidate: {token: 'snapshot-token', item: 'snapshot-site',
+      url: 'https://snapshot-site.test/', title: 'snapshot', source: 'manual', disposition: 'retry',
+      failure: {tag: 'http_server', category: 'network', retryable: true, message: 'HTTP 503'}}});
+    f.end('snapshot-new');
+    f.lessons.close();
+    const events = [...f.journal.read()];
+    const runs = ['snapshot-old', 'snapshot-new'];
+    const expected = new Map(runs.map(run => [run, groupLessonObservations(events, run, f.f.compiled)]));
+    const bySequence = (groups: ReturnType<typeof groupLessonObservations>) =>
+      groups.flat().sort((left, right) => left.seq - right.seq);
+    assert.deepEqual(expected.get('snapshot-old')?.flat().map(entry => entry.framework), [['storybook'], ['storybook']]);
+    assert.ok(expected.get('snapshot-new')?.flat().every(entry => entry.framework.join() === 'next.js'));
+    for (const cut of [middle, ended, events.at(-1)!.seq]) {
+      const prefix = new Lessons(f.f, f.dir, {rolesRoot: path.join(f.dir, 'roles'), deferReplay: true});
+      for (const event of events) if (event.seq <= cut) prefix.observe(event);
+      const body = prefix.serialize();
+      assert.ok(!body.includes('do-not-retain-business-data'));
+      const restored = new Lessons(f.f, f.dir, {rolesRoot: path.join(f.dir, 'roles'), deferReplay: true});
+      restored.restore(body);
+      for (const event of events) if (event.seq > cut) restored.observe(event);
+      for (const event of f.journal.read(events.at(-1)!.seq)) restored.observe(event);
+      restored.start();
+      const history = t.mock.method(f.journal, 'read', () => {
+        assert.fail('Restored lesson drafts must use saved observations, without rereading history');
+      });
+      try {
+        for (const run of runs) {
+          const drafts = restored.draftRun(run);
+          assert.deepEqual(bySequence(drafts.map(draft => draft.observations)), bySequence(expected.get(run)!));
+        }
+        assert.equal(history.mock.callCount(), 0);
+        assert.equal(fs.readFileSync(f.roleFile, 'utf8'), f.role);
+        assert.throws(() => restored.restore('{broken'), SyntaxError);
+        assert.throws(() => restored.restore('{}'), /Invalid lessons snapshot/);
+      } finally {
+        history.mock.restore();
+        restored.close();
+      }
+    }
   } finally { f.close(); }
 });
 

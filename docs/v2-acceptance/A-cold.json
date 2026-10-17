@@ -1,0 +1,151 @@
+{
+  "mode": "cold-without-cli",
+  "events": 187492,
+  "samples": [
+    {
+      "run": 1,
+      "backendReadyMs": 9831,
+      "launchToReadyMs": 10457,
+      "stages": [
+        {
+          "stage": "import",
+          "ms": 0
+        },
+        {
+          "stage": "journal",
+          "ms": 0
+        },
+        {
+          "stage": "compile",
+          "ms": 10
+        },
+        {
+          "stage": "restore-factory-state",
+          "ms": 0
+        },
+        {
+          "stage": "restore-docs",
+          "ms": 0
+        },
+        {
+          "stage": "restore-lessons",
+          "ms": 0
+        },
+        {
+          "stage": "restore-channels",
+          "ms": 0
+        },
+        {
+          "stage": "restore-sources",
+          "ms": 0
+        },
+        {
+          "stage": "restore-outbox",
+          "ms": 0
+        },
+        {
+          "stage": "replay",
+          "ms": 5423
+        },
+        {
+          "stage": "factory",
+          "ms": 9224
+        },
+        {
+          "stage": "dispatcher",
+          "ms": 0
+        }
+      ],
+      "receivedStages": [
+        {
+          "stage": "import",
+          "elapsedMs": 96,
+          "durationMs": 0
+        },
+        {
+          "stage": "journal",
+          "elapsedMs": 358,
+          "durationMs": 0
+        },
+        {
+          "stage": "compile",
+          "elapsedMs": 368,
+          "durationMs": 10
+        },
+        {
+          "stage": "restore-factory-state",
+          "elapsedMs": 380,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-docs",
+          "elapsedMs": 381,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-lessons",
+          "elapsedMs": 382,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-channels",
+          "elapsedMs": 383,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-sources",
+          "elapsedMs": 383,
+          "durationMs": 0
+        },
+        {
+          "stage": "restore-outbox",
+          "elapsedMs": 383,
+          "durationMs": 0
+        },
+        {
+          "stage": "replay",
+          "elapsedMs": 5804,
+          "durationMs": 5423
+        },
+        {
+          "stage": "factory",
+          "elapsedMs": 9553,
+          "durationMs": 9224
+        },
+        {
+          "stage": "dispatcher",
+          "elapsedMs": 9559,
+          "durationMs": 0
+        }
+      ]
+    }
+  ],
+  "snapshots": [
+    {
+      "name": "channels",
+      "seq": 187492
+    },
+    {
+      "name": "docs",
+      "seq": 187492
+    },
+    {
+      "name": "factory-state",
+      "seq": 187492
+    },
+    {
+      "name": "lessons",
+      "seq": 187492
+    },
+    {
+      "name": "outbox",
+      "seq": 187492
+    },
+    {
+      "name": "sources",
+      "seq": 187492
+    }
+  ],
+  "readyLimitMs": 5000,
+  "passed": true
+}

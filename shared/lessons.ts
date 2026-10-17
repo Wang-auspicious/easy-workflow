@@ -66,6 +66,8 @@ export interface LessonValidation {
 }
 
 export type LessonEvent =
+  | {kind: 'lesson.shared'; lesson: SharedLesson}
+  | {kind: 'lesson.deleted'; id: string; actor: 'user'}
   | { kind: "lesson.proposed"; draft: LessonDraft }
   | { kind: "lesson.revised"; draft: LessonDraft; by: "agent" | "dispatcher" | "user" }
   | { kind: "lesson.validation.started"; trial: LessonTrial }
@@ -75,6 +77,16 @@ export type LessonEvent =
   | { kind: "lesson.approved"; lessonId: string; digest: string; validationDigest: string; actor: "user"; roleRevision: string; roleResultDigest: string; addition: string }
   | { kind: "lesson.applied"; lessonId: string; digest: string; roleResultDigest: string }
   | { kind: "lesson.rejected"; lessonId: string; digest: string; actor: "user"; reason: string };
+
+/** Cross-item advice is separate from approved ROLE edits, on the same journal. */
+export interface SharedLesson {
+  id: string;
+  node: string;
+  text: string;
+  evidence: string[];
+  at: number;
+  status: 'active' | 'canary' | 'deleted';
+}
 
 export interface LessonView extends LessonDraft {
   status: "pending" | "validated" | "approved" | "applied" | "rejected";

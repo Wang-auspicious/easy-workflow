@@ -17,6 +17,8 @@ import base from "./pi-conversation.css?inline";
 import styles from "./transcript.css?inline";
 import avatar from "./avatar.css?inline";
 import roomStyles from "./rooms.css?inline";
+import {ProgressToggle} from '../KernelPanels.tsx';
+import {kernelRooms, kernelRoomLines} from '../kernel.ts';
 
 const VERB: Record<RoomLine["kind"], string> = {
   consult: "提出修改", verdict: "判定", return: "退回", channel: "交付", correction: "纠错", note: "播报",
@@ -31,12 +33,16 @@ export function RoomLog({ room, rooms }: { room: RoomSpec; rooms: readonly RoomS
   const fs = useStore((s) => s.fs);
   const factory = useStore((s) => s.factory);
   const bots = useStore((s) => s.layout.bots);
+  const kernel = useStore(state => state.replay ? 'v1' : state.kernel);
+  const events = useStore(state => state.kernelEvents);
+  const showProgress = useStore(state => state.showProgress);
   const now = useNow(2000);
   const [showNotes, setShowNotes] = useState(false);
   const all = useMemo(() => {
-    const ctx: RoomContext = { factory, state: fs, look: stationLook(factory, fs, bots, now), now };
+    const ctx: RoomContext = { factory, state: fs, look: stationLook(factory, fs, bots, now), now,
+      ...(kernel === 'v2' ? {kernelEvents: events, showProgress} : {}) };
     return buildRoomLines(room, rooms, ctx);
-  }, [room, rooms, factory, fs, bots, now]);
+  }, [room, rooms, factory, fs, bots, now, kernel, events, showProgress]);
   // A station announcing its own progress is not a conversation; it stays one tap away.
   const notes = all.filter((line) => line.kind === "note").length;
   const lines = showNotes ? all : all.filter((line) => line.kind !== "note");
@@ -74,6 +80,7 @@ export function RoomLog({ room, rooms }: { room: RoomSpec; rooms: readonly RoomS
 
   return (
     <>
+      {kernel === 'v2' && <ProgressToggle />}
       <div className="room-scroll" ref={scroll} onScroll={onScroll}>
         <p className="room-intro">{room.subtitle}<br /><span>{room.members.map((m) => m.name).join(" · ")}</span></p>
         {notes > 0 && <button className="room-notes" onClick={() => setShowNotes(!showNotes)}>{showNotes ? "隐藏工位播报" : `${notes} 条工位播报已折叠`}</button>}
@@ -98,7 +105,7 @@ export function RoomLog({ room, rooms }: { room: RoomSpec; rooms: readonly RoomS
   );
 }
 
-function RoomRow({ line, first }: { line: RoomLine; first: boolean }) {
+export function RoomRow({ line, first = true }: { line: RoomLine; first?: boolean }) {
   const fs = useStore((s) => s.fs);
   const item = line.token ? fs.tokens[line.token]?.item ?? line.token : "";
   const open = () => { const key = line.actor.node; if (!key) return; setState({ view: "canvas" }); toggleInspector(key); };
@@ -113,9 +120,10 @@ function RoomRow({ line, first }: { line: RoomLine; first: boolean }) {
           <time className="num">{time(line.at)}</time>
         </header>}
         <div className={`bub bub--${line.kind}${line.tone === "warn" ? " is-warn" : ""}`}>
-          {line.kind !== "note" && <span className="bub-verb">{VERB[line.kind]}</span>}
+          {line.kind !== "note" && <span className="bub-verb">{line.label ?? VERB[line.kind]}</span>}
           {line.text.replace(/^\[[^\]]{1,24}\]\s*/, "")}
           {item && <span className="bub-item">{item}</span>}
+          {line.note && <span className="bub-item">{({open: '待处理', resolved: '已解决', rejected: '已拒绝', superseded: '已替代', judged: '已裁决', parked: '待处理'} as Record<string, string>)[line.note] ?? line.note}</span>}
         </div>
       </div>
     </article>
@@ -123,3 +131,29 @@ function RoomRow({ line, first }: { line: RoomLine; first: boolean }) {
 }
 
 export type { RoomActor };
+
+/** The root retains its normal chat transcript; progress remains optional. */
+export function KernelProgressLog() {
+  const host = useRef<HTMLDivElement>(null);
+  const [container, setContainer] = useState<HTMLElement | null>(null);
+  const fs = useStore(state => state.fs);
+  const factory = useStore(state => state.factory);
+  const events = useStore(state => state.kernelEvents);
+  const bots = useStore(state => state.layout.bots);
+  const now = useNow(2000);
+  const lines = kernelRoomLines(kernelRooms(factory)[0], {factory, state: fs,
+    look: stationLook(factory, fs, bots, now), now}, events, true).slice(-100);
+  useLayoutEffect(() => {
+    const shadow = host.current!.shadowRoot ?? host.current!.attachShadow({mode: 'open'});
+    const sheet = document.createElement('style');
+    sheet.textContent = `${base}\n${styles}\n${avatar}\n${roomStyles}`;
+    const slot = document.createElement('div');
+    slot.className = 'tr-root';
+    shadow.replaceChildren(sheet, slot);
+    setContainer(slot);
+    return () => shadow.replaceChildren();
+  }, []);
+  return <div className="pi-conversation" ref={host} aria-label="主调度进展流">
+    {container && createPortal(<div className="tr">{lines.map(line => <RoomRow key={line.id} line={line} />)}</div>, container)}
+  </div>;
+}

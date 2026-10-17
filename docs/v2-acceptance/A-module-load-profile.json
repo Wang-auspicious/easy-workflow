@@ -1,0 +1,320 @@
+[
+  {
+    "run": 1,
+    "elapsedMs": 6698.7749,
+    "categories": {
+      "vendor": {
+        "files": 1,
+        "ms": 202.11300000000006,
+        "bytes": 904600
+      },
+      "undici": {
+        "files": 108,
+        "ms": 3218.5060000000058,
+        "bytes": 1187480
+      },
+      "server": {
+        "files": 58,
+        "ms": 1692.2574000000009,
+        "bytes": 1063613
+      },
+      "app": {
+        "files": 2,
+        "ms": 75.80769999999984,
+        "bytes": 23505
+      },
+      "shared": {
+        "files": 13,
+        "ms": 345.44480000000044,
+        "bytes": 145196
+      },
+      "packs": {
+        "files": 12,
+        "ms": 345.84680000000003,
+        "bytes": 297385
+      },
+      "other": {
+        "files": 135,
+        "ms": 1.0117999999987006,
+        "bytes": 1098
+      }
+    },
+    "loadDistribution": {
+      "min": 0.0010999999994965037,
+      "median": 28.99749999999949,
+      "p90": 40.77470000000085,
+      "over10ms": 177
+    },
+    "filesystemReadMs": 5920.3911999999955,
+    "topFs": [
+      {
+        "kind": "fs.readFileSync",
+        "name": "vendor/pi.js",
+        "calls": 1,
+        "ms": 202.02869999999996,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "node_modules/undici/lib/web/fetch/index.js",
+        "calls": 1,
+        "ms": 57.69170000000031,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "node_modules/undici/lib/web/fetch/data-url.js",
+        "calls": 1,
+        "ms": 57.3122000000003,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "node_modules/undici/lib/dispatcher/client.js",
+        "calls": 1,
+        "ms": 52.27970000000005,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "node_modules/undici/lib/util/cache.js",
+        "calls": 1,
+        "ms": 51.32850000000053,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "server/preflight.js",
+        "calls": 1,
+        "ms": 50.784400000000005,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "node_modules/undici/lib/mock/mock-utils.js",
+        "calls": 1,
+        "ms": 45.75619999999981,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "node_modules/undici/lib/dispatcher/client-h1.js",
+        "calls": 1,
+        "ms": 45.43100000000004,
+        "bytes": 0
+      }
+    ]
+  },
+  {
+    "run": 2,
+    "elapsedMs": 555.5834,
+    "categories": {
+      "undici": {
+        "files": 108,
+        "ms": 31.604799999999813,
+        "bytes": 1187480
+      },
+      "vendor": {
+        "files": 1,
+        "ms": 0.7754999999999939,
+        "bytes": 904600
+      },
+      "server": {
+        "files": 58,
+        "ms": 21.00239999999981,
+        "bytes": 1063613
+      },
+      "packs": {
+        "files": 12,
+        "ms": 4.8326000000000136,
+        "bytes": 297385
+      },
+      "other": {
+        "files": 135,
+        "ms": 0.9022000000004624,
+        "bytes": 1098
+      },
+      "shared": {
+        "files": 13,
+        "ms": 5.294200000000004,
+        "bytes": 145196
+      },
+      "app": {
+        "files": 2,
+        "ms": 0.7415000000000305,
+        "bytes": 23505
+      }
+    },
+    "loadDistribution": {
+      "min": 0.0004999999999881766,
+      "median": 0.28659999999999286,
+      "p90": 0.4814000000000078,
+      "over10ms": 0
+    },
+    "filesystemReadMs": 59.717799999999485,
+    "topFs": [
+      {
+        "kind": "fs.readFileSync",
+        "name": "node_modules/undici/lib/core/constants.js",
+        "calls": 1,
+        "ms": 1.549599999999998,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "resources/vislexicon/Spec.md",
+        "calls": 1,
+        "ms": 0.7708000000000084,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "vendor/pi.js",
+        "calls": 1,
+        "ms": 0.7375000000000114,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "node_modules/undici/lib/web/fetch/index.js",
+        "calls": 1,
+        "ms": 0.582300000000032,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "resources/vislexicon/public/spec/v1/preview-rules.json",
+        "calls": 1,
+        "ms": 0.5432000000000698,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "packs/vislexicon/preview.js",
+        "calls": 1,
+        "ms": 0.5340999999999951,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "server/intake-captures.js",
+        "calls": 1,
+        "ms": 0.5294000000000096,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "<diagnostic-entry>",
+        "calls": 1,
+        "ms": 0.5287000000000006,
+        "bytes": 0
+      }
+    ]
+  },
+  {
+    "run": 3,
+    "elapsedMs": 612.0237999999999,
+    "categories": {
+      "undici": {
+        "files": 108,
+        "ms": 37.5542999999993,
+        "bytes": 1187480
+      },
+      "packs": {
+        "files": 12,
+        "ms": 4.864399999999989,
+        "bytes": 297385
+      },
+      "server": {
+        "files": 58,
+        "ms": 20.545900000000046,
+        "bytes": 1063613
+      },
+      "vendor": {
+        "files": 1,
+        "ms": 0.640199999999993,
+        "bytes": 904600
+      },
+      "app": {
+        "files": 2,
+        "ms": 1.1385000000000218,
+        "bytes": 23505
+      },
+      "shared": {
+        "files": 13,
+        "ms": 5.04549999999999,
+        "bytes": 145196
+      },
+      "other": {
+        "files": 135,
+        "ms": 0.8672000000001105,
+        "bytes": 1098
+      }
+    },
+    "loadDistribution": {
+      "min": 0.0006000000000767614,
+      "median": 0.3223999999999876,
+      "p90": 0.49799999999999045,
+      "over10ms": 0
+    },
+    "filesystemReadMs": 64.64460000000085,
+    "topFs": [
+      {
+        "kind": "fs.readFileSync",
+        "name": "resources/vislexicon/Spec.md",
+        "calls": 1,
+        "ms": 1.0534999999999854,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "packs/vislexicon/agents.js",
+        "calls": 1,
+        "ms": 0.7017000000000166,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "server/browser.js",
+        "calls": 1,
+        "ms": 0.6795000000000186,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "node_modules/undici/lib/handler/deduplication-handler.js",
+        "calls": 1,
+        "ms": 0.6602000000000317,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "packs/vislexicon/decisions.js",
+        "calls": 1,
+        "ms": 0.6239999999999952,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "vendor/pi.js",
+        "calls": 1,
+        "ms": 0.6016999999999939,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "<external>/settings.json",
+        "calls": 1,
+        "ms": 0.5999000000000478,
+        "bytes": 0
+      },
+      {
+        "kind": "fs.readFileSync",
+        "name": "shared/layout.js",
+        "calls": 1,
+        "ms": 0.5484000000000151,
+        "bytes": 0
+      }
+    ]
+  }
+]

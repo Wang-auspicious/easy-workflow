@@ -16,9 +16,13 @@ import { pack } from "../../packs/vislexicon/pack.ts";
 import { Runtime } from "../../server/runtime.ts";
 import { Journal } from "../../server/journal.ts";
 import { Broker } from "../../server/broker.ts";
+import {KernelStore} from '../../server/kernel/store.ts';
+import {createItem} from '../../server/kernel/item.ts';
+import {BoardStore} from '../../server/board.ts';
 
 const root = path.resolve(import.meta.dirname, "../..");
-const out = path.join(root, "var/verification/rooms");
+const v2 = process.argv.includes('--v2');
+const out = path.join(root, v2 ? 'docs/v2-acceptance/E' : 'var/verification/rooms');
 await fs.mkdir(out, { recursive: true });
 
 /* ---------------------------------------------------------------- 1. 真实运行，产出真实往来 */
@@ -73,6 +77,63 @@ async function seedProject(directory) {
   return { token: token.id, crossed: crossed.id };
 }
 
+/** UI fixture only: durable rows and journal events, no live model acceptance. */
+async function seedV2(directory) {
+  const compiled = compile([pack]);
+  const journal = new Journal(path.join(directory, 'journal.db'));
+  const store = new KernelStore(journal);
+  const board = new BoardStore(journal, compiled, {'curation/proof': {outputKey: 'shots'}});
+  const now = Date.now();
+  const item = createItem(compiled, {id: 'ui-v2-shots', run: 'ui-v2-run', entry: 'curation/reader', item: '三屏协作样本',
+    url: 'https://fixture.invalid/shots', source: 'isolated-ui-fixture', now, data: {title: '三屏协作样本', mode: 'shots', shots: {proof: 'fixture'}}});
+  item.status = 'active';
+  for (const state of Object.values(item.nodes)) state.status = 'pending';
+  for (const [node, reason] of [['curation/plan', 'model'], ['curation/identity', 'budget'], ['curation/breadth', 'backoff'],
+    ['curation/proof', 'room'], ['curation/process', 'resource']]) {
+    Object.assign(item.nodes[node], {status: 'waiting', waitingFor: reason, waitingSince: now - 660000});
+    if (reason === 'budget') item.nodes[node].agentBudget = {maxTokens: 60000, maxMs: 900000};
+    if (reason === 'backoff') item.nodes[node].nextAt = now + 900000;
+  }
+  const parked = createItem(compiled, {id: 'ui-v2-auth', run: item.run, entry: 'curation/plan', item: '需要登录的素材',
+    url: 'https://fixture.invalid/login', source: 'isolated-ui-fixture', now});
+  parked.status = 'parked';
+  parked.parked = {node: 'curation/proof', code: 'auth', reason: '来源页需要登录后继续', at: now};
+  parked.nodes['curation/proof'].status = 'failed';
+  const published = createItem(compiled, {id: 'ui-v2-published', run: item.run, entry: 'curation/plan', item: '已发布样本',
+    url: 'https://fixture.invalid/published', source: 'isolated-ui-fixture', now});
+  published.status = 'published';
+  published.nodes['curation/published'].status = 'done';
+  published.data.published = true;
+  journal.atomic(() => {
+    journal.append({kind: 'run.started', runId: item.run, title: 'E 界面 fixture · 不调用外部模型'});
+    for (const value of [item, parked, published]) {
+      store.save(value);
+      journal.append({kind: 'token.created', token: value.id, line: value.line, item: value.item, title: value.item, url: value.url, source: value.source});
+      journal.append({kind: 'token.data', token: value.id, patch: value.data});
+    }
+    journal.append({kind: 'token.finished', token: parked.id, node: 'curation/proof', status: 'manual', reason: parked.parked.reason});
+    journal.append({kind: 'token.finished', token: published.id, node: 'curation/published', status: 'published', reason: 'Fixture publication state'});
+    board.autoClaim(item, 'curation/proof', '已保存选中页面的主体证据（UI fixture）', {shots: item.data.shots}, []);
+    const challenge = board.addPost({item, author: 'curation/shot-review', type: 'challenge', field: 'shots.proof',
+      addressee: 'curation/proof', body: '特写没有完整展示组件主体，请保留页面路径并补充证据。'});
+    board.addPost({item, author: 'curation/proof', type: 'answer', field: 'shots.proof', target: challenge.id,
+      body: '已核对原页面：组件主体在选中舞台区域，补充截图后继续复核。'});
+    const room = board.createRoom({item, field: 'shots.proof', topic: '核对三屏主体证据',
+      participants: ['curation/shot-review', 'curation/style', 'curation/reader'], judge: 'program:shot-rules'});
+    board.closeRoom(room.id, {status: 'resolved', value: {verified: true}});
+    store.saveAttempt({id: 'ui-v2-progress', item: item.id, node: 'curation/shot-review', startedAt: now, endedAt: now + 1,
+      status: 'ok', body: {summary: 'Fixture program receipt'}});
+    journal.append({kind: 'attempt.started', attempt: 'ui-v2-progress', token: item.id, node: 'curation/shot-review', worker: 'fixture', input: '三屏复核'});
+    journal.append({kind: 'attempt.progress', attempt: 'ui-v2-progress', text: '正在核对选中页面与像素统计（UI fixture 进展）'});
+    journal.append({kind: 'attempt.finished', attempt: 'ui-v2-progress', ok: true, summary: '已保存三屏检查记录', ms: 1, queuedMs: 0});
+    journal.append({kind: 'lesson.shared', lesson: {id: 'ui-v2-lesson', node: 'curation/proof', text: '复核前保留选中页面路径，截图必须包含组件主体。',
+      evidence: ['ui-v2-progress'], at: now, status: 'active'}});
+    journal.append({kind: 'run.paused', runId: item.run});
+  });
+  journal.close();
+  return {token: item.id, parked: parked.id, lesson: 'ui-v2-lesson'};
+}
+
 /* ---------------------------------------------------------------- 2. 指向这份日志启动界面 */
 
 async function serve(directory) {
@@ -81,7 +142,7 @@ async function serve(directory) {
     cwd: root, execArgv: [], stdio: ["ignore", "pipe", "pipe", "ipc"],
     env: { ...process.env, FACTORY_ROOT: root, FACTORY_VAR: directory, FACTORY_LAYOUT: path.join(directory, "layout.json"),
       VISLEXICON_ROOT: path.join(directory, "unconnected"), FACTORY_PORT: "0", FACTORY_TOKEN: token,
-      FACTORY_DISCOVERY: "0", FACTORY_PREFLIGHT: "0", FACTORY_HTTP_CACHE: "0", FACTORY_READONLY: "0", FACTORY_START_PAUSED: "0" },
+      FACTORY_DISCOVERY: "0", FACTORY_PREFLIGHT: "0", FACTORY_HTTP_CACHE: "0", FACTORY_READONLY: "0", FACTORY_START_PAUSED: v2 ? '1' : '0', FACTORY_KERNEL: v2 ? 'v2' : 'v1' },
   });
   let log = "";
   child.stdout.on("data", (chunk) => { log += chunk; });
@@ -95,7 +156,8 @@ async function serve(directory) {
   const vite = await createServer({
     configFile: path.join(root, "ui/vite.config.ts"), logLevel: "error",
     server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false,
-      proxy: { "/api": { target: backend, headers: { authorization: `Bearer ${token}` } }, "/evidence": { target: backend, headers: { authorization: `Bearer ${token}` } } } },
+      fs: {allow: [root, await fs.realpath(path.join(root, 'node_modules'))]},
+      proxy: { "/api": { target: backend, changeOrigin: false, headers: { authorization: `Bearer ${token}` } }, "/evidence": { target: backend, changeOrigin: false, headers: { authorization: `Bearer ${token}` } } } },
   });
   await vite.listen();
   return { url: `http://127.0.0.1:${vite.httpServer.address().port}`, close: async () => {
@@ -106,19 +168,102 @@ async function serve(directory) {
 
 /* ---------------------------------------------------------------- 3. 检查界面 */
 
+async function verifyV2(page, seeded, errors) {
+  await page.waitForFunction(() => document.querySelector('.kernel-summary')?.textContent?.includes('已发布 1'));
+  assert.equal(await page.locator('.room-rail .room-item').count(), 6);
+  const names = await page.locator('.room-item-name').allInnerTexts();
+  for (const label of ['主调度', '分类', '三屏', '风格', '事实', '文案']) assert.ok(names.some(name => name.includes(label)), label);
+  assert.ok(await page.locator('.kernel-attention').count() >= 2);
+  assert.equal(await page.locator('.allocation-shortcut,.allocation-proposal').count(), 0);
+  await page.screenshot({path: path.join(out, 'summary-attention.png')});
+  await page.locator('.room-item').filter({has: page.locator('.room-item-name').filter({hasText: '三屏'})}).click();
+  await page.getByText('特写没有完整展示组件主体，请保留页面路径并补充证据。', {exact: true}).waitFor();
+  assert.ok((await page.locator('.rlog-verb').allInnerTexts()).includes('答复'));
+  assert.equal(await page.getByText('已保存选中页面的主体证据（UI fixture）', {exact: true}).count(), 0, 'claims are not conversation rows');
+  const toggle = page.getByRole('checkbox', {name: '显示进展'});
+  assert.equal(await toggle.isChecked(), false);
+  assert.equal(await page.getByText('正在核对选中页面与像素统计（UI fixture 进展）', {exact: true}).count(), 0);
+  await page.screenshot({path: path.join(out, 'shots-challenge.png')});
+  await page.screenshot({path: path.join(out, 'progress-off.png')});
+  await toggle.check();
+  await page.getByText('正在核对选中页面与像素统计（UI fixture 进展）', {exact: true}).waitFor();
+  await page.screenshot({path: path.join(out, 'progress-on.png')});
+  await page.reload();
+  await page.locator('.rail-conn.is-on').waitFor();
+  await page.getByRole('checkbox', {name: '显示进展'}).waitFor();
+  assert.equal(await page.getByRole('checkbox', {name: '显示进展'}).isChecked(), true, 'progress preference survives reload');
+  await page.evaluate(async token => {
+    const {toggleInspector} = await import('/src/canvas/Canvas.tsx');
+    toggleInspector(token, 'token');
+  }, seeded.token);
+  await page.locator('.kernel-board-post[data-board-type="claim"]').waitFor();
+  assert.ok(await page.locator('.kernel-board-chain').innerText().then(text => text.includes('已保存选中页面的主体证据')));
+  await page.locator(`[data-inspector="${seeded.token}"]`).getByRole('button', {name: '关闭详情', exact: true}).click();
+  await page.evaluate(async () => {
+    const {toggleInspector} = await import('/src/canvas/Canvas.tsx');
+    toggleInspector('curation/proof');
+  });
+  await page.locator('.kernel-lesson').waitFor();
+  assert.equal(await page.getByRole('button', {name: '加一个人', exact: true}).count(), 0);
+  assert.equal(await page.getByRole('button', {name: '撤一个', exact: true}).count(), 0);
+  const deletion = page.waitForResponse(response => response.url().endsWith('/api/lessons/shared/delete') && response.request().method() === 'POST');
+  await page.locator('.kernel-lesson').getByRole('button', {name: '删除', exact: true}).click();
+  const receipt = await deletion;
+  assert.equal(receipt.status(), 200, await receipt.text());
+  await page.waitForFunction(() => document.querySelectorAll('.kernel-lesson').length === 0);
+  const lessons = await page.evaluate(async () => (await (await fetch('/api/lessons/shared?node=curation%2Fproof')).json()).lessons);
+  assert.ok(!lessons.some(lesson => lesson.id === seeded.lesson && lesson.status !== 'deleted'));
+  await page.locator('[data-inspector="curation/proof"]').getByRole('button', {name: '关闭详情', exact: true}).click();
+  for (const reason of ['model', 'budget', 'room', 'backoff']) assert.ok(await page.locator(`.node [data-waiting="${reason}"]`).count() > 0, `Missing ${reason} canvas count`);
+  await page.evaluate(async () => {
+    const {setState} = await import('/src/store.ts');
+    setState({chatOpen: false});
+  });
+  await page.waitForFunction(() => document.querySelector('.cv')?.getBoundingClientRect().width > 1200);
+  await delay(350);
+  await page.evaluate(async () => {
+    const {setState} = await import('/src/store.ts');
+    const keys = ['curation/plan', 'curation/identity', 'curation/breadth', 'curation/proof', 'curation/process'];
+    const boxes = keys.map(key => document.querySelector(`[data-node="${key}"]`)).filter(Boolean).map(element => ({
+      x: parseFloat(element.style.left), y: parseFloat(element.style.top), w: parseFloat(element.style.width), h: parseFloat(element.style.height),
+    }));
+    const left = Math.min(...boxes.map(box => box.x)), top = Math.min(...boxes.map(box => box.y));
+    const right = Math.max(...boxes.map(box => box.x + box.w)), bottom = Math.max(...boxes.map(box => box.y + box.h));
+    setState({focus: {x: (left + right) / 2, y: (top + bottom) / 2, area: {w: right - left + 40, h: bottom - top + 40}, at: Date.now()}});
+  });
+  await delay(700);
+  for (const reason of ['model', 'budget', 'room', 'backoff']) {
+    const box = await page.locator(`.node [data-waiting="${reason}"]`).first().boundingBox();
+    assert.ok(box && box.x >= 60 && box.x + box.width <= 1450 && box.y >= 0 && box.y + box.height <= 900,
+      `${reason} must be visible in the actual canvas screenshot: ${JSON.stringify(box)}`);
+  }
+  await page.screenshot({path: path.join(out, 'canvas-waits.png')});
+  assert.deepEqual(errors, []);
+  const report = {ok: true, kind: 'isolated UI fixture, not live-model acceptance', groups: names,
+    checked: ['summary-attention', 'field-conversation', 'claim-evidence-chain', 'progress-toggle-persistence', 'lesson-deletion', 'canvas-wait-colors', 'v2-worker-controls-hidden']};
+  await fs.writeFile(path.join(out, 'fixture-report.json'), JSON.stringify(report, null, 2) + '\n');
+  console.log(JSON.stringify(report, null, 2));
+  console.log(`screenshots: ${out}`);
+}
+
 const directory = await fs.mkdtemp(path.join(os.tmpdir(), "easy-ui-rooms-"));
 const errors = [];
 let server, browser;
 try {
-  const seeded = await seedProject(directory);
+  const seeded = v2 ? await seedV2(directory) : await seedProject(directory);
   server = await serve(directory);
   browser = await chromium.launch({ executablePath: process.env.CHROME_PATH ?? "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: true });
-  const page = await browser.newPage({ viewport: { width: 1500, height: 940 }, deviceScaleFactor: 2 });
+  const page = await browser.newPage({ viewport: { width: 1500, height: 940 }, deviceScaleFactor: 2,
+    ...(v2 ? {reducedMotion: 'reduce'} : {}) });
   page.on("pageerror", (error) => errors.push(error.message));
   await page.addInitScript(() => { localStorage.setItem("pf.chatOpen", "true"); localStorage.setItem("pf.chatWidth", "320"); });
   await page.goto(server.url);
   await page.locator(".rail-conn.is-on").waitFor();
   await page.locator(".room-rail-list .room-item").first().waitFor();
+
+  if (v2) {
+    await verifyV2(page, seeded, errors);
+  } else {
 
   const rail = page.locator(".room-rail");
   const items = rail.locator(".room-item");
@@ -219,6 +364,7 @@ try {
     kinds: [...seenKinds], withTraffic,
   }, null, 2));
   console.log(`screenshots: ${out}`);
+  }
 } finally {
   await browser?.close();
   await server?.close();

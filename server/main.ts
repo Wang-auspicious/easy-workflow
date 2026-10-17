@@ -26,6 +26,7 @@ const factory = new Factory();
 await factory.boot();
 const control = new FactoryControl(factory);
 const dispatcher = new Dispatcher(factory, control);
+console.log('BOOT_STAGE dispatcher 0');
 let latestBrowserState: import('../shared/browser.ts').BrowserState | undefined;
 browserEvents.add(state => {
   latestBrowserState = state;
@@ -141,7 +142,7 @@ const server = http.createServer(async (req, res) => {
       const agentDefaults = factory.getAgentDefaults();
       const modelStatus = factory.dispatcherModelStatus();
       const pi = modelStatus.adapter === 'pi' ? modelStatus : null;
-      return send(res, 200, { factory: c, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: modelStatus.id === 'native-default' ? modelStatus.name : modelStatus.id, modelStatus, pi, keyPresent: pi?.ready ?? false, patches: factory.patches, agentDefaults, agentBindings: factory.agentBindings().bindings });
+      return send(res, 200, { factory: c, kernel: factory.kernel, layout: factory.readLayout(), defaultLayout: layoutFactory(c.nodes, c.edges, c.ui.order, c.ui.hints, c.ui.collapsed), settings: factory.settings, model: modelStatus.id === 'native-default' ? modelStatus.name : modelStatus.id, modelStatus, pi, keyPresent: pi?.ready ?? false, patches: factory.patches, agentDefaults, agentBindings: factory.agentBindings().bindings });
     }
     const view = url.searchParams.get('view');
     if (['/api/state', '/api/events'].includes(p) && view !== null && view !== 'raw' && view !== 'ui-v1') {
@@ -159,6 +160,18 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, state);
     }
     if (p === "/api/browser" && req.method === "GET") return send(res, 200, await browserCommand({action:"state"}));
+    if (p === '/api/board' && req.method === 'GET') {
+      const item = url.searchParams.get('item');
+      if (!item) throw new ControlError(400, 'missing_item', '需要货 id');
+      if (!factory.board) throw new ControlError(410, 'kernel_v2_required', '黑板需要 v2 内核');
+      return send(res, 200, {posts: factory.board.read(item, {field: url.searchParams.get('field') ?? undefined}), rooms: factory.board.rooms(item)});
+    }
+    if (p === '/api/lessons/shared' && req.method === 'GET') return send(res, 200, {lessons: factory.lessons.sharedLessons(url.searchParams.get('node') ?? undefined)});
+    if (p === '/api/kernel/streams' && req.method === 'GET') return send(res, 200, factory.streamSnapshot());
+    if (p === '/api/kernel/conversation' && req.method === 'GET') {
+      const result = factory.streamEvents(Number(url.searchParams.get('since') ?? 0), url.searchParams.get('includeProgress') === '1');
+      return send(res, 200, {...result, events: result.events.map(uiEvent)});
+    }
     if (p === "/api/events") {
       const since = Number(req.headers["last-event-id"] ?? url.searchParams.get("since") ?? 0);
       if (!Number.isSafeInteger(since) || since < 0) throw new ControlError(400, "invalid_cursor", "since 必须是非负整数");
@@ -269,6 +282,8 @@ const server = http.createServer(async (req, res) => {
         case "/api/correct/undo": return send(res, 200, await control.execute("undo_correction", b, "user"));
         case "/api/business/feed": return send(res, 200, await control.execute("business_feed", b, "user"));
         case "/api/browser": return send(res, 200, (await control.execute("browser", b, "user")).result);
+        case '/api/kernel/continue': return send(res, 200, await control.execute('continue_budget', b, 'user'));
+        case '/api/lessons/shared/delete': return send(res, 200, await control.execute('delete_shared_lesson', b, 'user'));
         case "/api/chat/abort": dispatcher.abort(); return send(res, 200, { ok: true });
         case "/api/chat/continue": {
           if (dispatcher.busy) return send(res, 202, { ok: true, accepted: true, turn: dispatcher.status.turn, status: dispatcher.status });
@@ -354,7 +369,19 @@ const shutdown = async () => {
   server.close(); server.closeAllConnections();
   await Promise.all([sourceTask, factory.runtime.close(), chatTask]);
   factory.publicationOutbox?.close();
-  await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]); factory.docs.flush(); factory.lessons.close(); factory.journal.close(); process.exit(0);
+  await Promise.all([closeBrowser(), closeModelTransport(), closeNetwork()]);
+  factory.docs.flush();
+  factory.lessons.close();
+  let exitCode = 0;
+  try {
+    await factory.closeSnapshots();
+  } catch {
+    console.error('Shutdown snapshot failed; journal events remain durable');
+    exitCode = 1;
+  } finally {
+    factory.journal.close();
+  }
+  process.exit(exitCode);
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

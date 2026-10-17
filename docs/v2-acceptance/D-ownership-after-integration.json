@@ -1,0 +1,123 @@
+{
+  "source": "read-only acceptance copy v2 successful attempts",
+  "journalSeq": 191528,
+  "ownership": {
+    "route": [
+      "candidates/route"
+    ],
+    "canonical": [
+      "curation/dedupe"
+    ],
+    "host": [
+      "curation/dedupe"
+    ],
+    "key": [
+      "curation/dedupe"
+    ],
+    "dossier": [
+      "curation/scout"
+    ],
+    "title": [
+      "curation/scout"
+    ],
+    "homeLinks": [
+      "curation/scout",
+      "curation/identity"
+    ],
+    "home": [
+      "curation/scout"
+    ],
+    "understanding": [
+      "curation/reader"
+    ],
+    "readerPlan": [
+      "curation/reader"
+    ],
+    "factLeads": [
+      "curation/reader"
+    ],
+    "readerBlockers": [
+      "curation/reader"
+    ],
+    "kind1": [
+      "curation/classify"
+    ],
+    "kind2": [
+      "curation/classify-review"
+    ],
+    "kindAgreed": [
+      "curation/kind-join"
+    ],
+    "kind": [
+      "curation/kind-join"
+    ],
+    "reviews": [
+      "curation/kind-join",
+      "curation/fact-review",
+      "curation/shot-review"
+    ],
+    "catalogV3": [
+      "curation/catalog"
+    ],
+    "reply": [
+      "curation/catalog",
+      "curation/facts"
+    ],
+    "mode": [
+      "curation/plan",
+      "curation/identity"
+    ],
+    "breadthCandidates": [
+      "curation/plan"
+    ],
+    "needsProof": [
+      "curation/plan"
+    ],
+    "shots": [
+      "curation/identity",
+      "curation/breadth",
+      "curation/proof",
+      "curation/process"
+    ],
+    "motion": [
+      "curation/identity"
+    ],
+    "facts": [
+      "curation/facts"
+    ],
+    "pricingNote": [
+      "curation/facts"
+    ],
+    "factConflicts": [
+      "curation/facts"
+    ],
+    "factPages": [
+      "curation/facts"
+    ],
+    "breadthLinks": [
+      "curation/breadth"
+    ],
+    "candidateAccessFailures": [
+      "curation/breadth",
+      "curation/proof"
+    ],
+    "fact-reviewVerdict": [
+      "curation/fact-review"
+    ],
+    "images": [
+      "curation/process"
+    ],
+    "shotReview": [
+      "curation/shot-review"
+    ],
+    "shotRepairs": [
+      "curation/shot-review"
+    ],
+    "rejectedPages": [
+      "curation/shot-review"
+    ],
+    "style": [
+      "curation/style"
+    ]
+  }
+}
